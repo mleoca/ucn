@@ -7,7 +7,11 @@
  *   1. cold AST index build;
  *   2. repeated persisted-index load and first semantic warm-up;
  *   3. a deterministic board of pinned `context` queries;
- *   4. per-repository process RSS after the board.
+ *   4. the query-class board (fix #432): pinned class, constructor,
+ *      overloaded-method, value-member and orientation queries, each class
+ *      compared with the same handles measured on the last release
+ *      (eval/lib/performance-query-board.js);
+ *   5. per-repository process RSS after the boards.
  *
  * Absolute latency budgets catch slow releases. Ratio/throughput budgets make
  * the gate portable across CI hosts. Tiny repositories are excluded from the
@@ -22,8 +26,6 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { performance } = require('perf_hooks');
 
-const { ProjectIndex } = require('../core/project');
-const { execute } = require('../core/execute');
 const {
     REPOS,
     RELEASE_REPOS,
@@ -39,6 +41,16 @@ const {
     resolveHostFactor,
     evaluatePerformanceBudgets,
 } = require('./performance-gate-policy');
+const {
+    QUERY_CLASSES,
+    boardQueries,
+    candidateKeys,
+    evaluateQueryClasses,
+    pinnedQueryBoard,
+    queryCandidates,
+    selectQueryHandles,
+    summarizeQueryClasses,
+} = require('./lib/performance-query-board');
 
 const CALIBRATION_SCRIPT = path.join(__dirname, 'lib', 'host-calibration.js');
 
@@ -59,6 +71,17 @@ function repoBaseline(repo) {
 }
 
 const args = process.argv.slice(2);
+// The engine under measurement. Default: this tree. `--engine-root DIR`
+// measures another tree's engine (an exported release) with THIS gate's
+// boards, which is how the query-class release baselines are pinned
+// (fix #432); such runs are measurements, never release evidence.
+const engineRootArg = readArg('--engine-root');
+const ENGINE_ROOT = path.resolve(engineRootArg || path.join(__dirname, '..'));
+if (!fs.existsSync(path.join(ENGINE_ROOT, 'core', 'project.js'))) {
+    throw new Error(`--engine-root ${engineRootArg} has no core/project.js`);
+}
+const { ProjectIndex } = require(path.join(ENGINE_ROOT, 'core', 'project'));
+const { execute } = require(path.join(ENGINE_ROOT, 'core', 'execute'));
 const releaseOnly = args.includes('--release');
 const repoArg = readArg('--repo');
 const repoNames = repoArg ? new Set(repoArg.split(',').map(s => s.trim()).filter(Boolean)) : null;
@@ -68,6 +91,10 @@ const processSamples = positiveInteger('--samples', releaseOnly ? 3 : 1);
 const workerRepoName = readArg('--worker-repo');
 const workerResultPath = readArg('--worker-result');
 const workerQuiet = args.includes('--worker-quiet');
+const selectQueryBoard = args.includes('--select-query-board');
+const selectAgainstRoot = readArg('--against');
+const pinQueryBaseline = args.includes('--pin-query-baseline');
+const skipQueryClasses = args.includes('--no-query-classes');
 const requestedWorkerCount = envPositiveInteger('UCN_WORKERS');
 const requireColdWallThroughput = releaseOnly ||
     args.includes('--require-wall-throughput');
@@ -101,7 +128,25 @@ const budgets = {
     maxQueryP95Ms: positiveNumber('--max-query-p95-ms', DEFAULT_BUDGETS.maxQueryP95Ms),
     maxBuildRssMb: positiveNumber('--max-build-rss-mb', legacyMaxRssMb),
     maxBoardRssMb: positiveNumber('--max-board-rss-mb', legacyMaxRssMb),
+    maxQueryClassRatio: positiveNumber(
+        '--max-query-class-ratio', DEFAULT_BUDGETS.maxQueryClassRatio),
+    minQueryClassDeltaMs: positiveNumber(
+        '--min-query-class-delta-ms', DEFAULT_BUDGETS.minQueryClassDeltaMs),
+    // Release and PR runs gate the query classes against the pinned release
+    // baselines, exactly when wall throughput becomes release-blocking.
+    requireQueryClassBaselines: requireColdWallThroughput,
 };
+if (engineRootArg && selectQueryBoard) {
+    throw new Error('--select-query-board selects on this tree; name the comparison engine with --against');
+}
+// Release baselines come from the release's own tree, never from the tree
+// under test: a self-pinned baseline would make every regression the norm.
+if (pinQueryBaseline && !engineRootArg) {
+    throw new Error('--pin-query-baseline measures the last release: pass --engine-root <release tree>');
+}
+if (skipQueryClasses && (requireColdWallThroughput || pinQueryBaseline)) {
+    throw new Error('--no-query-classes cannot be combined with gating runs or --pin-query-baseline');
+}
 const REPORTS_DIR = path.resolve(
     process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 
@@ -248,7 +293,48 @@ function callableBoard(index, limit) {
     return result;
 }
 
+/**
+ * Run the pinned query-class board once on a warm index, in the fixed
+ * `boardQueries` order. Returns { [classId]: { handles, samplesMs, errors,
+ * errorDetails } } -- raw timings; `summarizeQueryClasses` merges processes.
+ */
+function runQueryClassBoard(index, pins) {
+    const classes = {};
+    for (const query of boardQueries(pins)) {
+        let row = classes[query.classId];
+        if (!row) {
+            row = classes[query.classId] = { handles: [], samplesMs: [], errors: 0, errorDetails: [] };
+        }
+        const started = performance.now();
+        let response;
+        try {
+            response = execute(index, query.command, query.params);
+        } catch (error) {
+            response = { ok: false, error: error.message };
+        }
+        row.samplesMs.push(elapsed(started));
+        row.handles.push(query.handle ?? query.command);
+        if (!response?.ok) {
+            row.errors++;
+            if (row.errorDetails.length < 5) {
+                row.errorDetails.push(`${query.command} ${query.handle ?? ''}: ` +
+                    `${String(response?.error || 'failed').split('\n')[0].slice(0, 160)}`);
+            }
+        }
+    }
+    return classes;
+}
+
+function queryBoardFor(repo) {
+    return skipQueryClasses ? null : pinnedQueryBoard(repo);
+}
+
+function queryBaselineFor(pins) {
+    return pins?.baseline?.[HOST_CLASS] ? { ...pins.baseline[HOST_CLASS], hostClass: HOST_CLASS } : null;
+}
+
 async function evaluateRepo(repo) {
+    const queryPins = queryBoardFor(repo);
     const clone = cloneAtCommit(repo);
     const target = resolveTarget(clone, repo);
     if (!workerQuiet) {
@@ -283,6 +369,7 @@ async function evaluateRepo(repo) {
     let firstQueryMs;
     let queryErrors = 0;
     let queryTimes = [];
+    let queryClasses = null;
     const querySamples = [];
     const cacheLoadSamplesMs = [];
     const firstQuerySamplesMs = [];
@@ -336,6 +423,10 @@ async function evaluateRepo(repo) {
             });
             if (!result.ok) queryErrors++;
         }
+
+        // After the context board, so both engines enter it with the same
+        // lazy state materialized; one pass per process, best across them.
+        if (queryPins) queryClasses = runQueryClassBoard(warm, queryPins);
     } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -366,7 +457,12 @@ async function evaluateRepo(repo) {
         requestedWorkerCount, actualWorkerCount, workerPinMismatch, queryErrors,
     };
     const verdict = evaluatePerformanceBudgets(metrics, budgets);
-    const { failures, warnings } = verdict;
+    const queryClassSummary = queryClasses
+        ? summarizeQueryClasses([queryClasses], verdict.hostFactor) : null;
+    const queryClassVerdict = evaluateQueryClasses(queryClassSummary,
+        queryBaselineFor(queryPins), budgets, { repo: repo.name, hostClass: HOST_CLASS });
+    const failures = [...verdict.failures, ...queryClassVerdict.failures];
+    const warnings = [...verdict.warnings, ...queryClassVerdict.warnings];
     const firstSummary = summarizeSamples(firstQuerySamplesMs);
     const slowestQueries = [...querySamples]
         .sort((a, b) => b.durationMs - a.durationMs)
@@ -439,6 +535,8 @@ async function evaluateRepo(repo) {
         requestedWorkerCount,
         actualWorkerCount,
         workerPinMismatch,
+        queryClasses,
+        queryClassRows: queryClassVerdict.rows,
         failures,
         warnings,
     };
@@ -514,7 +612,13 @@ function aggregateRepoRuns(repo, runs) {
         queryErrors: runs.reduce((sum, run) => sum + run.queryErrors, 0),
     };
     const verdict = evaluatePerformanceBudgets(metrics, budgets);
-    const { failures, warnings } = verdict;
+    const classRuns = runs.map(run => run.queryClasses).filter(Boolean);
+    const queryClassSummary = classRuns.length
+        ? summarizeQueryClasses(classRuns, verdict.hostFactor) : null;
+    const queryClassVerdict = evaluateQueryClasses(queryClassSummary,
+        queryBaselineFor(queryBoardFor(repo)), budgets, { repo: repo.name, hostClass: HOST_CLASS });
+    const failures = [...verdict.failures, ...queryClassVerdict.failures];
+    const warnings = [...verdict.warnings, ...queryClassVerdict.warnings];
     const slowestQueries = runs.flatMap(run => run.slowestQueries || [])
         .sort((a, b) => b.durationMs - a.durationMs)
         .slice(0, 5);
@@ -542,6 +646,8 @@ function aggregateRepoRuns(repo, runs) {
         rssMb: Math.max(...runs.map(run => run.rssMb)),
         peakRssMb: metrics.boardPeakRssMb,
         availableParallelism: runs[0].availableParallelism,
+        queryClasses: undefined,
+        queryClassRows: queryClassVerdict.rows,
         failures,
         warnings,
     };
@@ -588,6 +694,55 @@ function printResult(repo, result) {
             `${query.file}:${query.line}:${query.name} ${query.durationMs}ms`)
             .join(' | ')}\n`);
     }
+    for (const [classId, row] of Object.entries(result.queryClassRows || {})) {
+        process.stdout.write(`  ${classId} n=${row.handles.length} | p50/p95 ` +
+            `${row.normalizedP50Ms}/${row.normalizedP95Ms}ms` +
+            (row.baseline ? ` vs release ${row.baseline.p50Ms}/${row.baseline.p95Ms}ms = ` +
+                `${row.p50Ratio ?? '-'}x/${row.p95Ratio ?? '-'}x` : ' (no release baseline)') +
+            `${row.failed ? ' FAIL' : ''} | slowest ${row.slowest.map(item =>
+                `${item.handle} ${item.ms}ms`).join(', ')}\n`);
+    }
+}
+
+/** Markdown rows of the query-class board for one repository result. */
+function queryClassMarkdownRows(result) {
+    return Object.entries(result.queryClassRows || {}).map(([classId, row]) =>
+        `| ${result.repo} | ${classId} | ${row.handles.length} | ${row.normalizedP50Ms}ms | ` +
+        `${row.normalizedP95Ms}ms | ${row.baseline ? `${row.baseline.p50Ms}/${row.baseline.p95Ms}ms` : '-'} | ` +
+        `${row.p50Ratio ?? '-'}/${row.p95Ratio ?? '-'} | ` +
+        `${row.slowest.map(item => `\`${item.handle}\` ${item.ms}ms`).join(', ')} | ` +
+        `${row.errors ? `**${row.errors} error(s)**` : row.failed ? '**FAIL**' : row.baseline ? 'PASS' : 'reported'} |`);
+}
+
+/**
+ * Release baseline block for one aggregated result (`--pin-query-baseline`):
+ * paste it under `baseline['<host class>']` of the repository's pinned board.
+ */
+function queryBaselineBlock(result, hostFactor) {
+    const classes = {};
+    for (const [classId, row] of Object.entries(result.queryClassRows || {})) {
+        classes[classId] = {
+            p50Ms: row.normalizedP50Ms,
+            p95Ms: row.normalizedP95Ms,
+            boardKey: row.boardKey,
+        };
+    }
+    return {
+        engine: engineLabel(),
+        measuredAt: new Date().toISOString().slice(0, 10),
+        processSamples: result.processSamples,
+        hostFactor,
+        classes,
+    };
+}
+
+function engineLabel() {
+    let label = path.basename(ENGINE_ROOT);
+    try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(ENGINE_ROOT, 'package.json'), 'utf8'));
+        label = `${pkg.version} (${path.basename(ENGINE_ROOT)})`;
+    } catch { /* label stays the directory name */ }
+    return label;
 }
 
 function performanceScope(isFullRelease, repos) {
@@ -760,17 +915,21 @@ async function main() {
             reference: HOST_REFERENCE,
         },
     };
-    const isFullRelease = releaseOnly && !repoNames &&
+    // A run of another engine (--engine-root) is a measurement of that
+    // engine, never release evidence for this tree.
+    const isFullRelease = releaseOnly && !repoNames && !engineRootArg &&
         repos.length === RELEASE_REPO_NAMES.length &&
         repos.every(repo => RELEASE_REPO_NAMES.includes(repo.name));
     const scope = performanceScope(isFullRelease, repos);
     const generatedAt = new Date().toISOString();
+    const filePrefix = engineRootArg ? 'performance-gate-engine' : 'performance-gate-run';
     const report = {
         schemaVersion: 2,
         generatedAt,
         date,
         scope,
         release: isFullRelease,
+        engine: { root: engineRootArg ? ENGINE_ROOT : null, label: engineLabel() },
         budgets,
         host,
         processSamples,
@@ -778,7 +937,7 @@ async function main() {
         passed: !failed,
     };
     const jsonPath = path.join(REPORTS_DIR,
-        `performance-gate-run-${scope}-${date}.json`);
+        `${filePrefix}-${scope}-${date}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
 
     const md = [
@@ -786,8 +945,10 @@ async function main() {
         '',
         `Real pinned repositories; ${processSamples} isolated cold-build process samples, ` +
             `${startupSamples} persisted-index startup samples per process, ` +
-            'and a steady-state pinned `context` board.',
+            'a steady-state pinned `context` board, and the pinned query-class board.',
         '',
+        ...(engineRootArg ? [`Engine measured: ${engineLabel()} at ${ENGINE_ROOT} ` +
+            '(a measurement of that engine, not release evidence for this tree).', ''] : []),
         `Host: ${host.platform}/${host.arch}; available parallelism ${host.availableParallelism}; ` +
             `worker pin ${host.requestedWorkerCount ?? 'auto'}.`,
         '',
@@ -807,10 +968,21 @@ async function main() {
             ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
             : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} (${r.normalizedColdLocPerSec}) | ${r.coldLocPerCpuSec} (${r.normalizedColdLocPerCpuSec}) | ${r.wallThroughputRatio ?? '-'}/${r.cpuThroughputRatio ?? '-'} | ${r.actualWorkerCount}${r.requestedWorkerCount == null ? '' : `/${r.requestedWorkerCount}`} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}/${r.firstQueryMaxMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.buildPeakRssMb}/${r.boardPeakRssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : r.warnings.length ? `PASS (${r.warnings.join('; ')})` : 'PASS'} |`),
         '',
+        '## Query classes vs the last release',
+        '',
+        'Per handle the best of the isolated process samples, host-normalized; p50/p95 over the ' +
+            'class\'s pinned handles, compared with the same handles measured on the release ' +
+            `engine on this host class (limit ${budgets.maxQueryClassRatio}x and ` +
+            `+${budgets.minQueryClassDeltaMs}ms).`,
+        '',
+        '| repo | class | n | p50 | p95 | release p50/p95 | ratio p50/p95 | slowest | result |',
+        '|---|---|---:|---:|---:|---:|---:|---|---|',
+        ...results.flatMap(r => (r.error ? [] : queryClassMarkdownRows(r))),
+        '',
         `Budgets: ${JSON.stringify(budgets)}.`,
     ];
     const mdPath = path.join(REPORTS_DIR,
-        `performance-gate-run-${scope}-${date}.md`);
+        `${filePrefix}-${scope}-${date}.md`);
     fs.writeFileSync(mdPath, md.join('\n'));
 
     // Keep the historical full-board path for consumers, but scoped runs can
@@ -823,6 +995,26 @@ async function main() {
         fs.writeFileSync(legacyJsonPath, JSON.stringify(report, null, 2));
         fs.writeFileSync(legacyMdPath, md.join('\n'));
         written.push(legacyJsonPath, legacyMdPath);
+    }
+
+    if (pinQueryBaseline) {
+        const blocks = {};
+        for (const result of results) {
+            if (!result.error && result.queryClassRows) {
+                blocks[result.repo] = { [HOST_CLASS]: queryBaselineBlock(result, result.hostFactor) };
+            }
+        }
+        const pinPath = path.join(REPORTS_DIR, `performance-query-baseline-${scope}-${date}.json`);
+        fs.writeFileSync(pinPath, JSON.stringify(blocks, null, 2));
+        written.push(pinPath);
+        process.stdout.write(`\nRelease query baselines (paste under each board's baseline):\n` +
+            `${JSON.stringify(blocks, null, 2)}\n`);
+    }
+    if (engineRootArg) {
+        process.stdout.write(`\n${written.map(file =>
+            `wrote ${path.relative(process.cwd(), file)}`).join('\n')}\n`);
+        process.exitCode = failed ? 1 : 0;
+        return;
     }
 
     const rollup = collectPerformanceRollup(REPORTS_DIR, date, report);
@@ -853,8 +1045,47 @@ async function main() {
     process.exitCode = failed ? 1 : 0;
 }
 
+/**
+ * `--select-query-board [--against DIR]`: print the query-class handles this
+ * tree's index selects for each repository in scope, restricted to handles
+ * the comparison engine at DIR (the last release) indexes in the same group,
+ * so both engines answer the same symbols. Paste the output into
+ * eval/lib/performance-query-board.json, then pin the release baselines from
+ * DIR with `--engine-root DIR --pin-query-baseline`.
+ */
+async function selectMain() {
+    const { isTestPath } = require('../core/shared');
+    const baseRepos = releaseOnly ? RELEASE_REPOS : REPOS;
+    const repos = baseRepos.filter(repo => !repoNames || repoNames.has(repo.name));
+    if (repos.length === 0) throw new Error(`No repositories match --repo ${repoArg || '(all)'}`);
+    const against = selectAgainstRoot ? path.resolve(selectAgainstRoot) : null;
+    const AgainstIndex = against
+        ? require(path.join(against, 'core', 'project')).ProjectIndex : null;
+    const selection = {};
+    for (const repo of repos) {
+        const target = resolveTarget(cloneAtCommit(repo), repo);
+        const index = new ProjectIndex(target);
+        index.build(null, { quiet: true });
+        const candidates = queryCandidates(index, { isTestPath });
+        let allowed = null;
+        if (AgainstIndex) {
+            const other = new AgainstIndex(target);
+            other.build(null, { quiet: true });
+            allowed = candidateKeys(queryCandidates(other, { isTestPath }));
+        }
+        const handles = selectQueryHandles(candidates, { allowed });
+        selection[repo.name] = { commit: repo.commit, handles };
+        process.stdout.write(`${repo.name}: ${QUERY_CLASSES.filter(c => c.group)
+            .map(c => c.group).filter((g, i, all) => all.indexOf(g) === i)
+            .map(group => `${group} ${Object.hasOwn(handles, group) ? handles[group].length : 0}`)
+            .join(', ')}\n`);
+        if (global.gc) global.gc();
+    }
+    process.stdout.write(`${JSON.stringify(selection, null, 2)}\n`);
+}
+
 if (require.main === module) {
-    const entry = workerRepoName ? workerMain : main;
+    const entry = workerRepoName ? workerMain : selectQueryBoard ? selectMain : main;
     entry().catch(error => {
         process.stderr.write(`${error.stack || error.message}\n`);
         process.exitCode = 1;
@@ -864,6 +1095,7 @@ if (require.main === module) {
 module.exports = {
     evaluateRepo,
     aggregateRepoRuns,
+    runQueryClassBoard,
     collectPerformanceRollup,
     performanceScope,
     percentile,

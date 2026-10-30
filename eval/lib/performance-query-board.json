@@ -1,0 +1,735 @@
+{
+  "preact-signals": {
+    "commit": "e0ce9fdf92df7f0ece2c89d44554c39f36dc6882",
+    "handles": {
+      "types": [
+        "src/index.ts:269:Signal",
+        "src/index.ts:591:Computed",
+        "src/index.ts:324:SignalOptions",
+        "src/index.ts:740:ReadonlySignal",
+        "src/index.ts:840:Effect",
+        "src/index.ts:858:EffectOptions"
+      ],
+      "constructors": [
+        "src/index.ts:289:constructor",
+        "src/index.ts:597:constructor",
+        "src/index.ts:849:constructor"
+      ],
+      "overloads": [
+        "src/index.ts:295:_subscribe",
+        "src/index.ts:298:_unsubscribe",
+        "src/index.ts:306:subscribe",
+        "src/index.ts:463:signal"
+      ],
+      "values": [
+        "src/index.ts:17:_source",
+        "src/index.ts:30:_version",
+        "src/index.ts:271:_value",
+        "src/index.ts:318:brand",
+        "src/index.ts:594:_globalVersion",
+        "src/index.ts:843:_sources"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 35.981,
+            "p95Ms": 35.981,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 0.355,
+            "p95Ms": 1.946,
+            "boardKey": "2713947aa480"
+          },
+          "class-show": {
+            "p50Ms": 1.428,
+            "p95Ms": 3.192,
+            "boardKey": "2713947aa480"
+          },
+          "class-impact": {
+            "p50Ms": 0.737,
+            "p95Ms": 3.34,
+            "boardKey": "2713947aa480"
+          },
+          "constructor-show": {
+            "p50Ms": 0.647,
+            "p95Ms": 1.063,
+            "boardKey": "1c039d2d253e"
+          },
+          "overload-show": {
+            "p50Ms": 1.724,
+            "p95Ms": 4.429,
+            "boardKey": "438659caab60"
+          },
+          "value-impact": {
+            "p50Ms": 2.271,
+            "p95Ms": 2.542,
+            "boardKey": "2bf8ac03a7e6"
+          }
+        }
+      }
+    }
+  },
+  "httpx": {
+    "commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+    "handles": {
+      "types": [
+        "httpx/_models.py:515:Response",
+        "httpx/_client.py:594:Client",
+        "httpx/_auth.py:22:Auth",
+        "httpx/_decoders.py:44:IdentityDecoder",
+        "httpx/_exceptions.py:187:ConnectError",
+        "httpx/_models.py:1261:_CookieCompatResponse"
+      ],
+      "constructors": [
+        "httpx/_auth.py:119:__init__",
+        "httpx/_auth.py:132:__init__",
+        "httpx/_auth.py:150:__init__",
+        "httpx/_decoders.py:63:__init__",
+        "httpx/_exceptions.py:287:__init__",
+        "httpx/_multipart.py:122:__init__"
+      ],
+      "values": [
+        "httpx/_client.py:114:USE_CLIENT_DEFAULT",
+        "httpx/_config.py:20:UNSET",
+        "httpx/_decoders.py:381:SUPPORTED_DECODERS",
+        "httpx/_urlparse.py:32:UNRESERVED_CHARACTERS",
+        "httpx/_urlparse.py:49:QUERY_SAFE",
+        "httpx/_urlparse.py:89:USERINFO_SAFE"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 187.766,
+            "p95Ms": 187.766,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 0.552,
+            "p95Ms": 7.674,
+            "boardKey": "94ebce837c8e"
+          },
+          "class-show": {
+            "p50Ms": 12.095,
+            "p95Ms": 81.392,
+            "boardKey": "94ebce837c8e"
+          },
+          "class-impact": {
+            "p50Ms": 0.804,
+            "p95Ms": 19.599,
+            "boardKey": "94ebce837c8e"
+          },
+          "constructor-show": {
+            "p50Ms": 1.154,
+            "p95Ms": 1.832,
+            "boardKey": "11fc58af6d64"
+          },
+          "value-impact": {
+            "p50Ms": 4.449,
+            "p95Ms": 12.538,
+            "boardKey": "a777dee1b588"
+          }
+        }
+      }
+    }
+  },
+  "cobra": {
+    "commit": "ad460ea8f249db69c943a365fb84f3a59042d54e",
+    "handles": {
+      "types": [
+        "command.go:54:Command",
+        "doc/man_docs.go:94:GenManHeader",
+        "command.go:45:Group",
+        "completions.go:47:flagCompError",
+        "completions.go:311:SliceValue",
+        "doc/yaml_docs.go:30:cmdOption"
+      ],
+      "values": [
+        "bash_completions.go:30:BashCompFilenameExt",
+        "command.go:80:Long",
+        "command.go:149:commandgroups",
+        "command.go:200:outWriter",
+        "command.go:259:SuggestionsMinimumDistance",
+        "doc/man_docs.go:86:Path"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 92.203,
+            "p95Ms": 92.203,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 0.54,
+            "p95Ms": 14.378,
+            "boardKey": "139a405e02e6"
+          },
+          "class-show": {
+            "p50Ms": 2.909,
+            "p95Ms": 41.586,
+            "boardKey": "139a405e02e6"
+          },
+          "class-impact": {
+            "p50Ms": 1.319,
+            "p95Ms": 46.505,
+            "boardKey": "139a405e02e6"
+          },
+          "value-impact": {
+            "p50Ms": 2.063,
+            "p95Ms": 3.89,
+            "boardKey": "1b363f6ce906"
+          }
+        }
+      }
+    }
+  },
+  "viper": {
+    "commit": "528f7416c4b56a4948673984b190bf8713f0c3c4",
+    "handles": {
+      "types": [
+        "encoding.go:27:Codec",
+        "internal/encoding/dotenv/codec.go:16:Codec",
+        "encoding.go:16:Encoder",
+        "errors.go:20:ConfigFileNotFoundError",
+        "flags.go:22:pflagValueSet",
+        "remote.go:25:RemoteResponse"
+      ],
+      "values": [
+        "encoding.go:28:Encoder",
+        "errors.go:38:locations",
+        "internal/features/finder.go:6:Finder",
+        "util.go:27:err",
+        "viper.go:128:envPrefix",
+        "viper.go:140:env"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 57.489,
+            "p95Ms": 57.489,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 1.011,
+            "p95Ms": 2.063,
+            "boardKey": "076d9c12ad0a"
+          },
+          "class-show": {
+            "p50Ms": 2.356,
+            "p95Ms": 3.508,
+            "boardKey": "076d9c12ad0a"
+          },
+          "class-impact": {
+            "p50Ms": 1.504,
+            "p95Ms": 2.959,
+            "boardKey": "076d9c12ad0a"
+          },
+          "value-impact": {
+            "p50Ms": 3.111,
+            "p95Ms": 7.229,
+            "boardKey": "28a1d628d129"
+          }
+        }
+      }
+    }
+  },
+  "ripgrep": {
+    "commit": "82313cf95849bfe425109ad9506a52154879b1b1",
+    "handles": {
+      "types": [
+        "crates/core/search.rs:19:Config",
+        "crates/printer/src/json.rs:25:Config",
+        "crates/cli/src/decompress.rs:15:DecompressionMatcherBuilder",
+        "crates/core/flags/defs.rs:5332:PCRE2",
+        "crates/globset/src/lib.rs:167:ErrorKind",
+        "crates/printer/src/hyperlink/mod.rs:106:State"
+      ],
+      "overloads": [
+        "crates/matcher/src/interpolate.rs:80:from",
+        "crates/printer/src/stats.rs:110:add",
+        "crates/globset/src/lib.rs:1035:escape",
+        "crates/globset/src/pathutil.rs:67:normalize_path",
+        "crates/ignore/src/walk.rs:2025:device_num",
+        "crates/printer/src/stats.rs:133:add_assign"
+      ],
+      "values": [
+        "crates/cli/src/decompress.rs:17:commands",
+        "crates/core/flags/lowargs.rs:65:ignore_file",
+        "crates/core/search.rs:239:searcher",
+        "crates/ignore/src/walk.rs:238:path",
+        "crates/printer/src/json.rs:55:config",
+        "crates/regex/src/config.rs:31:ignore_whitespace"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 2056.319,
+            "p95Ms": 2056.319,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 2.741,
+            "p95Ms": 23.516,
+            "boardKey": "b3aa5ce1afab"
+          },
+          "class-show": {
+            "p50Ms": 7.268,
+            "p95Ms": 20.916,
+            "boardKey": "b3aa5ce1afab"
+          },
+          "class-impact": {
+            "p50Ms": 2.447,
+            "p95Ms": 17.797,
+            "boardKey": "b3aa5ce1afab"
+          },
+          "overload-show": {
+            "p50Ms": 6.19,
+            "p95Ms": 38.518,
+            "boardKey": "4a98b27d0859"
+          },
+          "value-impact": {
+            "p50Ms": 7.903,
+            "p95Ms": 43.377,
+            "boardKey": "610b1c5a5166"
+          }
+        }
+      }
+    }
+  },
+  "clap": {
+    "commit": "d3e59a9ab214910b9dad02921b7ef42c6400de9b",
+    "handles": {
+      "types": [
+        "clap_builder/src/builder/command.rs:74:Command",
+        "clap_builder/src/builder/arg.rs:60:Arg",
+        "clap_bench/benches/complex.rs:118:Args",
+        "clap_builder/src/builder/value_parser.rs:2646:_impls_From_OsStringSealed",
+        "clap_builder/src/util/flat_map.rs:179:VacantEntry",
+        "clap_lex/src/lib.rs:399:ShortFlags"
+      ],
+      "overloads": [
+        "clap_builder/src/builder/os_str.rs:51:from",
+        "clap_builder/src/builder/range.rs:134:from",
+        "clap_bench/benches/ripgrep.rs:17:short_help",
+        "clap_builder/src/builder/styled_str.rs:78:wrap",
+        "clap_builder/src/error/mod.rs:895:from",
+        "clap_builder/src/util/any_value.rs:59:eq"
+      ],
+      "values": [
+        "clap_bench/benches/complex.rs:65:COMPLEX_ARGS",
+        "clap_builder/src/builder/arg_settings.rs:47:Hidden",
+        "clap_builder/src/error/context.rs:7:InvalidSubcommand",
+        "clap_builder/src/parser/matches/arg_matches.rs:1756:iter",
+        "clap_complete/src/lib.rs:55:INTERNAL_ERROR_MSG",
+        "clap_mangen/src/lib.rs:20:title"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 904.763,
+            "p95Ms": 904.763,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 1.929,
+            "p95Ms": 28.149,
+            "boardKey": "3f3ef09a29c3"
+          },
+          "class-show": {
+            "p50Ms": 26.69,
+            "p95Ms": 218.754,
+            "boardKey": "3f3ef09a29c3"
+          },
+          "class-impact": {
+            "p50Ms": 2.984,
+            "p95Ms": 17.811,
+            "boardKey": "3f3ef09a29c3"
+          },
+          "overload-show": {
+            "p50Ms": 10.829,
+            "p95Ms": 25.544,
+            "boardKey": "f0bcb4828471"
+          },
+          "value-impact": {
+            "p50Ms": 17.203,
+            "p95Ms": 49.791,
+            "boardKey": "1d2368d6e55f"
+          }
+        }
+      }
+    }
+  },
+  "javapoet": {
+    "commit": "b9017a9503b76e11b4ad4c1a9f050e2d29112cb0",
+    "handles": {
+      "types": [
+        "src/main/java/com/squareup/javapoet/ClassName.java:33:ClassName",
+        "src/main/java/com/squareup/javapoet/TypeName.java:68:TypeName",
+        "src/main/java/com/squareup/javapoet/AnnotationSpec.java:44:AnnotationSpec",
+        "src/main/java/com/squareup/javapoet/CodeWriter.java:44:CodeWriter",
+        "src/main/java/com/squareup/javapoet/LineWrapper.java:139:FlushType",
+        "src/main/java/com/squareup/javapoet/ParameterizedTypeName.java:31:ParameterizedTypeName"
+      ],
+      "constructors": [
+        "src/main/java/com/squareup/javapoet/TypeSpec.java:400:Kind"
+      ],
+      "overloads": [
+        "src/main/java/com/squareup/javapoet/AnnotationSpec.java:110:get",
+        "src/main/java/com/squareup/javapoet/ArrayTypeName.java:92:get",
+        "src/main/java/com/squareup/javapoet/AnnotationSpec.java:156:builder",
+        "src/main/java/com/squareup/javapoet/FieldSpec.java:142:addAnnotation",
+        "src/main/java/com/squareup/javapoet/MethodSpec.java:472:beginControlFlow",
+        "src/main/java/com/squareup/javapoet/TypeSpec.java:135:interfaceBuilder"
+      ],
+      "values": [
+        "src/main/java/com/squareup/javapoet/AnnotationSpec.java:45:VALUE",
+        "src/main/java/com/squareup/javapoet/CodeWriter.java:55:packageName",
+        "src/main/java/com/squareup/javapoet/JavaFile.java:64:alwaysQualify",
+        "src/main/java/com/squareup/javapoet/MethodSpec.java:54:exceptions",
+        "src/main/java/com/squareup/javapoet/TypeName.java:70:BOOLEAN",
+        "src/main/java/com/squareup/javapoet/TypeSpec.java:58:enumConstants"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 404.48,
+            "p95Ms": 404.48,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 3.233,
+            "p95Ms": 8.806,
+            "boardKey": "f1771ef8e7ca"
+          },
+          "class-show": {
+            "p50Ms": 4.28,
+            "p95Ms": 12.955,
+            "boardKey": "f1771ef8e7ca"
+          },
+          "class-impact": {
+            "p50Ms": 7.733,
+            "p95Ms": 31.836,
+            "boardKey": "f1771ef8e7ca"
+          },
+          "constructor-show": {
+            "p50Ms": 4.228,
+            "p95Ms": 4.228,
+            "boardKey": "b411dabf7430"
+          },
+          "overload-show": {
+            "p50Ms": 8.15,
+            "p95Ms": 20.976,
+            "boardKey": "7898fdea7987"
+          },
+          "value-impact": {
+            "p50Ms": 2.542,
+            "p95Ms": 3.447,
+            "boardKey": "dfc124550211"
+          }
+        }
+      }
+    }
+  },
+  "newtonsoft-json": {
+    "commit": "4f73e74372445108d2c1bda37b36e6f5e43402e0",
+    "handles": {
+      "types": [
+        "Utilities/ValidationUtils.cs:32:ValidationUtils",
+        "Utilities/MiscellaneousUtils.cs:41:MiscellaneousUtils",
+        "Bson/BsonBinaryType.cs:32:BsonBinaryType",
+        "JsonNameTable.cs:6:JsonNameTable",
+        "NullValueHandling.cs:35:NullValueHandling",
+        "Utilities/BidirectionalDictionary.cs:33:BidirectionalDictionary"
+      ],
+      "constructors": [
+        "Utilities/ReflectionUtils.cs:88:ReflectionUtils",
+        "JsonSerializationException.cs:62:JsonSerializationException",
+        "Bson/BsonBinaryWriter.cs:46:BsonBinaryWriter",
+        "JsonReader.cs:326:JsonReader",
+        "Linq/JValue.cs:82:JValue",
+        "Serialization/JsonPrimitiveContract.cs:44:JsonPrimitiveContract"
+      ],
+      "overloads": [
+        "Utilities/StringUtils.cs:54:FormatWith",
+        "JsonConvert.cs:104:ToString",
+        "Bson/BsonBinaryWriter.cs:229:CalculateSize",
+        "JsonTextWriter.cs:856:WriteNumberToBuffer",
+        "Linq/JToken.cs:2588:Annotation",
+        "Utilities/LinqBridge.cs:253:SelectMany"
+      ],
+      "values": [
+        "Bson/BsonBinaryType.cs:34:Binary",
+        "JsonContainerAttribute.cs:116:_itemTypeNameHandling",
+        "JsonTextReader.cs:2640:LineNumber",
+        "Linq/JsonPath/QueryExpression.cs:35:Operator",
+        "Serialization/JsonContract.cs:237:DefaultCreator",
+        "Utilities/ConvertUtils.cs:88:TimeSpanNullable"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 8160.039,
+            "p95Ms": 8160.039,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 19.032,
+            "p95Ms": 25.771,
+            "boardKey": "620e153620df"
+          },
+          "class-show": {
+            "p50Ms": 39.838,
+            "p95Ms": 294.569,
+            "boardKey": "620e153620df"
+          },
+          "class-impact": {
+            "p50Ms": 36.732,
+            "p95Ms": 154.705,
+            "boardKey": "620e153620df"
+          },
+          "constructor-show": {
+            "p50Ms": 89.063,
+            "p95Ms": 183.824,
+            "boardKey": "763e90b2c203"
+          },
+          "overload-show": {
+            "p50Ms": 12.437,
+            "p95Ms": 58.699,
+            "boardKey": "21d420560a6e"
+          },
+          "value-impact": {
+            "p50Ms": 21.306,
+            "p95Ms": 127.675,
+            "boardKey": "1998b64275bc"
+          }
+        }
+      }
+    }
+  },
+  "cjson": {
+    "commit": "c859b25da02955fef659d658b8f324b5cde87be3",
+    "handles": {
+      "types": [
+        "cJSON.c:88:error",
+        "cJSON.c:156:internal_hooks",
+        "cJSON.c:289:parse_buffer",
+        "cJSON.c:473:printbuffer",
+        "cJSON.h:103:cJSON",
+        "cJSON.h:125:cJSON_Hooks"
+      ],
+      "values": [
+        "cJSON.c:90:position",
+        "cJSON.c:292:length",
+        "cJSON.c:476:length",
+        "cJSON.c:480:format",
+        "cJSON.h:119:valuedouble",
+        "cJSON_Utils.c:740:MOVE"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 138.054,
+            "p95Ms": 138.054,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 1.469,
+            "p95Ms": 2.257,
+            "boardKey": "62cf8e8ac68f"
+          },
+          "class-show": {
+            "p50Ms": 11.441,
+            "p95Ms": 39.873,
+            "boardKey": "62cf8e8ac68f"
+          },
+          "class-impact": {
+            "p50Ms": 1.484,
+            "p95Ms": 2.707,
+            "boardKey": "62cf8e8ac68f"
+          },
+          "value-impact": {
+            "p50Ms": 4.757,
+            "p95Ms": 7.782,
+            "boardKey": "40d1801f7da2"
+          }
+        }
+      }
+    }
+  },
+  "fmt": {
+    "commit": "e424e3f2e607da02742f73db84873b8084fc714c",
+    "handles": {
+      "types": [
+        "include/fmt/base.h:648:formatter",
+        "include/fmt/base.h:2792:formatter",
+        "include/fmt/args.h:22:is_reference_wrapper",
+        "include/fmt/base.h:2864:format_to_n_result",
+        "include/fmt/format.h:294:bytes",
+        "include/fmt/ranges.h:37:is_set"
+      ],
+      "constructors": [
+        "include/fmt/base.h:650:formatter",
+        "include/fmt/base.h:524:basic_string_view",
+        "include/fmt/args.h:47:typed_node",
+        "include/fmt/base.h:2240:value",
+        "include/fmt/color.h:197:rgb",
+        "include/fmt/format.h:4183:format_int"
+      ],
+      "overloads": [
+        "include/fmt/chrono.h:1917:format",
+        "include/fmt/compile.h:459:format",
+        "include/fmt/args.h:26:unwrap",
+        "include/fmt/chrono.h:619:write_padding",
+        "include/fmt/format.h:1064:do_count_digits",
+        "include/fmt/ranges.h:29:check"
+      ],
+      "values": [
+        "include/fmt/args.h:40:next",
+        "include/fmt/base.h:2139:size",
+        "include/fmt/color.h:40:dark_golden_rod",
+        "include/fmt/color.h:121:pale_turquoise",
+        "include/fmt/format-inl.h:224:shift_amount",
+        "include/fmt/format.h:3882:separator_"
+      ]
+    },
+    "baseline": {
+      "darwin-arm64": {
+        "engine": "5.5.1 (a274a48)",
+        "measuredAt": "2026-10-30",
+        "runs": 2,
+        "processSamples": 3,
+        "hostFactors": [
+          0.9496,
+          0.9766
+        ],
+        "classes": {
+          "orientation": {
+            "p50Ms": 855.981,
+            "p95Ms": 855.981,
+            "boardKey": "32a6fcbaa454"
+          },
+          "class-find": {
+            "p50Ms": 3.935,
+            "p95Ms": 51.607,
+            "boardKey": "5a5f949960e9"
+          },
+          "class-show": {
+            "p50Ms": 8.322,
+            "p95Ms": 15.567,
+            "boardKey": "5a5f949960e9"
+          },
+          "class-impact": {
+            "p50Ms": 4.311,
+            "p95Ms": 5.22,
+            "boardKey": "5a5f949960e9"
+          },
+          "constructor-show": {
+            "p50Ms": 57.983,
+            "p95Ms": 93.717,
+            "boardKey": "5f67bc853bdd"
+          },
+          "overload-show": {
+            "p50Ms": 55.693,
+            "p95Ms": 329.858,
+            "boardKey": "eae7b46e40d2"
+          },
+          "value-impact": {
+            "p50Ms": 7.06,
+            "p95Ms": 75.262,
+            "boardKey": "b98abd28dccb"
+          }
+        }
+      }
+    }
+  }
+}

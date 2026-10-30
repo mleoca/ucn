@@ -150,9 +150,9 @@ in either the confirmed or unverified band. Unverified candidates, oracle
 abstentions, and unscored findings remain separate. These measurements do not
 establish complete runtime knowledge or identical performance on every machine.
 
-The scheduled board covers 25 pinned repositories: the ten above plus zod,
-express, hono, zustand, fastify, rich, click, attrs, grpc-go, chi, cursive,
-itertools, rayon, gson, and jsoup. A rotating fresh-repository arm checks codebases
+The scheduled board covers 27 pinned repositories: the ten above plus zod,
+express, hono, zustand, fastify, dayjs, rich, click, attrs, grpc-go, chi, cursive,
+itertools, rayon, rand, gson, and jsoup. A rotating fresh-repository arm checks codebases
 outside that pinned board.
 
 The [repository manifest](eval/lib/repos.js) records the full commits.

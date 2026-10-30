@@ -146,12 +146,41 @@ describe('command trust matrix: fail-closed proof coverage', () => {
             assert.doesNotMatch(script, /--repo/, `${script} must not duplicate the release list`);
         }
         assert.match(readme, /ten-repository/i);
-        assert.match(readme, /25 pinned repositories/i);
+        assert.match(readme, new RegExp(`${REPOS.length} pinned repositories`, 'i'));
+        assert.strictEqual(REPOS.length, 27);
         for (const name of RELEASE_REPO_NAMES) {
             assert.ok(readme.includes(name), `README must name release repository ${name}`);
         }
         for (const repo of REPOS) {
             assert.ok(readme.includes(repo.name), `README must name scheduled repository ${repo.name}`);
+        }
+    });
+
+    it('fix #432: keeps the fresh arm a holdout that spans every supported language', () => {
+        const { FRESH_POOL, OUTCOME_POOL, OUTCOME_TUNED } = require('../eval/lib/repos');
+        const pinned = new Set(REPOS.map(repo => repo.name));
+        assert.strictEqual(pinned.size, REPOS.length, 'pinned repository names are unique');
+        for (const repo of REPOS) {
+            assert.match(repo.commit, /^[0-9a-f]{40}$/, `${repo.name} is pinned to a full commit`);
+        }
+        const fresh = FRESH_POOL.map(repo => repo.name);
+        assert.strictEqual(new Set(fresh).size, fresh.length);
+        const elsewhere = new Set([...pinned, ...OUTCOME_POOL.map(repo => repo.name),
+            ...OUTCOME_TUNED.map(repo => repo.name)]);
+        for (const repo of FRESH_POOL) {
+            assert.ok(!elsewhere.has(repo.name), `${repo.name}: a tuned or outcome repository is no holdout`);
+            assert.strictEqual(repo.commit, undefined, `${repo.name}: fresh repositories are unpinned`);
+            assert.ok(repo.url && Array.isArray(repo.targetCandidates), repo.name);
+        }
+        // Graduated after driving fixes #403 and #406.
+        for (const name of ['dayjs', 'rand']) {
+            assert.ok(pinned.has(name) && !fresh.includes(name), name);
+        }
+        const languages = new Set(FRESH_POOL.map(repo => repo.language));
+        for (const family of [['javascript', 'typescript'], ['python'], ['go'], ['rust'], ['java'],
+            ['csharp'], ['c'], ['cpp']]) {
+            assert.ok(family.some(language => languages.has(language)),
+                `the fresh pool covers ${family.join('/')}`);
         }
     });
 });

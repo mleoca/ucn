@@ -100,6 +100,14 @@ const DEFAULT_BUDGETS = Object.freeze({
     maxQueryP95Ms: 250,
     maxBuildRssMb: 1536,
     maxBoardRssMb: 1536,
+    // Query-class board (fix #432): each class's host-normalized p50 and p95
+    // against the same handles measured on the last release, on this host
+    // class. A class fails when it is slower by more than the ratio AND by
+    // more than the delta (millisecond-scale queries jitter by whole
+    // milliseconds). Gating runs require it; other runs report it.
+    maxQueryClassRatio: 1.15,
+    minQueryClassDeltaMs: 5,
+    requireQueryClassBaselines: false,
 });
 
 function percentile(values, fraction) {

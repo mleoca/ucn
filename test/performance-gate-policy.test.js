@@ -652,3 +652,254 @@ describe('performance gate policy', () => {
         assert.match(fractional.stderr, /positive integer/);
     });
 });
+
+describe('fix #432: query-class performance board', () => {
+    const board = require('../eval/lib/performance-query-board');
+    const { REPOS } = require('../eval/lib/repos');
+    const { runQueryClassBoard } = require('../eval/run-performance-gate');
+    const { idx } = require('./helpers');
+
+    const def = (name, relativePath, startLine, extra = {}) =>
+        ({ name, relativePath, startLine, ...extra });
+    function fakeIndex(defs, calls = {}) {
+        const symbols = new Map();
+        for (const d of defs) {
+            if (!symbols.has(d.name)) symbols.set(d.name, []);
+            symbols.get(d.name).push(d);
+        }
+        return { symbols, getCalleeFiles: name => new Set(calls[name] || []) };
+    }
+    const GATING = {
+        ...DEFAULT_BUDGETS,
+        requireQueryClassBaselines: true,
+    };
+
+    it('groups definitions into types, constructors, overload families and values', () => {
+        const index = fakeIndex([
+            def('Shape', 'src/Shape.java', 1, { type: 'class' }),
+            def('Shape', 'src/Shape.java', 3, { type: 'constructor', isConstructor: true, params: 'int a' }),
+            def('Shape', 'src/Shape.java', 4, { type: 'constructor', isConstructor: true, params: 'long a' }),
+            def('area', 'src/Shape.java', 6, { type: 'method', className: 'Shape', params: 'int a' }),
+            def('area', 'src/Shape.java', 7, { type: 'method', className: 'Shape', params: 'long a' }),
+            def('width', 'src/Shape.java', 9, { type: 'field', memberType: 'field' }),
+            // A C/C++ declaration beside its definition is one function.
+            def('draw', 'src/draw.h', 2, { type: 'function', params: 'int x' }),
+            def('draw', 'src/draw.h', 9, { type: 'function', params: 'int  x' }),
+            // Namesakes in separate files (packages, modules) are not overloads.
+            def('New', 'a/a.go', 3, { type: 'function', params: 'x int' }),
+            def('New', 'b/b.go', 3, { type: 'function', params: 'y string' }),
+            // A getter/setter pair differs in parameters without overloading.
+            def('size', 'src/box.py', 4, { type: 'property', memberType: 'property', params: 'self' }),
+            def('size', 'src/box.py', 8, { type: 'setter', memberType: 'setter', params: 'self, v' }),
+            // Test code never enters the board.
+            def('Fixture', 'test/FixtureTest.java', 1, { type: 'class' }),
+        ]);
+        const candidates = board.queryCandidates(index, {
+            isTestPath: rp => rp.startsWith('test/'),
+        });
+        const handles = group => candidates[group].map(c => c.handle);
+        assert.deepEqual(handles('types'), ['src/Shape.java:1:Shape']);
+        assert.deepEqual(handles('constructors'), ['src/Shape.java:3:Shape', 'src/Shape.java:4:Shape']);
+        assert.deepEqual(handles('overloads'), ['src/Shape.java:6:area']);
+        assert.deepEqual(handles('values'), ['src/Shape.java:9:width']);
+    });
+
+    it('selects deterministically: most-called first, then evenly spaced, values spaced only', () => {
+        const defs = [];
+        for (let i = 1; i <= 20; i++) {
+            defs.push(def(`Type${String(i).padStart(2, '0')}`, 'src/types.ts', i, { type: 'class' }));
+            defs.push(def(`value${String(i).padStart(2, '0')}`, 'src/values.ts', i, { type: 'constant', memberType: 'constant' }));
+        }
+        const index = fakeIndex(defs, { Type17: ['a', 'b', 'c'], Type05: ['a'] });
+        const candidates = board.queryCandidates(index);
+        const first = board.selectQueryHandles(candidates, { perGroup: 6 });
+        const again = board.selectQueryHandles(board.queryCandidates(index), { perGroup: 6 });
+        assert.deepEqual(first, again);
+        assert.equal(first.types.length, 6);
+        assert.deepEqual(first.types.slice(0, 2), ['src/types.ts:17:Type17', 'src/types.ts:5:Type05']);
+        assert.equal(new Set(first.types).size, 6);
+        assert.equal(first.values.length, 6);
+        assert.equal(first.values[0], 'src/values.ts:1:value01');
+        // Groups without candidates are absent, never the prototype's
+        // `constructor` function.
+        assert.equal(Object.hasOwn(first, 'constructors'), false);
+        assert.deepEqual(board.boardQueries({ handles: first })
+            .filter(q => q.classId === 'constructor-show'), []);
+    });
+
+    it('keeps only handles the release engine also indexes in the same group', () => {
+        const current = board.queryCandidates(fakeIndex([
+            def('Kept', 'src/a.cs', 1, { type: 'class' }),
+            def('NewOnly', 'src/a.cs', 5, { type: 'constructor', isConstructor: true, params: '' }),
+        ]));
+        const release = board.queryCandidates(fakeIndex([
+            def('Kept', 'src/a.cs', 1, { type: 'class' }),
+        ]));
+        const selected = board.selectQueryHandles(current, { allowed: board.candidateKeys(release) });
+        assert.deepEqual(selected, { types: ['src/a.cs:1:Kept'] });
+    });
+
+    it('queries each class with the shape an agent types', () => {
+        const queries = board.boardQueries({ handles: {
+            types: ['src/a.java:3:Shape'], values: ['src/a.java:9:width'],
+        } });
+        assert.deepEqual(queries.map(q => [q.classId, q.command, q.params]), [
+            ['orientation', 'repo', {}],
+            ['class-find', 'find', { name: 'Shape' }],
+            ['class-show', 'show', { name: 'src/a.java:3:Shape' }],
+            ['class-impact', 'impact', { name: 'src/a.java:3:Shape' }],
+            ['value-impact', 'impact', { name: 'src/a.java:9:width' }],
+        ]);
+    });
+
+    it('keeps each handle\'s best process sample and normalizes by the host factor', () => {
+        const run = samplesMs => ({ 'class-show': { handles: ['a', 'b', 'c'], samplesMs, errors: 0 } });
+        const summary = board.summarizeQueryClasses(
+            [run([10, 40, 22]), run([12, 30, 20]), run([11, 90, 21])], 2);
+        const row = summary['class-show'];
+        assert.deepEqual(row.bestMs, [10, 30, 20]);
+        assert.equal(row.p50Ms, 20);
+        assert.equal(row.p95Ms, 30);
+        assert.equal(row.normalizedP50Ms, 10);
+        assert.equal(row.normalizedP95Ms, 15);
+        assert.equal(row.boardKey, board.boardKey(['a', 'b', 'c']));
+        assert.deepEqual(row.slowest[0], { handle: 'b', ms: 30 });
+    });
+
+    function measuredRow(p50, p95, handles = ['h1', 'h2']) {
+        return {
+            handles, boardKey: board.boardKey(handles), normalizedP50Ms: p50, normalizedP95Ms: p95,
+            errors: 0, errorDetails: [], slowest: [],
+        };
+    }
+    const release = (p50Ms, p95Ms, handles = ['h1', 'h2']) => ({
+        engine: '5.5.1 (a274a48)',
+        classes: { 'class-find': { p50Ms, p95Ms, boardKey: board.boardKey(handles) } },
+    });
+
+    it('passes a class within the release limit and fails a release regression on gating runs', () => {
+        const healthy = board.evaluateQueryClasses({ 'class-find': measuredRow(8.5, 64) },
+            release(8.3, 66.5), GATING, { repo: 'fmt' });
+        assert.deepEqual(healthy.failures, []);
+        assert.equal(healthy.rows['class-find'].p95Ratio, 0.962);
+        // fmt class find on the #417 engine: 66 ms on 5.5.1, 1364 ms after.
+        const regressed = board.evaluateQueryClasses({ 'class-find': measuredRow(8.8, 1364) },
+            release(8.3, 66.5), GATING, { repo: 'fmt' });
+        assert.ok(regressed.failures.some(f => /class-find p95 1364ms is 20\.511x/.test(f)));
+        assert.equal(regressed.rows['class-find'].failed, true);
+        const exploratory = board.evaluateQueryClasses({ 'class-find': measuredRow(8.8, 1364) },
+            release(8.3, 66.5), DEFAULT_BUDGETS, { repo: 'fmt' });
+        assert.deepEqual(exploratory.failures, []);
+        assert.ok(exploratory.warnings.some(w => /class-find p95/.test(w)));
+    });
+
+    it('never fails a millisecond-scale class on timer jitter alone', () => {
+        const verdict = board.evaluateQueryClasses({ 'class-find': measuredRow(2.4, 4.5) },
+            release(1.6, 3.1), GATING, { repo: 'javapoet' });
+        assert.deepEqual(verdict.failures, []);
+    });
+
+    it('refuses to compare a class measured on other handles than the release baseline', () => {
+        const verdict = board.evaluateQueryClasses(
+            { 'class-find': measuredRow(8, 60, ['h1', 'h3']) }, release(8, 60), GATING, { repo: 'fmt' });
+        assert.ok(verdict.failures.some(f => /differ from the release baseline/.test(f)));
+    });
+
+    it('reports without gating where no release baseline is pinned for the host class', () => {
+        const verdict = board.evaluateQueryClasses({ 'class-find': measuredRow(8, 600) },
+            null, GATING, { repo: 'fmt', hostClass: 'linux-x64' });
+        assert.deepEqual(verdict.failures, []);
+        assert.ok(verdict.warnings.some(w => /no pinned release query baseline for fmt on linux-x64/.test(w)));
+        const errors = board.evaluateQueryClasses(
+            { 'class-find': { ...measuredRow(8, 60), errors: 1, errorDetails: ['find X: not found'] } },
+            null, DEFAULT_BUDGETS, { repo: 'fmt' });
+        assert.ok(errors.failures.some(f => /1 query error/.test(f)));
+    });
+
+    it('pins a board and a release baseline for every release repository at its manifest commit', () => {
+        for (const repo of RELEASE_REPOS) {
+            const pins = board.pinnedQueryBoard(repo);
+            assert.ok(pins, `${repo.name}: pinned query board`);
+            const groups = Object.keys(pins.handles);
+            assert.ok(groups.includes('types') && groups.includes('values'), repo.name);
+            for (const group of groups) {
+                assert.ok(board.QUERY_GROUPS.includes(group), `${repo.name}: ${group}`);
+                for (const handle of pins.handles[group]) {
+                    assert.match(handle, /^[^:]+:\d+:[A-Za-z_$][\w$]*$/, `${repo.name}: ${handle}`);
+                }
+            }
+            const baseline = pins.baseline['darwin-arm64'];
+            // A released version at its commit, never the tree under test.
+            assert.match(baseline.engine, /^\d+\.\d+\.\d+ \([0-9a-f]{7,40}\)$/, repo.name);
+            const handlesOf = classId => {
+                const queryClass = board.QUERY_CLASSES.find(c => c.id === classId);
+                return board.boardQueries(pins).filter(q => q.classId === classId)
+                    .map(q => q.handle ?? queryClass.command);
+            };
+            for (const queryClass of board.QUERY_CLASSES) {
+                const handles = handlesOf(queryClass.id);
+                if (!handles.length) continue;
+                const pinned = baseline.classes[queryClass.id];
+                assert.ok(pinned, `${repo.name}: ${queryClass.id} baseline`);
+                assert.equal(pinned.boardKey, board.boardKey(handles), `${repo.name}: ${queryClass.id}`);
+                assert.ok(pinned.p50Ms > 0 && pinned.p95Ms >= pinned.p50Ms, `${repo.name}: ${queryClass.id}`);
+            }
+        }
+        const moved = { ...RELEASE_REPOS[0], commit: '0'.repeat(40) };
+        assert.throws(() => board.pinnedQueryBoard(moved), /re-select and re-pin/);
+        assert.equal(board.pinnedQueryBoard(REPOS.find(r => !RELEASE_REPO_NAMES.includes(r.name))), null);
+    });
+
+    it('runs every class on a real index without query errors', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'src/main/java/demo/Shape.java': [
+                'package demo;',
+                'public class Shape {',
+                '    static final int SIDES = 4;',
+                '    private int width;',
+                '    public Shape(int width) { this.width = width; }',
+                '    public Shape(long width) { this((int) width); }',
+                '    int area(int x) { return width * x; }',
+                '    int area(long x) { return area((int) x); }',
+                '}',
+                '',
+            ].join('\n'),
+            'src/main/java/demo/Use.java': [
+                'package demo;',
+                'class Use {',
+                '    int go() { Shape s = new Shape(3); return s.area(2) + Shape.SIDES; }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const selected = board.selectQueryHandles(board.queryCandidates(index));
+            assert.ok(selected.types && selected.constructors && selected.overloads && selected.values,
+                JSON.stringify(selected));
+            const classes = runQueryClassBoard(index, { handles: selected });
+            for (const [classId, row] of Object.entries(classes)) {
+                assert.equal(row.errors, 0, `${classId}: ${row.errorDetails.join('; ')}`);
+                assert.equal(row.samplesMs.length, row.handles.length);
+            }
+            assert.deepEqual(Object.keys(classes), board.QUERY_CLASSES.map(c => c.id));
+        } finally { rm(dir); }
+    });
+
+    it('rejects engine-root misuse before any repository work', () => {
+        const script = path.join(__dirname, '..', 'eval', 'run-performance-gate.js');
+        const missing = spawnSync(process.execPath, [script, '--engine-root', '/does/not/exist'],
+            { encoding: 'utf8' });
+        assert.notEqual(missing.status, 0);
+        assert.match(missing.stderr, /has no core\/project\.js/);
+        const ungated = spawnSync(process.execPath, [script, '--release', '--no-query-classes'],
+            { encoding: 'utf8' });
+        assert.notEqual(ungated.status, 0);
+        assert.match(ungated.stderr, /--no-query-classes cannot be combined/);
+        const selfPinned = spawnSync(process.execPath, [script, '--pin-query-baseline'],
+            { encoding: 'utf8' });
+        assert.notEqual(selfPinned.status, 0);
+        assert.match(selfPinned.stderr, /measures the last release/);
+    });
+});
