@@ -7,6 +7,11 @@ const path = require('path');
 const { isTestFile } = require('./discovery');
 const { detectLanguage } = require('./parser');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyLanguagesModuleCache = null;
+const lazyLanguagesModule = () => lazyLanguagesModuleCache || (lazyLanguagesModuleCache = require('../languages'));
+
 /**
  * Security containment check (fix #285): is `candidate` inside `root`?
  *
@@ -63,7 +68,7 @@ function isTestPath(rp) {
     // has a `.spec` form, only C's patterns name `.h`): no header-language
     // detection, which walks the project directory (fix #396).
     const language = path.extname(rp).toLowerCase() === '.h' ? 'c' : detectLanguage(rp);
-    const { langTraits } = require('../languages');
+    const { langTraits } = lazyLanguagesModule();
     const specConvention = langTraits(language)?.testFileCandidates?.('sample', '')
         .some(candidate => candidate.includes('.spec'));
     return isTestFile(rp, language) ||

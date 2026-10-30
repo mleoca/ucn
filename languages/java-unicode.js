@@ -1,5 +1,10 @@
 'use strict';
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazySourceMemoModuleCache = null;
+const lazySourceMemoModule = () => lazySourceMemoModuleCache || (lazySourceMemoModuleCache = require('../core/source-memo'));
+
 // Java translates eligible Unicode escapes before tokenization (JLS 3.3).
 // Keep this lexical step separate from name lookup and never rescan output.
 function translateUnicodeEscapes(source) {
@@ -165,7 +170,7 @@ function errorMemberScopes(source) {
     if (saved !== undefined) return saved;
     let scopes = null;
     if (!source.includes('\\u') && !source.includes('\\{') && !noncanonicalIdentifier(source)) {
-        const tree = require('../core/source-memo').parsedSource('java', source);
+        const tree = lazySourceMemoModule().parsedSource('java', source);
         if (tree) {
             scopes = [];
             const stack = [tree.rootNode];
@@ -193,7 +198,7 @@ function errorMemberScopes(source) {
 
 function typeNameOwnersAt(source, site) {
     if (!typeNameSourceCanonical(source) || !Number.isInteger(site?.start)) return null;
-    const tree = require('../core/source-memo').parsedSource('java', source);
+    const tree = lazySourceMemoModule().parsedSource('java', source);
     if (!tree) return null;
     let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
     if (!node || node.startPosition.row + 1 !== site.line) return null;

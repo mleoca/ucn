@@ -1651,7 +1651,7 @@ function about(index, name, options = {}) {
             // ("Using <def>...") stays consistent with the count.
             const visible = definitions.filter(d => {
                 if (d === primary || (d.relativePath === primary.relativePath && d.startLine === primary.startLine)) return true;
-                const lang = detectLanguage(d.file);
+                const lang = index.languageOf(d.file);
                 if (isTestFile(d.relativePath, lang) || isTestPath(d.relativePath)) return false;
                 return true;
             });
@@ -2201,7 +2201,7 @@ function diffImpact(index, options = {}) {
     let nonSourcePaths = 0;
 
     for (const change of changes) {
-        const lang = detectLanguage(change.filePath);
+        const lang = index.languageOf(change.filePath);
         if (!lang || (change.untracked && !index.files.has(change.filePath))) {
             nonSourcePaths++;
             continue;
@@ -2254,7 +2254,7 @@ function diffImpact(index, options = {}) {
                     'git', ['show', `${ref}:${change.gitRelativePath}`],
                     { cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
                 );
-                const fileLang = detectLanguage(change.filePath);
+                const fileLang = index.languageOf(change.filePath);
                 if (fileLang) {
                     oldParsed = parse(oldContent, fileLang);
                     oldText = oldContent;
@@ -2734,7 +2734,7 @@ function collectNonCallableChanges(index, change, oldParsed, currentSymbols, out
         before.get(key).push(s);
     }
     const touches = (s, lines) => lines.some(line => line >= s.startLine && line <= (s.endLine || s.startLine));
-    const language = detectLanguage(change.filePath);
+    const language = index.languageOf(change.filePath);
     let currentSnapshots = new Map();
     let oldSnapshots = new Map();
     // Unsupported/recovered declaration shapes retain conservative range

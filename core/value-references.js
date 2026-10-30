@@ -303,6 +303,10 @@ function enumValueBindingInfo(index, definition) {
     return result;
 }
 
+// Tree -> Map(`${language}\0${name}` -> the name's tokens with their roles
+// and binding scopes); entries die with their trees.
+const SYNTAX_NODES_BY_TREE = new WeakMap();
+
 class ValueReferenceResolver extends TypeReferenceResolver {
     constructor(index, def, name) {
         super(index, def, name);
@@ -581,6 +585,20 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         const key = `${file}\0${tree.rootNode.id}\0${name}`;
         if (this.syntaxMemo.has(key)) return this.syntaxMemo.get(key);
         const language = GRAMMAR_LANGUAGES.get(tree.language?.name) || this.index.files.get(file)?.language;
+        // The tokens of a name in a tree are syntax alone: every resolver of
+        // the process shares them while the tree lives (fix #436: each
+        // query re-classified every occurrence of each receiver's name).
+        // A witness view records its reads, so it derives its own.
+        let shared = null;
+        if (!this.index.isProvenanceFactIndex) {
+            shared = SYNTAX_NODES_BY_TREE.get(tree);
+            if (!shared) SYNTAX_NODES_BY_TREE.set(tree, shared = new Map());
+            const nodes = shared.get(`${language}\0${name}`);
+            if (nodes) {
+                this.syntaxMemo.set(key, nodes);
+                return nodes;
+            }
+        }
         const source = typeof tree.input === 'string' ? tree.input : this.index._readFile(file);
         const nodes = [];
         visitNameNodes(tree, source, name, node => {
@@ -600,6 +618,10 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             return true;
         });
         this.syntaxMemo.set(key, nodes);
+        if (shared) {
+            if (shared.size >= 64) shared.delete(shared.keys().next().value);
+            shared.set(`${language}\0${name}`, nodes);
+        }
         return nodes;
     }
 

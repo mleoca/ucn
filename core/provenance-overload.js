@@ -4,6 +4,11 @@ const { declarationIdentity, identityKey, sameDeclaration } = require('./provena
 const { langTraits } = require('../languages');
 const { UcnError, isInternalError } = require('./errors');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyCallersModuleCache = null;
+const lazyCallersModule = () => lazyCallersModuleCache || (lazyCallersModuleCache = require('./callers'));
+
 /**
  * A witness that cannot prove its answer (fix #421): a fact its view did
  * not record, or a filesystem read that failed when it was captured. A
@@ -403,7 +408,7 @@ function overloadReplay(witness) {
     try {
         // Lazy access avoids an initialization cycle with confidence.js.
         // The selector only sees the data-only replay facade above.
-        const select = require('./callers').selectProvenanceOverload;
+        const select = lazyCallersModule().selectProvenanceOverload;
         const index = factIndex(witness.reads, undefined, witness.fileFields ? OVERLOAD_FILE_FIELDS : undefined);
         const result = select(index, decode(witness.call), candidates, witness.language);
         replay.result = { missing: index.hasMissingProvenanceFacts, ambiguous: result.ambiguous === true,
@@ -439,7 +444,7 @@ function validateOverload(witness, members, selected, invalidCall = false, ambig
 const SLOT_SIGNATURES = new WeakMap();
 const STEP_MEMBER_CHECKS = new WeakMap();
 function overloadMemberGroup(steps) {
-    const normalize = require('./callers').provenanceParameterIdentity;
+    const normalize = lazyCallersModule().provenanceParameterIdentity;
     const seen = new Set();
     const group = [];
     for (const step of steps) {

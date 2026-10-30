@@ -15,6 +15,11 @@ const { summarizeCommandTrust } = require('./trust-matrix');
 const { projectComputedDispatch } = require('./ast-analysis');
 const { langTraits } = require('../languages');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazySharedModuleCache = null;
+const lazySharedModule = () => lazySharedModuleCache || (lazySharedModuleCache = require('./shared'));
+
 function matchesReportingScope(index, relativePath, options = {}) {
     if (!relativePath) return false;
     if (options.file && !relativePath.includes(options.file)) return false;
@@ -210,7 +215,7 @@ function getStats(index, options = {}) {
         // candidate set, the exact count, AND the upper bound (a bound that
         // still counted them stopped the early exit from firing, so the
         // orientation fell back to its approximate refinement budget).
-        const { inlineTestRanges, lineInRanges } = require('./shared');
+        const { inlineTestRanges, lineInRanges } = lazySharedModule();
         const inlineTestRangesByFile = new Map();
         const inInlineTest = (file, line) => {
             if (!file || !line) return false;
@@ -228,7 +233,7 @@ function getStats(index, options = {}) {
         // the exact passes never scan them (every per-site verdict is
         // file-local). Orientation on django spent most of its time
         // resolving the test suite's calls, which it then discarded.
-        const { isTestPath } = require('./shared');
+        const { isTestPath } = lazySharedModule();
         const countableFile = (filePath) => {
             if (!scopedPaths.has(filePath)) return false;
             const fileEntry = index.files.get(filePath);
@@ -308,7 +313,7 @@ function getStats(index, options = {}) {
                 if (upper === 0) continue;
                 if (index.files.get(symbol.file)?.isBundled) continue;
                 if (options.productionCallsOnly &&
-                    (require('./shared').isTestPath(symbol.relativePath) ||
+                    (lazySharedModule().isTestPath(symbol.relativePath) ||
                         inInlineTest(symbol.file, symbol.startLine))) continue;
                 const identity = `${symbol.file}:${symbol.startLine}:${name}:` +
                     `${symbol.className || symbol.receiver || ''}:${symbol.params || ''}`;
@@ -419,7 +424,7 @@ function getStats(index, options = {}) {
         const testPath = (file) => {
             let verdict = testPathMemo.get(file);
             if (verdict === undefined) {
-                verdict = require('./shared').isTestPath(file);
+                verdict = lazySharedModule().isTestPath(file);
                 testPathMemo.set(file, verdict);
             }
             return verdict;
@@ -745,7 +750,7 @@ function doctor(index, options = {}) {
     // Reflection/eval signals come from the shared text-blind-spot counter
     // (core/shared.js) — the SAME routine detectCompleteness uses for the about
     // footer, so the two never drift (field-report #2). Occurrence counts.
-    const { hasTextBlindspots, countTextBlindspots } = require('./shared');
+    const { hasTextBlindspots, countTextBlindspots } = lazySharedModule();
 
     const computedDispatch = projectComputedDispatch(index);
     for (const [filePath, fe] of index.files) {
@@ -1131,7 +1136,7 @@ function orient(index, options = {}) {
         in: options.in,
         exclude: options.exclude,
     };
-    const { isTestPath } = require('./shared');
+    const { isTestPath } = lazySharedModule();
     const hasProductionFiles = [...index.files.values()].some(fileEntry => {
         const relativePath = fileEntry.relativePath;
         return relativePath &&
@@ -1173,7 +1178,7 @@ function orient(index, options = {}) {
     let entrypoints = null;
     try {
         const { detectEntrypoints } = require('./entrypoints');
-        const { addTestExclusions } = require('./shared');
+        const { addTestExclusions } = lazySharedModule();
         const orientExclude = Array.isArray(options.exclude)
             ? options.exclude
             : (options.exclude

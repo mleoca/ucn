@@ -20,6 +20,7 @@ const { validateFileIR } = require('./ir');
 const { createFileEntryFromIR, populateFileEntryFromIR } = require('./index-ir');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 const { escapeRegExp, isCallableMember, codeUnitCompare, literalNameRegex, calleeNames } = require('./shared');
+const { containsCall } = require('./callable-scope');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
 // Loaded on first use (fix #375): most commands never reach dead-code
@@ -35,6 +36,11 @@ const graphModule = require('./graph');
 const graphBuildModule = require('./graph-build');
 const reportingModule = require('./reporting');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyClassIdentityModuleCache = null;
+const lazyClassIdentityModule = () => lazyClassIdentityModuleCache || (lazyClassIdentityModuleCache = require('./class-identity'));
+
 // Lazy-initialized per-language keyword sets (populated on first isKeyword call)
 let LANGUAGE_KEYWORDS = null;
 
@@ -42,10 +48,16 @@ let LANGUAGE_KEYWORDS = null;
 // small cross-operation LRU so a sequence of agent queries does not reparse the
 // same large headers/modules for every conservation-account classification.
 // The source-byte budget is deliberately conservative because tree-sitter's
-// native tree is larger than its source. Evictions explicitly release native
-// memory instead of waiting for N-API finalizers.
-const PARSED_TREE_CACHE_MAX_ENTRIES = 128;
-const PARSED_TREE_CACHE_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+// native tree is larger than its source (~40x). Evictions explicitly release
+// native memory instead of waiting for N-API finalizers. The bound is the
+// source bytes (fix #436): a 128-tree cap evicted in scan order whenever one
+// query read more files than that (clap `Command`: 164), so every later read
+// of the same files re-parsed them, and freed trees left the heap larger.
+const PARSED_TREE_CACHE_MAX_ENTRIES = 2048;
+const PARSED_TREE_CACHE_MAX_SOURCE_BYTES = 8 * 1024 * 1024;
+// The most recent tree alone stays up to the former budget, so one large
+// file (an amalgamation) is still read once across operations.
+const PARSED_TREE_CACHE_MAX_SINGLE_SOURCE_BYTES = 32 * 1024 * 1024;
 // Automatic build parallelism (fix #375): source bytes to (re)parse before a
 // build uses workers, and per worker. A worker's fixed cost (thread start
 // and its own JIT warm-up of the parsers) is about the CPU of parsing 300KB
@@ -163,6 +175,19 @@ class ProjectIndex {
         this._rustScopeMemo = null; // fix #368: Rust glob/bound resolution memo, index-lifetime
         require('./imports').resetRustResolveMemo(); // fix #372: the tree may have changed
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
+    }
+
+    /**
+     * The language a file is parsed in: the indexed language when the file is
+     * indexed (a `.h` header's grammar is decided at build time from the
+     * compilation database and the project's translation units), else the
+     * detection the build would make. A relative path is project-relative,
+     * never relative to the process directory (fix #436).
+     */
+    languageOf(filePath) {
+        if (!filePath) return null;
+        const absolute = path.isAbsolute(filePath) ? filePath : path.join(this.root, filePath);
+        return this.files.get(absolute)?.language || detectLanguage(absolute, this.root);
     }
 
     /**
@@ -325,7 +350,9 @@ class ProjectIndex {
         this._parsedTreeKeys.get(filePath).add(key);
         this._parsedTreeCacheSourceBytes += sourceBytes;
         while (this._parsedTreeCache.size > PARSED_TREE_CACHE_MAX_ENTRIES ||
-            this._parsedTreeCacheSourceBytes > PARSED_TREE_CACHE_MAX_SOURCE_BYTES) {
+            (this._parsedTreeCacheSourceBytes > PARSED_TREE_CACHE_MAX_SOURCE_BYTES &&
+                !(this._parsedTreeCache.size === 1 &&
+                    this._parsedTreeCacheSourceBytes <= PARSED_TREE_CACHE_MAX_SINGLE_SOURCE_BYTES))) {
             const oldest = this._parsedTreeCache.values().next().value;
             this._evictParsedTree(oldest.filePath, oldest.language);
         }
@@ -383,6 +410,35 @@ class ProjectIndex {
         if (tree) {
             this._cacheParsedTree(filePath, language, tree, Buffer.byteLength(content));
         }
+        return tree;
+    }
+
+    /**
+     * The plain parse of a file whose query view is another tree (C#
+     * conditional compilation), kept in the persistent tree cache under its
+     * own grammar key (fix #436). Null outside an operation, as
+     * _getParsedTree.
+     */
+    _plainParsedTree(filePath, content, language) {
+        if (!this._opTreeCache) return null;
+        const key = `${language}:plain`;
+        const persistent = this._persistentParsedTree(filePath, key);
+        const currentHash = this.files.get(filePath)?.hash || null;
+        if (persistent && persistent.fileHash === currentHash) {
+            const cacheKey = `${key}\0${filePath}`;
+            this._parsedTreeCache.delete(cacheKey);
+            this._parsedTreeCache.set(cacheKey, persistent);
+            return persistent.tree;
+        }
+        if (persistent) this._evictParsedTree(filePath, key);
+        let tree;
+        try {
+            const parser = getParser(language);
+            tree = parser ? safeParse(parser, content) : null;
+        } catch (e) {
+            tree = null;
+        }
+        if (tree) this._cacheParsedTree(filePath, key, tree, Buffer.byteLength(content));
         return tree;
     }
 
@@ -1344,7 +1400,7 @@ class ProjectIndex {
             // class. Only partial types gather bases from other files, and a
             // C/C++ declaration may be a forward declaration of a class
             // defined in another file.
-            if (contextFile && require('./class-identity').fileDeclaresClass(this, className, contextFile)) return null;
+            if (contextFile && lazyClassIdentityModule().fileDeclaresClass(this, className, contextFile)) return null;
 
             // Try imported file
             if (contextFile) {
@@ -2061,7 +2117,7 @@ class ProjectIndex {
         // A member declared in another same-name type's body (a
         // function-local class beside its module-level namesake, C#
         // `Outcome` beside `Outcome<T>`) is not this type's (fix #389).
-        const { ownerDefinitionOf, classKeyOf } = require('./class-identity');
+        const { ownerDefinitionOf, classKeyOf } = lazyClassIdentityModule();
         const typeKey = definition && definition.name === baseTypeName ? classKeyOf(this, definition) : null;
         const ownedHere = symbol => {
             if (!typeKey) return true;
@@ -2207,6 +2263,14 @@ class ProjectIndex {
      */
     getLineContent(filePath, lineNum) {
         try {
+            // Within an operation the file's split lines are shared, so a
+            // line is one lookup instead of a scan from the file's start
+            // (fix #436: value bands read thousands of lines of one file).
+            if (this._opLinesCache) {
+                const lines = this._getFileLines(filePath);
+                const at = lineNum >= 1 ? Math.ceil(lineNum) - 1 : 0;
+                return at < lines.length ? lines[at] : '';
+            }
             const content = this._readFile(filePath);
             // Find the Nth line without splitting the entire file
             let start = 0;
@@ -2651,7 +2715,7 @@ class ProjectIndex {
             if (isCallableMember(symbol) &&
                 symbol.startLine <= lineNum &&
                 symbol.endLine >= lineNum) {
-                const sourceScope = call ? require('./callable-scope').containsCall(symbol, call) : null;
+                const sourceScope = call ? containsCall(symbol, call) : null;
                 if (sourceScope === false) continue;
                 const size = candidate => sourceScope === true && candidate.sourceSpan
                     ? candidate.sourceSpan.end - candidate.sourceSpan.start : candidate.endLine - candidate.startLine;

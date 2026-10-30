@@ -103,7 +103,9 @@ function computeGroundSet(index, name) {
         const lines = index._getFileLines(filePath);
         const matched = [];
         for (let i = 0; i < lines.length; i++) {
-            if (wordRe.test(lines[i])) matched.push(i + 1);
+            // Only a line holding the text can match (fix #436: the
+            // Unicode-boundary test ran on every line of the file).
+            if (lines[i].includes(name) && wordRe.test(lines[i])) matched.push(i + 1);
         }
         if (matched.length > 0) {
             perFile.set(filePath, matched);
@@ -201,7 +203,7 @@ function scanFailedFiles(index, name) {
         if (!content.includes(name)) continue;
         let matched = 0;
         for (const line of content.split('\n')) {
-            if (wordRe.test(line)) matched++;
+            if (line.includes(name) && wordRe.test(line)) matched++;
         }
         if (matched > 0) {
             unparsed.fileCount++;
@@ -249,7 +251,7 @@ function scanUnsupportedFiles(index, name, opts = {}) {
         const lines = content.split('\n');
         let matched = 0;
         for (let i = 0; i < lines.length; i++) {
-            if (!wordRe.test(lines[i])) continue;
+            if (!lines[i].includes(name) || !wordRe.test(lines[i])) continue;
             matched++;
             if (unsupported.sites.length < UNSUPPORTED_SITE_CAP) {
                 unsupported.sites.push({

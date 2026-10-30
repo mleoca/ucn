@@ -110,6 +110,7 @@ function createLanguageAdapter(config) {
             // may release analysis-only trees as soon as those records have
             // been extracted. Direct parser/query calls omit this option and
             // retain their bounded cross-operation cache.
+            require('./index').captureLiteralParse(parser, code);
             const parsed = languageModule.parse(code, parser, {
                 releaseAnalysisTree: true,
                 // Macro definitions the file's include closure supplies
@@ -145,6 +146,16 @@ function createLanguageAdapter(config) {
                     ? languageModule.analysisTree(code, parser) : safeParse(parser, code);
                 const sites = reflectionSitesInTree(analysisTree, config.name, code);
                 if (sites.length > 0) parsed.reflectionSites = sites;
+            }
+            // Computed dispatch sites (`handlers[name]()`) of the literal
+            // parse the doctor's blind-spot inventory reads (fix #436): a
+            // query reads them from the index instead of parsing every file.
+            const literalTree = require('./index').takeLiteralParse();
+            if (!Array.isArray(parsed.computedDispatchSites)) {
+                const { safeParse } = require('./index');
+                const { computedDispatchSites } = require('../core/ast-analysis');
+                const tree = literalTree || (parser ? safeParse(parser, code) : null);
+                parsed.computedDispatchSites = tree ? computedDispatchSites(code, config.name, tree) : [];
             }
             return createFileIR({
                 language: config.name,

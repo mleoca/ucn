@@ -261,6 +261,9 @@ function createFileIR({
         ...(parsed.reflectionSites?.length > 0 && {
             reflectionSites: parsed.reflectionSites.map(item => ({ ...item })),
         }),
+        ...(Array.isArray(parsed.computedDispatchSites) && {
+            computedDispatchSites: parsed.computedDispatchSites.map(item => ({ ...item })),
+        }),
         ...(parsed.macroScopeMarkers?.length > 0 && {
             macroScopeMarkers: parsed.macroScopeMarkers.map(item => ({ ...item })),
         }),

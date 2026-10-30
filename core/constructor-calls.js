@@ -7,6 +7,13 @@ const { declarationIdentity, identityKey, sameDeclaration, validateConfirmation 
 const { captureOverload, projectFact, refusedProof } = require('./provenance-overload');
 const { codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyProvenanceFactsModuleCache = null;
+const lazyProvenanceFactsModule = () => lazyProvenanceFactsModuleCache || (lazyProvenanceFactsModuleCache = require('./provenance-facts'));
+let lazyProvenanceTypeModuleCache = null;
+const lazyProvenanceTypeModule = () => lazyProvenanceTypeModuleCache || (lazyProvenanceTypeModuleCache = require('./provenance-type'));
+
 const isConstructor = (def, index) => !def?.modifiers?.includes('destructor') &&
     (def?.type === 'constructor' && !def.modifiers?.includes('static') || !!(def?.className && index && !NON_CALLABLE_TYPES.has(def.type) &&
         langTraits(index.files.get(def.file)?.language)?.constructorProtocol?.initializer === def.name));
@@ -53,7 +60,7 @@ function ownMembers(index, owner) {
     // The parts of a C# partial type are one type (fix #430): a part
     // without constructors (`partial class JValue` in JValue.Async.cs) has
     // the constructors the other parts declare.
-    const parts = require('./provenance-facts').partialTypeParts(index, owner) || [owner];
+    const parts = lazyProvenanceFactsModule().partialTypeParts(index, owner) || [owner];
     const members = parts.flatMap(part => {
         const identity = declarationIdentity(part);
         return (index.files.get(part.file)?.symbols || []).filter(def =>
@@ -278,7 +285,7 @@ function constructionAliasBinding(index, file, call, targets) {
     }
     if (!candidates.length) return null;
     if (call.implicitBase) return require('./provenance-constructor-base').implicitBaseBinding(index, file, call, candidates);
-    const { occurrenceIdentity } = require('./provenance-facts');
+    const { occurrenceIdentity } = lazyProvenanceFactsModule();
     const site = occurrenceIdentity(index.files.get(file).relativePath, call);
     const query = { file, relativePath: site.file, line: site.line, column: site.column,
         name: call.name, qualifier: call.constructorQualifier || call.receiver || null, localShadow: !!call.localShadow,
@@ -287,7 +294,7 @@ function constructionAliasBinding(index, file, call, targets) {
         try {
             // The witness replays this same lookup. Other owner identities
             // cannot satisfy it and need no separate capture attempt.
-            const bound = require('./provenance-type').cppConstructionClasses(index, query);
+            const bound = lazyProvenanceTypeModule().cppConstructionClasses(index, query);
             candidates = candidates.filter(owner => bound.length > 0 && bound.every(def =>
                 sameDeclaration(declarationIdentity(def), declarationIdentity(owner))));
         } catch (error) {
@@ -298,7 +305,7 @@ function constructionAliasBinding(index, file, call, targets) {
     const family = langTraits(language)?.nameReferenceFamily || language;
     const found = candidates.filter(def => ['class', 'struct', 'record', 'enum'].includes(def.type) &&
         (langTraits(index.files.get(def.file)?.language)?.nameReferenceFamily || index.files.get(def.file)?.language) === family).map(owner => ({
-        owner, witness: require('./provenance-type').captureTypeLookup(index, query, owner),
+        owner, witness: lazyProvenanceTypeModule().captureTypeLookup(index, query, owner),
     })).filter(entry => entry.witness);
     if (found.length !== 1) return null;
     const { owner, witness } = found[0];
@@ -324,9 +331,9 @@ function ownClassBinding(index, file, call) {
     const owner = (entry.symbols || []).find(def => def.name === own.name && OWN_CLASS_KINDS.has(def.type) &&
         namedAt(def, own.line));
     if (!owner) return null;
-    const { occurrenceIdentity } = require('./provenance-facts');
+    const { occurrenceIdentity } = lazyProvenanceFactsModule();
     const site = occurrenceIdentity(entry.relativePath, call);
-    const witness = require('./provenance-type').captureTypeLookup(index, { file, relativePath: site.file,
+    const witness = lazyProvenanceTypeModule().captureTypeLookup(index, { file, relativePath: site.file,
         line: site.line, column: site.column, name: call.name, ownClass: own, construction: true }, owner);
     if (!witness) return null;
     return { owner, provenance: { rule: 'construction-type', rules: ['construction-type'],
@@ -369,8 +376,8 @@ function constructionTypeParameter(index, file, call) {
     if (!langTraits(language)?.hasConstructors || langTraits(language)?.typeSystem !== 'nominal' ||
         !isConstruction(call, null, language) || ['implicit', 'delegation', 'enum'].includes(call.constructorSyntax)) return false;
     if (!call.isConstructor && !constructionTypeCandidates(index, call.name).length) return false;
-    const site = require('./provenance-facts').occurrenceIdentity(index.files.get(file).relativePath, call);
-    return require('./provenance-type').constructionNameScope(index, { file, line: site.line, column: site.column,
+    const site = lazyProvenanceFactsModule().occurrenceIdentity(index.files.get(file).relativePath, call);
+    return lazyProvenanceTypeModule().constructionNameScope(index, { file, line: site.line, column: site.column,
         name: call.name, qualifier: call.constructorQualifier || call.receiver || null }) === false;
 }
 
@@ -448,20 +455,20 @@ function constructionEvidenceUncached(index, owner, call, classBinding) {
     const functional = !call.isConstructor && langTraits(language)?.functionalTypeConstruction;
     const nameScope = langTraits(language)?.typeSystem === 'nominal' &&
         !['implicit', 'delegation', 'enum'].includes(call.constructorSyntax) && site
-        ? require('./provenance-type').captureTypeLookup(index, {
+        ? lazyProvenanceTypeModule().captureTypeLookup(index, {
             file: path.resolve(index.root, site.file), relativePath: site.file,
             line: site.line, column: site.column, name: call.name,
             qualifier: call.constructorQualifier || call.receiver || null, nameScopeOnly: true,
         }, owner) : null;
     const typeLookup = call.ownClass && site
-        ? require('./provenance-type').captureTypeLookup(index, {
+        ? lazyProvenanceTypeModule().captureTypeLookup(index, {
             file: path.resolve(index.root, site.file), relativePath: site.file,
             line: site.line, column: site.column, name: call.name, ownClass: call.ownClass, construction: true,
         }, owner)
         : (call.isConstructor || functional || langTraits(language)?.classesCallableWithoutNew) && site &&
         (functional || langTraits(language)?.typeSystem === 'structural' ||
             validateConfirmation(classBinding, declarationIdentity(owner)).verdict !== 'establishes-target')
-        ? require('./provenance-type').captureTypeLookup(index, {
+        ? lazyProvenanceTypeModule().captureTypeLookup(index, {
             file: path.resolve(index.root, site.file), relativePath: site.file,
             line: site.line, column: site.column, name: call.name,
             qualifier: call.constructorQualifier || call.receiver || null, functional: !!functional, construction: true,
@@ -490,7 +497,7 @@ function constructionChoice(index, owner, call, classBinding, targets) {
         // The delegating constructor is never its own delegation's target,
         // even when no other member of the family remains (fix #419).
         if (evidence.delegating) {
-            const parts = require('./provenance-facts').partialTypeParts(index, owner);
+            const parts = lazyProvenanceFactsModule().partialTypeParts(index, owner);
             facts.constructorCall = { owner: declarationIdentity(owner), members: [],
                 ...(parts && { parts: parts.map(declarationIdentity) }),
                 delegating: declarationIdentity(evidence.delegating),
@@ -507,7 +514,7 @@ function constructionChoice(index, owner, call, classBinding, targets) {
     const { members, declaring, hierarchy, delegating, delegatingDefinition, language, protocol, overload, selected, chosen,
         nameScope, typeLookup } = evidence;
     targets ||= members;
-    const parts = require('./provenance-facts').partialTypeParts(index, declaring);
+    const parts = lazyProvenanceFactsModule().partialTypeParts(index, declaring);
     const facts = { language, site: classBinding?.facts?.site, targets: targets.map(declarationIdentity),
         constructorCall: { owner: declarationIdentity(declaring), members: members.map(declarationIdentity),
             ...(parts && { parts: parts.map(declarationIdentity) }),

@@ -8,6 +8,11 @@ const path = require('path');
 const { UcnError } = require('../core/errors');
 const { createLanguageAdapter } = require('./adapter');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyJavaUnicodeModuleCache = null;
+const lazyJavaUnicodeModule = () => lazyJavaUnicodeModuleCache || (lazyJavaUnicodeModuleCache = require('./java-unicode'));
+
 // Lazy-loaded tree-sitter
 let TreeSitter = null;
 
@@ -868,8 +873,8 @@ const LANGUAGES = {
             implicitEnumCaseLabels: true,
             standardPathRoots: ['java', 'javax'],
             typeNameScoping: 'package-on-demand',
-            typeNameSourceCanonical: (source, parseError, lines) => require('./java-unicode').typeNameSourceCanonical(source, parseError, lines),
-            typeNameOwnersAt: (source, site) => require('./java-unicode').typeNameOwnersAt(source, site),
+            typeNameSourceCanonical: (source, parseError, lines) => lazyJavaUnicodeModule().typeNameSourceCanonical(source, parseError, lines),
+            typeNameOwnersAt: (source, site) => lazyJavaUnicodeModule().typeNameOwnersAt(source, site),
             typeNamedSourceFile: true,
             // The public top-level types of java.lang (JDK 8-21, preview
             // included): a spec-level list, not project knowledge.
@@ -1563,10 +1568,32 @@ function getParseOptions(contentLength = 0) {
 let _lastParseParser = null;
 let _lastParseContent = null;
 let _lastParseTree = null;
+// The plain parse of the file an analysis reads (fix #436): a language may
+// parse other views of the source after it (recoveries, configurations),
+// and an index-time fact of the literal tree then needs no second parse.
+let _literalCapture = null;
+
+/** Remember the tree of the next plain parse of exactly (parser, content). */
+function captureLiteralParse(parser, content) {
+    _literalCapture = { parser, content, tree: null };
+}
+
+/** The tree captureLiteralParse remembered (null if none), ending the capture. */
+function takeLiteralParse() {
+    const capture = _literalCapture;
+    _literalCapture = null;
+    return capture?.tree || null;
+}
+
+function noteLiteralParse(parser, content, tree) {
+    if (_literalCapture && !_literalCapture.tree && tree && parser === _literalCapture.parser &&
+        content === _literalCapture.content) _literalCapture.tree = tree;
+}
 
 function safeParse(parser, content, oldTree = undefined, options = {}) {
     // Fast path: return cached tree if same parser and content (no oldTree override)
     if (!oldTree && parser === _lastParseParser && content === _lastParseContent && _lastParseTree) {
+        noteLiteralParse(parser, content, _lastParseTree);
         return _lastParseTree;
     }
 
@@ -1603,6 +1630,7 @@ function safeParse(parser, content, oldTree = undefined, options = {}) {
                 _lastParseParser = parser;
                 _lastParseContent = content;
                 _lastParseTree = tree;
+                noteLiteralParse(parser, content, tree);
             }
             return tree;
         } catch (e) {
@@ -1644,6 +1672,8 @@ module.exports = {
     PARSE_OPTIONS,
     getParseOptions,
     safeParse,
+    captureLiteralParse,
+    takeLiteralParse,
     langTraits,
     DEFAULT_BUFFER_SIZE,
     MAX_BUFFER_SIZE

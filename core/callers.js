@@ -33,6 +33,21 @@ const { pythonFixtureReceiver, pythonFixtureType } = require('./python-fixture-f
 const { sameConfigurationItem, itemsNamed, moduleItemNamed, siteExcludedAt, sitesReachableAt,
     DEFINITION_KINDS: CONFIGURATION_DEFINITION_KINDS } = require('./configuration-items');
 const { reflectionPatternReferences: _reflectionPatternReferences, patternIsAttributable } = require('./reflection');
+
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyProvenanceOverloadModuleCache = null;
+const lazyProvenanceOverloadModule = () => lazyProvenanceOverloadModuleCache || (lazyProvenanceOverloadModuleCache = require('./provenance-overload'));
+let lazyConstructorCallsModuleCache = null;
+const lazyConstructorCallsModule = () => lazyConstructorCallsModuleCache || (lazyConstructorCallsModuleCache = require('./constructor-calls'));
+let lazySourceMemoModuleCache = null;
+const lazySourceMemoModule = () => lazySourceMemoModuleCache || (lazySourceMemoModuleCache = require('./source-memo'));
+let lazyMacroExpansionModuleCache = null;
+const lazyMacroExpansionModule = () => lazyMacroExpansionModuleCache || (lazyMacroExpansionModuleCache = require('./macro-expansion'));
+let lazyCallNameCacheModuleCache = null;
+const lazyCallNameCacheModule = () => lazyCallNameCacheModuleCache || (lazyCallNameCacheModuleCache = require('./call-name-cache'));
+let lazyClassIdentityModuleCache = null;
+const lazyClassIdentityModule = () => lazyClassIdentityModuleCache || (lazyClassIdentityModuleCache = require('./class-identity'));
 const {
     ownerRefOf, lexicalClassRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
     shareDescendant: shareClassDescendant, parentRefsOf: parentRefsOfClass,
@@ -242,7 +257,7 @@ function getLine(content, lineNum) {
 function getCachedCalls(index, filePath, options = {}) {
     const result = _getCachedCallsRaw(index, filePath, options);
     if (!result) return result;
-    const { withMacroExpansion } = require('./macro-expansion');
+    const { withMacroExpansion } = lazyMacroExpansionModule();
     if (Array.isArray(result)) return withMacroExpansion(index, filePath, result);
     const calls = withMacroExpansion(index, filePath, result.calls);
     return calls === result.calls ? result : { ...result, calls };
@@ -269,7 +284,7 @@ function _pendingCallRecords(index, filePath, select) {
  * macro expansions' calls are not derived yet, only those records.
  */
 function getCachedCallsBearing(index, filePath, name, lineSet = null) {
-    if (require('./call-name-cache').absent(index, filePath, name)) return [];
+    if (lazyCallNameCacheModule().absent(index, filePath, name)) return [];
     const records = _pendingCallRecords(index, filePath, { name, lineSet, keep: call => _callBearsName(call, name) });
     return records !== undefined ? records : getCachedCalls(index, filePath);
 }
@@ -287,7 +302,7 @@ function _getCachedCallsRaw(index, filePath, options = {}) {
         // Fast path: check mtime first (stat is much faster than read+hash).
         // One stat per file per operation (fix #365): stats --hot and repo
         // visit the same callee files for hundreds of definitions.
-        const mtime = require('./source-memo').fileMtime(index, filePath);
+        const mtime = lazySourceMemoModule().fileMtime(index, filePath);
 
         if (cached && cached.mtime === mtime) {
             // mtime matches - cache is likely valid
@@ -316,7 +331,7 @@ function _getCachedCallsRaw(index, filePath, options = {}) {
         }
 
         // Content changed - need to reparse
-        const language = detectLanguage(filePath);
+        const language = index.languageOf(filePath);
         if (!language) return null;
 
         const langModule = getLanguageAdapter(language);
@@ -336,7 +351,7 @@ function _getCachedCallsRaw(index, filePath, options = {}) {
 
         // Remove old callee index entries before overwriting cache (the
         // macro-expanded view carries every name the old entry contributed)
-        const { withMacroExpansion } = require('./macro-expansion');
+        const { withMacroExpansion } = lazyMacroExpansionModule();
         if (cached) index._removeFromCalleeIndex(filePath, withMacroExpansion(index, filePath, cached.calls,
             { materialize: false }));
         index.callsCache.set(filePath, {
@@ -551,6 +566,56 @@ function _recordsBearing(calls, name) {
             (Array.isArray(call.resolvedNames) && call.resolvedNames.includes(name)))) out.push(call);
     }
     return out;
+}
+
+// A plain type query reads, of a file's records, those bearing the type's
+// name, those whose receiver is spelled as the type, destructured and
+// own-class records, and (where a bare call can reach a method) the
+// type-qualified ones. Each records array keeps one index of those keys for
+// the index's lifetime, so a query selects its records instead of testing
+// every record of every file (fix #436: clap `find Command` tested 50k).
+// C# receiver rewrites can name the type only through a type-qualified
+// receiver (a type parameter read as its constraint) or a field path whose
+// segment it is (a namespace-qualified type), so `csharp` adds those.
+const TYPE_QUERY_RECORD_INDEX = new WeakMap(); // calls array -> { length, keyed, fieldKeyed, always, typeQualified }
+function _typeQueryRecordIndex(calls) {
+    let memo = TYPE_QUERY_RECORD_INDEX.get(calls);
+    if (memo && memo.length === calls.length) return memo;
+    const keyed = new Map();
+    const fieldKeyed = new Map();
+    const always = [];
+    const typeQualified = [];
+    const add = (map, key, i) => {
+        if (typeof key !== 'string') return;
+        let list = map.get(key);
+        if (!list) { list = []; map.set(key, list); }
+        if (list[list.length - 1] !== i) list.push(i);
+    };
+    for (let i = 0; i < calls.length; i++) {
+        const call = calls[i];
+        if (!call) continue;
+        add(keyed, call.name, i);
+        add(keyed, call.resolvedName, i);
+        if (Array.isArray(call.resolvedNames)) for (const resolved of call.resolvedNames) add(keyed, resolved, i);
+        if (call.ownClass) add(keyed, call.ownClass.name, i);
+        add(keyed, call.receiver, i);
+        if (Array.isArray(call.receiverFields)) for (const field of call.receiverFields) add(fieldKeyed, field, i);
+        if (call.ownClass || call.destructured) always.push(i);
+        if (call.receiverIsTypeQualified) typeQualified.push(i);
+    }
+    memo = { length: calls.length, keyed, fieldKeyed, always, typeQualified };
+    TYPE_QUERY_RECORD_INDEX.set(calls, memo);
+    return memo;
+}
+
+/** The records a plain type query on `name` can match, in record order. */
+function _typeQueryRecords(calls, name, bareReachesMethods, csharp = false) {
+    const { keyed, fieldKeyed, always, typeQualified } = _typeQueryRecordIndex(calls);
+    const parts = [keyed.get(name) || [], always, bareReachesMethods || csharp ? typeQualified : [],
+        csharp ? fieldKeyed.get(name) || [] : []].filter(list => list.length > 0);
+    if (parts.length === 0) return [];
+    const indexes = parts.length === 1 ? parts[0] : [...new Set(parts.flat())].sort((a, b) => a - b);
+    return indexes.map(i => calls[i]);
 }
 
 function _callBearsName(call, name) {
@@ -1074,7 +1139,7 @@ function findCallers(index, name, options = {}) {
     const valueAliasSurfaces = _classValueAliasSurfaces(index, name,
         options.targetDefinitions || definitions);
     for (const aliasName of valueAliasSurfaces) aliasNames.add(aliasName);
-    const constructionAliasSurfaces = require('./constructor-calls').constructionAliasNames(index,
+    const constructionAliasSurfaces = lazyConstructorCallsModule().constructionAliasNames(index,
         options.targetDefinitions || definitions);
     for (const aliasName of constructionAliasSurfaces) aliasNames.add(aliasName);
     const hasAliasSurfaces = aliasNames.size > 0;
@@ -1092,7 +1157,7 @@ function findCallers(index, name, options = {}) {
             const reachKey = targetNames.join('\0');
             let spellings = reaching?.get(reachKey);
             if (!spellings) {
-                spellings = require('./constructor-calls').constructionSpellingsReaching(index, targetNames);
+                spellings = lazyConstructorCallsModule().constructionSpellingsReaching(index, targetNames);
                 reaching?.set(reachKey, spellings);
             }
             aliasedVisit = { spellings,
@@ -1371,7 +1436,7 @@ function findCallers(index, name, options = {}) {
             fileEntry.rustMacroExpansion?.callsPending &&
             !require('./rust-macro-expansion').rustPendingMayBear(fileEntry, name)) continue;
         if (!hasAliasSurfaces && !targetIsTypeQuery &&
-            require('./call-name-cache').absent(index, filePath, name)) continue;
+            lazyCallNameCacheModule().absent(index, filePath, name)) continue;
         try {
             const typedViews = csharpTargetTypedByFile.get(filePath);
             // A record that cannot match below is skipped by the loop's first
@@ -1435,9 +1500,17 @@ function findCallers(index, name, options = {}) {
             if (targetIsTypeQuery && hasAliasSurfaces && fileEntry.language !== 'csharp' &&
                 !typedViews && !index.isProvenanceFactIndex && visitCalls === calls) {
                 visitCalls = aliasedTypeQueryVisits(filePath, calls);
+            } else if (typeQueryOnly && !typedViews && !index.isProvenanceFactIndex && visitCalls === calls) {
+                visitCalls = _typeQueryRecords(calls, name, bareReachesMethods, fileEntry.language === 'csharp');
             }
             const inheritedOverloadSignatures = !!langTraits(fileEntry.language)?.inheritedOverloadSignatures;
             for (let call of visitCalls) {
+                // A record a type query cannot match is skipped before the
+                // copy below (fix #436: every record of a Java file was
+                // copied per type query).
+                if (typeQueryOnly && !call.ownClass && !call.destructured && call.receiver !== name &&
+                    !_callBearsName(call, name) && fileEntry.language !== 'csharp' &&
+                    !(call.receiverIsTypeQualified && bareReachesMethods)) continue;
                 if (inheritedOverloadSignatures) {
                     call = { ...call, argumentFile: fileEntry.relativePath };
                 }
@@ -1447,7 +1520,7 @@ function findCallers(index, name, options = {}) {
                 // spelled like its receiver.
                 if (call.ownClass) {
                     if (call.ownClass.name !== name) continue;
-                    const own = require('./constructor-calls').ownClassBinding(index, filePath, call);
+                    const own = lazyConstructorCallsModule().ownClassBinding(index, filePath, call);
                     if (own && validateConfirmation(own.provenance, (options.targetDefinitions || definitions)
                         .map(declarationIdentity)).verdict === 'establishes-target') {
                         if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
@@ -1458,9 +1531,6 @@ function findCallers(index, name, options = {}) {
                     }
                     continue;
                 }
-                if (typeQueryOnly && !call.destructured && call.receiver !== name &&
-                    !_callBearsName(call, name) && fileEntry.language !== 'csharp' &&
-                    !(call.receiverIsTypeQualified && bareReachesMethods)) continue;
                 if (call.destructured) {
                     // A destructured name reads a member (fix #397): it
                     // reaches member targets through the member view, and a
@@ -1522,7 +1592,7 @@ function findCallers(index, name, options = {}) {
                 if (call.implicitBase && !options.constructorProjectionSource) continue;
                 const constructionAlias = constructionAliasSurfaces.has(call.name) || call.constructorQualifier || call.implicitBase ||
                     langTraits(fileEntry.language)?.functionalTypeConstruction
-                    ? require('./constructor-calls').constructionAliasBinding(index, filePath, call,
+                    ? lazyConstructorCallsModule().constructionAliasBinding(index, filePath, call,
                         options.targetDefinitions || definitions) : null;
                 // Skip if not matching our target name (also check alias resolution)
                 let calledAs = null; // surface name when matched via an import/export rename
@@ -1553,8 +1623,8 @@ function findCallers(index, name, options = {}) {
                     }
                     if (!calledAs && constructionAlias) calledAs = call.name;
                     if (!calledAs && constructionAliasSurfaces.has(call.name) &&
-                        require('./constructor-calls').constructionAliasPossibilities(index, filePath, call).length) {
-                        const other = require('./constructor-calls').constructionAliasBinding(index, filePath, call);
+                        lazyConstructorCallsModule().constructionAliasPossibilities(index, filePath, call).length) {
+                        const other = lazyConstructorCallsModule().constructionAliasBinding(index, filePath, call);
                         if (other && validateConfirmation(other.provenance,
                             (options.targetDefinitions || definitions).map(declarationIdentity)).verdict === 'establishes-other') {
                             recordExcluded(filePath, call.line, 'constructor-type-other', other.provenance);
@@ -1667,7 +1737,7 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
-                if (require('./constructor-calls').constructionTypeParameter(index, filePath, call)) {
+                if (lazyConstructorCallsModule().constructionTypeParameter(index, filePath, call)) {
                     routeUnverified(filePath, fileEntry, call, 'constructor-type-parameter', calledAs);
                     continue;
                 }
@@ -8380,7 +8450,7 @@ function findCallers(index, name, options = {}) {
         });
     }
 
-    require('./constructor-calls').projectConstructorCallers(index, name, options, callers);
+    lazyConstructorCallsModule().projectConstructorCallers(index, name, options, callers);
     _addOutOfClassImplicitBaseCallers(index, name, options, callers);
 
     if (queryProfile) {
@@ -8880,14 +8950,14 @@ function findCallees(index, definition, options = {}) {
                 continue;
             }
 
-            if (require('./constructor-calls').constructionTypeParameter(index, def.file, call)) {
+            if (lazyConstructorCallsModule().constructionTypeParameter(index, def.file, call)) {
                 noteUnverified(siteId, call, 'constructor-type-parameter');
                 continue;
             }
             // A construction through the method's own receiver (fix #434)
             // calls the method's class.
             if (call.ownClass) {
-                const own = require('./constructor-calls').ownClassBinding(index, def.file, call);
+                const own = lazyConstructorCallsModule().ownClassBinding(index, def.file, call);
                 if (own) {
                     const record = siteEvidence.get(siteId);
                     record.constructionBinding = own.provenance;
@@ -8906,7 +8976,7 @@ function findCallees(index, definition, options = {}) {
                     continue;
                 }
             }
-            const constructionAlias = require('./constructor-calls').constructionAliasBinding(index, def.file, call);
+            const constructionAlias = lazyConstructorCallsModule().constructionAliasBinding(index, def.file, call);
             if (constructionAlias) {
                 const { owner, provenance } = constructionAlias;
                 if (constructionAlias.nonClass) {
@@ -8928,13 +8998,13 @@ function findCallees(index, definition, options = {}) {
                 continue;
             }
             if (call.implicitBase) {
-                if (!require('./constructor-calls').constructionTypeCandidates(index, call.name).length || externalTypeDenotation(index, def.file,
+                if (!lazyConstructorCallsModule().constructionTypeCandidates(index, call.name).length || externalTypeDenotation(index, def.file,
                     call.name, call.constructorQualifier, call.implicitBase.header.line)) {
                     noteSite(siteId, 'external', null, call);
                 } else noteUnverified(siteId, call, 'implicit-base-unresolved');
                 continue;
             }
-            if (require('./constructor-calls').constructionAliasPossibilities(index, def.file, call).length) {
+            if (lazyConstructorCallsModule().constructionAliasPossibilities(index, def.file, call).length) {
                 noteUnverified(siteId, call, 'construction-type-unresolved');
                 continue;
             }
@@ -11331,7 +11401,7 @@ function findCallees(index, definition, options = {}) {
                         if (current.importUnresolved) {
                             // Every configuration alternative of the base
                             // declaring one definition decides it (fix #434).
-                            const agreed = require('./class-identity').alternativesDeclare(index, current,
+                            const agreed = lazyClassIdentityModule().alternativesDeclare(index, current,
                                 symbols.filter(symbol => isCallableMember(symbol)));
                             if (agreed?.members.length === 1) { match = agreed.members[0]; break; }
                             noteUnverified(siteId, call, 'inherited-unresolved');
@@ -11625,7 +11695,7 @@ function findCallees(index, definition, options = {}) {
                             const rp = fe ? fe.relativePath : (s.relativePath || '');
                             if (typeOrder.has(s.type)) score += 1000;
                             if (!callerIsTest &&
-                                isTestFile(rp, detectLanguage(s.file))) score -= 500;
+                                isTestFile(rp, index.languageOf(s.file))) score -= 500;
                             if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
                             if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
                             return { symbol: s, score };
@@ -11707,7 +11777,7 @@ function findCallees(index, definition, options = {}) {
                 }
                 let constructed = null;
                 if (IDENTITY_TYPE_KINDS.has(callee.type)) {
-                    const projected = require('./constructor-calls').projectConstructorCalleeSites(index, callee,
+                    const projected = lazyConstructorCallsModule().projectConstructorCalleeSites(index, callee,
                         siteIds, siteId => ({ call: siteEvidence.get(siteId).call,
                             site: provenanceForSite(siteId, callee) }));
                     constructed = projected;
@@ -12047,7 +12117,7 @@ function _pythonClassFieldFacts(index, classDef) {
     let facts;
     try {
         const content = index._readFile(classDef.file);
-        const { indexedContent, SYNTAX_FAMILIES } = require('./source-memo');
+        const { indexedContent, SYNTAX_FAMILIES } = lazySourceMemoModule();
         const mode = `${SYNTAX_FAMILIES.classFields.prefix}:${classDef.startLine}`;
         const cacheable = !index.isProvenanceFactIndex && index._usageResultCache && entry.hash &&
             indexedContent(index, classDef.file, entry, content);
@@ -18039,7 +18109,7 @@ function _cppCompletedTypeOrigin(index, file, typeName) {
     const declared = (index.symbols.get(typeName) || []).filter(d =>
         d.file === origin.fromFile && IDENTITY_TYPE_KINDS.has(d.type));
     if (declared.length === 1 && declared[0].forwardDeclaration) {
-        const provider = require('./class-identity').forwardDeclarationProvider(index, declared[0]);
+        const provider = lazyClassIdentityModule().forwardDeclarationProvider(index, declared[0]);
         if (provider) return { ...origin, fromFile: provider.file, ...(provider.namespace && { namespace: provider.namespace }) };
     }
     return origin;
@@ -18815,7 +18885,7 @@ function selectProvenanceOverload(index, call, candidates, language) {
         // operation, its reads recorded for every witness (fix #428: each
         // capture over a forty-overload family recomputed it).
         const positions = index.isProvenanceFactIndex
-            ? require('./provenance-overload').sharedRead(index, `overload-slots\0${key}`, slotPositions)
+            ? lazyProvenanceOverloadModule().sharedRead(index, `overload-slots\0${key}`, slotPositions)
             : slotPositions(index);
         slots = positions.map(position => candidates[position]);
         memo?.set(key, slots);
@@ -19524,7 +19594,7 @@ function _macroInvocationSites(index, filePath, macroHead) {
 }
 
 function _macroInvocationSitesUncached(index, filePath, macroHead) {
-    const { codeTokens } = require('./macro-expansion');
+    const { codeTokens } = lazyMacroExpansionModule();
     const sites = [];
     const seenSites = new Set();
     const visited = new Set();
@@ -19625,7 +19695,7 @@ function _macroInvocationArgs(tokens, at) {
  * sites cannot be enumerated or an argument cannot be read.
  */
 function _macroParameterArgumentSites(index, filePath, macroHead, paramIndex) {
-    const { codeTokens } = require('./macro-expansion');
+    const { codeTokens } = lazyMacroExpansionModule();
     const sites = [];
     const visited = new Set();
     const queue = [{ file: filePath, name: macroHead.name, startLine: macroHead.startLine, paramIndex, literal: null }];
@@ -19768,8 +19838,8 @@ function _cppMacroParamReceiverType(index, filePath, call) {
 function _addOutOfClassImplicitBaseCallers(index, name, options, callers) {
     if (!options.collectAccount || options.constructorProjectionSource) return;
     const members = require('./out-of-class-members');
-    const { isConstructor } = require('./constructor-calls');
-    const { ownerDefinitionOf } = require('./class-identity');
+    const { isConstructor } = lazyConstructorCallsModule();
+    const { ownerDefinitionOf } = lazyClassIdentityModule();
     const owners = new Set();
     for (const target of options.targetDefinitions || index.symbols.get(name) || []) {
         if (!langTraits(index.files.get(target.file)?.language)?.outOfClassMemberDefinitions) continue;
@@ -19855,8 +19925,8 @@ function _specializationFamily(index, targets) {
     for (const target of targets || []) {
         if (memo?.has(target)) { if (memo.get(target)) return true; continue; }
         let owner = IDENTITY_TYPE_KINDS.has(target.type) ? target : null;
-        if (!owner && require('./constructor-calls').isConstructor(target, index)) {
-            owner = require('./class-identity').ownerDefinitionOf(index, target) ||
+        if (!owner && lazyConstructorCallsModule().isConstructor(target, index)) {
+            owner = lazyClassIdentityModule().ownerDefinitionOf(index, target) ||
                 require('./out-of-class-members').definitionOwner(index, target);
         }
         const family = owner ? (index.symbols.get(owner.name) || []).filter(def => IDENTITY_TYPE_KINDS.has(def.type) &&
@@ -19870,7 +19940,7 @@ function _specializationFamily(index, targets) {
 
 /** Does `name` denote a C/C++ class type, directly or through an alias (fix #421)? */
 function _cppNamesClass(index, name) {
-    return require('./constructor-calls').constructionTypeCandidates(index, name).some(def =>
+    return lazyConstructorCallsModule().constructionTypeCandidates(index, name).some(def =>
         ['class', 'struct'].includes(def.type) && ['c', 'cpp'].includes(index.files.get(def.file)?.language));
 }
 
@@ -21155,7 +21225,7 @@ function _rustTypePathIdentity(index, filePath, call, targets) {
 function _cMacroShadowedCall(index, filePath, call) {
     const sameName = index.symbols.get(call.name);
     if (!sameName || !sameName.some(def => def.type === 'macro')) return null;
-    const { macroDefinitionsAt, macroBodyTokens } = require('./macro-expansion');
+    const { macroDefinitionsAt, macroBodyTokens } = lazyMacroExpansionModule();
     const scope = macroDefinitionsAt(index, filePath, call.line, call.name);
     if (!scope) return null;
     // A header that declares the function and defines the macro holds them
@@ -24099,7 +24169,7 @@ function _javaClassLiteralReturnInfo(index, definition, file, origin, argKinds) 
         _javaKnownReferenceConversion(index, parameter.type, definition, new Set(['java.lang.Class'])) !== true) return null;
     const start = parameter.type.indexOf('<'), end = parameter.type.lastIndexOf('>');
     if (start < 0 || _splitTopLevelGenericArgs(parameter.type.slice(start + 1, end)).join(',').trim() !== variable) return null;
-    const tree = require('./source-memo').parsedSource('java', index._readFile(file));
+    const tree = lazySourceMemoModule().parsedSource('java', index._readFile(file));
     if (!tree) return null;
     {
         const site = origin.site;
@@ -24340,7 +24410,7 @@ function _javaStaticTypeForKind(index, kind, contextFile = null) {
     if (!kind || kind === 'expr' || _isLambdaKind(kind) || kind === 'null') return null;
     // One answer per argument kind and file in an operation, shared by every
     // overload witness that asks (fix #418); a witness records its reads.
-    return require('./provenance-overload').sharedRead(index, `java-static-type\0${kind}\0${contextFile ?? ''}`,
+    return lazyProvenanceOverloadModule().sharedRead(index, `java-static-type\0${kind}\0${contextFile ?? ''}`,
         view => _javaStaticTypeForKindUncached(view, kind, contextFile));
 }
 
@@ -24758,7 +24828,7 @@ function _javaTypeImports(index, entry, name) {
 // as member resolution, including lexically enclosing classes.
 function _javaFormalMemberType(index, name, owner) {
     if (!owner) return { uncertain: true };
-    const { ownerDefinitionOf, supertypeRefsOf, classKeyOf } = require('./class-identity');
+    const { ownerDefinitionOf, supertypeRefsOf, classKeyOf } = lazyClassIdentityModule();
     let scope = ownerDefinitionOf(index, owner);
     if (!scope) return { uncertain: true };
     const named = (index.symbols.get(name) || []).filter(def =>
@@ -24806,7 +24876,7 @@ function _typeNamesCanonicalAt(index, writtenFile, at = null) {
     if (typeof index._readFile !== 'function') return false;
     const lines = Number.isInteger(at?.startLine)
         ? { startLine: at.startLine, endLine: Number.isInteger(at.endLine) ? at.endLine : at.startLine } : null;
-    try { return require('./source-memo').typeNamesCanonical(index, file, canonical, language, lines); }
+    try { return lazySourceMemoModule().typeNamesCanonical(index, file, canonical, language, lines); }
     catch (error) {
         if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR'].includes(error.code)) return false;
         throw error;
@@ -24930,7 +25000,7 @@ function _javaSimplePlatformArgument(index, origin, name) {
 function _javaInfersClassParameter(index, name, owner, origin) {
     const invocation = origin?.invocation;
     if (!owner?.sourceSpan || !invocation?.file || !invocation.site || !name) return false;
-    const { parsedSource } = require('./source-memo');
+    const { parsedSource } = lazySourceMemoModule();
     const declaration = parsedSource('java', index._readFile(owner.file));
     if (!declaration) return false;
     {
@@ -25559,7 +25629,7 @@ function _javaVariadicArgumentMatches(index, call, kind, type, position, typePar
     if (!entry?.language || !Number.isInteger(site.start) || !Number.isInteger(site.end) || !site.nodeType) return true;
     const source = index._readFile(file);
     if (site.start < 0 || site.end > source.length || site.end <= site.start) return true;
-    const tree = require('./source-memo').parsedSource(entry.language, source);
+    const tree = lazySourceMemoModule().parsedSource(entry.language, source);
     if (!tree) return true;
     let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
     while (node && !(node.startIndex === site.start && node.endIndex === site.end && node.type === site.nodeType)) node = node.parent;
@@ -32018,7 +32088,7 @@ function findCallbackUsages(index, name) {
     for (const [filePath, fileEntry] of index.files) {
         try {
             const content = index._readFile(filePath);
-            const language = detectLanguage(filePath);
+            const language = fileEntry.language || detectLanguage(filePath, index.root);
             if (!language) continue;
 
             const langModule = getLanguageAdapter(language);
@@ -32044,4 +32114,4 @@ function findCallbackUsages(index, name) {
 
 module.exports = { rustPathQualifierVerdict: _pathQualifierVerdict, rustTraitDeclPathProbe: _rustTraitDeclPathProbe, _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _nonSourceModuleFile, _moduleValueAliasType, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
-    _goFileConstraint };
+    _goFileConstraint, _typeQueryRecords };

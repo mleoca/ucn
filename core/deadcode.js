@@ -488,7 +488,7 @@ function buildUsageIndex(index, filterNames) {
 
     for (const [filePath, fileEntry] of index.files) {
         try {
-            const language = detectLanguage(filePath);
+            const language = fileEntry.language || detectLanguage(filePath, index.root);
             if (!language) continue;
 
             const content = index._readFile(filePath);

@@ -7952,3 +7952,54 @@ describe('fix #434: C++ auto locals deduce the type of the object they copy, ref
         } finally { rm(dir); }
     });
 });
+
+describe('fix #436: a header\'s grammar is its indexed language, whatever the process directory', () => {
+    const { execFileSync } = require('child_process');
+    const cli = path.join(__dirname, '..', 'cli', 'index.js');
+    const header = 'namespace geo {\nclass Box {\npublic:\n' +
+        '    int total(const std::vector<int>& values) const {\n        int sum = 0;\n' +
+        '        for (auto v : values) {\n            if (v > 0) { sum += v; }\n        }\n' +
+        '        try { check(sum); } catch (...) { return -1; }\n        return sum;\n    }\n' +
+        '    void check(int) const;\n};\n}\n';
+    const source = '#include "box.h"\nvoid geo::Box::check(int) const {}\n' +
+        'int main() { geo::Box b; return b.total({1, 2}); }\n';
+    const showFrom = (cwd, root, handle) => execFileSync('node',
+        [cli, root, 'show', handle, '--no-cache', '--json'],
+        { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    it('cpp: show answers the same from the project root and from another directory', () => {
+        // lib/box.cpp beside the header decides C++; a header elsewhere is
+        // decided by the project's translation units. Both are C++ in the index.
+        const dir = tmp({ 'lib/box.h': header, 'lib/box.cpp': source,
+            'include/geo/box.h': header, 'src/use.cpp': source.replace('"box.h"', '"geo/box.h"') });
+        const elsewhere = tmp({ 'README.md': 'unrelated\n' });
+        try {
+            for (const handle of ['lib/box.h:4:total', 'include/geo/box.h:4:total']) {
+                const inside = showFrom(dir, dir, handle);
+                const outside = showFrom(elsewhere, dir, handle);
+                assert.strictEqual(outside, inside, `${handle}: identical output from both directories`);
+                const summary = JSON.parse(inside).data.summary;
+                assert.strictEqual(summary.symbol.language, 'cpp', handle);
+                assert.strictEqual(summary.complexity.measuredBy, 'tree-sitter-ast', handle);
+                assert.strictEqual(summary.complexity.branches, 3, handle);
+            }
+            // In process, from this test's own directory (outside the project).
+            const index = idx(dir);
+            assert.strictEqual(index.languageOf('include/geo/box.h'), 'cpp');
+            assert.strictEqual(index.languageOf(path.join(dir, 'lib/box.h')), 'cpp');
+            const { brief } = require('../core/brief');
+            assert.strictEqual(brief(index, 'total', { file: 'include/geo/box.h' }).symbol.language, 'cpp');
+        } finally { rm(dir); rm(elsewhere); }
+    });
+
+    it('c: a C header keeps the C grammar from every directory', () => {
+        const dir = tmp({ 'lib/sum.h': 'static int sum(int a, int b) {\n    if (a > b) { return a; }\n    return a + b;\n}\n',
+            'lib/sum.c': '#include "sum.h"\nint main(void) { return sum(1, 2); }\n' });
+        const elsewhere = tmp({ 'README.md': 'unrelated\n' });
+        try {
+            const inside = showFrom(dir, dir, 'lib/sum.h:1:sum');
+            assert.strictEqual(showFrom(elsewhere, dir, 'lib/sum.h:1:sum'), inside);
+            assert.strictEqual(JSON.parse(inside).data.summary.symbol.language, 'c');
+        } finally { rm(dir); rm(elsewhere); }
+    });
+});

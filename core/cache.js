@@ -991,7 +991,10 @@ function clearAllCaches() {
 // v320 (fix #434): call records of constructions through a method's own
 // receiver (`cls(..)`, `type(self)(..)`, `self.__class__(..)`, `new
 // this(..)`, `new this.constructor(..)`) carry `ownClass`.
-const CACHE_FORMAT_VERSION = 320;
+// v321 (fix #436): file entries carry `computedDispatchSites`, extracted
+// from the literal parse at index time (the doctor read them by parsing every
+// file on the first `repo` of a process).
+const CACHE_FORMAT_VERSION = 321;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

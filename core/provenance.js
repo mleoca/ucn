@@ -7,6 +7,13 @@ const isOffset = value => Number.isFinite(value) && value >= 0;
 
 const { codeUnitCompare } = require('./shared');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyProvenanceOverloadModuleCache = null;
+const lazyProvenanceOverloadModule = () => lazyProvenanceOverloadModuleCache || (lazyProvenanceOverloadModuleCache = require('./provenance-overload'));
+let lazyReceiverTypesModuleCache = null;
+const lazyReceiverTypesModule = () => lazyReceiverTypesModuleCache || (lazyReceiverTypesModuleCache = require('./receiver-types'));
+
 const TYPE_SOURCE_RULES = Object.freeze({
     annotation: 'receiver-annotation', constructor: 'constructor-typed',
     flow: 'return-flow', field: 'field-hop', literal: 'literal-receiver',
@@ -198,7 +205,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         if (invalidCall && members.length !== 1) return incomplete('constructor-overload-unselected');
         if (!require('../languages').langTraits(facts.language)?.hasArityOverloads && members.length > 1 &&
             !overload?.candidates?.some(def => def.isSignature === true)) return incomplete('constructor-definition-ambiguous');
-        if (!require('./provenance-overload').validateOverload(overload, members, selected, invalidCall, false, facts.site)) {
+        if (!lazyProvenanceOverloadModule().validateOverload(overload, members, selected, invalidCall, false, facts.site)) {
             return incomplete('constructor-overload-unselected');
         }
         return verdictFor(selected);
@@ -355,7 +362,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         }
     }
     if (facts.builtinReceiver) {
-        if (!require('./receiver-types').isProvenanceBuiltinReceiver(facts.receiverType, facts.language) ||
+        if (!lazyReceiverTypesModule().isProvenanceBuiltinReceiver(facts.receiverType, facts.language) ||
             facts.builtinReceiver.type !== facts.receiverType ||
             facts.builtinReceiver.language !== facts.language) return inconsistent('builtin-receiver-mismatch');
         if (!facts.receiverOrigin || ['unknown', 'guess'].includes(facts.receiverTypeSource) ||
@@ -412,7 +419,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             castThis.enclosing.className !== receiver.name || castThis.enclosing.file !== receiver.file ||
             castThis.interfaceType !== facts.receiverType)) return inconsistent('receiver-this-cast-mismatch');
         const overload = facts.lookup.overload;
-        const group = overload && require('./provenance-overload').overloadMemberGroup(steps);
+        const group = overload && lazyProvenanceOverloadModule().overloadMemberGroup(steps);
         if (overload && !group) return incomplete('missing-overload-declarations');
         if (overload && !group.some(member => sameDeclaration(declarationIdentity(member), selected))) {
             return inconsistent('selected-member-outside-overload-group');
@@ -515,12 +522,12 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             } else if (!overload && (named.length !== 1 || !sameDeclaration(named[0], selected))) {
                 const propertyRead = facts.valueReference && step.propertyRead &&
                     sameDeclaration(propertyReadMember(named), selected);
-                if (!propertyRead && !require('./provenance-overload').validateOverload(step.overload, named, selected, false, false, facts.site)) {
+                if (!propertyRead && !lazyProvenanceOverloadModule().validateOverload(step.overload, named, selected, false, false, facts.site)) {
                     return incomplete('ambiguous-or-missing-member');
                 }
             }
         }
-        if (overload && !require('./provenance-overload').validateOverload(
+        if (overload && !lazyProvenanceOverloadModule().validateOverload(
             overload, group.map(declarationIdentity), selected, invalidCall, ambiguousOverload, facts.site)) {
             return incomplete(overload.outcome === 'no-fit' ? 'no-applicable-overload' : 'ambiguous-or-missing-member');
         }

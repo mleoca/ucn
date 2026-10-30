@@ -670,20 +670,45 @@ function _collectCallNodes(node, callTypes, targetRow, funcName, limit, out = []
     // Children are in source order: binary-search the first one that can
     // reach the target row instead of visiting every earlier sibling.
     const count = node.childCount;
+    // A wide node (a file's top level, a class body) keeps its children's
+    // rows for the tree's lifetime: every call site of the file searches
+    // them (fix #436: two native reads per probe, per site).
+    const rows = count > 16 ? _childRowsOf(node) : null;
     let lo = 0;
     let hi = count;
     while (lo < hi) {
         const mid = (lo + hi) >> 1;
-        if (node.child(mid).endPosition.row < targetRow) lo = mid + 1;
+        if ((rows ? rows.ends[mid] : node.child(mid).endPosition.row) < targetRow) lo = mid + 1;
         else hi = mid;
     }
     for (let i = lo; i < count; i++) {
+        if (rows && rows.starts[i] > targetRow) break;
         const child = node.child(i);
-        if (child.startPosition.row > targetRow) break;
+        if (!rows && child.startPosition.row > targetRow) break;
         _collectCallNodes(child, callTypes, targetRow, funcName, limit, out);
         if (out.length >= limit) return out;
     }
     return out;
+}
+
+const CHILD_ROWS = new WeakMap(); // tree -> Map(node id -> { starts, ends })
+function _childRowsOf(node) {
+    const tree = node.tree;
+    if (!tree) return null;
+    let byNode = CHILD_ROWS.get(tree);
+    if (!byNode) CHILD_ROWS.set(tree, byNode = new Map());
+    let rows = byNode.get(node.id);
+    if (!rows) {
+        const count = node.childCount;
+        rows = { starts: new Int32Array(count), ends: new Int32Array(count) };
+        for (let i = 0; i < count; i++) {
+            const child = node.child(i);
+            rows.starts[i] = child.startPosition.row;
+            rows.ends[i] = child.endPosition.row;
+        }
+        byNode.set(node.id, rows);
+    }
+    return rows;
 }
 
 /**
@@ -851,7 +876,7 @@ function formatTypedSignature(def, overrides = {}) {
  */
 function extractArrowTypesFromVarDecl(index, def) {
     if (!def || !def.file || !def.startLine) return null;
-    const lang = detectLanguage(def.file);
+    const lang = index.languageOf(def.file);
     if (lang !== 'typescript' && lang !== 'tsx') return null;
     // Already have types — nothing to enrich.
     const ps = def.paramsStructured;
@@ -1647,7 +1672,12 @@ function sharedParsedTree(index, file, content, language) {
     // compilation) shares the tree only where that view is the plain parse
     // (fix #395).
     const adapter = getLanguageAdapter(language);
-    if (adapter?.queryTree && !adapter.queryTreeIsPlain?.(content, index.files?.get(file))) return null;
+    if (adapter?.queryTree && !adapter.queryTreeIsPlain?.(content, index.files?.get(file))) {
+        // Its plain parse, kept across operations like the view (fix #436:
+        // impact re-parsed every caller file with a conditional per query).
+        return typeof index._plainParsedTree === 'function'
+            ? index._plainParsedTree(file, content, language) : null;
+    }
     return index._getParsedTree(file, content, language);
 }
 
@@ -1656,7 +1686,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
         return { args: [], argCount: 0, isMethodCall: false, implicitConstruction: true };
     }
     try {
-        const language = detectLanguage(call.file);
+        const language = index.languageOf(call.file);
         if (!language) return { args: null, argCount: 0 };
 
         // Use tree cache to avoid re-parsing the same file in batch operations
@@ -1851,7 +1881,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
  */
 function analyzeCallShape(index, filePath, lineNum, funcName) {
     try {
-        const language = detectLanguage(filePath);
+        const language = index.languageOf(filePath);
         if (!language) return null;
 
         // Reuse tree cache to avoid re-parsing during a batch (clustering scans many sites)
@@ -6496,7 +6526,7 @@ function analyzeCallSiteAST(index, filePath, lineNum, funcName) {
     };
 
     try {
-        const language = detectLanguage(filePath);
+        const language = index.languageOf(filePath);
         if (!language) return result;
 
         const parser = getParser(language);

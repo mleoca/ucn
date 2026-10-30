@@ -146,6 +146,9 @@ function createFileEntryFromIR({
         ...(ir.reflectionSites?.length > 0 && {
             reflectionSites: ir.reflectionSites,
         }),
+        ...(Array.isArray(ir.computedDispatchSites) && {
+            computedDispatchSites: ir.computedDispatchSites,
+        }),
         ...(ir.macroScopeMarkers?.length > 0 && {
             macroScopeMarkers: ir.macroScopeMarkers,
         }),

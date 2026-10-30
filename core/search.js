@@ -599,7 +599,7 @@ function search(index, term, options = {}) {
 
             // Use AST-based filtering for codeOnly mode when language is supported
             if (options.codeOnly) {
-                const language = detectLanguage(filePath);
+                const language = fileEntry.language || detectLanguage(filePath, index.root);
                 if (language) {
                     try {
                         const parser = getParser(language);

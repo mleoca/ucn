@@ -17,10 +17,16 @@ function bodyRanges(tree, kinds) {
     if (!tree) return null;
     const ranges = [];
     if (!tree.rootNode.hasError) {
-        // No node of an error-free tree has an error.
+        // No node of an error-free tree has an error. A block's first and
+        // last tokens are its first and last characters (an error-free tree
+        // has no missing tokens), read from the parsed text when it is at
+        // hand instead of asking for two child nodes (fix #436).
+        const text = typeof tree.input === 'string' ? tree.input : null;
         for (const body of tree.rootNode.descendantsOfType('block')) {
-            if (body.firstChild?.type === '{' && body.lastChild?.type === '}') {
-                ranges.push([body.startIndex + 1, body.endIndex - 1]);
+            const start = body.startIndex, end = body.endIndex;
+            if (text !== null ? end - start >= 2 && text[start] === '{' && text[end - 1] === '}'
+                : body.firstChild?.type === '{' && body.lastChild?.type === '}') {
+                ranges.push([start + 1, end - 1]);
             }
         }
         return ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);

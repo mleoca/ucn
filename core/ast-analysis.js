@@ -405,7 +405,11 @@ function projectComputedDispatch(index) {
     const byFile = new Map();
     for (const [filePath, fileEntry] of index.files) {
         try {
-            const sites = computedDispatchSites(index._readFile(filePath), fileEntry.language);
+            // Extracted at index time from the file's literal parse (fix
+            // #436); an entry without them is read here.
+            const sites = Array.isArray(fileEntry.computedDispatchSites)
+                ? fileEntry.computedDispatchSites.map(site => ({ ...site }))
+                : computedDispatchSites(index._readFile(filePath), fileEntry.language);
             if (sites.length > 0) byFile.set(filePath, sites);
         } catch (_) {
             // Unreadable files are reported through the existing parse/read

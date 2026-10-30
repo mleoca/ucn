@@ -3625,3 +3625,196 @@ describe('fix #435: query-board costs without answer changes', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #436: first-touch query costs read from the index, answers unchanged', () => {
+    const countParses = (run) => {
+        const Parser = require('tree-sitter');
+        const original = Parser.prototype.parse;
+        let parses = 0;
+        Parser.prototype.parse = function (...args) { parses++; return original.apply(this, args); };
+        try { run(); } finally { Parser.prototype.parse = original; }
+        return parses;
+    };
+    const DISPATCH = {
+        'a.js': 'const handlers = { go() {} };\nfunction run(k) { handlers[k](); const h = handlers[k]; h(); }\nmodule.exports = { run };\n',
+        'b.py': 'HANDLERS = {}\ndef run(k):\n    HANDLERS[k]()\n',
+        'c.go': 'package c\nvar fs = map[string]func(){}\nfunc Run(k string) { fs[k]() }\n',
+        'd.rs': 'pub fn run(fs: &[fn()], k: usize) { fs[k](); }\n',
+        'E.java': 'class E { void run(Runnable[] fs, int k) { fs[k].run(); } }\n',
+        'f.cs': 'class F { void Run(System.Action[] fs, int k) { fs[k](); } }\n',
+        'g.c': 'void (*fs[2])(void);\nvoid run(int k) { fs[k](); }\n',
+        'h.cpp': '#include <functional>\nstd::function<void()> fs[2];\nvoid run(int k) { fs[k](); }\n',
+        'i.ts': 'const m: Record<string, () => void> = {};\nexport function run(k: string) { m[k](); }\n',
+    };
+
+    it('every language: computed dispatch sites are indexed and equal the scan of the file', () => {
+        const dir = tmp(DISPATCH);
+        try {
+            const { computedDispatchSites, projectComputedDispatch } = require('../core/ast-analysis');
+            for (const workers of [0, 2]) {
+                const index = new (require('../core/project').ProjectIndex)(dir);
+                index.build(null, { quiet: true, workers });
+                let total = 0;
+                for (const [file, entry] of index.files) {
+                    assert.ok(Array.isArray(entry.computedDispatchSites), entry.relativePath);
+                    assert.deepStrictEqual(entry.computedDispatchSites,
+                        computedDispatchSites(fs.readFileSync(file, 'utf-8'), entry.language), entry.relativePath);
+                    total += entry.computedDispatchSites.length;
+                }
+                assert.ok(total >= 7, `sites found (${total})`);
+                // The doctor's inventory reads the indexed sites: no parse.
+                let inventory;
+                assert.strictEqual(countParses(() => { inventory = projectComputedDispatch(index); }), 0);
+                assert.strictEqual([...inventory.values()].reduce((n, sites) => n + sites.length, 0), total);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a query reading more files than 128 keeps their trees for the next query', () => {
+        const files = {};
+        for (let i = 0; i < 150; i++) files[`m${i}.js`] = `const { Shape } = require('./shape');\nfunction f${i}() { return new Shape(${i}); }\nmodule.exports = { f${i} };\n`;
+        files['shape.js'] = 'class Shape { constructor(n) { this.n = n; } }\nmodule.exports = { Shape };\n';
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const first = execute(index, 'impact', { name: 'shape.js:1:Shape' });
+            assert.ok(first.ok);
+            const again = countParses(() => assert.deepStrictEqual(execute(index, 'impact', { name: 'shape.js:1:Shape' }), first));
+            assert.strictEqual(again, 0);
+            assert.ok(index._parsedTreeCache.size > 128);
+        } finally { rm(dir); }
+    });
+
+    it('a line read inside an operation equals the scan outside one', () => {
+        const dir = tmp({ 'x.txt': '' });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'x.txt');
+            for (const content of ['a\nb', 'a\n', '', 'x\r\ny\r\n\nz', '\n\n']) {
+                fs.writeFileSync(file, content);
+                for (const line of [0, -1, 1, 2, 3, 4, 5, 2.5, NaN]) {
+                    const outside = index.getLineContent(file, line);
+                    index._beginOp();
+                    try { assert.strictEqual(index.getLineContent(file, line), outside, `${JSON.stringify(content)} ${line}`); }
+                    finally { index._endOp(); }
+                }
+            }
+        } finally { rm(dir); }
+    });
+
+    it('every language: a type query visits exactly the records the record filter keeps', () => {
+        const dir = tmp({
+            'a.ts': 'class Box { static make() { return new Box(); } }\nconst { Box: B } = { Box };\nBox.make(); other.Box(); f(Box);\n',
+            'b.py': 'class Box:\n    @classmethod\n    def make(cls):\n        return cls()\nBox.make()\nBox()\n',
+            'c.go': 'package c\ntype Box struct{}\nfunc (Box) Make() {}\nfunc f() { b := Box{}; b.Make(); Box.Make(b) }\n',
+            'd.rs': 'struct Box;\nimpl Box { fn make() -> Box { Box } }\nfn f() { Box::make(); }\n',
+            'E.java': 'class E { static E make() { return new E(); } void g() { E.make(); make(); } }\n',
+            'f.c': 'struct Box { int n; };\nint g(struct Box b) { return b.n; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const callers = require('../core/callers');
+            const { langTraits } = require('../languages');
+            const bears = (call, name) => call.name === name || call.resolvedName === name || call.ownClass?.name === name ||
+                (Array.isArray(call.resolvedNames) && call.resolvedNames.includes(name));
+            let pairs = 0;
+            for (const [file, entry] of index.files) {
+                const calls = callers.getCachedCalls(index, file) || [];
+                const bare = !!langTraits(entry.language)?.bareCallReachesMethods;
+                for (const name of ['Box', 'E', 'make', 'Make', 'cls', 'missing']) {
+                    const kept = calls.filter(call => call.ownClass || call.destructured || call.receiver === name ||
+                        bears(call, name) || (call.receiverIsTypeQualified && bare));
+                    const selected = callers._typeQueryRecords(calls, name, bare);
+                    assert.strictEqual(selected.length, kept.length, `${entry.relativePath} ${name}`);
+                    assert.ok(selected.every((call, i) => call === kept[i]), `${entry.relativePath} ${name}`);
+                    pairs++;
+                }
+            }
+            assert.ok(pairs >= 30);
+        } finally { rm(dir); }
+    });
+
+    it('go, java, csharp: body ranges read from the text equal the ranges read from the block tokens', () => {
+        const { getParser, safeParse } = require('../languages');
+        const { bodyRangesForTest } = require('../core/query-bodies');
+        const sources = {
+            go: 'package p\nfunc f() { if x { y() } else { z() }; for { } }\nvar s = "{ é 😀 }"\n',
+            java: 'class A { String s = "héllo 😀"; void f() { int x = 1; { int y; } } static { g(); } }\n',
+            csharp: 'class A { void F() { if (x) { G(); } } string S => "{"; void H() { } }\n',
+        };
+        for (const [language, source] of Object.entries(sources)) {
+            const tree = safeParse(getParser(language), source);
+            assert.ok(!tree.rootNode.hasError, language);
+            const byTokens = tree.rootNode.descendantsOfType('block')
+                .filter(block => block.firstChild?.type === '{' && block.lastChild?.type === '}')
+                .map(block => [block.startIndex + 1, block.endIndex - 1])
+                .sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+            assert.ok(byTokens.length >= 2, language);
+            assert.deepStrictEqual(bodyRangesForTest(tree, new Set()), byTokens, language);
+        }
+    });
+
+    it('csharp: a file read through conditional views keeps its plain parse for call-site arguments', () => {
+        const dir = tmp({
+            'Lib.cs': 'namespace N {\npublic static class Util {\n    public static int Twice(int v) => v * 2;\n}\n}\n',
+            'Use.cs': 'namespace N {\npublic class Use\n#if NET8\n    : System.IDisposable\n#endif\n{\n' +
+                '    public int A() => Util.Twice(1);\n    public int B() => Util.Twice(3) + Util.Twice(4);\n' +
+                '#if NET8\n    public void Dispose() { }\n#endif\n}\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(Array.isArray(index.files.get(path.join(dir, 'Use.cs')).conditionalViews), 'Use.cs is read through views');
+            const plainReads = [];
+            const plain = index._plainParsedTree.bind(index);
+            index._plainParsedTree = (file, ...rest) => { plainReads.push(path.basename(file)); return plain(file, ...rest); };
+            const first = execute(index, 'impact', { name: 'Lib.cs:2:Util' });
+            assert.ok(first.ok);
+            const again = countParses(() => assert.deepStrictEqual(execute(index, 'impact', { name: 'Lib.cs:2:Util' }), first));
+            assert.strictEqual(again, 0);
+            const twice = execute(idx(dir), 'impact', { name: 'Lib.cs:3:Twice' });
+            assert.ok(twice.ok);
+            assert.deepStrictEqual(execute(index, 'impact', { name: 'Lib.cs:3:Twice' }), twice);
+            assert.ok(plainReads.includes('Use.cs'), 'the conditional file is read through its plain parse');
+        } finally { rm(dir); }
+    });
+
+    it('every language: call-site arguments in a wide file are the same from its first and later sites', () => {
+        const bodies = {
+            js: n => `function f${n}() { return g(${n}, 'x'); }\n`,
+            py: n => `def f${n}():\n    return g(${n}, 'x')\n`,
+            go: n => `func f${n}() int { return g(${n}, "x") }\n`,
+            rs: n => `fn f${n}() -> i32 { g(${n}, "x") }\n`,
+        };
+        const heads = { js: 'function g(a, b) { return a; }\nmodule.exports = { g };\n', py: 'def g(a, b):\n    return a\n',
+            go: 'package p\nfunc g(a int, b string) int { return a }\n', rs: 'pub fn g(a: i32, b: &str) -> i32 { a }\n' };
+        for (const [ext, body] of Object.entries(bodies)) {
+            let source = heads[ext];
+            for (let n = 0; n < 40; n++) source += body(n);
+            const dir = tmp({ [`m.${ext}`]: source });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'impact', { name: `m.${ext}:${ext === 'go' ? 2 : 1}:g` });
+                assert.ok(result.ok, ext);
+                const sites = (result.result.byFile || []).flatMap(group => group.sites || group.callSites || []);
+                const args = sites.map(site => (site.args || []).join(','));
+                assert.strictEqual(args.length, 40, ext);
+                assert.deepStrictEqual(args, args.map((_, i) => `${i},${ext === 'js' || ext === 'py' ? "'x'" : '"x"'}`), ext);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('a value query reuses the classified tokens of a tree another query read', () => {
+        const dir = tmp({ 'a.js': 'class C { constructor() { this.size = 0; this.total = 0; } }\n' +
+            'function f(c) { const s = c; s.size++; s.total++; return s.size + s.total; }\nmodule.exports = { C, f };\n' });
+        try {
+            const index = idx(dir);
+            const first = execute(index, 'impact', { name: 'a.js:1:size' });
+            const second = execute(index, 'impact', { name: 'a.js:1:total' });
+            assert.ok(first.ok && second.ok);
+            // The same answers from a fresh index (nothing shared).
+            const fresh = idx(dir);
+            assert.deepStrictEqual(execute(fresh, 'impact', { name: 'a.js:1:total' }), second);
+            assert.deepStrictEqual(execute(fresh, 'impact', { name: 'a.js:1:size' }), first);
+        } finally { rm(dir); }
+    });
+});

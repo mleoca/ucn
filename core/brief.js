@@ -102,7 +102,7 @@ function brief(index, name, options = {}) {
         const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
         if (!def) return null;
 
-        const language = detectLanguage(def.relativePath || def.file);
+        const language = index.languageOf(def.file || def.relativePath);
         const symbol = {
             name: def.name,
             type: def.type,
@@ -362,8 +362,9 @@ function sideEffectsFor(index, symbol) {
         index._sideEffectCache.set(key, null);
         return null;
     }
-    const language = detectLanguage(symbol.relativePath || symbol.file);
-    const fileEntry = index.files.get(symbol.file);
+    const language = typeof index.languageOf === 'function'
+        ? index.languageOf(filePath) : detectLanguage(filePath, index.root);
+    const fileEntry = index.files.get(filePath);
     const fileImports = collectImportNames(fileEntry);
     const tags = classifySideEffects(bodyText, language, fileImports);
     index._sideEffectCache.set(key, tags);

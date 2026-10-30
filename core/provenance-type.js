@@ -5,6 +5,15 @@ const { symbolsSpanning } = require('./shared');
 const { factIndex, sealFacts, replayed, seedReplay, refusedProof } = require('./provenance-overload');
 const { BoundedMap, SourceMemo, parsedSource, typeNamesCanonical } = require('./source-memo');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyCppScopeModuleCache = null;
+const lazyCppScopeModule = () => lazyCppScopeModuleCache || (lazyCppScopeModuleCache = require('./cpp-scope'));
+let lazyCallableScopeModuleCache = null;
+const lazyCallableScopeModule = () => lazyCallableScopeModuleCache || (lazyCallableScopeModuleCache = require('./callable-scope'));
+let lazyLanguagesModuleCache = null;
+const lazyLanguagesModule = () => lazyLanguagesModuleCache || (lazyLanguagesModuleCache = require('../languages'));
+
 // Type lookup replays the same package, namespace and include rules as a
 // type reference. The witness holds declarations and scope facts, rather
 // than a recorded resolution verdict or access to the live filesystem.
@@ -74,7 +83,7 @@ function constructionNameScope(index, query) {
     const entry = index.files.get(query.file);
     const language = entry?.language;
     const source = index._readFile(query.file);
-    const canonical = require('../languages').langTraits(language)?.typeNameSourceCanonical;
+    const canonical = lazyLanguagesModule().langTraits(language)?.typeNameSourceCanonical;
     if (canonical && !typeNamesCanonical(index, query.file, canonical, language, { startLine: query.line, endLine: query.line })) return null;
     // A name the file declares as no type parameter anywhere names none at
     // the site (fix #421): the indexed declaration names answer without a
@@ -96,7 +105,7 @@ function constructionNameScope(index, query) {
 
 function localConstructionBinding(index, query, definition, traits, language) {
     if (query.file !== definition.file || query.name !== definition.name) return false;
-    const { getParser } = require('../languages');
+    const { getParser } = lazyLanguagesModule();
     const config = traits.constructorInheritance;
     const source = index._readFile(query.file);
     const content = config?.source ? config.source(source, getParser(language)) : source;
@@ -117,7 +126,7 @@ function localConstructionBinding(index, query, definition, traits, language) {
 // recorded declaration extents supply that context without building a type
 // rename group. Equal or unreadable source scopes cannot select an owner.
 function constructionClassAt(index, file, line, column) {
-    const { containsCall } = require('./callable-scope');
+    const { containsCall } = lazyCallableScopeModule();
     let width = Infinity;
     const owners = new Set();
     for (const definition of symbolsSpanning(index.files.get(file)?.symbols, line)) {
@@ -150,7 +159,7 @@ function cppConstructionClasses(index, query, resolver = null) {
 }
 
 function cppConstructionClassesUncached(index, query, resolver) {
-    const { resolveQualifier, includeClosure, namespaceAt } = require('./cpp-scope');
+    const { resolveQualifier, includeClosure, namespaceAt } = lazyCppScopeModule();
     const { file, line, name, qualifier } = query;
     let context;
     if (query.position) context = resolver.cppSiteContext(file, line);
@@ -171,7 +180,7 @@ function constructionDenotes(index, resolver, query, definition, seen = new Set(
     const key = `${file}\0${qualifier || ''}\0${name}`;
     if (seen.has(key)) return false;
     const visited = new Set(seen).add(key);
-    const traits = require('../languages').langTraits(entry.language);
+    const traits = lazyLanguagesModule().langTraits(entry.language);
     if (query.localShadow && !localConstructionBinding(index, query, definition, traits, entry.language)) return false;
     if (traits.constructorInheritance?.order === 'single' && definition.decorators?.length) return false;
     if (traits.functionalTypeConstruction) {
@@ -258,7 +267,7 @@ const OWN_CLASS_KINDS = new Set(['class', 'struct', 'record']);
 function ownClassDenotes(index, query, owner) {
     const own = query.ownClass;
     const entry = index.files.get(query.file);
-    const ownClassMethod = require('../languages').langTraits(entry?.language)?.ownClassMethod;
+    const ownClassMethod = lazyLanguagesModule().langTraits(entry?.language)?.ownClassMethod;
     if (!own || !ownClassMethod || !entry) return false;
     const symbols = entry.symbols || [];
     const named = (def, line) => def.nameLine === line || def.startLine === line;
@@ -279,7 +288,7 @@ function resolve(index, query, owner) {
     if (query.nameScopeOnly) {
         if (!constructionNameScope(index, query)) return false;
         const language = index.files.get(query.file)?.language;
-        const canonical = require('../languages').langTraits(language)?.typeNameSourceCanonical;
+        const canonical = lazyLanguagesModule().langTraits(language)?.typeNameSourceCanonical;
         if (canonical) {
             const file = owner.file === query.relativePath ? query.file
                 : require('path').resolve(index.root, owner.file);
@@ -293,7 +302,7 @@ function resolve(index, query, owner) {
     const definition = (index.symbols.get(owner.name) || []).find(def =>
         sameDeclaration(declarationIdentity(def), owner));
     if (!definition) return false;
-    const { langTraits } = require('../languages');
+    const { langTraits } = lazyLanguagesModule();
     const definitionLanguage = index.files.get(definition.file)?.language;
     const canonical = langTraits(definitionLanguage)?.typeNameSourceCanonical;
     if (canonical && (!typeNamesCanonical(index, query.file, canonical, definitionLanguage, { startLine: query.line, endLine: query.line }) ||
@@ -327,8 +336,8 @@ function resolveAt(index, query, owner, definition, resolver) {
     if ((query.construction ? !constructionDenotes(index, resolver, query, definition) : answer.verdict !== 'yes') ||
         index.hasMissingProvenanceFacts) return false;
     if (query.functional) {
-        if (!require('../languages').langTraits(index.files.get(query.file)?.language)?.functionalTypeConstruction) return false;
-        const visible = require('./cpp-scope').includeClosure(index, query.file);
+        if (!lazyLanguagesModule().langTraits(index.files.get(query.file)?.language)?.functionalTypeConstruction) return false;
+        const visible = lazyCppScopeModule().includeClosure(index, query.file);
         const named = index.symbols.get(query.name) || [];
         let boundType = false;
         for (const file of visible) {
@@ -370,7 +379,7 @@ function cppPositionConstructionClasses(index, query) {
     while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.nodeType)) node = node.parent;
     let classes = null;
     if (node && node.startPosition.row + 1 === query.line && node.startPosition.column === query.column) {
-        const { resolveQualifier, includeClosure } = require('./cpp-scope');
+        const { resolveQualifier, includeClosure } = lazyCppScopeModule();
         const context = require('./type-references').cppSiteContextOf(index, node, query.file, query.file, query.line);
         const found = resolveQualifier(index, { file: query.file, line: query.line, ...context },
             query.qualifier ? `${query.qualifier}::${query.name}` : query.name, includeClosure(index, query.file));
@@ -386,7 +395,7 @@ function cppPositionConstructionClasses(index, query) {
 function cppPositionConstructionDenied(index, query, identity) {
     if (index.isProvenanceFactIndex || !query.construction || !query.position || query.functional ||
         query.ownClass || query.nameScopeOnly || query.localShadow) return false;
-    if (!require('../languages').langTraits(index.files.get(query.file)?.language)?.functionalTypeConstruction) return false;
+    if (!lazyLanguagesModule().langTraits(index.files.get(query.file)?.language)?.functionalTypeConstruction) return false;
     const classes = cppPositionConstructionClasses(index, query);
     return !classes || !(classes.length > 0 && classes.every(def => sameDeclaration(declarationIdentity(def), identity)));
 }

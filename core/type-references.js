@@ -45,6 +45,11 @@ const { classKeyOf } = require('./class-identity');
 const { projectHas } = require('./provenance-overload');
 const { indexedContent } = require('./source-memo');
 
+// Modules read lazily (load cycles), each resolved once: a require() per
+// call in hot paths was measurable (fix #436).
+let lazyCppScopeModuleCache = null;
+const lazyCppScopeModule = () => lazyCppScopeModuleCache || (lazyCppScopeModuleCache = require('./cpp-scope'));
+
 /** The namespaces (packages) a language's files declare, with each dotted prefix. */
 function declaredNamespacePrefixes(index, language) {
     return require('./type-denotation').memoizedDerivation(index, `\x01ns-prefixes\x00${language}`, () => {
@@ -974,7 +979,7 @@ function pinGroupOf(index, def, name) {
                 group.add(other);
                 continue;
             }
-            const { includeClosure } = require('./cpp-scope');
+            const { includeClosure } = lazyCppScopeModule();
             if (includeClosure(index, def.file).has(other.file) || includeClosure(index, other.file).has(def.file)) {
                 group.add(other);
                 continue;
@@ -994,7 +999,7 @@ function isHeader(file) {
 }
 
 function effectiveNs(index, d) {
-    const { effectiveNamespace } = require('./cpp-scope');
+    const { effectiveNamespace } = lazyCppScopeModule();
     return effectiveNamespace(index, d) || '';
 }
 
@@ -1063,7 +1068,7 @@ function enclosingClassIn(index, file, line) {
 function cppSiteContextOf(index, siteNode, siteFile, file, line) {
     const node = siteNode && siteFile === file && siteNode.startPosition.row + 1 === line
         ? siteNode : null;
-    const { macroNamespacePrefixAt, namespaceAt } = require('./cpp-scope');
+    const { macroNamespacePrefixAt, namespaceAt } = lazyCppScopeModule();
     if (!node) return { namespace: namespaceAt(index, file, line), className: enclosingClassIn(index, file, line) };
     const namespaces = [];
     const classes = [];
@@ -1822,7 +1827,7 @@ class TypeReferenceResolver {
 
     resolveCFamily(file, line, name, qualifierText, options = {}) {
         const entry = this.index.files.get(file);
-        const { includeClosure, resolveQualifier } = require('./cpp-scope');
+        const { includeClosure, resolveQualifier } = lazyCppScopeModule();
         const visible = includeClosure(this.index, file);
         if (entry.language === 'c') {
             // C tags (struct/union/enum) live in their own namespace; typedef
@@ -1996,7 +2001,7 @@ class TypeReferenceResolver {
      * from file:line (its injected class name), or null. */
     cppBaseNamed(file, line, className, name, depth) {
         if (depth > 3) return null;
-        const { includeClosure, resolveQualifier, effectiveNamespace } = require('./cpp-scope');
+        const { includeClosure, resolveQualifier, effectiveNamespace } = lazyCppScopeModule();
         const { splitParentList } = require('./graph-build');
         const visible = includeClosure(this.index, file);
         const simple = String(className).split('::').pop();
@@ -2930,7 +2935,7 @@ function macroArgumentOtherUse(resolver, file, node) {
         : (list.namedChildren || []).filter(child => !child.type.endsWith('comment'));
     const index = args.findIndex(arg => sameNode(arg, argument));
     if (index < 0 || argument.text !== node.text) return null;
-    const { includeClosure } = require('./cpp-scope');
+    const { includeClosure } = lazyCppScopeModule();
     const visible = includeClosure(resolver.index, file);
     const macros = (resolver.index.symbols.get(callee.text) || []).filter(d => d.type === 'macro' &&
         d.functionLike && (d.file === file || visible.has(d.file)));
@@ -3002,7 +3007,7 @@ function decide(resolver, file, entry, token, bindings, typeParams) {
             // the class its qualifier spells.
             const spelled = cppPrefix(node);
             if (spelled == null) return { verdict: 'unknown', reason: 'constructor-owner' };
-            const { resolveQualifier, includeClosure } = require('./cpp-scope');
+            const { resolveQualifier, includeClosure } = lazyCppScopeModule();
             const site = resolver.cppSiteContext(file, line);
             // The qualifier may be an alias of the declaring class. Resolve
             // its type identity, rather than renaming the alias declaration.
