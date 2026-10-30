@@ -289,11 +289,14 @@ const clangdOracle = {
             if (copy === 'other') continue;
             if (valueTarget) {
                 // A value's references are its uses; no call classification.
-                // A use the line does not spell is a macro expansion's.
+                // A use whose range does not spell the name is a macro
+                // expansion's, reported at the invocation (fix #431: the line
+                // `INIT(*e, t->data.x.y)` spells `x` in an argument while the
+                // expansion's own `.x` sits at the macro name).
                 refs.set(`${rel}:${refLine}:${refColumn}:${isDefinition ? 'definition' : 'reference'}`, {
                     file: rel, line: refLine, column: refColumn,
                     kind: isDefinition ? 'definition' : 'reference',
-                    ...(!isDefinition && !identifierOnLine(handle, refAbs, refLine, name) && {
+                    ...(!isDefinition && !identifierAt(handle, refAbs, refLine, refColumn, name) && {
                         oracleResolution: 'macro-expansion',
                     }),
                     ...(copy === 'unknown' && {
@@ -861,6 +864,15 @@ function unitCompiles(handle, absFile, relDefinitionFile) {
     const relFile = path.relative(handle.root, canonical(absFile));
     return relDefinitionFile === relFile ||
         ['.h', '.hh', '.hpp', '.hxx', '.inc'].includes(path.extname(relDefinitionFile).toLowerCase());
+}
+
+/** Does the line spell `name` as an identifier starting at UTF-16 `column`? */
+function identifierAt(handle, absFile, line, column, name) {
+    const text = sourceLine(handle, absFile, line);
+    if (!Number.isInteger(column)) return identifierOnLine(handle, absFile, line, name);
+    const before = column > 0 ? text[column - 1] : '';
+    const after = text[column + String(name).length] || '';
+    return text.startsWith(name, column) && !/[A-Za-z0-9_]/.test(before) && !/[A-Za-z0-9_]/.test(after);
 }
 
 function identifierOnLine(handle, absFile, line, name) {
@@ -1904,4 +1916,4 @@ function inside(root, candidate) {
 
 // canonicalOperatorName is exported for the lockstep test against the
 // engine-side canon (languages/c-family.js).
-module.exports = { clangdOracle, canonicalOperatorName, pruneToLine, declarationHasBody, spellsName, definesValue };
+module.exports = { clangdOracle, canonicalOperatorName, pruneToLine, declarationHasBody, spellsName, definesValue, identifierAt };

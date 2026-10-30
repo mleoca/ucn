@@ -105,7 +105,9 @@ class User {
         const result = parse(code, 'javascript');
         assert.strictEqual(result.classes.length, 1);
         assert.strictEqual(result.classes[0].name, 'User');
-        assert.strictEqual(result.classes[0].members.length, 2);
+        // constructor, greet and the `this.name` instance property (fix #431)
+        assert.deepStrictEqual(result.classes[0].members.map(m => `${m.name}:${m.memberType}`),
+            ['constructor:constructor', 'greet:method', 'name:field']);
     });
 
     it('parses generator functions', () => {

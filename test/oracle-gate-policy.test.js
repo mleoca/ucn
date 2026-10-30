@@ -948,6 +948,17 @@ describe('fix #429: clangd oracle answers stay bounded and copy-aware', () => {
     });
 });
 
+describe('fix #431: clangd value references at a macro invocation', () => {
+    it('a reference whose range does not spell the name is the expansion\'s, though an argument spells it', () => {
+        const { identifierAt } = require('../eval/oracles/clangd-oracle');
+        const file = path.join(__dirname, 'fixtures-431-virtual.c');
+        const handle = { source: new Map([[file, ['    INIT(*event, token->data.stream_start.encoding);']]]) };
+        assert.strictEqual(identifierAt(handle, file, 1, 4, 'stream_start'), false);
+        assert.strictEqual(identifierAt(handle, file, 1, 29, 'stream_start'), true);
+        assert.strictEqual(identifierAt(handle, file, 1, 30, 'stream_start'), false);
+    });
+});
+
 describe('fix #429: jdtls method-reference definitions', () => {
     const { declarationSpells } = require('../eval/oracles/jdtls-oracle');
     const fs = require('fs');

@@ -349,12 +349,16 @@ class Fetcher:
                 line: 3,
             });
             assert.ok(result.propertyAccesses, 'accessor impact must expose property accesses');
-            assert.equal(result.propertyAccesses.confirmedCount, 4,
-                'self accesses and both typed instance-field reads are proven dependencies');
+            // The `@last_probe_status.setter` decorator reads the property
+            // from the class body (fix #431).
+            assert.equal(result.propertyAccesses.confirmedCount, 5,
+                'self accesses, the setter decorator and both typed instance-field reads are proven dependencies');
             assert.ok(result.propertyAccesses.byFile.some(group =>
                 group.file === 'consumer.py' && group.sites.some(site => site.line === 8)));
+            assert.ok(result.propertyAccesses.byFile.some(group =>
+                group.file === 'model.py' && group.sites.some(site => site.line === 6)));
             assert.match(require('../core/output').formatImpact(result),
-                /PROPERTY ACCESS SITES: 4 confirmed/);
+                /PROPERTY ACCESS SITES: 5 confirmed/);
             const plan = index.plan('last_probe_status', {
                 file: 'model.py',
                 line: 3,
@@ -10037,6 +10041,164 @@ describe('fix #430: Python instance attributes are value members of their class'
             const changes = plan.result.changes || [];
             assert.deepStrictEqual(changes.map(c => c.line).sort((a, b) => a - b), [5, 12, 22]);
             assert.ok(!changes.some(c => c.needsReview), JSON.stringify(changes.filter(c => c.needsReview)));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #431: Python value accesses by what each token reads', () => {
+    const lines = band => band.byFile.flatMap(group => group.sites.map(site => site.line));
+    const unverified = band => band.unverifiedSites.map(site => `${site.line}:${site.reason}`);
+
+    it('reads a dict display key as a value, never as a property name', () => {
+        const dir = tmp({
+            'box.py': [
+                'HEAVY = 1',
+                'SQUARE = 2',
+                'TABLE = {HEAVY: SQUARE, "x": HEAVY}',
+                'def f(HEAVY):',
+                '    return {HEAVY: 0}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('HEAVY', { file: 'box.py', line: 1 }).valueAccesses;
+            assert.deepStrictEqual(lines(band), [3, 3]);
+            assert.ok(band.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('binds construction keywords to the fields a dataclass, NamedTuple or TypedDict synthesizes', () => {
+        const dir = tmp({
+            'm.py': [
+                'from dataclasses import dataclass',
+                'from typing import NamedTuple, TypedDict',
+                '',
+                '@dataclass',
+                'class D:',
+                '    style: int = 0',
+                '',
+                'class N(NamedTuple):',
+                '    style: int = 0',
+                '',
+                'class T(TypedDict):',
+                '    style: int',
+                '',
+                'class P:',
+                '    style: int = 0',
+                '    def __init__(self, style):',
+                '        self.style = style',
+                '',
+                'class E(D):',
+                '    pass',
+                '',
+                'def deco(cls):',
+                '    return cls',
+                '',
+                '@deco',
+                'class W(NamedTuple):',
+                '    style: int = 0',
+                '',
+                'd = D(style=1)',
+                'n = N(style=1)',
+                't = T(style=1)',
+                'p = P(style=1)',
+                'e = E(style=2)',
+                'w = W(style=3)',
+                '',
+                '@deco',
+                'class Q:',
+                '    style: int = 0',
+                '    def __init__(self, style):',
+                '        self.style = style',
+                '',
+                'q = Q(style=4)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = line => index.impact('style', { file: 'm.py', line }).valueAccesses;
+            assert.deepStrictEqual(lines(band(6)), [29]);
+            assert.deepStrictEqual(unverified(band(6)), ['33:inherited-initializer']);
+            assert.deepStrictEqual(lines(band(9)), [30]);
+            assert.deepStrictEqual(lines(band(12)), [31]);
+            // An explicit __init__ takes a parameter of its own.
+            assert.deepStrictEqual(lines(band(15)), [17]);
+            // A class decorator may replace the class; a class's own
+            // `__init__` takes its parameters whatever its decorators.
+            assert.deepStrictEqual(unverified(band(27)), ['34:class-decorator']);
+            assert.deepStrictEqual(lines(band(38)), [40]);
+            assert.deepStrictEqual(unverified(band(38)), []);
+            const plan = execute(index, 'plan', { name: 'm.py:6:style', renameTo: 'tone' });
+            assert.ok(plan.ok, plan.error);
+            const edited = (plan.result.changes || []).filter(c => !c.needsReview).map(c => c.line);
+            assert.ok(edited.includes(29), JSON.stringify(plan.result.changes));
+            assert.ok(!edited.includes(30) && !edited.includes(32));
+        } finally { rm(dir); }
+    });
+
+    it('reads a property in its class body: the setter decorator is an access', () => {
+        const dir = tmp({
+            'text.py': [
+                'class Text:',
+                '    @property',
+                '    def plain(self):',
+                '        return self._t',
+                '',
+                '    @plain.setter',
+                '    def plain(self, value):',
+                '        self._t = value',
+                '',
+                'class Other:',
+                '    plain = None',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('plain', { file: 'text.py', line: 3 }).propertyAccesses;
+            assert.deepStrictEqual(lines(band), [6]);
+        } finally { rm(dir); }
+    });
+
+    it('tiers accesses through a slot: base receivers may dispatch, siblings and overrides are other members', () => {
+        const dir = tmp({
+            'types.py': [
+                'class ParamType:',
+                '    name: str',
+                '    def describe(self):',
+                '        return self.name',
+                '',
+                'class UUIDType(ParamType):',
+                '    name = "uuid"',
+                '    def own(self):',
+                '        return self.name',
+                '',
+                'class Path(ParamType):',
+                '    name: str',
+                '    def __init__(self):',
+                '        self.name = "path"',
+                '    def show(self):',
+                '        return self.name',
+                '',
+                'class Sub(UUIDType):',
+                '    name = "sub"',
+                '',
+                'def use(u: UUIDType, p: Path):',
+                '    return u.name, p.name',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('name', { file: 'types.py', line: 7 }).valueAccesses;
+            assert.deepStrictEqual(lines(band), [9, 22]);
+            assert.deepStrictEqual(unverified(band), ['4:possible-dispatch']);
+            assert.ok(band.excluded.byReason['other-slot-member'] >= 3, JSON.stringify(band.excluded));
+            assert.ok(band.excluded.byReason['slot-member-declaration'] >= 3, JSON.stringify(band.excluded));
+            assert.ok(band.account.conserved);
+            // A rename keeps the whole slot.
+            const plan = execute(index, 'plan', { name: 'types.py:7:name', renameTo: 'label' });
+            assert.ok(plan.ok, plan.error);
+            const edited = new Set((plan.result.changes || []).map(c => c.line));
+            for (const line of [2, 4, 7, 9, 12, 14, 16, 19, 22]) assert.ok(edited.has(line), `line ${line}`);
         } finally { rm(dir); }
     });
 });

@@ -48,6 +48,10 @@ function accessKind(tree, usage, token = null) {
     if (node.parent?.type === 'expression_list' && node.parent.parent?.type === 'assignment_statement') {
         node = node.parent;
     }
+    // A destructuring assignment target (`[a, b] = f()`, fix #431).
+    if (['array_pattern', 'object_pattern', 'pair_pattern', 'rest_pattern', 'assignment_pattern',
+        'object_assignment_pattern'].includes(node.parent?.type) &&
+        require('../languages/lexical-scope').jsPatternTarget(node) === 'assignment') return 'write';
     const parent = node.parent;
     if (['update_expression', 'inc_statement', 'dec_statement'].includes(parent?.type)) return 'read/write';
     if (parent?.type === 'delete_statement') return 'delete';
@@ -92,6 +96,21 @@ function receiverlessShape(tree, usage) {
             shorthand: key.type === 'shorthand_property_identifier_pattern' };
     }
     return 'none';
+}
+
+// The class whose body reads a bare name as its own attribute (fix #431):
+// directly in the body (not in a method), after the body binds the name.
+function classBodyRead(tree, usage, name) {
+    if (!tree || !Number.isInteger(usage.column)) return null;
+    const node = tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
+    if (!node || node.text !== name) return null;
+    const { pythonClassBodyOf } = require('./value-references');
+    const { pythonClassBodyOrder } = require('../languages/lexical-scope');
+    const classNode = pythonClassBodyOf(node);
+    if (!classNode || pythonClassBodyOrder(classNode, node, name) !== 'class') return null;
+    const className = classNode.childForFieldName('name')?.text;
+    return className ? { name: className, startLine: classNode.startPosition.row + 1,
+        endLine: classNode.endPosition.row + 1 } : null;
 }
 
 // Source offset of an occurrence (fix #398F): orders it against same-line
@@ -459,7 +478,15 @@ function findAccessorReferences(index, name, definition, options = {}) {
                 let shape = null;
                 if (!usage.receiver && !dependencyShape) {
                     shape = receiverlessShape(tree, usage);
-                    if (shape === 'none') continue;
+                    if (shape === 'none') {
+                        // A bare name in a class body after the class binds it
+                        // reads the class attribute (fix #431: `@plain.setter`
+                        // reads the `plain` property).
+                        const classBody = langTraits(entry.language)?.bareValueMemberScope === 'class-body'
+                            ? classBodyRead(tree, usage, name) : null;
+                        if (!classBody) continue;
+                        shape = { classBody };
+                    }
                 }
                 // A parameter annotation types the receiver (fix #424), the
                 // evidence method calls on it already take.
@@ -469,6 +496,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
                     ...usage,
                     ...(annotated && { receiverType: annotated, receiverAnnotation: true }),
                     ...(shape?.pattern && { patternKey: shape, ...(shape.thisSource && { receiver: 'this' }) }),
+                    ...(shape?.classBody && { classBody: shape.classBody }),
                     ...(dependencyShape && { dependencyShape }),
                     accessKind: dependencyShape?.accessKind || (shape?.pattern ? 'read' : accessKind(tree, usage, dependencyShape?.node)),
                     ...(usage.receiver && { flowSite: flowSiteOf(tree, usage, dependencyShape?.node) }),
@@ -504,6 +532,14 @@ function findAccessorReferences(index, name, definition, options = {}) {
             else unverified.push({ ...shaped,
                 reason: ref.dependencyShape.inferredName ? 'inferred-member-name' : 'member-owner-unresolved',
                 tier: 'unverified' });
+            continue;
+        }
+
+        if (ref.classBody) {
+            const own = definition.className === ref.classBody.name && path.resolve(ref.file) === path.resolve(definition.file) &&
+                definition.startLine >= ref.classBody.startLine && definition.endLine <= ref.classBody.endLine;
+            if (own) confirmed.push({ ...shaped, callerName: null, resolution: 'class-body-binding', tier: 'confirmed' });
+            else excluded.push({ ...shaped, reason: 'other-class-body' });
             continue;
         }
 

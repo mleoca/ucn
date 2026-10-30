@@ -179,7 +179,7 @@ const SYNTAX_FAMILIES = Object.freeze({
     contractSyntax: { prefix: 'contract-syntax-v1', weight: 'json' },
     usageText: { prefix: 'usage-text-v2', weight: 'json' },
     enumSyntax: { prefix: 'enum-syntax-v2', weight: 'json' },
-    valueLocal: { prefix: 'value-local-v2', weight: 'json' },
+    valueLocal: { prefix: 'value-local-v3', weight: 'json' },
     valueBodies: { prefix: 'value-bodies-v4', weight: 'json' },
     classFields: { prefix: 'class-fields-v1', weight: 'json' },
 });

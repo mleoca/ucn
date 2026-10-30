@@ -9655,3 +9655,41 @@ describe('fix #422: Rust item scopes, namespaces, path values, trait paths', () 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #431: a Rust type path never names a struct field', () => {
+    it('excludes `Type::name()` associated items from a field of that name', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "m"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub struct ColorStyle {',
+                '    pub back: u8,',
+                '}',
+                '',
+                'impl ColorStyle {',
+                '    pub fn back(back: u8) -> Self {',
+                '        ColorStyle { back }',
+                '    }',
+                '    pub fn get(&self) -> u8 {',
+                '        self.back',
+                '    }',
+                '}',
+                '',
+                'pub fn make() -> u8 {',
+                '    let s = ColorStyle::back(1);',
+                '    let t = Self_::back;',
+                '    s.back',
+                '}',
+                'pub struct Self_;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('back', { file: 'src/lib.rs', line: 2 }).valueAccesses;
+            const lines = band.byFile.flatMap(group => group.sites.map(site => site.line));
+            assert.ok(lines.includes(10), JSON.stringify(lines));
+            assert.ok(!lines.includes(15) && !band.unverifiedSites.some(site => site.line === 15),
+                JSON.stringify(band));
+            assert.ok(band.excluded.byReason['associated-item-path'] >= 2, JSON.stringify(band.excluded));
+        } finally { rm(dir); }
+    });
+});

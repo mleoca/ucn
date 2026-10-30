@@ -206,6 +206,15 @@ const STRUCTURAL_TRAITS = {
     // (Rust: enum variants a `use` brings in), 'none' (Go struct fields, C).
     // Imports in these languages never name a member either.
     bareValueMemberScope: 'declaration-body',
+    // An enum member names a type of its own (TS literal enum member types:
+    // `kind: Kind.Text` in an annotation reads the member, fix #431).
+    enumMemberTypes: true,
+    // A type path can name a field (`T::f` for a static member): Rust sets
+    // false (fix #431).
+    typePathReachesFields: true,
+    // Classes whose synthesized initializer takes their fields as keyword
+    // parameters (Python dataclasses, NamedTuple, TypedDict), or null.
+    fieldInitializers: null,
     // A method-shaped call CAN reach a standalone function here: attribute
     // assignment rebinds functions onto objects (obj.print = print), so the
     // #218b gate routes such calls visible instead of excluding (fix #220).
@@ -435,6 +444,9 @@ const NOMINAL_TRAITS = {
     // static imports).
     bareCallReachesMethods: false,
     bareValueMemberScope: 'none',
+    enumMemberTypes: false,
+    typePathReachesFields: true,
+    fieldInitializers: null,
     // Whether a method-shaped call (x.f()) can reach a standalone FUNCTION:
     // Go func-typed fields are name-callable (s.Run() may invoke a stored
     // function), so exclusion needs !bindingId there; Rust requires (s.f)()
@@ -627,6 +639,15 @@ const LANGUAGES = {
             keywordArguments: true,
             assignmentDeclaresLocal: true,
             bareValueMemberScope: 'class-body',
+            enumMemberTypes: false,
+            // Classes whose initializer the standard library synthesizes from
+            // their own fields (fix #431): a keyword argument of their
+            // construction names a field. Resolved qualified names.
+            fieldInitializers: {
+                decorators: ['dataclasses.dataclass'],
+                bases: ['typing.NamedTuple', 'typing_extensions.NamedTuple',
+                    'typing.TypedDict', 'typing_extensions.TypedDict'],
+            },
             // Calling an async def creates a coroutine object in any scope:
             // audit-async checks such calls in sync functions too, and
             // follows a local assigned from the call to the uses that need
@@ -734,6 +755,10 @@ const LANGUAGES = {
             valuePatternConstants: true,
             moduleValueLookup: true,
             typeArgumentValues: 'generic-parameter',
+            // A struct's fields are reached through a value (`x.f`, struct
+            // expressions and patterns); a type path `T::f` names an
+            // associated item (fix #431).
+            typePathReachesFields: false,
             hasDynamicImports: false,
             moduleTypeIdentity: true,
             // Same-scope definitions of one name are configuration

@@ -40,6 +40,7 @@
 const path = require('path');
 const { getParser, safeParse, langTraits, LANGUAGES } = require('../languages');
 const { sameNode } = require('../languages/utils');
+const { jsPatternTarget } = require('../languages/lexical-scope');
 const { classKeyOf } = require('./class-identity');
 const { projectHas } = require('./provenance-overload');
 
@@ -394,11 +395,24 @@ function classifyJs(node) {
         case 'member_expression':
             if (field === 'property') return { role: 'member', receiver: parent.childForFieldName('object') };
             return { role: 'value' };
-        case 'required_parameter': case 'optional_parameter': case 'rest_pattern':
-        case 'formal_parameters': case 'array_pattern': case 'assignment_pattern':
-        case 'object_assignment_pattern':
+        case 'required_parameter': case 'optional_parameter':
+            // The parameter's pattern binds; its default value and type are
+            // read (fix #431: `x: number = LIMIT` reads LIMIT).
+            if (node.type === 'identifier' && field === 'pattern') return skip('parameter', { binding: true });
+            break;
+        case 'formal_parameters':
             if (node.type === 'identifier') return skip('parameter', { binding: true });
             break;
+        case 'rest_pattern': case 'array_pattern': case 'assignment_pattern':
+        case 'object_assignment_pattern': {
+            if (node.type !== 'identifier') break;
+            // A destructuring target declares a name, or (an assignment
+            // pattern, `[a, b] = f()`) writes the binding in scope (fix #431).
+            const target = jsPatternTarget(node);
+            if (target === 'declaration') return skip('parameter', { binding: true });
+            if (target === 'assignment') return { role: 'value', patternWrite: true };
+            break;
+        }
         case 'variable_declarator':
             if (field === 'name') return skip('variable', { binding: true });
             break;
@@ -425,6 +439,11 @@ function classifyJs(node) {
                 if (required) return { role: 'import', requireSource: required, aliased: true };
                 return skip('property-key');
             }
+            if (parent.type === 'pair_pattern' && field === 'value' && node.type === 'identifier') {
+                const target = jsPatternTarget(node);
+                if (target === 'declaration') return skip('destructured', { binding: true });
+                if (target === 'assignment') return { role: 'value', patternWrite: true };
+            }
             break;
         case 'type_parameter':
             if (field === 'name') return skip('type-parameter', { typeParam: true });
@@ -441,6 +460,8 @@ function classifyJs(node) {
         // `const { Widget } = require('./w')` is an import of Widget.
         const required = requireSourceOf(node);
         if (required) return { role: 'import', requireSource: required };
+        // `({ a } = obj)` writes the binding in scope (fix #431).
+        if (jsPatternTarget(node) === 'assignment') return { role: 'value', patternWrite: true };
         return skip('destructured', { binding: true });
     }
     if (node.type === 'type_identifier') return { role: 'type' };
@@ -551,7 +572,13 @@ function classifyGo(node) {
             if (field === 'name') return { role: 'decl', declNode: parent };
             break;
         case 'qualified_type':
-            if (field === 'name') return { role: 'type', qualifier: parent.childForFieldName('package') };
+            if (field === 'name') {
+                // In an expression the grammar reads the index of `x[a.b]`
+                // as a type argument `a.b` (fix #431): a selector on a value
+                // `a` unless `a` names an imported package.
+                return { role: 'type', qualifier: parent.childForFieldName('package'),
+                    ...(require('../languages/lexical-scope').goExpressionTypeArgument(parent) && { selectorOperand: true }) };
+            }
             return skip('package');
         case 'field_declaration':
             if (node.type === 'field_identifier') return skip('field-name');

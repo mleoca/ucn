@@ -553,12 +553,50 @@ function jsVerdict(info) {
     return { local: true, defRows: info.defRows.slice() };
 }
 
+/**
+ * What a destructuring pattern's target name does (fix #431): 'declaration'
+ * (a declarator, parameter, catch or `for (const [a] of ..)` pattern binds
+ * it), 'assignment' (`[a, b] = f()`, `({ a } = o)`, `for ([a] of ..)` write
+ * the binding in scope) or null (a default value or key, not a target).
+ */
+function jsPatternTarget(node) {
+    let current = node;
+    for (let parent = node.parent; parent; current = parent, parent = parent.parent) {
+        switch (parent.type) {
+            case 'array_pattern': case 'object_pattern': case 'rest_pattern':
+                continue;
+            case 'pair_pattern':
+                if (fieldIs(current, 'value')) continue;
+                return null;
+            case 'assignment_pattern': case 'object_assignment_pattern':
+                if (fieldIs(current, 'left')) continue;
+                return null;
+            case 'assignment_expression':
+                return current !== node && fieldIs(current, 'left') ? 'assignment' : null;
+            case 'for_in_statement':
+                if (current === node || !fieldIs(current, 'left')) return null;
+                return parent.childForFieldName('kind') ? 'declaration' : 'assignment';
+            case 'parenthesized_expression':
+                return null;
+            default:
+                return current === node ? null : 'declaration';
+        }
+    }
+    return null;
+}
+
+function fieldIs(node, field) {
+    const child = node.parent?.childForFieldName(field);
+    return !!child && sameNode(child, node);
+}
+
 function jsReferenceScope(node, name, memo, includeClasses) {
-    if (node.type !== 'identifier' && node.type !== 'shorthand_property_identifier') {
+    if (node.type !== 'identifier' && node.type !== 'shorthand_property_identifier' &&
+        !(node.type === 'shorthand_property_identifier_pattern' && jsPatternTarget(node) === 'assignment')) {
         // Keys, member properties and type names are not variable
         // references. Object shorthand `{ name }` is both key and value:
         // its value resolves like an identifier (fix #397; the rename keeps
-        // the key).
+        // the key), as `({ name } = o)` writes it (fix #431).
         return 'none';
     }
     const parent = node.parent;
@@ -684,8 +722,22 @@ function goParamNames(list, out) {
     }
 }
 
+/** A Go qualified type that is a type argument of an instantiation written
+ * in an expression: `x[a.b]` parses as one, though `a` may be a value whose
+ * field `b` indexes `x` (fix #431). */
+function goExpressionTypeArgument(qualifiedType) {
+    let current = qualifiedType?.parent;
+    if (current?.type === 'type_elem') current = current.parent;
+    if (current?.type !== 'type_arguments') return false;
+    current = current.parent;
+    if (current?.type === 'generic_type') current = current.parent;
+    return current?.type === 'type_instantiation_expression';
+}
+
 function goReferenceScope(node, name) {
-    if (node.type !== 'identifier') return 'none';
+    // The package of an expression type argument may be a value (fix #431).
+    if (node.type !== 'identifier' && !(node.type === 'package_identifier' &&
+        node.parent?.type === 'qualified_type' && goExpressionTypeArgument(node.parent))) return 'none';
     const parent = node.parent;
     if (!parent) return 'unknown';
     // `T{field: v}`: a struct field name or a map key, undecidable here.
@@ -1372,6 +1424,11 @@ function pythonClassBodyOrder(classNode, node, name) {
             const left = assignment?.type === 'assignment' ? assignment.childForFieldName('left') : null;
             const right = assignment?.type === 'assignment' ? assignment.childForFieldName('right') : null;
             if (left && right && within(site, left) && within(node, right)) continue;
+            // A decorator runs before the definition it decorates binds the
+            // name (fix #431: `@plain.setter` reads the earlier `plain`).
+            if (statement.type === 'decorated_definition' && statement.namedChildren.some(child =>
+                child.type === 'decorator' && within(node, child)) && !statement.namedChildren.some(child =>
+                child.type === 'decorator' && within(site, child))) continue;
             return null;
         }
         if (statement.type !== 'expression_statement' && statement.type !== 'function_definition' &&
@@ -1382,4 +1439,4 @@ function pythonClassBodyOrder(classNode, node, name) {
 }
 
 module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding,
-    pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds };
+    pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds, goExpressionTypeArgument, jsPatternTarget };

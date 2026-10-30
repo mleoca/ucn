@@ -12738,3 +12738,173 @@ describe('fix #424: nested callees and parameters added before a rest parameter'
         } finally { rm(dir); }
     });
 });
+
+describe('fix #431: JS/TS value accesses by what each token reads', () => {
+    const lines = band => band.byFile.flatMap(group => group.sites.map(site => `${group.file}:${site.line}`));
+    const unverified = band => band.unverifiedSites.map(site => `${site.file}:${site.line}:${site.reason}`);
+
+    it('reads a TS enum member written as a type', () => {
+        const dir = tmp({
+            'kinds.ts': [
+                'export enum Kind {',
+                '  Text = "Text",',
+                '  Number = "Number",',
+                '}',
+                'export interface TextDef {',
+                '  kind: Kind.Text;',
+                '}',
+                'export const k = Kind.Text;',
+                'export type Text = string;',
+            ].join('\n'),
+            // A type qualified by a namespace import names a module export.
+            'use.ts': 'import * as kinds from "./kinds";\nexport const v: kinds.Text = "x";\n',
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('Text', { file: 'kinds.ts', line: 2 }).valueAccesses;
+            assert.deepStrictEqual(lines(band), ['kinds.ts:6', 'kinds.ts:8']);
+            assert.deepStrictEqual(unverified(band), []);
+        } finally { rm(dir); }
+    });
+
+    it('follows a namespace chain through re-exported namespaces', () => {
+        const dir = tmp({
+            'core/registries.ts': 'export const globalRegistry = { add() {} };\n',
+            'core/index.ts': 'export * from "./registries";\n',
+            'classic/external.ts': 'export * as core from "../core/index";\nexport const other = 1;\n',
+            'classic/index.ts': 'export * from "./external";\n',
+            'index.ts': 'export * from "./classic/index";\n',
+            'use.ts': [
+                'import * as z from "./index";',
+                'z.core.globalRegistry.add();',
+                'const local = { core: { globalRegistry: 1 } };',
+                'local.core.globalRegistry;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('globalRegistry', { file: 'core/registries.ts', line: 1 }).valueAccesses;
+            assert.deepStrictEqual(lines(band), ['use.ts:2']);
+        } finally { rm(dir); }
+    });
+
+    it('lists a whole-module import of the pin and leaves the local name to the importer', () => {
+        const dir = tmp({
+            'request.js': 'var req = Object.create(null);\nreq.get = function () {};\nmodule.exports = req;\n',
+            'express.js': "var req = require('./request');\nexports.request = req;\n",
+            'thing.mjs': 'const thing = { a: 1 };\nexport default thing;\n',
+            'use.mjs': "import thing from './thing.mjs';\nconsole.log(thing.a);\n",
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('req', { file: 'request.js', line: 1 }).valueAccesses;
+            // The importer's own reads of the module value stay accesses.
+            assert.deepStrictEqual(lines(band), ['express.js:1', 'express.js:2', 'request.js:2', 'request.js:3']);
+            const site = band.byFile.find(group => group.file === 'express.js').sites[0];
+            assert.strictEqual(site.accessKind, 'import');
+            assert.deepStrictEqual(lines(index.impact('thing', { file: 'thing.mjs', line: 1 }).valueAccesses),
+                ['thing.mjs:2', 'use.mjs:1', 'use.mjs:2']);
+            const plan = execute(index, 'plan', { name: 'request.js:1:req', renameTo: 'request' });
+            assert.ok(plan.ok, plan.error);
+            assert.ok(!(plan.result.changes || []).some(change => change.file === 'express.js'),
+                JSON.stringify(plan.result.changes));
+        } finally { rm(dir); }
+    });
+
+    it('reads a destructuring assignment as a write and a parameter default as a read', () => {
+        const dir = tmp({
+            'a.js': [
+                'let host, port;',
+                'const LIMIT = 3;',
+                'function load() {',
+                '  [host, port] = pair();',
+                '  ({ host } = other());',
+                '  return host;',
+                '}',
+                'function f(x = LIMIT, { y = LIMIT } = {}) { return x + y; }',
+                'function g(x: number = LIMIT) { return x; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const hostBand = index.impact('host', { file: 'a.js', line: 1 }).valueAccesses;
+            assert.deepStrictEqual(lines(hostBand), ['a.js:4', 'a.js:5', 'a.js:6']);
+            const write = hostBand.byFile[0].sites.find(site => site.line === 4);
+            assert.strictEqual(write.accessKind, 'write');
+            assert.deepStrictEqual(lines(index.impact('LIMIT', { file: 'a.js', line: 2 }).valueAccesses),
+                ['a.js:8', 'a.js:8', 'a.js:9']);
+        } finally { rm(dir); }
+    });
+
+    it('indexes properties a class assigns on this, never names its body declares', () => {
+        const dir = tmp({
+            'client.js': [
+                'class Client {',
+                '  constructor(url) {',
+                '    this.url = url;',
+                '    this.count = 0;',
+                '    function inner() { this.notMine = 1; }',
+                '    const arrow = () => { this.viaArrow = 2; };',
+                '  }',
+                '  get size() { return this._size; }',
+                '  set size(v) { this._size = v; this.size2 = v; }',
+                '  run() { this.count += 1; this.extra = this.url; }',
+                '  static make() { this.staticOnly = 1; }',
+                '  bindAll() { this.inherited = this.inherited.bind(this); }',
+                '  label = "x";',
+                '  setLabel() { this.label = "y"; }',
+                '}',
+                'const c = new Client("u");',
+                'console.log(c.url, c.count);',
+                'module.exports = { Client };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const fields = name => (index.symbols.get(name) || []).filter(d => d.type === 'field')
+                .map(d => `${d.className}:${d.startLine}${d.instanceAttribute ? ':instance' : ''}`);
+            assert.deepStrictEqual(fields('url'), ['Client:3:instance']);
+            assert.deepStrictEqual(fields('count'), ['Client:4:instance']);
+            assert.deepStrictEqual(fields('viaArrow'), ['Client:6:instance']);
+            assert.deepStrictEqual(fields('_size'), ['Client:9:instance']);
+            assert.deepStrictEqual(fields('extra'), ['Client:10:instance']);
+            assert.deepStrictEqual(fields('notMine'), []);
+            assert.deepStrictEqual(fields('staticOnly'), []);
+            assert.deepStrictEqual(fields('label'), ['Client:13']);
+            // A rebinding of a member a base may declare is no property.
+            assert.deepStrictEqual(fields('inherited'), []);
+            assert.deepStrictEqual(lines(index.impact('url', { file: 'client.js', line: 3 }).valueAccesses),
+                ['client.js:10', 'client.js:17']);
+        } finally { rm(dir); }
+    });
+
+    it('tiers slot accesses: a sibling implementation is another member, an interface receiver may dispatch', () => {
+        const dir = tmp({
+            'api.ts': [
+                'interface FieldLike { store: number; }',
+                'export class FieldApi implements FieldLike {',
+                '  store = 1;',
+                '  read() { return this.store; }',
+                '}',
+                'export class GroupApi implements FieldLike {',
+                '  store = 2;',
+                '  read() { return this.store; }',
+                '}',
+                'export function any(x: FieldLike, g: GroupApi, f: FieldApi) {',
+                '  return [x.store, g.store, f.store];',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('store', { file: 'api.ts', line: 3 }).valueAccesses;
+            assert.deepStrictEqual(lines(band), ['api.ts:4', 'api.ts:11']);
+            assert.deepStrictEqual(unverified(band), ['api.ts:11:possible-dispatch']);
+            assert.strictEqual(band.excluded.byReason['other-slot-member'], 2, JSON.stringify(band.excluded));
+            const plan = execute(index, 'plan', { name: 'api.ts:3:store', renameTo: 'state' });
+            assert.ok(plan.ok, plan.error);
+            const edited = new Set((plan.result.changes || []).map(c => c.line));
+            for (const line of [1, 3, 4, 7, 8, 11]) assert.ok(edited.has(line), `line ${line}`);
+        } finally { rm(dir); }
+    });
+});

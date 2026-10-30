@@ -8978,3 +8978,48 @@ describe('fix #430: every name of a multi-name Go struct field is a field', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #431: Go index operands the grammar reads as type arguments', () => {
+    it('reads `x[a.b]` as a field selector when `a` is a value, and keeps `pkg.T` a type', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'tree.go': [
+                'package m',
+                '',
+                'import "example.com/m/kinds"',
+                '',
+                'type node struct {',
+                '\ttyp      int',
+                '\tchildren [3][]*node',
+                '}',
+                '',
+                'func Box[T any]() T { var z T; return z }',
+                '',
+                'func (n *node) replace(child *node, i int) {',
+                '\tn.children[child.typ][i] = child',
+                '\tif n.children[child.typ][i].typ == 0 {',
+                '\t\treturn',
+                '\t}',
+                '\t_ = Box[kinds.typ]()',
+                '}',
+            ].join('\n'),
+            'kinds/kinds.go': 'package kinds\n\ntype typ int\n',
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('typ', { file: 'tree.go', line: 6 }).valueAccesses;
+            const lines = band.byFile.flatMap(group => group.sites.map(site => site.line));
+            // `child.typ` is a field of the typed parameter; the trailing
+            // `.typ` of an indexed element has an untyped receiver.
+            assert.deepStrictEqual(lines, [13, 14]);
+            assert.ok(!band.unverifiedSites.some(site => site.line === 17), JSON.stringify(band.unverifiedSites));
+            const plan = execute(index, 'plan', { name: 'tree.go:6:typ', renameTo: 'kind' });
+            assert.ok(plan.ok, plan.error);
+            const changes = plan.result.changes || [];
+            const at = line => changes.find(c => c.line === line);
+            assert.ok(at(13) && !at(13).needsReview, JSON.stringify(changes));
+            assert.match(at(14).newExpression, /children\[child\.kind\]/);
+            assert.ok(!at(17));
+        } finally { rm(dir); }
+    });
+});

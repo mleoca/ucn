@@ -981,7 +981,11 @@ function clearAllCaches() {
 // structs and unions (`memberPaths`) and C++ variable templates are indexed;
 // C# receivers drop the null-forgiving `!`; Java resources take their
 // declared type; C/C++ macro bodies read `#param` as a string literal.
-const CACHE_FORMAT_VERSION = 317;
+// v318 (fix #431): JS/TS properties a class's methods assign on `this` are
+// indexed as fields (`instanceAttribute`); value-reference records read
+// destructuring assignment targets as writes, parameter defaults as reads
+// and Python dict keys as values.
+const CACHE_FORMAT_VERSION = 318;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

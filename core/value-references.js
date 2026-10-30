@@ -5,8 +5,8 @@ const { sameNode, visitNameNodes } = require('../languages/utils');
 const { referenceScope, pythonClassBodyOrder } = require('../languages/lexical-scope');
 const { TypeReferenceResolver, referenceRole, referenceBindingScope, referenceTypeParameterScope,
     typeReferenceSites, referenceImportVerdict } = require('./type-references');
-const { ownerRefOf, classDefsNamed, findDeclaringClass, relationToTargets,
-    parentRefsOf, lexicalClassRefOf, completeForwardDeclaration } = require('./class-identity');
+const { ownerRefOf, classDefsNamed, findDeclaringClass, relationToTargets, descendsFromTargets, shareDescendant,
+    parentRefsOf, supertypeRefsOf, lexicalClassRefOf, completeForwardDeclaration } = require('./class-identity');
 const { isValueDefinition } = require('./shared');
 const TYPE_BODIES = new Set(['class_declaration', 'class_definition', 'class',
     'abstract_class_declaration', 'struct_specifier', 'class_specifier', 'union_specifier',
@@ -44,6 +44,13 @@ function mergeHolds(holds) {
         return { modules: [...new Set(holds.flatMap(hold => hold.modules))] };
     }
     return 'unknown';
+}
+
+/** The template-id a name token heads (`v` in `v<T>`), else the token. */
+function templateIdOf(node) {
+    const parent = node?.parent;
+    return parent && ['template_function', 'template_method'].includes(parent.type) &&
+        sameNode(parent.childForFieldName('name'), node) ? parent : node;
 }
 
 /** The Python class whose body a node is directly in (not in a nested
@@ -780,13 +787,33 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             const { bindingIsExternal } = require('./type-denotation');
             return bindingIsExternal(this.index, entry, file, binding) === true ? 'value' : 'unknown';
         }
+        return this.jsExportHolds(target, binding.kind === 'default' ? null : binding.name, depth) || 'unknown';
+    }
+
+    /**
+     * What module `target` exports under `name` (null: its default export),
+     * as jsBindingHolds answers; null when it exports no such name. Names a
+     * module re-exports with `export * from` are its exports too (fix #431).
+     */
+    jsExportHolds(target, name, depth, seen = new Set()) {
+        if (depth > 4 || seen.has(target)) return 'unknown';
+        seen.add(target);
         const targetEntry = this.index.files.get(target);
         const exports = targetEntry?.exportDetails || [];
-        const defaultImport = binding.kind === 'default';
-        const details = exports.filter(detail => defaultImport ? detail.type === 'default'
-            : detail.type !== 'default' && detail.type !== 're-export-all' && (detail.alias || detail.name) === binding.name ||
-                detail.type === 're-export-all' && detail.alias === binding.name);
-        if (details.length === 0) return 'unknown';
+        const details = exports.filter(detail => name == null ? detail.type === 'default'
+            : detail.type !== 'default' && detail.type !== 're-export-all' && (detail.alias || detail.name) === name ||
+                detail.type === 're-export-all' && detail.alias === name);
+        if (details.length === 0) {
+            if (name == null) return null;
+            const holds = [];
+            for (const star of exports) {
+                if (star.type !== 're-export-all' || star.alias) continue;
+                const module = star.source && this.moduleFile(targetEntry, star.source);
+                const hold = module ? this.jsExportHolds(module, name, depth + 1, seen) : 'unknown';
+                if (hold) holds.push(hold);
+            }
+            return holds.length > 0 ? mergeHolds(holds) : null;
+        }
         const holds = details.map(detail => {
             if (detail.type === 're-export-all') {
                 const module = detail.source && this.moduleFile(targetEntry, detail.source);
@@ -806,6 +833,80 @@ class ValueReferenceResolver extends TypeReferenceResolver {
     }
 
     /**
+     * The modules a namespace receiver chain denotes (fix #431): an import
+     * binding of a module namespace, then each `.name` the modules export as
+     * a namespace (`z.core` through `export * as core from`). 'value' when a
+     * link holds an ordinary value, 'unknown' when a link cannot be
+     * followed, null when the head is no module-scope import binding.
+     */
+    jsNamespaceHolds(file, expression, depth = 0) {
+        if (depth > 4) return 'unknown';
+        if (expression?.type === 'identifier') {
+            const language = this.index.files.get(file)?.language;
+            const lexical = referenceScope(expression, language === 'html' ? 'javascript' : language,
+                this.lexicalMemo(expression), expression.text);
+            if (lexical !== 'module') return lexical === 'unknown' ? 'unknown' : null;
+            const entry = this.index.files.get(file);
+            const bindings = (entry?.importBindings || []).filter(binding =>
+                (binding.alias || binding.name) === expression.text && binding.module != null);
+            if (bindings.length === 0) return null;
+            return mergeHolds(bindings.map(binding => {
+                if (binding.kind !== 'namespace' && binding.kind !== 'require') return this.jsBindingHolds(file, binding);
+                const module = entry && this.moduleFile(entry, binding.module);
+                return module ? { modules: [module] } : 'unknown';
+            }));
+        }
+        if (expression?.type !== 'member_expression') return null;
+        const property = expression.childForFieldName('property');
+        if (property?.type !== 'property_identifier') return null;
+        const inner = this.jsNamespaceHolds(file, expression.childForFieldName('object'), depth + 1);
+        if (!inner?.modules) return inner;
+        return mergeHolds(inner.modules.map(module => this.jsExportHolds(module, property.text, 1) || 'unknown'));
+    }
+
+    /**
+     * An import binding of a module's whole value at this token (fix #431):
+     * `const req = require('./request')` of a module whose `module.exports`
+     * is the pin, `import req from './request'` of one whose default export
+     * is the pin. The access verdict, or null.
+     */
+    jsWholeModuleImport(file, entry, node) {
+        const line = node.startPosition.row + 1;
+        const binding = (entry.importBindings || []).find(candidate => candidate.line === line &&
+            (candidate.alias || candidate.name) === node.text && candidate.module != null &&
+            (candidate.kind === 'default' || candidate.kind === 'require' && candidate.defaultLike));
+        const access = binding && this.wholeModuleValue(entry, binding);
+        return access ? { ...access, accessKind: 'import' } : null;
+    }
+
+    /** The access verdict when `binding` imports a module whose whole value
+     * (`module.exports`, the default export) is the pin, else null. */
+    wholeModuleValue(entry, binding) {
+        const module = this.moduleFile(entry, binding.module);
+        if (!module || module !== this.def.file || this.def.className || this.def.lexicalScopeStartLine != null) return null;
+        const whole = (this.index.files.get(module)?.exportDetails || []).filter(detail =>
+            binding.kind === 'default' ? detail.type === 'default'
+                : detail.type === 'module.exports' && detail.defaultLike);
+        if (whole.length === 0) return null;
+        const names = whole.map(detail => detail.localName || detail.name);
+        if (names.every(name => name === this.def.name)) return { verdict: 'yes' };
+        return names.some(name => name === this.def.name)
+            ? { verdict: 'unknown', reason: 'module-value-alternatives' } : null;
+    }
+
+    /** A whole-module import binds the module's value under a name of the
+     * importer's own (fix #431): its reads depend on the pin, a rename keeps
+     * them. */
+    importBindingVerdict(file, entry, binding, name) {
+        if (this.family === 'js' && !this.owner && binding.module != null &&
+            (binding.kind === 'default' || binding.kind === 'require' && binding.defaultLike)) {
+            const access = this.wholeModuleValue(entry, binding);
+            if (access) return { verdict: 'no', reason: 'import-alias', access };
+        }
+        return super.importBindingVerdict(file, entry, binding, name);
+    }
+
+    /**
      * A JS/TS member access `R.name` against a module-scope value (fix
      * #420): only a module namespace or exports object holds the module's
      * bindings as members. A receiver a local binding shadows, or an
@@ -815,6 +916,17 @@ class ValueReferenceResolver extends TypeReferenceResolver {
      * the module-attribute lookup decides.
      */
     jsModuleMemberAt(file, receiver) {
+        if (receiver.type === 'member_expression') {
+            // `z.core.name` through a re-exported namespace (fix #431).
+            const holds = this.jsNamespaceHolds(file, receiver);
+            if (!holds) return null;
+            if (holds === 'value') return { verdict: 'no', reason: 'member' };
+            if (!holds.modules) return { verdict: 'unknown', reason: 'module-attribute' };
+            const reach = holds.modules.map(module => this.chase(module, this.name));
+            return reach.every(verdict => verdict === 'yes') ? { verdict: 'yes' }
+                : reach.every(verdict => verdict === 'no') ? { verdict: 'no', reason: 'other-module' }
+                    : { verdict: 'unknown', reason: 'module-attribute' };
+        }
         if (receiver.type !== 'identifier') return null;
         const language = this.index.files.get(file)?.language;
         const lexical = referenceScope(receiver, language === 'html' ? 'javascript' : language,
@@ -1051,7 +1163,9 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         const declaring = findDeclaringClass(this.index, owner, this.memberCandidates);
         if (!declaring || declaring.uncertain) return { verdict: 'unknown', reason: 'member-owner-unresolved' };
         if (declaring.members.length !== 1) return { verdict: 'unknown', reason: 'ambiguous-value-declaration' };
-        const result = this.group.has(declaring.members[0]) ? { verdict: 'yes' }
+        const result = this.group.has(declaring.members[0])
+            ? declaring.members[0] === this.def ? { verdict: 'yes' }
+                : { verdict: 'yes', access: this.slotAccess(owner, declaring.members[0]) }
             : langTraits(this.language)?.typeSystem === 'structural' &&
                 (relationToTargets(this.index, owner, [this.def]) !== 'unrelated' ||
                  relationToTargets(this.index, this.owner, declaring.members) !== 'unrelated')
@@ -1059,6 +1173,219 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             : { verdict: 'no', reason: 'other-member-owner' };
         this.memberMemo.set(owner.key, result);
         return result;
+    }
+
+    /**
+     * The field a keyword argument names (fix #431), Python: the keyword of
+     * a construction `C(.., name=v)` binds a parameter of the initializer
+     * the call runs. A class the language's field initializers synthesize
+     * (trait `fieldInitializers`: a dataclass, a NamedTuple or TypedDict
+     * subclass) takes its own fields as parameters, so the keyword names
+     * the field C's member lookup finds; an explicit `__init__` takes
+     * parameters of its own. An initializer C inherits, a class decorator
+     * that may replace C, an external base or a `cls(..)` construction
+     * (a subclass may run) leave the binding for review.
+     */
+    keywordFieldAt(file, entry, node) {
+        const other = { verdict: 'no', reason: 'keyword-argument' };
+        const list = node.parent?.parent;
+        const call = list?.type === 'argument_list' ? list.parent : null;
+        const callee = call?.type === 'call' ? call.childForFieldName('function') : null;
+        if (!callee) return other;
+        const traits = langTraits(entry.language);
+        let owner;
+        let receiverClass = false;
+        if (callee.type === 'identifier' && traits.selfParam?.includes(callee.text)) {
+            owner = this.enclosingOwner(file, callee);
+            receiverClass = true;
+        } else {
+            // Only a class of the slot, or one below it, can take the field.
+            const calleeName = callee.type === 'attribute' ? callee.childForFieldName('attribute')?.text : callee.text;
+            if (!this.keywordOwnerNames().has(calleeName)) return other;
+            const syntax = callee.type === 'attribute'
+                ? (() => {
+                    const attribute = callee.childForFieldName('attribute');
+                    const object = callee.childForFieldName('object');
+                    return attribute && object ? { name: attribute.text, node: attribute, qualifier: object,
+                        qualifierText: object.text } : null;
+                })()
+                : typeSyntax(callee);
+            owner = syntax ? this.classForType(file, syntax, true) : null;
+        }
+        if (!owner?.key || !owner.def) return other;
+        const declaring = findDeclaringClass(this.index, owner, this.memberCandidates);
+        if (!declaring) return other;
+        if (declaring.uncertain || declaring.members.length !== 1) {
+            return { verdict: 'unknown', reason: 'member-owner-unresolved' };
+        }
+        const member = declaring.members[0];
+        if (!this.group.has(member)) return { verdict: 'no', reason: 'other-member-owner' };
+        const initializer = this.synthesizedInitializer(owner);
+        if (initializer === 'explicit') return other;
+        if (initializer !== 'own') return { verdict: 'unknown', reason: initializer };
+        // A field a base declares reaches the synthesized parameter through
+        // the base's fields.
+        if (declaring.ref?.key !== owner.key) return { verdict: 'unknown', reason: 'inherited-field' };
+        if (receiverClass) return { verdict: 'unknown', reason: 'receiver-class-call' };
+        return member === this.def ? { verdict: 'yes' }
+            : { verdict: 'yes', access: this.slotAccess(owner, member) };
+    }
+
+    /** Names of the classes owning a member of the pin's slot and of their
+     * descendants (by name): the only constructions whose keywords can name
+     * the field. */
+    keywordOwnerNames() {
+        if (this._keywordOwnerNames) return this._keywordOwnerNames;
+        const names = new Set();
+        const queue = [];
+        for (const member of this.group) {
+            if (member.className && !names.has(member.className)) { names.add(member.className); queue.push(member.className); }
+        }
+        while (queue.length) {
+            for (const child of this.index.extendedByGraph?.get(queue.shift()) || []) {
+                const name = typeof child === 'string' ? child : child?.name;
+                if (name && !names.has(name)) { names.add(name); queue.push(name); }
+            }
+        }
+        this._keywordOwnerNames = names;
+        return names;
+    }
+
+    /**
+     * Who builds the initializer a construction of `owner` runs (fix #431):
+     * 'own' (synthesized from the class's own fields), 'explicit' (a
+     * project `__init__` the class or a base defines, or none at all), or
+     * the review reason ('inherited-initializer', 'class-decorator',
+     * 'external-initializer').
+     */
+    synthesizedInitializer(owner) {
+        const memo = this._initializers ||= new Map();
+        if (memo.has(owner.key)) return memo.get(owner.key);
+        const result = this.synthesizedInitializerUncached(owner);
+        memo.set(owner.key, result);
+        return result;
+    }
+
+    synthesizedInitializerUncached(owner) {
+        const vocabulary = langTraits(this.index.files.get(owner.def.file)?.language)?.fieldInitializers;
+        const decorators = langTraits(this.index.files.get(owner.def.file)?.language)?.callableDecorators || {};
+        if (!vocabulary) return 'external-initializer';
+        const { resolveDecorator } = require('./async-producers');
+        const classInfo = ref => {
+            const fileEntry = this.index.files.get(ref.def.file);
+            const node = this.declarationNode(ref.def);
+            const decorated = node?.parent?.type === 'decorated_definition' ? node.parent : null;
+            let synthesizes = false, replaces = false;
+            for (const decorator of decorated ? decorated.namedChildren.filter(child => child.type === 'decorator') : []) {
+                let expression = decorator.namedChild(0);
+                const called = expression?.type === 'call';
+                const args = called ? expression.childForFieldName('arguments') : null;
+                if (called) expression = expression.childForFieldName('function');
+                const resolved = expression && ['identifier', 'attribute'].includes(expression.type)
+                    ? resolveDecorator(expression.text, fileEntry, decorators) : null;
+                const key = resolved?.name;
+                if (key && vocabulary.decorators.includes(key)) {
+                    // `@dataclass(init=False)` generates no initializer.
+                    const noInit = (args?.namedChildren || []).some(arg => arg.type === 'keyword_argument' &&
+                        arg.childForFieldName('name')?.text === 'init' &&
+                        arg.childForFieldName('value')?.type === 'false');
+                    if (!noInit) synthesizes = true;
+                } else if (!key || ![...(decorators.transparent || []), ...(decorators.namePreserving || [])]
+                    .some(known => known === key || known === `${key}()`)) {
+                    replaces = true;
+                }
+            }
+            const bases = ref.def.extends ? String(ref.def.extends).split(',').map(base => base.trim()) : [];
+            if (bases.some(base => {
+                const resolved = resolveDecorator(base.replace(/\[.*$/s, ''), fileEntry, {});
+                return resolved && vocabulary.bases.includes(resolved.name);
+            })) synthesizes = true;
+            const explicit = (this.index.symbols.get('__init__') || []).some(definition =>
+                definition.file === ref.def.file && ownerRefOf(this.index, definition)?.key === ref.key);
+            return { synthesizes, replaces, explicit };
+        };
+        // A class's own `__init__` takes its parameters, whatever its
+        // decorators (a dataclass keeps a defined initializer).
+        const own = classInfo(owner);
+        if (own.explicit) return 'explicit';
+        if (own.replaces) return 'class-decorator';
+        if (own.synthesizes) return 'own';
+        // The initializer comes from a base: the first class of the chain
+        // that defines or synthesizes one. `object` takes no keywords.
+        const queue = parentRefsOf(this.index, owner).map(parent => ({ parent, from: owner.def.file }));
+        const seen = new Set([owner.key]);
+        while (queue.length) {
+            const { parent, from } = queue.shift();
+            if (parent.external || !parent.key || !parent.def) {
+                const resolved = resolveDecorator(String(parent.name || ''), this.index.files.get(from),
+                    { builtins: ['object'] });
+                if (resolved?.name === 'builtins.object') continue;
+                if (resolved && vocabulary.bases.includes(resolved.name)) return 'inherited-initializer';
+                return 'external-initializer';
+            }
+            if (seen.has(parent.key)) continue;
+            seen.add(parent.key);
+            const info = classInfo(parent);
+            if (info.explicit) return 'explicit';
+            if (info.replaces) return 'class-decorator';
+            if (info.synthesizes) return 'inherited-initializer';
+            queue.push(...parentRefsOf(this.index, parent).map(next => ({ parent: next, from: parent.def.file })));
+        }
+        return 'explicit';
+    }
+
+    /**
+     * What an access whose lookup finds another member of the pin's slot
+     * reaches (fix #431). A rename edits the whole slot; impact tiers it as
+     * the caller contract does: a receiver of an ancestor or interface class
+     * may hold an instance of the target's class (possible dispatch), an
+     * override below the target and an unrelated class's own member are
+     * other members (excluded), unless a project class descends from both.
+     */
+    slotAccess(owner, member) {
+        if (!owner?.key || !this.owner?.key) return { verdict: 'unknown', reason: 'member-owner-unresolved' };
+        if (owner.key === this.owner.key) return { verdict: 'unknown', reason: 'value-declaration-identity' };
+        const below = descendsFromTargets(this.index, owner, [this.def]);
+        if (below === 'yes') {
+            // A Python instance attribute shadows the class attribute only
+            // once assigned.
+            return member.instanceAttribute || this.def.instanceAttribute
+                ? { verdict: 'unknown', reason: 'instance-attribute-shadow' }
+                : { verdict: 'no', reason: 'slot-override' };
+        }
+        const relation = this.supertypeOfOwner(owner) || relationToTargets(this.index, owner, [this.def]);
+        if (relation === 'ancestor') return { verdict: 'unknown', reason: 'possible-dispatch' };
+        if (relation === 'maybe' || below === 'maybe') return { verdict: 'unknown', reason: 'member-owner-unresolved' };
+        return shareDescendant(this.index, owner, [this.def])
+            ? { verdict: 'unknown', reason: 'possible-dispatch' }
+            : { verdict: 'no', reason: 'other-slot-member' };
+    }
+
+    /** 'ancestor' when `owner` is a supertype of the pin's class through its
+     * base and implements clauses, 'maybe' when an unresolved supertype of
+     * that name is on the way, else null. */
+    supertypeOfOwner(owner) {
+        const queue = [...supertypeRefsOf(this.index, this.owner, { implements: true })];
+        const seen = new Set([this.owner.key]);
+        let maybe = false;
+        while (queue.length) {
+            const parent = queue.shift();
+            if (parent.key && parent.key === owner.key) return 'ancestor';
+            if (!parent.key || parent.external) {
+                if (parent.name === owner.name) maybe = true;
+                continue;
+            }
+            if (seen.has(parent.key)) continue;
+            seen.add(parent.key);
+            queue.push(...supertypeRefsOf(this.index, parent, { implements: true }));
+        }
+        return maybe ? 'maybe' : null;
+    }
+
+    /** The access verdict of another slot member's declaration token. */
+    slotDeclarationAccess(file, node, otherOwner) {
+        if (!this.owner?.key || !otherOwner?.key || otherOwner.key === this.owner.key) return null;
+        return { verdict: 'no', reason: 'slot-member-declaration' };
     }
 
     receiverOwner(file, receiver) {
@@ -1085,7 +1412,7 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             }
             return owner;
         }
-        if (receiver.type !== 'identifier' && receiver.type !== 'type_identifier') return null;
+        if (!['identifier', 'type_identifier', 'package_identifier'].includes(receiver.type)) return null;
         const local = this.localBinding(file, receiver, receiver.text, true);
         if (local?.binding) {
             const type = declarationType(local.binding.node);
@@ -1224,7 +1551,7 @@ class ValueReferenceResolver extends TypeReferenceResolver {
     qualifiedValueAt(file, qualifier, role) {
         const scopes = [];
         let global = false;
-        for (let current = this.siteNode; current?.parent?.type === 'qualified_identifier' &&
+        for (let current = templateIdOf(this.siteNode); current?.parent?.type === 'qualified_identifier' &&
             sameNode(current.parent.childForFieldName('name'), current); current = current.parent) {
             const scope = current.parent.childForFieldName('scope');
             if (scope) scopes.unshift(scope);
@@ -1296,6 +1623,45 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         return null;
     }
 
+    /**
+     * A body a namespace-scope macro invocation wraps (`TEST_F(Fixture,
+     * Name) { .. }`) may be expanded as a member function of a class an
+     * argument names (a fixture subclass), as the caller side reads it
+     * (fix #396): a bare name the class chain of such an argument declares
+     * may be that member (fix #431). Visible, never confirmed or excluded.
+     */
+    macroScopeValueAt(file, node) {
+        if (!this.owner) return null;
+        let body = null;
+        for (let current = node.parent; current; current = current.parent) {
+            if (current.type === 'function_definition') { body = current; break; }
+            if (TYPE_BODIES.has(current.type) || current.type === 'lambda_expression') return null;
+        }
+        if (!body || body.parent && !['translation_unit', 'declaration_list'].includes(body.parent.type) &&
+            !String(body.parent.type).startsWith('preproc_')) return null;
+        const enclosing = this.index.findEnclosingFunction(file, node.startPosition.row + 1, true);
+        const args = enclosing?.generatedByMacro?.args;
+        if (!Array.isArray(args) || enclosing.className || enclosing.startLine !== body.startPosition.row + 1) return null;
+        const declarator = body.childForFieldName('declarator');
+        if (!declarator) return null;
+        const names = new Set(args);
+        const tokens = [];
+        const visit = current => {
+            if (['identifier', 'type_identifier'].includes(current.type) && names.has(current.text)) tokens.push(current);
+            for (const child of current.namedChildren || []) visit(child);
+        };
+        visit(declarator);
+        for (const token of tokens) {
+            const owner = this.classForType(file, typeSyntax(token));
+            if (!owner?.key) continue;
+            const declaring = findDeclaringClass(this.index, owner, this.memberCandidates);
+            if (declaring?.members.some(member => this.group.has(member))) {
+                return { verdict: 'unknown', reason: 'macro-generated-scope' };
+            }
+        }
+        return null;
+    }
+
     localUsingAt(file, node) {
         if (!this._usingMemo) this._usingMemo = new Map();
         const key = `${file}\0${node.tree.rootNode.id}`;
@@ -1363,7 +1729,8 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             }
         }
         if (traits.typeArgumentValues === 'ordinary') {
-            return this.classValueAt(file, node) || this.resolveName(file, node.startPosition.row + 1);
+            return this.classValueAt(file, node) || this.macroScopeValueAt(file, node) ||
+                this.resolveName(file, node.startPosition.row + 1);
         }
         if (traits.bareCallReachesMethods) {
             const owner = this.enclosingOwner(file, node);
@@ -1565,12 +1932,23 @@ class ValueReferenceResolver extends TypeReferenceResolver {
     decideToken(file, entry, token) {
         const { node } = token;
         let { role } = token;
+        if (role.selectorOperand && role.qualifier) {
+            // `x[a.b]` read as an instantiation (fix #431): a value `a` (a
+            // local, or any name no import binds) makes `a.b` a selector.
+            const operand = role.qualifier;
+            const scope = referenceScope(operand, entry.language, this.lexicalMemo(operand), operand.text);
+            const imported = (entry.importBindings || []).some(binding =>
+                (binding.alias || binding.name) === operand.text && binding.module);
+            if (scope !== 'unknown' && (!imported || (scope && scope !== 'module' && scope !== 'none'))) {
+                role = { role: 'member', receiver: operand };
+            }
+        }
         const position = role.role === 'type' ? this.typePosition(file, node, role) : null;
         const contextualValue = position === 'value';
         if (contextualValue) role = { ...role, role: 'value' };
         const receiver = memberReceiver(node, role);
         let declaration = false;
-        let verdict;
+        let verdict, wholeModuleImport;
         const parent = node.parent;
         const privateToken = node.type === 'private_property_identifier';
         const privateDeclaration = privateToken &&
@@ -1578,8 +1956,10 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             sameNode(parent.childForFieldName('name') || parent.childForFieldName('property'), node);
         const pattern = ['field_initializer', 'field_pattern', 'shorthand_field_initializer',
             'field_designator'].includes(parent?.type);
+        // A key the grammar reads as an expression (a Python dict display,
+        // `{HEAVY: SQUARE}`) is a value read, not a property name (fix #431).
         const objectKey = (parent?.type === 'pair' || parent?.type === 'pair_pattern') &&
-            sameNode(parent.childForFieldName('key'), node);
+            sameNode(parent.childForFieldName('key'), node) && role.role !== 'value';
         const shorthand = ['shorthand_property_identifier_pattern',
             'shorthand_property_identifier', 'shorthand_field_identifier'].includes(node.type);
         const declarationRole = role.role === 'skip' &&
@@ -1587,11 +1967,14 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 'enum-constant', 'enum-member', 'variant'].includes(role.why));
         const callableValue = role.role === 'skip' && role.why === 'method-call' &&
             !langTraits(entry.language)?.fieldsAndMethodsSeparate;
-        const qualifier = role.qualifier || (parent?.type === 'qualified_identifier' &&
-            sameNode(parent.childForFieldName('name'), node) && parent.childForFieldName('scope'));
+        // A template-id names the value it instantiates: `ns::v<T>` is
+        // qualified as `ns::v` (fix #431).
+        const nameExpression = templateIdOf(node);
+        const qualified = nameExpression.parent?.type === 'qualified_identifier' &&
+            sameNode(nameExpression.parent.childForFieldName('name'), nameExpression) ? nameExpression.parent : null;
+        const qualifier = role.qualifier || qualified?.childForFieldName('scope');
         const globalQualified = langTraits(entry.language)?.typeArgumentValues === 'ordinary' &&
-            parent?.type === 'qualified_identifier' && sameNode(parent.childForFieldName('name'), node) &&
-            !parent.childForFieldName('scope') && parent.children.some(child => child.type === '::');
+            qualified && !qualified.childForFieldName('scope') && qualified.children.some(child => child.type === '::');
         const shape = this.owner && !declarationRole
             ? langTraits(entry.language)?.accessorReferenceShape?.(node.tree, {
                 line: node.startPosition.row + 1, column: node.startPosition.column, usageType: 'reference',
@@ -1607,6 +1990,15 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         } else if (privateToken) {
             declaration = privateDeclaration;
             verdict = this.privateValueAt(file, node);
+        } else if (position === 'type' && role.qualifier && this.owner?.def?.type === 'enum' &&
+            langTraits(entry.language)?.enumMemberTypes) {
+            // `Kind.Text` in a type names the enum member's type (fix #431);
+            // `ns.Text` through a namespace import names a module export.
+            const enumOwner = this.classForType(file, typeSyntax(role.qualifier));
+            const namespaceQualifier = !enumOwner && !!this.jsNamespaceHolds(file, role.qualifier)?.modules;
+            verdict = enumOwner ? this.memberAt(enumOwner)
+                : namespaceQualifier ? { verdict: 'no', reason: 'non-value-position' }
+                    : { verdict: 'unknown', reason: 'member-owner-unresolved' };
         } else if (position === 'type' || role.role === 'decl') {
             verdict = { verdict: 'no', reason: 'non-value-position' };
         } else if (position === 'unknown' || position === 'initializer-unknown') {
@@ -1620,7 +2012,9 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             verdict = { verdict: 'unknown', reason: 'script-binding-scope' };
         } else if (patternReference && patternReference.verdict !== 'no') {
             verdict = patternReference;
-        } else if (shorthand) {
+        } else if (shorthand && !(role.patternWrite && !this.owner)) {
+            // `({ a } = o)` writes the binding `a` in scope (fix #431); a
+            // member target reads the source object's property.
             verdict = { verdict: 'unknown', reason: 'value-key-binding' };
         } else if (pattern || objectKey) {
             const literalOwner = this.owner && objectKey && parent.type === 'pair' &&
@@ -1650,7 +2044,8 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 if (file === this.def.file && node.startPosition.row + 1 === (this.def.nameLine || this.def.startLine)) {
                     declaration = true;
                 } else if (this.groupMemberAt(file, node, receiverOwner) === 'group') {
-                    verdict = { verdict: 'yes', declarationOf: true };
+                    const access = this.slotDeclarationAccess(file, node, receiverOwner);
+                    verdict = { verdict: 'yes', declarationOf: true, ...(access && { access }) };
                 }
             }
         } else if (globalQualified) {
@@ -1659,6 +2054,11 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             // value the unqualified spelling would find first.
             verdict = this.owner ? { verdict: 'no', reason: 'global-qualified' }
                 : this.resolveCFamily(file, node.startPosition.row + 1, this.name, '::');
+        } else if (qualifier && role.role !== 'import' && this.owner && this.def.type === 'field' &&
+            langTraits(entry.language)?.typePathReachesFields === false) {
+            // A type path names an associated item, never a struct field
+            // (fix #431: `Opt::command()` calls the derived constructor).
+            verdict = { verdict: 'no', reason: 'associated-item-path' };
         } else if (qualifier && role.role !== 'import') {
             verdict = langTraits(entry.language)?.typeArgumentValues === 'ordinary'
                 ? this.qualifiedValueAt(file, qualifier, role)
@@ -1675,6 +2075,19 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                     { verdict: 'unknown', reason: 'value-import-unresolved' };
         } else if (role.role === 'import') {
             verdict = referenceImportVerdict(this, file, entry, token);
+        } else if (this.owner && role.role === 'skip' && role.why === 'keyword-argument' &&
+            langTraits(entry.language)?.fieldInitializers) {
+            // `Segment(text, style=s)`: the keyword of a construction whose
+            // initializer the class synthesizes from its fields names the
+            // field (fix #431).
+            verdict = this.keywordFieldAt(file, entry, node);
+        } else if (this.family === 'js' && !this.owner && role.role === 'skip' &&
+            (role.why === 'variable' || role.why === 'import-local') &&
+            (wholeModuleImport = this.jsWholeModuleImport(file, entry, node))) {
+            // `const req = require('./request')` / `import req from ..` of a
+            // module whose value is the pin (fix #431): a dependency site;
+            // the local binding keeps its name in a rename.
+            verdict = { verdict: 'no', reason: 'import-alias', access: wholeModuleImport };
         } else if (!callableValue && (role.role === 'skip' || role.role === 'decl')) {
             if (!declarationRole) verdict = { verdict: 'no', reason: 'non-value-position' };
             else {
@@ -1699,7 +2112,8 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 const member = verdict.verdict === 'no' && (globalDeclaration || otherOwner) &&
                     this.groupMemberAt(file, node, otherOwner || null);
                 if (member) {
-                    verdict = member === 'group' ? { verdict: 'yes', declarationOf: true }
+                    const access = member === 'group' && this.slotDeclarationAccess(file, node, otherOwner);
+                    verdict = member === 'group' ? { verdict: 'yes', declarationOf: true, ...(access && { access }) }
                         : { verdict: 'unknown', reason: 'link-alternatives', declarationOf: true };
                     declaration = false;
                 }
@@ -1775,15 +2189,20 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 ...(receiver && { receiver: receiver.text }),
                 // Another declaration of the renamed entity (a linkage
                 // declaration, a slot member) is listed as a declaration.
-                accessKind: verdict.declarationOf ? 'declaration' : require('./accessors').referenceAccessKind(node.tree,
-                    { line, column: node.startPosition.column }, node),
-                verdict: verdict.verdict, reason: verdict.reason });
+                accessKind: verdict.access?.accessKind || (verdict.declarationOf ? 'declaration'
+                    : require('./accessors').referenceAccessKind(node.tree, { line, column: node.startPosition.column }, node)),
+                // A rename decides the token (edit, review, skip); impact
+                // lists it by what it reaches (fix #431): another member of
+                // the slot is not the target's access, and an import of the
+                // pin's module value is a dependency site the rename leaves.
+                ...(verdict.access ? { verdict: verdict.access.verdict, reason: verdict.access.reason }
+                    : { verdict: verdict.verdict, reason: verdict.reason }) });
             if (this.enumReferenceSyntax?.collecting(file)) {
                 this.enumReferenceSyntax.capture(file,
                     this.enumSyntaxFact(file, entry, token, receiver, qualifier, position, shape));
             }
         }
-        if (verdict.verdict === 'no' && role.binding &&
+        if (verdict.verdict === 'no' && !verdict.access && role.binding &&
             this.sourceLocalBinding(file, { node, role,
                 scope: referenceBindingScope(node, entry.language, role) })) verdict.fileLocalOnly = true;
         return verdict;
@@ -1931,4 +2350,4 @@ function hasCallableInitializer(index, definition) {
 }
 
 module.exports = { isValueDefinition, valueReferenceSites, findValueReferences, hasCallableInitializer,
-    enumValueBindingInfo, declaredFieldOwner };
+    enumValueBindingInfo, declaredFieldOwner, pythonClassBodyOf };

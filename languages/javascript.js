@@ -1994,7 +1994,60 @@ function extractClassMembers(classNode, codeOrLines) {
         }
     }
 
+    members.push(...jsInstanceProperties(bodyNode, members.map(member => member.name)));
     return members;
+}
+
+/** Does an expression read `this.<name>` (outside nested own-`this` scopes)? */
+function readsThisMember(expression, name) {
+    if (!expression) return false;
+    let found = false;
+    traverseTree(expression, node => {
+        if (found || JS_OWN_THIS_SCOPES.has(node.type)) return false;
+        if (node.type === 'member_expression' && node.childForFieldName('object')?.type === 'this' &&
+            node.childForFieldName('property')?.text === name) found = true;
+        return !found;
+    });
+    return found;
+}
+
+const JS_OWN_THIS_SCOPES = new Set(['function_expression', 'function_declaration', 'function',
+    'generator_function', 'generator_function_declaration', 'class', 'class_declaration',
+    'abstract_class_declaration', 'method_definition']);
+
+/**
+ * Instance properties a class's methods create by assigning them on `this`
+ * (fix #431, as Python instance attributes, fix #430): one per name, the
+ * first assignment in source order, for names the class body does not
+ * declare. A static method's `this` is the class; a nested function or
+ * class has its own `this`; an arrow function shares it.
+ */
+function jsInstanceProperties(bodyNode, declared) {
+    const out = [];
+    const seen = new Set(declared);
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const member = bodyNode.namedChild(i);
+        if (member.type !== 'method_definition' || member.children.some(part => part.type === 'static')) continue;
+        const body = member.childForFieldName('body');
+        if (!body) continue;
+        traverseTree(body, node => {
+            if (JS_OWN_THIS_SCOPES.has(node.type)) return false;
+            if (node.type !== 'assignment_expression' && node.type !== 'augmented_assignment_expression') return true;
+            const left = node.childForFieldName('left');
+            const property = left?.type === 'member_expression' && left.childForFieldName('object')?.type === 'this'
+                ? left.childForFieldName('property') : null;
+            // `this.m = this.m.bind(this)` rebinds a member a base may
+            // declare: no property of its own.
+            if (property?.type === 'property_identifier' && !seen.has(property.text) &&
+                !readsThisMember(node.childForFieldName('right'), property.text)) {
+                seen.add(property.text);
+                out.push({ name: property.text, startLine: property.startPosition.row + 1,
+                    endLine: node.endPosition.row + 1, memberType: 'field', instanceAttribute: true });
+            }
+            return true;
+        });
+    }
+    return out;
 }
 
 // Module-level state detection helpers

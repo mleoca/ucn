@@ -972,7 +972,7 @@ describe('fix #415: persisted local value proofs preserve fresh rename decisions
     const { execute } = require('../core/execute');
     const cache = require('../core/cache');
     const proofs = index => [...index._usageResultCache].filter(([key]) =>
-        key.split('\0')[3]?.startsWith('value-local-v2:'));
+        key.split('\0')[3]?.startsWith('value-local-v3:'));
     const plan = (index, name) => {
         const result = execute(index, 'plan', { name, renameTo: 'changed' });
         assert.ok(result.ok, result.error);
@@ -1025,7 +1025,7 @@ describe('fix #415: persisted local value proofs preserve fresh rename decisions
                 const read = cache.getUsageResult;
                 cache.getUsageResult = (...args) => {
                     const result = read(...args);
-                    if (args[3]?.startsWith('value-local-v2:') && result) hits++;
+                    if (args[3]?.startsWith('value-local-v3:') && result) hits++;
                     return result;
                 };
                 try { assert.deepStrictEqual(plan(loaded, handle), expected); }

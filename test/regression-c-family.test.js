@@ -7864,3 +7864,62 @@ describe('fix #427: C/C++ names, declarations and receivers by the languages own
         } finally { rm(dir); }
     });
 });
+
+describe('fix #431: C++ accesses in macro-generated scopes and qualified template-ids', () => {
+    it('keeps bare names of a fixture macro body visible for the fixture class an argument names', () => {
+        const dir = tmp({
+            'fixture.cc': [
+                '#define TEST_F(fixture, name) void fixture##_##name##_Test()',
+                'class Base {',
+                ' protected:',
+                '  static int n4_;',
+                '};',
+                'int Base::n4_;',
+                'class Other {',
+                ' protected:',
+                '  static int n4_;',
+                '};',
+                'typedef Base BaseTest;',
+                'TEST_F(BaseTest, Counts) {',
+                '  ++n4_;',
+                '}',
+                'TEST_F(Other, Counts) {',
+                '  ++n4_;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('n4_', { file: 'fixture.cc', line: 4 }).valueAccesses;
+            assert.deepStrictEqual(band.unverifiedSites.filter(site => site.line > 6)
+                .map(site => `${site.line}:${site.reason}`), ['13:macro-generated-scope']);
+            assert.ok(!band.byFile.some(group => group.sites.some(site => site.line === 16)));
+        } finally { rm(dir); }
+    });
+
+    it('qualifies a template-id by its scope: `ns::v<T>` reads `ns::v`', () => {
+        const dir = tmp({
+            'v.hpp': [
+                'namespace app {',
+                'namespace internal {',
+                'template<typename... T>',
+                'inline constexpr bool check_v = sizeof...(T) == 1;',
+                '}',
+                'template<typename... T>',
+                'bool run() {',
+                '  if (internal::check_v<T...> || false) return true;',
+                '  return false;',
+                '}',
+                '}',
+                'namespace other { template<typename T> inline constexpr bool check_v = false; }',
+                'bool g() { return other::check_v<int>; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('check_v', { file: 'v.hpp', line: 4 }).valueAccesses;
+            assert.deepStrictEqual(band.byFile.flatMap(group => group.sites.map(site => site.line)), [8]);
+            assert.ok(!band.unverifiedSites.some(site => site.line === 13), JSON.stringify(band.unverifiedSites));
+        } finally { rm(dir); }
+    });
+});
