@@ -331,7 +331,7 @@ describe('perf: cross-operation parsed-tree cache', () => {
 
             fs.appendFileSync(filePath, '\nexport const changed = true;\n');
             index.build(null, { forceRebuild: true, quiet: true, workers: 0 });
-            assert.strictEqual(index._parsedTreeCache.has(filePath), false,
+            assert.strictEqual(index._parsedTreeKeys.has(filePath), false,
                 'incremental rebuild must evict a changed file tree');
 
             const changedContent = fs.readFileSync(filePath, 'utf8');
@@ -3437,6 +3437,191 @@ describe('fix #422: macro expansion and call derivation in fresh workers', () =>
             assert.strictEqual(disabled.expansionWorkers, 0);
             assert.strictEqual(disabled.index.lastBuildWorkerLimit, 0);
             assert.strictEqual(indexSnapshot(disabled.index), indexSnapshot(inPlace.index));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #435: query-board costs without answer changes', () => {
+    const countParses = (language, run) => {
+        const parser = require('../languages').getParser(language);
+        const original = parser.parse;
+        let parses = 0;
+        parser.parse = function (...args) { parses++; return original.apply(this, args); };
+        try { run(); } finally { parser.parse = original; }
+        return parses;
+    };
+
+    it('cpp: an aliased type query looks up only spellings whose alias closure names the type', () => {
+        const dir = tmp({ 'b.cpp': 'struct Box { Box(int v) { } };\ntypedef Box BoxAlias;\ntypedef BoxAlias BoxAlias2;\n' +
+            'typedef int Other;\nint f(int v) { return v; }\nint g() { return f(1) + f(2) + f(3); }\n' +
+            'Box h() { return Box(4); }\nBoxAlias k() { return BoxAlias(5); }\nBoxAlias2 m() { return BoxAlias2(6); }\n' +
+            'Other n() { return Other(7); }\n' });
+        try {
+            const index = idx(dir);
+            const constructors = require('../core/constructor-calls');
+            const original = constructors.constructionAliasBinding;
+            const spelled = [];
+            constructors.constructionAliasBinding = (i, file, call, ...rest) => { spelled.push(call.name); return original(i, file, call, ...rest); };
+            let lines;
+            try {
+                const box = index.symbols.get('Box').find(def => def.type === 'struct');
+                lines = index.findCallers('Box', { targetDefinitions: [box], collectAccount: true }).map(site => site.line);
+            } finally { constructors.constructionAliasBinding = original; }
+            assert.deepStrictEqual(lines, [7, 8, 9]);
+            assert.deepStrictEqual([...new Set(spelled)].sort(), ['Box', 'BoxAlias', 'BoxAlias2']);
+            // The backward closure is the forward closure read the other way.
+            const reaching = constructors.constructionSpellingsReaching(index, ['Box']);
+            for (const spelling of ['Box', 'BoxAlias', 'BoxAlias2', 'Other', 'f']) {
+                assert.strictEqual(reaching.has(spelling), constructors.constructionTypeNames(index, spelling).includes('Box'), spelling);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('cpp: an omitted base initializer naming another class captures no witness for this one', () => {
+        const dir = tmp({ 'b.cpp': 'namespace a { struct Base { Base() {} }; }\n' +
+            'namespace b { struct Base { Base() {} };\nstruct Child : Base { Child(int v) { (void)v; } }; }\n' });
+        try {
+            const index = idx(dir);
+            const { provenanceWork } = require('../core/provenance-overload');
+            const { captureTypeLookup } = require('../core/provenance-type');
+            const file = path.join(dir, 'b.cpp');
+            const call = require('../core/callers').getCachedCalls(index, file).find(record => record.implicitBase);
+            const header = call.implicitBase.header;
+            const query = { file, relativePath: 'b.cpp', line: header.line, column: header.column, name: call.name,
+                qualifier: call.constructorQualifier || null, arity: call.implicitBase.arity, position: header, construction: true };
+            const [other, own] = index.symbols.get('Base').filter(def => def.type === 'struct')
+                .sort((x, y) => x.startLine - y.startLine);
+            index._beginOp();
+            try {
+                const before = provenanceWork().captures;
+                assert.strictEqual(captureTypeLookup(index, query, other), null);
+                assert.strictEqual(provenanceWork().captures, before, 'no witness view for the class the header does not name');
+                assert.ok(captureTypeLookup(index, query, own), 'the class the header names is still captured');
+            } finally { index._endOp(); }
+            const [first, second] = index.symbols.get('Base').filter(def => def.type === 'constructor')
+                .sort((x, y) => x.startLine - y.startLine);
+            assert.deepStrictEqual(index.findCallers('Base', { targetDefinitions: [first], collectAccount: true })
+                .map(site => site.line), []);
+            assert.deepStrictEqual(index.findCallers('Base', { targetDefinitions: [second], collectAccount: true })
+                .map(site => site.line), [3]);
+        } finally { rm(dir); }
+    });
+
+    it('enclosing callables from the per-line index equal the symbol scan', () => {
+        const lines = ['class Outer {'];
+        for (let i = 0; i < 12; i++) lines.push(`    void M${i}(int v) {`, `        System.Func<int, int> f${i} = x => x + v;`, '        Use(f' + i + '(v));', '    }');
+        lines.push('    void Use(int v) { }', '}');
+        const dir = tmp({ 'A.cs': lines.join('\n') + '\n' });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'A.cs');
+            const scan = [];
+            for (let line = 1; line <= lines.length; line++) scan.push(index.findEnclosingFunction(file, line, true)?.startLine ?? null);
+            const calls = require('../core/callers').getCachedCalls(index, file);
+            const scanCalls = calls.map(call => index.findEnclosingFunction(file, call.line, true, call)?.startLine ?? null);
+            index._beginOp();
+            try {
+                const indexed = [];
+                for (let line = 1; line <= lines.length; line++) indexed.push(index.findEnclosingFunction(file, line, true)?.startLine ?? null);
+                assert.deepStrictEqual(indexed, scan);
+                assert.deepStrictEqual(calls.map(call => index.findEnclosingFunction(file, call.line, true, call)?.startLine ?? null), scanCalls);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
+    it('a file read in two grammars keeps both persistent trees', () => {
+        const dir = tmp({ 'w.h': 'struct W { int v; };\n', 'w.cpp': '#include "w.h"\nint f() { W w; return w.v; }\n' });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'w.h');
+            const content = fs.readFileSync(file, 'utf8');
+            const read = language => { index._beginOp(); try { return index._getParsedTree(file, content, language); } finally { index._endOp(); } };
+            const c = read('c');
+            const cpp = read('cpp');
+            assert.notStrictEqual(c, cpp);
+            assert.strictEqual(read('c'), c, 'a C read after a C++ read reuses the C tree');
+            assert.strictEqual(read('cpp'), cpp);
+            index.removeFileSymbols(file);
+            assert.strictEqual(index._parsedTreeKeys.has(file), false, 'removing the file evicts every grammar');
+        } finally { rm(dir); }
+    });
+
+    it('closed query bodies: the one-pass body ranges equal the parent-chain walk', () => {
+        const { getParser, safeParse, langTraits } = require('../languages');
+        const { bodyRangesForTest } = require('../core/query-bodies');
+        const walk = (tree, kinds) => {
+            const ranges = [];
+            for (const body of tree.rootNode.descendantsOfType('block')) {
+                if (body.hasError || body.firstChild?.type !== '{' || body.lastChild?.type !== '}') continue;
+                let damaged = false;
+                for (let parent = body.parent; parent; parent = parent.parent) {
+                    if (parent.type === 'ERROR' || (parent.type === 'block' || kinds.has(parent.type)) && parent.hasError) { damaged = true; break; }
+                }
+                if (!damaged) ranges.push([body.startIndex + 1, body.endIndex - 1]);
+            }
+            return ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+        };
+        for (const [language, source] of [
+            ['go', 'package p\nfunc a() { if x { y() } }\nfunc b() { { z() }\nfunc c() { w( }\nfunc d() { { q() } }\n'],
+            ['java', 'class A { void a() { if (x) { y(); } } void b() { { z(); } void c() { w(; } void d() { { q(); } } }\n'],
+            ['csharp', 'class A { void B() { { z(); } } void C() { w(; } void D() { if (x) { y(); } } }\n'],
+        ]) {
+            const kinds = new Set(langTraits(language).closedQueryBodies);
+            for (const text of [source, source.replace(/\(;|\( \}/g, '(); }')]) {
+                const tree = safeParse(getParser(language), text);
+                assert.deepStrictEqual(bodyRangesForTest(tree, kinds), walk(tree, kinds), `${language}: ${text}`);
+            }
+        }
+    });
+
+    it('rust: a macro template name is looked up only in files that invoke the macro', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "w"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub mod a;\npub mod b;\npub mod c;\npub struct Widget;\n#[macro_export]\nmacro_rules! make { () => { Widget } }\n',
+            'src/a.rs': 'use crate::Widget;\npub fn a() -> Widget { make!() }\n',
+            'src/b.rs': 'pub fn make() -> u8 { 1 }\npub fn other() -> u8 { make() }\n',
+            'src/c.rs': 'use crate::Widget;\npub fn c() -> Widget { make /* spaced */ !() }\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('Widget').find(d => d.type === 'struct');
+            const { TypeReferenceResolver } = require('../core/type-references');
+            let sites;
+            index._beginOp();
+            try {
+                const parses = countParses('rust', () => {
+                    sites = new TypeReferenceResolver(index, def, 'Widget').rustMacroInvocations('make');
+                });
+                assert.strictEqual(parses, 2, 'b.rs spells `make` but never invokes it');
+            } finally { index._endOp(); }
+            assert.deepStrictEqual(sites.map(site => `${path.basename(site.file)}:${site.line}`), ['a.rs:2', 'c.rs:2']);
+        } finally { rm(dir); }
+    });
+
+    it('a ranking option that is not plain data shares one class read across a class\'s constructors', () => {
+        const dir = tmp({ 'p/Box.java': 'package p;\npublic class Box { public Box() { } public Box(int v) { } }\n',
+            'p/Use.java': 'package p;\npublic class Use { static Box a() { return new Box(1); } static Box b() { return new Box(); } }\n' });
+        try {
+            const index = idx(dir);
+            const constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            assert.strictEqual(constructors.length, 2);
+            const original = index.findCallers.bind(index);
+            let classReads = 0;
+            index.findCallers = (name, options) => {
+                if (options?.constructorProjectionSource) classReads++;
+                return original(name, options);
+            };
+            const candidateFiles = new Set(index.files.keys());
+            const answers = [];
+            index._beginOp();
+            try {
+                for (const target of constructors) {
+                    answers.push(original('Box', { targetDefinitions: [target], collectAccount: true, candidateFiles })
+                        .map(site => site.line));
+                }
+            } finally { index._endOp(); delete index.findCallers; }
+            assert.strictEqual(classReads, 1);
+            assert.deepStrictEqual(answers, [[2], [2]]);
         } finally { rm(dir); }
     });
 });

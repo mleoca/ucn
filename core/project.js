@@ -59,6 +59,32 @@ const symbolsByNameAndLine = new WeakMap();
 /**
  * ProjectIndex - Manages symbol table for a project
  */
+// The callables of a file spanning each line, in symbol order, for a file
+// whose enclosing-function lookups miss often within one operation (fix
+// #435: a C# type query looked every record of a file up against every
+// symbol of the file). Fewer lookups scan the symbols as before.
+const ENCLOSING_LINE_INDEX = new WeakMap(); // per-operation line cache -> { misses, lines }
+const ENCLOSING_INDEX_AFTER = 16;
+function enclosingCandidates(byLine, fileEntry, lineNum) {
+    let state = ENCLOSING_LINE_INDEX.get(byLine);
+    if (!state) ENCLOSING_LINE_INDEX.set(byLine, state = { misses: 0, lines: null, symbols: null });
+    if (!state.lines || state.symbols !== fileEntry.symbols) {
+        if (++state.misses <= ENCLOSING_INDEX_AFTER) return fileEntry.symbols;
+        const lines = new Map();
+        for (const symbol of fileEntry.symbols) {
+            if (!isCallableMember(symbol) || !Number.isInteger(symbol.startLine) || !Number.isInteger(symbol.endLine)) continue;
+            for (let line = symbol.startLine; line <= symbol.endLine; line++) {
+                let list = lines.get(line);
+                if (!list) lines.set(line, list = []);
+                list.push(symbol);
+            }
+        }
+        state.lines = lines;
+        state.symbols = fileEntry.symbols;
+    }
+    return state.lines.get(lineNum) || [];
+}
+
 class ProjectIndex {
     /**
      * Create a new ProjectIndex
@@ -102,7 +128,8 @@ class ProjectIndex {
         this._opCppTypeCategoryCache = null; // per-operation normalized C++ parameter categories
         this._opDerefPairs = null;      // per-operation Rust Deref identity pairs
         this._opAliasPairs = null;      // per-operation language type-alias identity pairs
-        this._parsedTreeCache = new Map(); // cross-operation LRU: filePath -> immutable tree entry
+        this._parsedTreeCache = new Map(); // cross-operation LRU: `${language}\0${filePath}` -> immutable tree entry
+        this._parsedTreeKeys = new Map(); // filePath -> its keys in _parsedTreeCache
         this._parsedTreeCacheSourceBytes = 0;
         // Cross-operation, content-hash-keyed usage classifications. Account
         // queries often ask several projections for the same hot symbol; the
@@ -249,37 +276,58 @@ class ProjectIndex {
         }
     }
 
-    /** Remove one persistent parsed tree, deferring disposal if an operation still uses it. */
-    _evictParsedTree(filePath) {
-        const entry = this._parsedTreeCache.get(filePath);
-        if (!entry) return;
-        this._parsedTreeCache.delete(filePath);
-        this._parsedTreeCacheSourceBytes -= entry.sourceBytes;
-        if (this._opTreeCache?.get(filePath) === entry.tree) {
-            this._opTransientTrees?.add(entry.tree);
-        } else {
-            entry.tree?.delete?.();
+    /**
+     * Remove a file's persistent parsed trees (every grammar it was read in,
+     * or only `language`'s), deferring disposal if an operation still uses one.
+     */
+    _evictParsedTree(filePath, language = null) {
+        const keys = this._parsedTreeKeys.get(filePath);
+        if (!keys) return;
+        for (const key of [...keys]) {
+            const entry = this._parsedTreeCache.get(key);
+            if (!entry || (language !== null && entry.language !== language)) continue;
+            this._parsedTreeCache.delete(key);
+            keys.delete(key);
+            this._parsedTreeCacheSourceBytes -= entry.sourceBytes;
+            if (this._opTreeCache?.get(filePath) === entry.tree) {
+                this._opTransientTrees?.add(entry.tree);
+            } else {
+                entry.tree?.delete?.();
+            }
         }
+        if (keys.size === 0) this._parsedTreeKeys.delete(filePath);
+    }
+
+    /** The persistent tree of a file in one grammar, or undefined. */
+    _persistentParsedTree(filePath, language) {
+        return this._parsedTreeCache.get(`${language}\0${filePath}`);
     }
 
     /** Dispose every cross-operation tree. Used when an index is replaced from cache. */
     _clearParsedTreeCache() {
-        for (const filePath of [...this._parsedTreeCache.keys()]) {
+        for (const filePath of [...this._parsedTreeKeys.keys()]) {
             this._evictParsedTree(filePath);
         }
         this._parsedTreeCacheSourceBytes = 0;
     }
 
+    // Keyed by grammar and path: a file read in two grammars (a header a
+    // reader detects as C, the index as C++) keeps both trees instead of
+    // evicting one for the other on every alternating read (fix #435).
     _cacheParsedTree(filePath, language, tree, sourceBytes) {
         const fileHash = this.files.get(filePath)?.hash || null;
-        this._evictParsedTree(filePath);
-        this._parsedTreeCache.set(filePath, {
-            tree, language, fileHash, sourceBytes,
+        this._evictParsedTree(filePath, language);
+        const key = `${language}\0${filePath}`;
+        this._parsedTreeCache.set(key, {
+            tree, language, fileHash, sourceBytes, filePath,
         });
+        if (!this._parsedTreeKeys.has(filePath)) this._parsedTreeKeys.set(filePath, new Set());
+        this._parsedTreeKeys.get(filePath).add(key);
         this._parsedTreeCacheSourceBytes += sourceBytes;
         while (this._parsedTreeCache.size > PARSED_TREE_CACHE_MAX_ENTRIES ||
             this._parsedTreeCacheSourceBytes > PARSED_TREE_CACHE_MAX_SOURCE_BYTES) {
-            this._evictParsedTree(this._parsedTreeCache.keys().next().value);
+            const oldest = this._parsedTreeCache.values().next().value;
+            this._evictParsedTree(oldest.filePath, oldest.language);
         }
     }
 
@@ -293,9 +341,8 @@ class ProjectIndex {
      * fall back to parsing themselves.
      */
     _peekParsedTree(filePath, language) {
-        const cached = this._parsedTreeCache.get(filePath);
-        return cached && cached.language === language &&
-            cached.fileHash === (this.files.get(filePath)?.hash || null)
+        const cached = this._persistentParsedTree(filePath, language);
+        return cached && cached.fileHash === (this.files.get(filePath)?.hash || null)
             ? cached.tree : null;
     }
 
@@ -304,17 +351,17 @@ class ProjectIndex {
         const cached = this._opTreeCache.get(filePath);
         if (cached !== undefined) return cached;
 
-        const persistent = this._parsedTreeCache.get(filePath);
+        const persistent = this._persistentParsedTree(filePath, language);
         const currentHash = this.files.get(filePath)?.hash || null;
-        if (persistent && persistent.language === language &&
-            persistent.fileHash === currentHash) {
+        if (persistent && persistent.fileHash === currentHash) {
             // LRU touch.
-            this._parsedTreeCache.delete(filePath);
-            this._parsedTreeCache.set(filePath, persistent);
+            const key = `${language}\0${filePath}`;
+            this._parsedTreeCache.delete(key);
+            this._parsedTreeCache.set(key, persistent);
             this._opTreeCache.set(filePath, persistent.tree);
             return persistent.tree;
         }
-        if (persistent) this._evictParsedTree(filePath);
+        if (persistent) this._evictParsedTree(filePath, language);
 
         let tree;
         try {
@@ -2600,7 +2647,7 @@ class ProjectIndex {
         let best = null;
         let bestSourceScope = false;
         // An arrow-function class field is a function body (fix #423).
-        for (const symbol of fileEntry.symbols) {
+        for (const symbol of byLine ? enclosingCandidates(byLine, fileEntry, lineNum) : fileEntry.symbols) {
             if (isCallableMember(symbol) &&
                 symbol.startLine <= lineNum &&
                 symbol.endLine >= lineNum) {

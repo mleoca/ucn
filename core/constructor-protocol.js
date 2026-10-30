@@ -49,7 +49,16 @@ function collectConstructorProtocol(index, owner, seen = new Set()) {
     const tree = shared || safeParse(getParser(language), content);
     if (!tree) return null;
     try {
-        const nodes = tree.rootNode.descendantsOfType(protocol.classNode).filter(node =>
+        // One native walk per tree and operation lists its class nodes for
+        // every owner a query reads (fix #435: one walk per owner).
+        const memo = typeof index._opMemo === 'function' && !index.isProvenanceFactIndex
+            ? index._opMemo('protocolClassNodes', () => new WeakMap()) : null;
+        let classNodes = memo?.get(tree);
+        if (!classNodes) {
+            classNodes = tree.rootNode.descendantsOfType(protocol.classNode);
+            memo?.set(tree, classNodes);
+        }
+        const nodes = classNodes.filter(node =>
             node.childForFieldName('name')?.text === owner.name && node.startPosition.row + 1 >= owner.startLine &&
             node.endPosition.row + 1 === owner.endLine);
         if (nodes.length !== 1) return null;

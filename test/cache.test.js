@@ -1122,7 +1122,7 @@ describe('fix #415: persisted local value proofs preserve fresh rename decisions
                     assert.ok(!tree.rootNode.descendantsOfType(['string_literal', 'interpreted_string_literal'])
                         .some(node => node.text.includes('雪😀')));
                     assert.ok(!loaded._opTreeCache.has(file));
-                    assert.ok(!loaded._parsedTreeCache.has(file));
+                    assert.ok(!loaded._parsedTreeKeys.has(file));
                     const complete = loaded._getParsedTree(file, fixture.use, entry.language);
                     assert.ok(complete.rootNode.text.includes('return "雪😀"'), 'another name still reads the complete body');
                 } finally { loaded._endOp(); }

@@ -5,20 +5,35 @@ const { getUsageResult, storeUsageResult } = require('./cache');
 const { indexedContent, syntaxMode } = require('./source-memo');
 const localNameTrees = new WeakSet();
 
-/** Bodies whose declarations cannot bind a name outside their own scope. */
+/**
+ * Bodies whose declarations cannot bind a name outside their own scope.
+ * A block is damaged when an enclosing ERROR node or an enclosing block or
+ * callable with an error holds it. One native query lists those nodes in
+ * document order; a stack of the open ones stands for each block's
+ * ancestors (fix #435: every block walked its parent chain). In document
+ * order a node that starts before an open non-empty node ends lies inside it.
+ */
 function bodyRanges(tree, kinds) {
     if (!tree) return null;
     const ranges = [];
-    for (const body of tree.rootNode.descendantsOfType('block')) {
-        if (body.hasError || body.firstChild?.type !== '{' || body.lastChild?.type !== '}') continue;
-        let damaged = false;
-        for (let parent = body.parent; parent; parent = parent.parent) {
-            if (parent.type === 'ERROR' || (parent.type === 'block' || kinds.has(parent.type)) && parent.hasError) {
-                damaged = true;
-                break;
+    if (!tree.rootNode.hasError) {
+        // No node of an error-free tree has an error.
+        for (const body of tree.rootNode.descendantsOfType('block')) {
+            if (body.firstChild?.type === '{' && body.lastChild?.type === '}') {
+                ranges.push([body.startIndex + 1, body.endIndex - 1]);
             }
         }
-        if (!damaged) ranges.push([body.startIndex + 1, body.endIndex - 1]);
+        return ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+    }
+    const open = []; // [endIndex, damages descendants]
+    for (const node of tree.rootNode.descendantsOfType(['block', 'ERROR', ...kinds])) {
+        const start = node.startIndex, end = node.endIndex;
+        while (open.length && open[open.length - 1][0] <= start) open.pop();
+        const damaged = open.some(entry => entry[1]);
+        const hasError = node.hasError;
+        if (node.type === 'block' && !damaged && !hasError && node.firstChild?.type === '{' &&
+            node.lastChild?.type === '}') ranges.push([start + 1, end - 1]);
+        if (end > start) open.push([end, node.type === 'ERROR' || hasError]);
     }
     // Bindings in a block stay in that block. Retain nested ranges so a
     // query-bearing function can still skip unrelated sibling scopes.
@@ -104,8 +119,8 @@ function localQueryTree(index, file, entry, language, name, content) {
     const key = '\x01body-ranges';
     const value = getUsageResult(index, file, key, mode);
     const ranges = readRanges(value, content);
-    const persistent = index._parsedTreeCache?.get(file);
-    const warm = index._opTreeCache?.has(file) || persistent?.language === language && persistent.fileHash === entry.hash;
+    const persistent = index._persistentParsedTree?.(file, language);
+    const warm = index._opTreeCache?.has(file) || persistent?.fileHash === entry.hash;
     const parser = getParser(language);
     if (ranges && !warm) {
         let complete = true;
@@ -135,4 +150,4 @@ function localQueryTree(index, file, entry, language, name, content) {
     return tree;
 }
 
-module.exports = { localQueryTree, isLocalNameTree: tree => localNameTrees.has(tree) };
+module.exports = { localQueryTree, isLocalNameTree: tree => localNameTrees.has(tree), bodyRangesForTest: bodyRanges };

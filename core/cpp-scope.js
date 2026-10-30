@@ -135,6 +135,17 @@ function _expandedNamespaceName(index, name, visible, depth = 0) {
 function _filePrefixes(index, file) {
     const state = _state(index);
     if (state.filePrefixes.has(file)) return state.filePrefixes.get(file);
+    // Every witness of an operation reads a file's macro scopes alike: a
+    // capture derives them once and records that derivation's reads (fix
+    // #435: each type-lookup capture re-derived them).
+    const transitions = index.isProvenanceFactIndex && typeof index.sharedRead === 'function'
+        ? index.sharedRead(`cpp-file-prefixes\0${file}`, view => _filePrefixesUncached(view, file))
+        : _filePrefixesUncached(index, file);
+    state.filePrefixes.set(file, transitions);
+    return transitions;
+}
+
+function _filePrefixesUncached(index, file) {
     const entry = index.files.get(file);
     const markers = entry?.macroScopeMarkers || [];
     let transitions = [];
@@ -152,7 +163,6 @@ function _filePrefixes(index, file) {
         for (const group of effect.opens || []) stack.push(group);
         transitions.push({ line: marker.line, prefix: stack.flat().join('::') });
     }
-    state.filePrefixes.set(file, transitions);
     return transitions;
 }
 

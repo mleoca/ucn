@@ -163,6 +163,31 @@ function constructionTypeNames(index, name) {
     return [...names];
 }
 
+// Every spelling whose alias closure (`constructionTypeNames`) holds one of
+// `typeNames`: the closure read backwards, to the same depth.
+function constructionSpellingsReaching(index, typeNames) {
+    const aliases = constructionAliases(index);
+    const reverse = new Map();
+    for (const [spelling, targets] of aliases) {
+        for (const target of targets) {
+            if (!reverse.has(target)) reverse.set(target, []);
+            reverse.get(target).push(spelling);
+        }
+    }
+    const reached = new Set(typeNames);
+    let frontier = [...reached];
+    for (let round = 0; round < 12 && frontier.length; round++) {
+        const next = [];
+        for (const current of frontier) {
+            for (const spelling of reverse.get(current) || []) {
+                if (!reached.has(spelling)) { reached.add(spelling); next.push(spelling); }
+            }
+        }
+        frontier = next;
+    }
+    return reached;
+}
+
 function constructionTypeCandidates(index, name) {
     return projectFact(index, `construction-type-names:${name}`, live => constructionTypeNames(live, name))
         .flatMap(current => index.symbols.get(current) || [])
@@ -607,20 +632,29 @@ function classConstructionCalls(index, owner, options) {
         constructorProjectionSource: true, targetDefinitions: [owner], collectAccount: true,
         includeMethods: true, needsTotal: true });
     if (options.profile || options.stats) return read();
-    let key;
-    try {
-        key = identityKey(declarationIdentity(owner)) + '\0' + JSON.stringify(Object.keys(options).sort()
-            .filter(name => name !== 'targetDefinitions' && name !== 'profile')
-            .map(name => [name, options[name]]), (_name, value) => {
-                if (typeof value === 'function' || typeof value === 'symbol' || value && typeof value === 'object' &&
-                    !Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype) {
-                    throw new Error('unkeyed option');
-                }
-                return value;
-            });
-    } catch { return read(); }
     const memo = index._opMemo?.('classConstructionCalls', () => new Map());
     if (!memo) return read();
+    // An option that is not plain data (the candidate-file Set of a HOT
+    // ranking) is keyed by its identity within the operation; a function
+    // keeps its own read (fix #435: the key threw for a Set, so every
+    // constructor of a ranking re-read its class).
+    const identities = index._opMemo('classConstructionOptionIds', () => ({ ids: new WeakMap(), next: 0 }));
+    let unkeyed = false;
+    const key = identityKey(declarationIdentity(owner)) + '\0' + JSON.stringify(Object.keys(options).sort()
+        .filter(name => name !== 'targetDefinitions' && name !== 'profile')
+        .map(name => [name, options[name]]), (_name, value) => {
+            if (typeof value === 'function' || typeof value === 'symbol') {
+                unkeyed = true;
+                return null;
+            }
+            if (value && typeof value === 'object' && !Array.isArray(value) &&
+                Object.getPrototypeOf(value) !== Object.prototype) {
+                if (!identities.ids.has(value)) identities.ids.set(value, `\0object:${identities.next++}`);
+                return identities.ids.get(value);
+            }
+            return value;
+        });
+    if (unkeyed) return read();
     if (!memo.has(key)) memo.set(key, read());
     return memo.get(key);
 }
@@ -770,4 +804,4 @@ function projectConstructorCallers(index, name, options, result) {
 
 module.exports = { isConstructor, ownConstructors, isConstruction, constructionChoice, constructionTypeParameter,
     projectConstructorCallers, projectConstructorCalleeSites, constructionAliasNames, constructionAliasBinding, ownClassBinding,
-    constructionTypeCandidates, constructionAliasPossibilities, ownMembers };
+    constructionTypeCandidates, constructionTypeNames, constructionSpellingsReaching, constructionAliasPossibilities, ownMembers };

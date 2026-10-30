@@ -1078,6 +1078,40 @@ function findCallers(index, name, options = {}) {
         options.targetDefinitions || definitions);
     for (const aliasName of constructionAliasSurfaces) aliasNames.add(aliasName);
     const hasAliasSurfaces = aliasNames.size > 0;
+    // Type queries with alias surfaces (fix #435): the records of a file that
+    // can match in the visit loop below, read once per operation for the
+    // same name, surfaces and target names. A spelling matches through
+    // construction aliases when its alias closure holds a target's name (the
+    // test constructionAliasBinding applies to the targets it is given).
+    let aliasedVisit = null;
+    const aliasedTypeQueryVisits = (filePath, calls) => {
+        if (!aliasedVisit) {
+            const targetNames = [...new Set((options.targetDefinitions || definitions).map(def => def.name))]
+                .sort(codeUnitCompare);
+            const reaching = index._opMemo?.('constructionSpellingsReaching', () => new Map());
+            const reachKey = targetNames.join('\0');
+            let spellings = reaching?.get(reachKey);
+            if (!spellings) {
+                spellings = require('./constructor-calls').constructionSpellingsReaching(index, targetNames);
+                reaching?.set(reachKey, spellings);
+            }
+            aliasedVisit = { spellings,
+                key: JSON.stringify([name, [...aliasNames].sort(codeUnitCompare), targetNames]) };
+        }
+        const memo = index._opMemo?.('aliasedTypeQueryVisits', () => new Map());
+        const key = `${filePath}\0${aliasedVisit.key}`;
+        const saved = memo?.get(key);
+        if (saved && saved.calls === calls) return saved.visits;
+        const { spellings } = aliasedVisit;
+        const visits = calls.filter(call => call.ownClass || call.destructured || call.receiver === name ||
+            _callBearsName(call, name) || call.receiverIsTypeQualified || call.receiverMacroParam ||
+            call.constructorQualifier || call.implicitBase || aliasNames.has(call.name) ||
+            (call.resolvedName && aliasNames.has(call.resolvedName)) ||
+            (Array.isArray(call.resolvedNames) && call.resolvedNames.some(n => aliasNames.has(n))) ||
+            spellings.has(call.name));
+        memo?.set(key, { calls, visits });
+        return visits;
+    };
     // The local binding shadowing a bare reference reaches the pin only
     // when it is a pinned definition (the shared lexical rule, fix #403):
     // `new Helper()` in a closure nested in the function declaring
@@ -1390,8 +1424,21 @@ function findCallers(index, name, options = {}) {
             // (fix #403: the views ran for every call of every file).
             const typeQueryOnly = targetIsTypeQuery && !hasAliasSurfaces;
             const bareReachesMethods = typeQueryOnly && langTraits(fileEntry.language)?.bareCallReachesMethods;
+            // A type query with alias surfaces visits every record of a file
+            // (a C++ record of any spelling may construct through an alias).
+            // A record matches below only by the name, an alias surface, a
+            // destructured key, a type-qualified or macro-parameter receiver,
+            // a qualified or omitted-base construction, or a spelling whose
+            // alias closure reaches a target's name; the views on the way
+            // change receivers only (C#'s rewrites can change what a receiver
+            // names, so C# files visit every record).
+            if (targetIsTypeQuery && hasAliasSurfaces && fileEntry.language !== 'csharp' &&
+                !typedViews && !index.isProvenanceFactIndex && visitCalls === calls) {
+                visitCalls = aliasedTypeQueryVisits(filePath, calls);
+            }
+            const inheritedOverloadSignatures = !!langTraits(fileEntry.language)?.inheritedOverloadSignatures;
             for (let call of visitCalls) {
-                if (langTraits(fileEntry.language)?.inheritedOverloadSignatures) {
+                if (inheritedOverloadSignatures) {
                     call = { ...call, argumentFile: fileEntry.relativePath };
                 }
                 // A construction through a method's own receiver (`cls(..)`,

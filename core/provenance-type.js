@@ -352,6 +352,45 @@ function resolveAt(index, query, owner, definition, resolver) {
     return !index.hasMissingProvenanceFacts;
 }
 
+// The classes a C/C++ construction at a source position names (an omitted
+// base initializer's header), looked up once per operation on the live
+// index. A position lookup reads the site's tree node and the index, never
+// the pinned type, so every owner a query tries shares it. null when the
+// recorded position no longer names a node (the lookup fails for every
+// owner).
+function cppPositionConstructionClasses(index, query) {
+    const memo = index._opMemo?.('cppPositionConstructionClasses', () => new Map());
+    const at = query.position;
+    const key = `${query.file}\0${query.line}\0${query.column}\0${query.name}\0${query.qualifier ?? ''}\0` +
+        `${at.start}\0${at.end}\0${at.nodeType}`;
+    if (memo?.has(key)) return memo.get(key);
+    const language = index.files.get(query.file)?.language;
+    const tree = parsedSource(language, index._readFile(query.file));
+    let node = tree?.rootNode.descendantForIndex(at.start);
+    while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.nodeType)) node = node.parent;
+    let classes = null;
+    if (node && node.startPosition.row + 1 === query.line && node.startPosition.column === query.column) {
+        const { resolveQualifier, includeClosure } = require('./cpp-scope');
+        const context = require('./type-references').cppSiteContextOf(index, node, query.file, query.file, query.line);
+        const found = resolveQualifier(index, { file: query.file, line: query.line, ...context },
+            query.qualifier ? `${query.qualifier}::${query.name}` : query.name, includeClosure(index, query.file));
+        classes = found.kind === 'type' && found.visible ? found.classes : [];
+    }
+    memo?.set(key, classes);
+    return classes;
+}
+
+// A position-based C/C++ construction lookup (`resolve`) holds only when the
+// site's classes are exactly the owner; when they are not, no witness can be
+// captured for this owner and none is attempted.
+function cppPositionConstructionDenied(index, query, identity) {
+    if (index.isProvenanceFactIndex || !query.construction || !query.position || query.functional ||
+        query.ownClass || query.nameScopeOnly || query.localShadow) return false;
+    if (!require('../languages').langTraits(index.files.get(query.file)?.language)?.functionalTypeConstruction) return false;
+    const classes = cppPositionConstructionClasses(index, query);
+    return !classes || !(classes.length > 0 && classes.every(def => sameDeclaration(declarationIdentity(def), identity)));
+}
+
 function captureTypeLookup(index, query, owner) {
     const identity = declarationIdentity(owner);
     // A rename visits one construction once for each slot member. Its type
@@ -374,6 +413,10 @@ function captureTypeLookup(index, query, owner) {
         // The replay of this caller's spelling is the saved capture's.
         seedReplay(saved.reads, JSON.stringify(['type-lookup', query, identity]), true);
         return { query: globalThis.structuredClone(query), owner: { ...saved.owner }, reads: saved.reads };
+    }
+    if (cppPositionConstructionDenied(index, query, identity)) {
+        memo?.set(key, null);
+        return null;
     }
     const reads = {};
     let result = null;

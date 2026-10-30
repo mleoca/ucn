@@ -43,6 +43,7 @@ const { sameNode } = require('../languages/utils');
 const { jsPatternTarget } = require('../languages/lexical-scope');
 const { classKeyOf } = require('./class-identity');
 const { projectHas } = require('./provenance-overload');
+const { indexedContent } = require('./source-memo');
 
 /** The namespaces (packages) a language's files declare, with each dotted prefix. */
 function declaredNamespacePrefixes(index, language) {
@@ -1004,6 +1005,131 @@ function rustModulePath(index, d) {
 
 // ── Resolution ───────────────────────────────────────────────────────────
 
+// Whether a word occurrence of `name` in Rust source is followed, past
+// whitespace and comments, by `!`: what an invocation's path needs before
+// its token tree in a source that parses without error.
+function spelledBeforeBang(source, name) {
+    // ASCII word characters only: anything else around the name (Unicode
+    // identifiers, Unicode whitespace) keeps the file.
+    const word = c => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+    for (let at = source.indexOf(name); at >= 0; at = source.indexOf(name, at + 1)) {
+        if (at > 0 && word(source.charCodeAt(at - 1)) || word(source.charCodeAt(at + name.length))) continue;
+        let i = at + name.length;
+        for (;;) {
+            const c = source.charCodeAt(i);
+            if (c > 127) return true;
+            if (c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12) { i++; continue; }
+            if (c === 47 && source.charCodeAt(i + 1) === 47) {
+                const end = source.indexOf('\n', i);
+                if (end < 0) { i = source.length; break; }
+                i = end + 1;
+                continue;
+            }
+            if (c === 47 && source.charCodeAt(i + 1) === 42) {
+                let depth = 1;
+                i += 2;
+                while (i < source.length && depth > 0) {
+                    if (source.charCodeAt(i) === 47 && source.charCodeAt(i + 1) === 42) { depth++; i += 2; }
+                    else if (source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47) { depth--; i += 2; }
+                    else i++;
+                }
+                continue;
+            }
+            break;
+        }
+        if (source.charCodeAt(i) === 33) return true;
+    }
+    return false;
+}
+
+// The innermost class around a line by the index's declarations.
+function enclosingClassIn(index, file, line) {
+    const entry = index.files.get(file);
+    let best = null;
+    for (const s of entry?.symbols || []) {
+        if (s.startLine > line || s.endLine < line) continue;
+        const isClass = TYPE_DECL_KINDS.has(s.type) && s.type !== 'type';
+        const candidate = isClass ? s.name : (s.className || null);
+        if (!candidate) continue;
+        if (!best || (s.endLine - s.startLine) < (best.span)) {
+            best = { name: candidate, span: s.endLine - s.startLine };
+        }
+    }
+    return best?.name || null;
+}
+
+// The namespace and class a C/C++ site's lookup starts in: from the site's
+// own tree node when it has one (no pinned type takes part).
+function cppSiteContextOf(index, siteNode, siteFile, file, line) {
+    const node = siteNode && siteFile === file && siteNode.startPosition.row + 1 === line
+        ? siteNode : null;
+    const { macroNamespacePrefixAt, namespaceAt } = require('./cpp-scope');
+    if (!node) return { namespace: namespaceAt(index, file, line), className: enclosingClassIn(index, file, line) };
+    const namespaces = [];
+    const classes = [];
+    let memberOf = null;
+    let recovered = false;
+    for (let current = node.parent; current; current = current.parent) {
+        if (current.type === 'ERROR') recovered = true;
+        if (current.type === 'namespace_definition') {
+            const nameNode = current.childForFieldName('name');
+            if (nameNode) namespaces.unshift(textOf(nameNode));
+        } else if (C_TYPE_SPECIFIERS.has(current.type)) {
+            const body = current.childForFieldName('body');
+            const nameNode = current.childForFieldName('name');
+            if (body && contains(body, node) && nameNode) {
+                // Specializations keep their arguments (`Acc<double>`), as
+                // the index names them; an out-of-class nested definition
+                // (`struct List<K>::Node`) is in its owner's scope too
+                // (fix #396).
+                const segments = textOf(nameNode).split('::');
+                classes.unshift(segments.slice(-2).join('::'));
+            }
+        } else if (current.type === 'function_definition' && !memberOf && classes.length === 0) {
+            let declarator = current.childForFieldName('declarator');
+            while (declarator && declarator.type !== 'function_declarator' && declarator.childForFieldName?.('declarator')) {
+                declarator = declarator.childForFieldName('declarator');
+            }
+            const qualified = declarator?.childForFieldName?.('declarator');
+            if (qualified?.type === 'qualified_identifier') {
+                const scope = qualified.childForFieldName('scope');
+                // `List<K>::Node::f`: Node's scope, then List's (fix #396).
+                if (scope) memberOf = qualifiedScopeText(qualified) || textOf(scope).split('::').pop();
+            }
+        }
+    }
+    // A class body the raw tree lost (macro-heavy headers, conditional
+    // members): the indexed nested classes around the line (parsed from
+    // the recovered source) still name their owners (fix #396: `union
+    // Data` inside `GenericValue`).
+    if (classes.length > 0) {
+        const symbols = index.files.get(file)?.symbols || [];
+        const around = name => symbols.find(s => s.name === name && TYPE_DECL_KINDS.has(s.type) &&
+            s.startLine <= line && line <= s.endLine);
+        for (let owner = around(classes[0].split('::').pop())?.enclosingType, depth = 0;
+            owner && depth < 8 && !classes.includes(owner); depth++) {
+            classes.unshift(owner);
+            owner = around(owner)?.enclosingType;
+        }
+    }
+    const prefix = macroNamespacePrefixAt(index, file, line);
+    const own = namespaces.join('::');
+    let namespace = prefix && own ? `${prefix}::${own}` : prefix || own;
+    let className = classes.length > 0 ? classes.join('::') : memberOf;
+    // Macro-heavy code can break the raw tree so that an enclosing
+    // namespace block closes early; the indexed declarations around the
+    // line (parsed from the recovered source) still carry it.
+    const indexed = namespaceAt(index, file, line);
+    if (indexed && indexed !== namespace && (namespace === '' || own === '' ||
+        indexed.endsWith(`::${own}`) || indexed.startsWith(`${namespace}::`) ||
+        (recovered && indexed.startsWith(namespace)))) namespace = indexed;
+    // Out-of-line member bodies: the index (parsed from the recovered
+    // source) knows their class even when a macro before the return type
+    // broke the literal head; the head's own qualifier is the fallback.
+    if (classes.length === 0) className = enclosingClassIn(index, file, line) || memberOf;
+    return { namespace, className };
+}
+
 class TypeReferenceResolver {
     constructor(index, def, name) {
         this.index = index;
@@ -1581,19 +1707,20 @@ class TypeReferenceResolver {
             if (entry?.language !== 'rust') continue;
             let content;
             try { content = this.index._readFile(file); } catch { continue; }
+            // A cleanly parsed file holds an invocation of the macro only
+            // where its name token is followed by `!` (fix #435: every file
+            // spelling a type-like macro name was parsed and walked).
+            if (!entry.parseErrorRegions && indexedContent(this.index, file, entry, content) &&
+                !spelledBeforeBang(content, macroName)) continue;
             const tree = this.index._getParsedTree?.(file, content, 'rust') || safeParse(getParser('rust'), content);
             if (!tree) continue;
             const rows = new Set(lineNumbers.map(n => n - 1));
-            const stack = [tree.rootNode];
-            while (stack.length > 0) {
-                const current = stack.pop();
-                if (current.type === 'macro_invocation' && rows.has(current.startPosition.row)) {
-                    const macro = current.childForFieldName('macro');
-                    if (macro && macro.text.split('::').pop() === macroName) {
-                        sites.push({ file, line: current.startPosition.row + 1 });
-                    }
+            for (const current of tree.rootNode.descendantsOfType('macro_invocation')) {
+                if (!rows.has(current.startPosition.row)) continue;
+                const macro = current.childForFieldName('macro');
+                if (macro && macro.text.split('::').pop() === macroName) {
+                    sites.push({ file, line: current.startPosition.row + 1 });
                 }
-                for (let i = current.namedChildCount - 1; i >= 0; i--) stack.push(current.namedChild(i));
             }
         }
         this.memo.set(key, sites);
@@ -1691,20 +1818,7 @@ class TypeReferenceResolver {
 
     // ── C / C++ ──
 
-    enclosingClassAt(file, line) {
-        const entry = this.index.files.get(file);
-        let best = null;
-        for (const s of entry?.symbols || []) {
-            if (s.startLine > line || s.endLine < line) continue;
-            const isClass = TYPE_DECL_KINDS.has(s.type) && s.type !== 'type';
-            const candidate = isClass ? s.name : (s.className || null);
-            if (!candidate) continue;
-            if (!best || (s.endLine - s.startLine) < (best.span)) {
-                best = { name: candidate, span: s.endLine - s.startLine };
-            }
-        }
-        return best?.name || null;
-    }
+    enclosingClassAt(file, line) { return enclosingClassIn(this.index, file, line); }
 
     resolveCFamily(file, line, name, qualifierText, options = {}) {
         const entry = this.index.files.get(file);
@@ -1918,75 +2032,7 @@ class TypeReferenceResolver {
      * definition qualifies (`void Widget::f() {}`). Template headers and
      * other lines outside every indexed symbol keep their real scope.
      */
-    cppSiteContext(file, line) {
-        const node = this.siteNode && this.siteFile === file && this.siteNode.startPosition.row + 1 === line
-            ? this.siteNode : null;
-        const { macroNamespacePrefixAt, namespaceAt } = require('./cpp-scope');
-        if (!node) return { namespace: namespaceAt(this.index, file, line), className: this.enclosingClassAt(file, line) };
-        const namespaces = [];
-        const classes = [];
-        let memberOf = null;
-        let recovered = false;
-        for (let current = node.parent; current; current = current.parent) {
-            if (current.type === 'ERROR') recovered = true;
-            if (current.type === 'namespace_definition') {
-                const nameNode = current.childForFieldName('name');
-                if (nameNode) namespaces.unshift(textOf(nameNode));
-            } else if (C_TYPE_SPECIFIERS.has(current.type)) {
-                const body = current.childForFieldName('body');
-                const nameNode = current.childForFieldName('name');
-                if (body && contains(body, node) && nameNode) {
-                    // Specializations keep their arguments (`Acc<double>`), as
-                    // the index names them; an out-of-class nested definition
-                    // (`struct List<K>::Node`) is in its owner's scope too
-                    // (fix #396).
-                    const segments = textOf(nameNode).split('::');
-                    classes.unshift(segments.slice(-2).join('::'));
-                }
-            } else if (current.type === 'function_definition' && !memberOf && classes.length === 0) {
-                let declarator = current.childForFieldName('declarator');
-                while (declarator && declarator.type !== 'function_declarator' && declarator.childForFieldName?.('declarator')) {
-                    declarator = declarator.childForFieldName('declarator');
-                }
-                const qualified = declarator?.childForFieldName?.('declarator');
-                if (qualified?.type === 'qualified_identifier') {
-                    const scope = qualified.childForFieldName('scope');
-                    // `List<K>::Node::f`: Node's scope, then List's (fix #396).
-                    if (scope) memberOf = qualifiedScopeText(qualified) || textOf(scope).split('::').pop();
-                }
-            }
-        }
-        // A class body the raw tree lost (macro-heavy headers, conditional
-        // members): the indexed nested classes around the line (parsed from
-        // the recovered source) still name their owners (fix #396: `union
-        // Data` inside `GenericValue`).
-        if (classes.length > 0) {
-            const symbols = this.index.files.get(file)?.symbols || [];
-            const around = name => symbols.find(s => s.name === name && TYPE_DECL_KINDS.has(s.type) &&
-                s.startLine <= line && line <= s.endLine);
-            for (let owner = around(classes[0].split('::').pop())?.enclosingType, depth = 0;
-                owner && depth < 8 && !classes.includes(owner); depth++) {
-                classes.unshift(owner);
-                owner = around(owner)?.enclosingType;
-            }
-        }
-        const prefix = macroNamespacePrefixAt(this.index, file, line);
-        const own = namespaces.join('::');
-        let namespace = prefix && own ? `${prefix}::${own}` : prefix || own;
-        let className = classes.length > 0 ? classes.join('::') : memberOf;
-        // Macro-heavy code can break the raw tree so that an enclosing
-        // namespace block closes early; the indexed declarations around the
-        // line (parsed from the recovered source) still carry it.
-        const indexed = namespaceAt(this.index, file, line);
-        if (indexed && indexed !== namespace && (namespace === '' || own === '' ||
-            indexed.endsWith(`::${own}`) || indexed.startsWith(`${namespace}::`) ||
-            (recovered && indexed.startsWith(namespace)))) namespace = indexed;
-        // Out-of-line member bodies: the index (parsed from the recovered
-        // source) knows their class even when a macro before the return type
-        // broke the literal head; the head's own qualifier is the fallback.
-        if (classes.length === 0) className = this.enclosingClassAt(file, line) || memberOf;
-        return { namespace, className };
-    }
+    cppSiteContext(file, line) { return cppSiteContextOf(this.index, this.siteNode, this.siteFile, file, line); }
 
     // ── Qualified names ──
 
@@ -3549,6 +3595,7 @@ function csharpAttributeShortSites(index, def, name) {
 }
 
 module.exports = {
+    cppSiteContextOf,
     csharpAttributeShortSites,
     TYPE_RENAME_KINDS,
     isTypeRenamePin,
