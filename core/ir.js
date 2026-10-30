@@ -63,7 +63,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
     };
     const passthrough = [
         'docstring', 'sourceSpan', 'returnedFunctionResult', 'isFunctionVariable', 'paramTypes',
-        'isAsync', 'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent',
+        'isAsync', 'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'typeParameterConstraints', 'extends', 'implements', 'indent',
         'isNested', 'enclosingType', 'isMethod', 'memberType', 'fieldType', 'embedded',
         'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
         'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',

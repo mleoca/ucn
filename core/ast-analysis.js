@@ -37,7 +37,10 @@ const DECLARATION_NODES = {
     trait: new Set(['trait_item']),
     impl: new Set(['impl_item']),
     record: new Set(['record_declaration']),
-    field: new Set(['field_definition', 'public_field_definition', 'property_signature', 'field_declaration', 'variable_declarator']),
+    // An instance attribute a method assigns on its receiver (`this.v = v`,
+    // `self.v = v`) is declared by that assignment (fix #434).
+    field: new Set(['field_definition', 'public_field_definition', 'property_signature', 'field_declaration', 'variable_declarator',
+        'assignment_expression', 'assignment']),
     state: new Set(['variable_declarator', 'assignment', 'init_declarator', 'const_item', 'static_item', 'const_spec', 'var_spec']),
 };
 const FUNCTION_EXPRESSIONS = new Set([
@@ -72,7 +75,9 @@ function declarationSnapshots(content, language, symbols) {
         if (!node) return false;
         if (node.text === name) return true;
         return hasName(node.childForFieldName('name') || node.childForFieldName('declarator') ||
-            (node.type === 'generic_type' && node.childForFieldName('type')), name);
+            (node.type === 'generic_type' && node.childForFieldName('type')) ||
+            (['member_expression', 'attribute'].includes(node.type) &&
+                (node.childForFieldName('property') || node.childForFieldName('attribute'))), name);
     };
     for (const symbol of symbols) {
         const kinds = DECLARATION_NODES[symbol.type];

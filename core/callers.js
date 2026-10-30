@@ -516,6 +516,7 @@ function _callsBearingName(index, filePath, calls, name) {
             if (Array.isArray(call.resolvedNames)) {
                 for (const resolved of call.resolvedNames) if (resolved) add(resolved, call);
             }
+            if (call.ownClass) add(call.ownClass.name, call);
         }
         memo.byName = byName;
     }
@@ -546,14 +547,14 @@ function _bindingsNamed(index, fileEntry, name) {
 function _recordsBearing(calls, name) {
     const out = [];
     for (const call of calls) {
-        if (call && (call.name === name || call.resolvedName === name ||
+        if (call && (call.name === name || call.resolvedName === name || call.ownClass?.name === name ||
             (Array.isArray(call.resolvedNames) && call.resolvedNames.includes(name)))) out.push(call);
     }
     return out;
 }
 
 function _callBearsName(call, name) {
-    return !!call && (call.name === name || call.resolvedName === name ||
+    return !!call && (call.name === name || call.resolvedName === name || call.ownClass?.name === name ||
         (Array.isArray(call.resolvedNames) && call.resolvedNames.includes(name)));
 }
 
@@ -1393,6 +1394,23 @@ function findCallers(index, name, options = {}) {
                 if (langTraits(fileEntry.language)?.inheritedOverloadSignatures) {
                     call = { ...call, argumentFile: fileEntry.relativePath };
                 }
+                // A construction through a method's own receiver (`cls(..)`,
+                // `type(self)(..)`, `new this(..)`, fix #434) spells no class
+                // at its site: it calls the method's class, never a function
+                // spelled like its receiver.
+                if (call.ownClass) {
+                    if (call.ownClass.name !== name) continue;
+                    const own = require('./constructor-calls').ownClassBinding(index, filePath, call);
+                    if (own && validateConfirmation(own.provenance, (options.targetDefinitions || definitions)
+                        .map(declarationIdentity)).verdict === 'establishes-target') {
+                        if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
+                        pendingByFile.get(filePath).push({ call, fileEntry, calledAs: call.ownClass.spelling,
+                            callerSymbol: index.findEnclosingFunction(filePath, call.line, true, call),
+                            isMethod: false, _evidence: { hasImportEvidence: true, facts: own.provenance.facts } });
+                        pendingCount++;
+                    }
+                    continue;
+                }
                 if (typeQueryOnly && !call.destructured && call.receiver !== name &&
                     !_callBearsName(call, name) && fileEntry.language !== 'csharp' &&
                     !(call.receiverIsTypeQualified && bareReachesMethods)) continue;
@@ -1443,7 +1461,8 @@ function findCallers(index, name, options = {}) {
                 // walk and route method-ambiguous.
                 if (fileEntry.language === 'csharp') {
                     const enclosingForRewrite = index.findEnclosingFunction(filePath, call.line, true, call);
-                    const rewritten = _csharpNamespaceQualifiedReceiver(index, call, enclosingForRewrite) ||
+                    const rewritten = _csharpTypeParameterStaticReceiver(index, call, enclosingForRewrite) ||
+                        _csharpNamespaceQualifiedReceiver(index, call, enclosingForRewrite) ||
                         _csharpTypeRootedPath(index, call, enclosingForRewrite, filePath) ||
                         _implicitMemberReceiver(index, call, enclosingForRewrite);
                     if (rewritten) call = rewritten;
@@ -3596,11 +3615,28 @@ function findCallers(index, name, options = {}) {
                     const extensionTargets = options.targetDefinitions || definitions;
                     if (extensionVerdict === 'no' && extensionTargets.length > 0 &&
                         extensionTargets.every(definition => definition.isExtensionMethod &&
-                            call.receiver !== definition.className) &&
-                        _csharpExtensionCallVerdict(index, filePath, fileEntry, call, extensionTargets,
-                            { receiverOnly: true }) === 'no') {
-                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
-                        continue;
+                            call.receiver !== definition.className)) {
+                        const receiverFit = _csharpExtensionCallVerdict(index, filePath, fileEntry, call, extensionTargets,
+                            { receiverOnly: true });
+                        if (receiverFit === 'no') {
+                            recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                            continue;
+                        }
+                        // The receiver fits, but no pinned extension takes
+                        // the call's argument count or written type
+                        // arguments while a sibling overload of the class
+                        // does (fix #434: `c.Query<A, B, C>(.., map)` never
+                        // runs `Query<T>(this Conn, string)`).
+                        if (receiverFit === 'match' && collectAccount && call.argCount != null && !call.argSpread &&
+                            extensionTargets.every(definition => !_callArityCompatible(call, [definition], 'csharp') ||
+                                call.methodTypeArgs > 0 && _typeArgumentsReject(index, call, definition)) &&
+                            definitions.some(definition => definition.isExtensionMethod && !extensionTargets.includes(definition) &&
+                                extensionTargets.some(target => target.className === definition.className &&
+                                    (target.namespace || null) === (definition.namespace || null)) &&
+                                _callArityCompatible(call, [definition], 'csharp') && !_typeArgumentsReject(index, call, definition))) {
+                            recordExcluded(filePath, call.line, 'overload-mismatch');
+                            continue;
+                        }
                     }
                 }
                 // A static-imported FIELD shadows the capitalized static-
@@ -3648,6 +3684,15 @@ function findCallers(index, name, options = {}) {
                             }
                         }
                         if (![...targetOwners].some(owner => reachableOwners.has(owner))) {
+                            // `T.Parse(s)` through a constraint (fix #434)
+                            // runs the static member of T's runtime type
+                            // argument: an implementation below may run.
+                            if (call.receiverTypeParameter && qualifiedTargetDefs.some(definition =>
+                                definition.className && _constraintImplementedBy(index, call, definition.className))) {
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs,
+                                    { dispatchVia: call.receiver });
+                                continue;
+                            }
                             // Preserve the caller-account mismatch taxonomy:
                             // if this call shape cannot invoke the pinned
                             // signature at all, arity is the narrower,
@@ -4229,6 +4274,15 @@ function findCallers(index, name, options = {}) {
                     if (receiverHasProjectType && targetOwners.size > 0 &&
                         ![...targetOwners].some(owner =>
                             reachableOwners.has(owner))) {
+                        // `T.Parse(s)` through a constraint (fix #434) runs
+                        // the static member of T's runtime type argument: an
+                        // implementation below the constraint may run.
+                        if (call.receiverTypeParameter && targetDefs.some(definition => definition.className &&
+                            _constraintImplementedBy(index, call, definition.className))) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs,
+                                { dispatchVia: call.receiver });
+                            continue;
+                        }
                         recordExcluded(filePath, call.line, 'receiver-other-class');
                         continue;
                     }
@@ -8693,7 +8747,8 @@ function findCallees(index, definition, options = {}) {
             if (language === 'csharp') {
                 // fix #353: `Beta.Helper.Widget()` — namespace-qualified type
                 // receiver (see the findCallers twin).
-                const rewritten = _csharpNamespaceQualifiedReceiver(index, call, def) ||
+                const rewritten = _csharpTypeParameterStaticReceiver(index, call, def) ||
+                    _csharpNamespaceQualifiedReceiver(index, call, def) ||
                     _csharpTypeRootedPath(index, call, def, def.file) ||
                     _implicitMemberReceiver(index, call, def);
                 if (rewritten) call = rewritten;
@@ -8781,6 +8836,28 @@ function findCallees(index, definition, options = {}) {
             if (require('./constructor-calls').constructionTypeParameter(index, def.file, call)) {
                 noteUnverified(siteId, call, 'constructor-type-parameter');
                 continue;
+            }
+            // A construction through the method's own receiver (fix #434)
+            // calls the method's class.
+            if (call.ownClass) {
+                const own = require('./constructor-calls').ownClassBinding(index, def.file, call);
+                if (own) {
+                    const record = siteEvidence.get(siteId);
+                    record.constructionBinding = own.provenance;
+                    record.call = call;
+                    const owner = own.owner;
+                    const key = owner.bindingId || `${owner.file}:${owner.startLine}:${owner.name}`;
+                    const existing = callees.get(key);
+                    if (existing) {
+                        existing.count++; existing.sites.push(call.line); existing.siteIds.push(siteId);
+                    } else callees.set(key, { name: owner.name, bindingId: owner.bindingId,
+                        isConstructor: true, count: 1, sites: [call.line], siteIds: [siteId] });
+                    continue;
+                }
+                if (call.name === call.ownClass.name) {
+                    noteUnverified(siteId, call, 'construction-type-unresolved');
+                    continue;
+                }
             }
             const constructionAlias = require('./constructor-calls').constructionAliasBinding(index, def.file, call);
             if (constructionAlias) {
@@ -11205,6 +11282,11 @@ function findCallees(index, definition, options = {}) {
                         // A base its import leaves undecided (fix #424) may
                         // be any class: its members are not known by name.
                         if (current.importUnresolved) {
+                            // Every configuration alternative of the base
+                            // declaring one definition decides it (fix #434).
+                            const agreed = require('./class-identity').alternativesDeclare(index, current,
+                                symbols.filter(symbol => isCallableMember(symbol)));
+                            if (agreed?.members.length === 1) { match = agreed.members[0]; break; }
                             noteUnverified(siteId, call, 'inherited-unresolved');
                             ambiguityClaimed = true;
                             break;
@@ -11330,6 +11412,23 @@ function findCallees(index, definition, options = {}) {
                 if (!bindingId && langTraits(language)?.nestedItemsBlockScoped && sites?.length) {
                     symbols = symbols.filter(s => s.className || s.receiver ||
                         !sites.every(line => _nestedItemOutOfScope(index, def.file, s, line)));
+                }
+                // A bare name a module neither declares nor imports reaches
+                // another file's top-level definition only as a global (fix
+                // #434, the caller side's import-link rule): a definition of
+                // another module is never one, a script file's may be.
+                if (!bindingId && langTraits(language)?.typeSystem === 'structural' && symbols.length > 0) {
+                    const callerEntry = index.files.get(def.file);
+                    if (_moduleScopedFile(callerEntry) && !_fileImportBindsName(callerEntry, calleeName) &&
+                        !(callerEntry.importNames || []).includes('*')) {
+                        const reachable = symbols.filter(s => s.file === def.file || s.className || s.receiver ||
+                            s.memberAssigned || s.ambientAugmentation || !_moduleScopedFile(index.files.get(s.file)));
+                        if (reachable.length === 0) {
+                            claimSites('excluded', 'name-not-in-scope');
+                            continue;
+                        }
+                        symbols = reachable;
+                    }
                 }
                 // fix #384: member-assigned candidates a bare name cannot
                 // reach from this function (the caller-side reach rule).
@@ -14765,8 +14864,9 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
                 if (!rel) {
                     // Unresolved: relative or project-ish → resolver gap, not
                     // a terminal; clearly external → that path pins outside
-                    // the project (dead end, consistent with #209c).
-                    if (_unresolvedModuleIsGap(index, module)) unknown = true;
+                    // the project (dead end, consistent with #209c), as does
+                    // a file of a language the index does not read.
+                    if (_unresolvedModuleIsGap(index, module) && !_nonSourceModuleFile(index, abs, module)) unknown = true;
                     return;
                 }
                 next.push([path.join(index.root, rel), nextAttr, hopAlternative]);
@@ -15626,6 +15726,17 @@ function _moduleImportBindings(fileEntry) {
  * `other-definition-import`. Statically composable `__dirname` paths are
  * resolved parser-side; whatever stays dynamic must route 'unknown'.
  */
+// A relative specifier naming an existing file the index does not read as
+// source (`import FormGroup from './FormGroup.svelte'`, fix #434) binds
+// that file's export: never a project declaration, never a resolver gap.
+function _nonSourceModuleFile(index, fromFile, module) {
+    const mod = String(module || '');
+    if (!fromFile || !/^\.\.?\//.test(mod) || !path.extname(mod)) return false;
+    const target = path.resolve(path.dirname(fromFile), mod);
+    if (index.files.has(target)) return false;
+    try { return require('fs').statSync(target).isFile(); } catch { return false; }
+}
+
 function _unresolvedModuleIsGap(index, module, binding) {
     const mod = String(module || '');
     if (binding && binding.dynamic) return true;
@@ -15899,6 +16010,54 @@ function _nestedReceiverBinding(index, call, typeName, targetDefs, definitions) 
  * bareCallReachesMethods: C#, Java) member lookup precedes type lookup.
  * Returns a this-rooted field-hop record, or null.
  */
+/**
+ * `T.Parse(s)` with `T` a type parameter of the enclosing method or type
+ * (fix #434): a member the constraints declare (a C# static abstract or
+ * static virtual interface member). The receiver is typed by the one
+ * constraint whose project hierarchy declares a member of the name, so the
+ * constraint's member is the call's static target and its implementations
+ * possible dispatch targets; any other shape stays as written.
+ */
+function _csharpTypeParameterStaticReceiver(index, call, enclosing) {
+    if (!call.isMethod || !call.receiverIsTypeQualified || !enclosing ||
+        !/^[A-Za-z_]\w*$/.test(String(call.receiver || ''))) return null;
+    // Only a name the method or its owner declares as a type parameter.
+    if (!_declaredTypeParameterNames(enclosing).has(call.receiver)) return null;
+    let constraints;
+    if (_methodTypeParameterNames(enclosing).has(call.receiver)) {
+        constraints = enclosing.typeParameterConstraints?.[call.receiver] || [];
+    } else if (enclosing.className) {
+        const owner = ownerDefinitionOf(index, enclosing);
+        if (!owner || !_declaredTypeParameterNames({ generics: owner.generics }).has(call.receiver)) return null;
+        constraints = owner.typeParameterConstraints?.[call.receiver] || [];
+    } else return null;
+    const members = (index.symbols.get(call.name) || []).filter(d => d.className && !NON_CALLABLE_TYPES.has(d.type));
+    const declaring = [];
+    for (const constraint of constraints) {
+        const name = _csharpTypeIdentity(constraint);
+        const defs = (index.symbols.get(name) || []).filter(d => _ARITY_TYPE_KINDS.has(d.type) &&
+            index.files.get(d.file)?.language === 'csharp');
+        if (defs.length !== 1) continue;
+        const ref = ownerRefOf(index, members.find(member => member.className === name) || { ...defs[0], className: name });
+        const found = ref && findDeclaringClass(index, ref, members);
+        if (found && !found.uncertain && found.members.length > 0) {
+            declaring.push({ name, def: defs[0], arity: _csharpTypeWithArity(constraint)?.arity || 0 });
+        }
+    }
+    if (declaring.length !== 1) return null;
+    return { ...call, receiver: declaring[0].name,
+        ...(declaring[0].arity > 0 && { receiverTypeArgs: declaring[0].arity }),
+        receiverTypeParameter: call.receiver };
+}
+
+/** Whether a project class implements the constraint a `T.M()` call was
+ * typed by (fix #434). */
+function _constraintImplementedBy(index, call, className) {
+    const arity = call.receiverTypeArgs || 0;
+    const expected = arity > 0 ? `${call.receiver}<${new Array(arity).fill('T').join(', ')}>` : call.receiver;
+    return _csharpAssignableWithArity(index, className, expected) === 'yes';
+}
+
 function _implicitMemberReceiver(index, call, enclosing) {
     if (!call.isMethod || !call.receiverIsTypeQualified || call.receiverTypeQualifier ||
         call.receiverTypeArgs || !call.receiver || !enclosing?.className) return null;
@@ -18437,7 +18596,7 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
             const enqueue = (module, nextAttr) => {
                 const rel = fe.moduleResolved && fe.moduleResolved[module];
                 if (!rel) {
-                    if (_unresolvedModuleIsGap(index, module)) unknown = true;
+                    if (_unresolvedModuleIsGap(index, module) && !_nonSourceModuleFile(index, abs, module)) unknown = true;
                     return;
                 }
                 next.push([path.join(index.root, rel), nextAttr, hopAlternative]);
@@ -19799,8 +19958,31 @@ function _overloadProvablyApplicable(index, call, definition, candidates, langua
  * whose platform or project ancestry reaches it. Unknown argument types and
  * unknown relationships are not proof.
  */
+/**
+ * Whether a C# parameter at `position` is a method type parameter the
+ * argument infers to its own known type, every constraint satisfied (fix
+ * #434).
+ */
+function _csharpInferredIdentity(index, definition, position, call, kind) {
+    const param = _javaParamAt(definition, position, call);
+    if (!param?.typeParameter || param.rest || typeof kind !== 'string' || !/^(?:new|type|cast):/.test(kind)) return false;
+    if (!_methodTypeParameterNames(definition).has(String(param.type).replace(/\?$/, ''))) return false;
+    const actual = kind.slice(kind.indexOf(':') + 1);
+    return (param.constraints || []).every(constraint => _csharpAssignableWithArity(index, actual, constraint) === 'yes');
+}
+
 function _argProvablyConverts(index, kind, param, language, paramOwner = null, argumentOrigin = null) {
     if (!param?.type) return false;
+    if (language === 'csharp' && param.typeParameter && paramOwner &&
+        _methodTypeParameterNames(paramOwner).has(String(param.type).replace(/\?$/, '')) &&
+        typeof kind === 'string' && /^(?:new|type|cast):/.test(kind)) {
+        const actual = kind.slice(kind.indexOf(':') + 1);
+        return (param.constraints || []).every(constraint => _csharpAssignableWithArity(index, actual, constraint) === 'yes');
+    }
+    if (language === 'csharp' && typeof kind === 'string' && /^(?:new|type|cast):/.test(kind) &&
+        String(param.type).includes('<') && _csharpAssignableWithArity(index, kind.slice(kind.indexOf(':') + 1), param.type) === 'yes' &&
+        [..._methodTypeParameterNames(paramOwner || {})].some(name =>
+            new RegExp(`(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|$)`).test(String(param.type)))) return true;
     if (language === 'csharp' && JAVA_KIND_TYPES[kind] && _csharpGenericInterfaceNeedsReview(param.type)) return false;
     const rawBare = String(param.type).replace(/<.*$/s, '').trim()
         .replace(/\.\.\.$/, '').replace(/\?$/, '').replace(/(?:\[\])+$/, '')
@@ -20739,6 +20921,19 @@ function _rustWrittenValueType(index, filePath, call, callerSymbol) {
     } else if (call.returnPosition && callerSymbol?.returnType) {
         written = callerSymbol.returnType;
         writtenAt = { file: callerSymbol.file || filePath, line: callerSymbol.startLine };
+    } else if (call.argumentOf) {
+        // An argument of a free function the name resolves to (fix #434):
+        // its declared parameter type at the argument's position.
+        const segments = String(call.argumentOf.callee).split('::');
+        const named = segments.length === 1
+            ? resolveRustName(index, filePath, call.line, segments[0], 'value')
+            : null;
+        const callee = named?.defs?.length === 1 ? named.defs[0] : null;
+        const param = callee && !callee.className && callee.type === 'function' &&
+            Array.isArray(callee.paramsStructured) ? callee.paramsStructured[call.argumentOf.index] : null;
+        if (!param?.type || callee.generics) return 'unknown';
+        written = param.type;
+        writtenAt = { file: callee.file, line: callee.startLine };
     }
     if (!written) return 'unknown';
     const typeName = _typeHead(written);
@@ -21606,6 +21801,8 @@ const _importAliasLocalsMemo = new WeakMap();
  */
 function _namelessSiteFields(fileEntry, call) {
     if (call.targetTyped) return { targetTyped: true };
+    // `cls(..)`, `type(self)(..)`, `new this(..)` (fix #434).
+    if (call.ownClass) return { ownClassConstruction: true };
     if (call.constructorSyntax === 'delegation' && call.ctorDelegation &&
         langTraits(fileEntry?.language)?.keywordConstructorDelegation) return { keywordDelegation: true };
     return null;
@@ -21624,6 +21821,19 @@ function _spelledByImportAlias(fileEntry, call, calledAs) {
         _importAliasLocalsMemo.set(bindings, locals);
     }
     return locals.has(call.name);
+}
+
+/**
+ * Whether a file's top-level names belong to its own module scope (fix
+ * #434): every Python module; a JS/TS file with module syntax (an import,
+ * a require binding or an export). A plain script's declarations are
+ * globals other scripts read.
+ */
+function _moduleScopedFile(fileEntry) {
+    if (!fileEntry) return false;
+    if (!langTraits(fileEntry.language)?.scriptsShareGlobalScope) return true;
+    return (fileEntry.importBindings || []).length > 0 || (fileEntry.exportDetails || []).length > 0 ||
+        (fileEntry.importNames || []).length > 0;
 }
 
 /** Whether the file binds `name` through an import (or a star import that may). */
@@ -22496,6 +22706,92 @@ function _csharpTypeIdentity(raw) {
  * the way up) or the expected type is a project type an external type cannot
  * derive from, 'unknown' otherwise (fix #380).
  */
+/** A written C# type's identity and generic arity (`IRequest<Pong>` -> IRequest/1). */
+function _csharpTypeWithArity(text) {
+    const name = _csharpTypeIdentity(text);
+    if (!name) return null;
+    const written = String(text).trim().replace(/^global::/, '').replace(/\?$/, '');
+    return { name, arity: written.includes('<') ? _topLevelTypeArguments(written).length : 0 };
+}
+
+/**
+ * C# assignability with generic arity as identity (fix #434): `IRequest`
+ * and `IRequest<T>` are two types. 'yes' when the argument's project
+ * ancestry reaches the expected type and arity, 'no' when it is wholly
+ * project-visible and never does, 'unknown' otherwise. Type arguments are
+ * not compared (any instantiation of the expected generic type matches).
+ */
+function _csharpAssignableWithArity(index, actualText, expectedText) {
+    const memo = !index.isProvenanceFactIndex ? index._opMemo?.('csharpAssignableWithArity', () => new Map()) : null;
+    const key = memo ? `${actualText}\0${expectedText}` : null;
+    if (memo?.has(key)) return memo.get(key);
+    const verdict = _csharpAssignableWithArityUncached(index, actualText, expectedText);
+    memo?.set(key, verdict);
+    return verdict;
+}
+
+function _csharpAssignableWithArityUncached(index, actualText, expectedText) {
+    const expected = _csharpTypeWithArity(expectedText);
+    const actual = _csharpTypeWithArity(actualText);
+    if (!expected || !actual) return 'unknown';
+    if (expected.name === 'object' || expected.name === 'Object' || expected.name === 'dynamic') return 'yes';
+    const typeDefs = (name, arity) => (index.symbols.get(name) || []).filter(d =>
+        _ARITY_TYPE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'csharp' &&
+        (d.typeArity || 0) === arity);
+    if (typeDefs(expected.name, expected.arity).length === 0) return 'unknown';
+    const seen = new Set();
+    const queue = [actual];
+    while (queue.length > 0 && seen.size < 128) {
+        const current = queue.shift();
+        const key = `${current.name}/${current.arity}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (current.name === expected.name && current.arity === expected.arity) return 'yes';
+        const defs = typeDefs(current.name, current.arity);
+        if (defs.length === 0) return 'unknown';
+        for (const definition of defs) {
+            const parents = [...(definition.implements || [])];
+            if (definition.extends) parents.push(...splitParentList(definition.extends));
+            for (const parent of parents) {
+                const ref = _csharpTypeWithArity(parent);
+                if (ref) queue.push(ref);
+            }
+        }
+    }
+    return 'no';
+}
+
+/**
+ * C# applicability by type identity (fix #434): an argument of a known
+ * type that satisfies none of a method type parameter's constraints, or
+ * that does not implement the generic project interface a parameter
+ * names, makes the method inapplicable (C# 7.3: candidates whose inferred
+ * type arguments violate their constraints are removed).
+ */
+function _csharpIdentityRejects(index, call, ps, def) {
+    const kinds = call.argKinds;
+    const methodTypeParams = _methodTypeParameterNames(def);
+    if (!Array.isArray(kinds) || methodTypeParams.size === 0) return false;
+    for (let i = 0; i < kinds.length && i < ps.length; i++) {
+        const p = ps[i];
+        const kind = kinds[i];
+        if (!p || p.rest || typeof kind !== 'string' || !/^(?:new|type|cast):/.test(kind)) continue;
+        const actual = kind.slice(kind.indexOf(':') + 1);
+        if (/\[\]\??$/.test(actual) || _CSHARP_TYPE_ALIASES.has(actual.replace(/\?$/, ''))) continue;
+        if (p.typeParameter) {
+            for (const constraint of p.constraints || []) {
+                if (_csharpAssignableWithArity(index, actual, constraint) === 'no') return true;
+            }
+            continue;
+        }
+        const type = String(p.type || '').trim();
+        if (!type.includes('<') || ![...methodTypeParams].some(name =>
+            new RegExp(`(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|$)`).test(type))) continue;
+        if (_csharpAssignableWithArity(index, actual, type) === 'no') return true;
+    }
+    return false;
+}
+
 function _csharpAssignability(index, actualType, expectedType) {
     if (!actualType || !expectedType) return 'unknown';
     if (expectedType === 'Object' || expectedType === 'object') return 'yes';
@@ -25285,6 +25581,7 @@ function _overloadApplicable(index, call, def) {
     if (_typeArgumentsReject(index, call, def)) return false;
     const kinds = call.argKinds;
     if (!Array.isArray(kinds)) return true;
+    if (language === 'csharp' && _csharpIdentityRejects(index, call, ps, def)) return false;
     const typeParams = language === 'cpp' ? null : _declaredTypeParameterNames(def);
     if (hasRest && langTraits(language)?.overloadPhases === 'strict-loose-variable') {
         const position = ps.findIndex(param => param?.rest);
@@ -25382,9 +25679,26 @@ function _csharpTypeParametersInferable(def, rawParams, ps, boundExtension, kind
 
 // Type parameter names a method or its owner declares (`<T, TResult>`),
 // as recorded in `generics` / `ownerGenerics` (fix #391).
+// Shared, read-only answers by declared text (fix #434: the overload and
+// receiver rules ask per candidate and per symbol of a file).
+const _EMPTY_TYPE_PARAMETERS = Object.freeze(new Set());
+const _typeParameterNameMemo = new Map();
 function _declaredTypeParameterNames(def) {
+    const generics = def?.generics, ownerGenerics = def?.ownerGenerics;
+    if (!generics && !ownerGenerics) return _EMPTY_TYPE_PARAMETERS;
+    const key = `${generics || ''}\0${ownerGenerics || ''}`;
+    let names = _typeParameterNameMemo.get(key);
+    if (!names) {
+        names = _declaredTypeParameterNamesUncached(generics, ownerGenerics);
+        if (_typeParameterNameMemo.size >= 8192) _typeParameterNameMemo.clear();
+        _typeParameterNameMemo.set(key, names);
+    }
+    return names;
+}
+
+function _declaredTypeParameterNamesUncached(generics, ownerGenerics) {
     const names = new Set();
-    for (const text of [def?.generics, def?.ownerGenerics]) {
+    for (const text of [generics, ownerGenerics]) {
         const inner = String(text || '').trim().replace(/^<|>$/g, '');
         if (!inner) continue;
         let depth = 0;
@@ -25517,6 +25831,10 @@ function _javaMostSpecificOverload(index, applicable, call, language) {
                     (staticType === paramType ||
                      (!staticType.includes('.') && !paramType.includes('.') &&
                       staticType === paramType))) {
+                    count++;
+                } else if (language === 'csharp' && staticType && _csharpInferredIdentity(index, definition, i, call, kind)) {
+                    // A method type parameter infers the argument's own type:
+                    // an identity conversion (fix #434).
                     count++;
                 }
             }
@@ -31677,6 +31995,6 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { rustPathQualifierVerdict: _pathQualifierVerdict, rustTraitDeclPathProbe: _rustTraitDeclPathProbe, _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
+module.exports = { rustPathQualifierVerdict: _pathQualifierVerdict, rustTraitDeclPathProbe: _rustTraitDeclPathProbe, _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _nonSourceModuleFile, _moduleValueAliasType, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
     _goFileConstraint };

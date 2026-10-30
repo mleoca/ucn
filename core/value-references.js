@@ -23,7 +23,7 @@ const DECLARATIONS = new Set(['parameter', 'formal_parameter', 'spread_parameter
     'required_parameter', 'optional_parameter', 'typed_parameter', 'parameter_declaration',
     'variable_declarator', 'let_declaration', 'assignment', 'var_spec', 'const_spec',
     'declaration', 'local_declaration_statement', 'field_declaration',
-    'field_definition', 'public_field_definition']);
+    'field_definition', 'public_field_definition', 'short_var_declaration']);
 const GRAMMAR_LANGUAGES = new Map(Object.values(LANGUAGES).map(config =>
     [config.treeSitterLang, config.name]));
 const TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum', 'record',
@@ -131,6 +131,70 @@ function contains(scope, node) {
     return !scope || scope.startIndex <= node.startIndex && scope.endIndex >= node.endIndex;
 }
 
+/** Whether a Go identifier is the key of a keyed composite-literal element
+ * (`limit` in `Box{limit: 5}`), fix #434. */
+function goKeyedFieldKey(node) {
+    const key = node?.parent;
+    const keyed = key?.parent;
+    return node?.type === 'identifier' && key?.type === 'literal_element' && keyed?.type === 'keyed_element' &&
+        key.namedChildCount === 1 && sameNode(keyed.namedChild(0), key);
+}
+
+/**
+ * The struct type a Go keyed element's literal builds (fix #434): its
+ * composite literal's written type, through pointers, or for an elided
+ * inner literal (`[]Box{{limit: 3}}`, `map[K]Box{k: {..}}`) the element or
+ * value type of the enclosing literal's type. Null when not written.
+ */
+function goCompositeLiteralType(keyNode) {
+    const literalValue = keyNode.parent.parent.parent;
+    if (literalValue?.type !== 'literal_value') return null;
+    const holder = literalValue.parent;
+    if (holder?.type === 'composite_literal') return unwrapGoType(holder.childForFieldName('type'));
+    if (holder?.type !== 'literal_element') return null;
+    const element = holder.parent;
+    const outerValue = element?.type === 'keyed_element' ? element.parent : element;
+    const outerType = goCompositeLiteralTypeOfValue(outerValue);
+    if (!outerType) return null;
+    if (outerType.type === 'slice_type' || outerType.type === 'array_type' || outerType.type === 'implicit_length_array_type') {
+        return unwrapGoType(outerType.childForFieldName('element'));
+    }
+    if (outerType.type === 'map_type') {
+        const isKey = element?.type === 'keyed_element' && sameNode(element.namedChild(0), holder);
+        return unwrapGoType(outerType.childForFieldName(isKey ? 'key' : 'value'));
+    }
+    return null;
+}
+
+function goCompositeLiteralTypeOfValue(literalValue) {
+    if (literalValue?.type !== 'literal_value') return null;
+    const holder = literalValue.parent;
+    if (holder?.type === 'composite_literal') return holder.childForFieldName('type');
+    if (holder?.type !== 'literal_element') return null;
+    const element = holder.parent;
+    const outerValue = element?.type === 'keyed_element' ? element.parent : element;
+    const outerType = goCompositeLiteralTypeOfValue(outerValue);
+    if (!outerType) return null;
+    if (['slice_type', 'array_type', 'implicit_length_array_type'].includes(outerType.type)) {
+        return unwrapGoType(outerType.childForFieldName('element'));
+    }
+    if (outerType.type === 'map_type') {
+        const isKey = element?.type === 'keyed_element' && sameNode(element.namedChild(0), holder);
+        return unwrapGoType(outerType.childForFieldName(isKey ? 'key' : 'value'));
+    }
+    return null;
+}
+
+function unwrapGoType(node) {
+    let current = node;
+    while (current?.type === 'pointer_type' || current?.type === 'parenthesized_type') {
+        current = current.type === 'pointer_type' ? current.namedChild(0) : current.namedChild(0);
+    }
+    return current?.type === 'type_identifier' || current?.type === 'qualified_type' ||
+        current?.type === 'generic_type' ? current : current?.type === 'slice_type' || current?.type === 'map_type' ||
+        current?.type === 'array_type' ? current : null;
+}
+
 function typeSyntax(node) {
     if (!node) return null;
     if (TYPE_NAMES.has(node.type)) return { name: node.text, node };
@@ -166,7 +230,18 @@ function declarationType(binding) {
         if (!DECLARATIONS.has(node.type)) continue;
         const type = node.childForFieldName('type');
         if (type) return { syntax: typeSyntax(type), origin: 'annotation' };
-        const value = node.childForFieldName('value') || node.childForFieldName('right');
+        let value = node.childForFieldName('value') || node.childForFieldName('right');
+        // Go `b, p := Box{..}, &Box{..}` (fix #434): the value at the
+        // binding's position, through the address operator.
+        if (value?.type === 'expression_list') {
+            const left = node.childForFieldName('left');
+            const names = left?.type === 'expression_list' ? left.namedChildren : left ? [left] : [];
+            const at = names.findIndex(name => sameNode(name, binding));
+            value = at >= 0 && value.namedChildCount === names.length ? value.namedChild(at) : null;
+        }
+        if (value?.type === 'unary_expression' && value.childForFieldName('operator')?.type === '&') {
+            value = value.childForFieldName('operand');
+        }
         if (value?.type === 'new_expression' || value?.type === 'object_creation_expression') {
             return { syntax: typeSyntax(value.childForFieldName('constructor') ||
                 value.childForFieldName('type')), origin: 'constructor' };
@@ -680,6 +755,38 @@ class ValueReferenceResolver extends TypeReferenceResolver {
      * tokens that bind nothing. An unaliased import of the name binds the
      * variable too; renaming it gives the import an alias (`importAlias`).
      */
+    /**
+     * A Python read run at module load before the pin's variable is first
+     * bound reads what a preceding star import binds (fix #434): `from m
+     * import *` then `X = LIMIT + 1` above `LIMIT = 5` reads m's LIMIT. A
+     * read in a function body runs later and reads the variable.
+     */
+    pythonStarBindingAt(file, node) {
+        const entry = this.index.files.get(file);
+        const line = node.startPosition.row + 1;
+        const stars = (entry?.importDetails || []).filter(detail => detail.names?.includes('*') && detail.line <= line);
+        if (stars.length === 0) return null;
+        for (let parent = node.parent; parent; parent = parent.parent) {
+            if (parent.type === 'function_definition' || parent.type === 'lambda') return null;
+        }
+        const lines = [...this.group].filter(def => def.file === file).map(def => def.nameLine || def.startLine);
+        if (lines.length === 0 || line > Math.min(...lines)) return null;
+        const binds = stars.map(star => {
+            const target = this.moduleFile(entry, star.module);
+            const other = target && this.index.files.get(target);
+            if (!other) return 'unknown';
+            const exported = (other.exportDetails || []).some(detail => (detail.alias || detail.name) === this.name);
+            if (this.name.startsWith('_') && !exported) return 'no';
+            if (exported || (other.symbols || []).some(def => def.name === this.name && !def.className &&
+                def.lexicalScopeStartLine == null) ||
+                (other.importBindings || []).some(binding => (binding.alias || binding.name) === this.name) ||
+                (other.moduleAssignedNames || []).includes(this.name)) return 'yes';
+            return (other.importNames || []).includes('*') ? 'unknown' : 'no';
+        });
+        if (binds.includes('yes')) return { verdict: 'no', reason: 'star-import-binding' };
+        return binds.includes('unknown') ? { verdict: 'unknown', reason: 'star-import-binding' } : null;
+    }
+
     pythonBindingAt(file, token) {
         const { node, role } = token;
         const parent = node.parent;
@@ -833,6 +940,108 @@ class ValueReferenceResolver extends TypeReferenceResolver {
     }
 
     /**
+     * The top-level declaration module `target` exports under `name` (null:
+     * its default export), followed through re-exports, imports and `export
+     * *` (fix #434): `{ file, name }`, 'unknown' for a link the index cannot
+     * follow or several answers, null when the module exports no such name.
+     */
+    jsExportedDeclaration(target, name, depth = 0, seen = new Set()) {
+        const key = `${target}\0${name ?? ''}`;
+        if (depth > 4 || seen.has(key)) return 'unknown';
+        seen.add(key);
+        const entry = this.index.files.get(target);
+        const exports = entry?.exportDetails || [];
+        const single = answers => {
+            if (answers.some(answer => answer === 'unknown')) return 'unknown';
+            const found = answers.filter(Boolean);
+            if (found.length === 0) return null;
+            return found.every(answer => answer.file === found[0].file && answer.name === found[0].name)
+                ? found[0] : 'unknown';
+        };
+        const details = exports.filter(detail => name == null ? detail.type === 'default'
+            : detail.type !== 'default' && detail.type !== 're-export-all' && (detail.alias || detail.name) === name);
+        if (details.length === 0) {
+            if (name == null) return null;
+            return single(exports.filter(star => star.type === 're-export-all' && !star.alias).map(star => {
+                const module = star.source && this.moduleFile(entry, star.source);
+                return module ? this.jsExportedDeclaration(module, name, depth + 1, seen) : 'unknown';
+            }));
+        }
+        return single(details.map(detail => {
+            if (detail.type === 're-export') {
+                const module = detail.source && this.moduleFile(entry, detail.source);
+                return module ? this.jsExportedDeclaration(module, detail.name === 'default' ? null : detail.name,
+                    depth + 1, seen) : 'unknown';
+            }
+            if (detail.type === 'exports' || detail.type === 'module.exports') return 'unknown';
+            const local = detail.localName || detail.name;
+            if (!local || local === 'default') return 'unknown';
+            const imported = (entry.importBindings || []).filter(binding =>
+                (binding.alias || binding.name) === local && binding.module != null);
+            if (imported.length === 0) return { file: target, name: local };
+            return single(imported.map(binding => {
+                if (binding.kind !== 'named' && binding.kind !== 'default') return 'unknown';
+                const module = this.moduleFile(entry, binding.module);
+                return module ? this.jsExportedDeclaration(module, binding.kind === 'default' ? null : binding.name,
+                    depth + 1, seen) : 'unknown';
+            }));
+        }));
+    }
+
+    /**
+     * The class, enum or interface a JS/TS receiver names through an import
+     * the receiver's name alone does not spell (fix #434): an aliased or
+     * default import (`import { Color as C }` then `C.Red`), a module
+     * namespace chain (`ns.Color.Red`), or a type its namespace declares
+     * (`E.Shade.Red`). Null when the link is no such import or undecided.
+     */
+    jsImportedOwner(file, receiver) {
+        const entry = this.index.files.get(file);
+        const language = entry?.language;
+        const syntax = language === 'html' ? 'javascript' : language;
+        let declaration = null;
+        if (receiver.type === 'identifier') {
+            const bindings = (entry.importBindings || []).filter(binding =>
+                (binding.alias || binding.name) === receiver.text && binding.module != null);
+            if (bindings.length !== 1) return null;
+            const [binding] = bindings;
+            if (binding.kind !== 'default' && !(binding.kind === 'named' && binding.alias && binding.alias !== binding.name)) return null;
+            if (referenceScope(receiver, syntax, this.lexicalMemo(receiver), receiver.text) !== 'module') return null;
+            const target = this.moduleFile(entry, binding.module);
+            declaration = target ? this.jsExportedDeclaration(target, binding.kind === 'default' ? null : binding.name) : null;
+        } else if (receiver.type === 'member_expression') {
+            const property = receiver.childForFieldName('property');
+            const object = receiver.childForFieldName('object');
+            if (property?.type !== 'property_identifier' || !object) return null;
+            const holds = this.jsNamespaceHolds(file, object);
+            if (holds?.modules) {
+                const answers = holds.modules.map(module => this.jsExportedDeclaration(module, property.text));
+                declaration = answers.length === 1 ? answers[0] : 'unknown';
+            } else if (!holds && object.type === 'identifier') {
+                // A type a TS namespace declares (`E.Shade`), the namespace
+                // named in this module.
+                const space = this.jsImportedOwner(file, object) || this.classForType(file, { name: object.text, node: object }, true);
+                const named = space?.def?.type === 'namespace' ? space.def
+                    : (this.index.symbols.get(object.text) || []).filter(def => def.type === 'namespace' && def.file === file &&
+                        !def.className && referenceScope(object, syntax, this.lexicalMemo(object), object.text) === 'module');
+                const spaceDef = Array.isArray(named) ? (named.length === 1 ? named[0] : null) : named;
+                if (!spaceDef) return null;
+                const inner = classDefsNamed(this.index, property.text).entries.filter(candidate =>
+                    candidate.def.file === spaceDef.file && candidate.def.startLine > spaceDef.startLine &&
+                    candidate.def.endLine <= spaceDef.endLine &&
+                    !(this.index.files.get(spaceDef.file)?.symbols || []).some(other => other !== spaceDef &&
+                        other.type === 'namespace' && other.startLine > spaceDef.startLine && other.endLine <= spaceDef.endLine &&
+                        other.startLine < candidate.def.startLine && other.endLine >= candidate.def.endLine));
+                return inner.length === 1 ? { name: property.text, key: inner[0].key, def: inner[0].def } : null;
+            }
+        }
+        if (!declaration || declaration === 'unknown') return null;
+        const entries = classDefsNamed(this.index, declaration.name).entries.filter(candidate =>
+            candidate.def.file === declaration.file && !candidate.def.className && candidate.def.lexicalScopeStartLine == null);
+        return entries.length === 1 ? { name: declaration.name, key: entries[0].key, def: entries[0].def } : null;
+    }
+
+    /**
      * The modules a namespace receiver chain denotes (fix #431): an import
      * binding of a module namespace, then each `.name` the modules export as
      * a namespace (`z.core` through `export * as core from`). 'value' when a
@@ -916,6 +1125,38 @@ class ValueReferenceResolver extends TypeReferenceResolver {
      * the module-attribute lookup decides.
      */
     jsModuleMemberAt(file, receiver) {
+        // `require('./m').name` reads what module m binds (fix #434): its
+        // own declaration, or a CommonJS export key of its exports object.
+        if (receiver.type === 'call_expression') {
+            const callee = receiver.childForFieldName('function');
+            const args = (receiver.childForFieldName('arguments')?.namedChildren || [])
+                .filter(arg => !arg.type.endsWith('comment'));
+            if (callee?.type !== 'identifier' || callee.text !== 'require' || args.length !== 1 ||
+                args[0].type !== 'string') return null;
+            const language = this.index.files.get(file)?.language;
+            const entry = this.index.files.get(file);
+            // The module scope's `require`, never a local or a module's own.
+            if (referenceScope(callee, language === 'html' ? 'javascript' : language, this.lexicalMemo(callee),
+                'require') !== 'module' || (entry?.symbols || []).some(def => def.name === 'require' && !def.className) ||
+                (entry?.importBindings || []).some(binding => (binding.alias || binding.name) === 'require')) {
+                return { verdict: 'unknown', reason: 'receiver-scope' };
+            }
+            const spec = args[0].namedChildren.find(child => child.type === 'string_fragment')?.text ?? '';
+            const target = this.moduleFile(entry, spec);
+            if (!target) {
+                const { _unresolvedModuleIsGap } = require('./callers');
+                return _unresolvedModuleIsGap(this.index, spec) ? { verdict: 'unknown', reason: 'module-attribute' }
+                    : { verdict: 'no', reason: 'other-module' };
+            }
+            const own = (this.index.files.get(target)?.exportDetails || []).filter(detail =>
+                (detail.alias || detail.name) === this.name);
+            const keyed = own.filter(detail => detail.type === 'exports' || detail.type === 'module.exports');
+            if (own.length > 0 && keyed.length === own.length) return { verdict: 'no', reason: 'export-key' };
+            if (keyed.length > 0) return { verdict: 'unknown', reason: 'export-key' };
+            const reach = this.chase(target, this.name);
+            return reach === 'yes' ? { verdict: 'yes' } : reach === 'no' ? { verdict: 'no', reason: 'other-module' }
+                : { verdict: 'unknown', reason: 'module-attribute' };
+        }
         if (receiver.type === 'member_expression') {
             // `z.core.name` through a re-exported namespace (fix #431).
             const holds = this.jsNamespaceHolds(file, receiver);
@@ -1201,7 +1442,7 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         } else {
             // Only a class of the slot, or one below it, can take the field.
             const calleeName = callee.type === 'attribute' ? callee.childForFieldName('attribute')?.text : callee.text;
-            if (!this.keywordOwnerNames().has(calleeName)) return other;
+            if (!this.keywordOwnerNames().has(calleeName) && !this.keywordAliasNames().has(calleeName)) return other;
             const syntax = callee.type === 'attribute'
                 ? (() => {
                     const attribute = callee.childForFieldName('attribute');
@@ -1211,6 +1452,15 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 })()
                 : typeSyntax(callee);
             owner = syntax ? this.classForType(file, syntax, true) : null;
+            // A module value naming a class (`Seg = Segment`, fix #434).
+            if (!owner && callee.type === 'identifier' && this.keywordAliasNames().has(callee.text) &&
+                this.pythonScope(callee, callee.text) === 'module') {
+                const aliased = require('./callers')._moduleValueAliasType(this.index, file, callee.text);
+                const entries = aliased ? classDefsNamed(this.index, aliased.type).entries
+                    .filter(candidate => candidate.def.file === aliased.fromFile && !candidate.def.className) : [];
+                if (entries.length !== 1) return { verdict: 'unknown', reason: 'construction-alias' };
+                owner = { name: aliased.type, key: entries[0].key, def: entries[0].def };
+            }
         }
         if (!owner?.key || !owner.def) return other;
         const declaring = findDeclaringClass(this.index, owner, this.memberCandidates);
@@ -1229,6 +1479,16 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         if (receiverClass) return { verdict: 'unknown', reason: 'receiver-class-call' };
         return member === this.def ? { verdict: 'yes' }
             : { verdict: 'yes', access: this.slotAccess(owner, member) };
+    }
+
+    /** Value aliases of the classes keywordOwnerNames lists (fix #434). */
+    keywordAliasNames() {
+        if (this._keywordAliasNames) return this._keywordAliasNames;
+        const classes = [...this.keywordOwnerNames()].flatMap(name => classDefsNamed(this.index, name).entries
+            .map(entry => entry.def));
+        this._keywordAliasNames = classes.length > 0
+            ? require('./constructor-calls').constructionAliasNames(this.index, classes) : new Set();
+        return this._keywordAliasNames;
     }
 
     /** Names of the classes owning a member of the pin's slot and of their
@@ -1290,8 +1550,9 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                         arg.childForFieldName('name')?.text === 'init' &&
                         arg.childForFieldName('value')?.type === 'false');
                     if (!noInit) synthesizes = true;
-                } else if (!key || ![...(decorators.transparent || []), ...(decorators.namePreserving || [])]
-                    .some(known => known === key || known === `${key}()`)) {
+                } else if ((!key || ![...(decorators.transparent || []), ...(decorators.namePreserving || [])]
+                    .some(known => known === key || known === `${key}()`)) &&
+                    !require('./decorator-binding').classPreservingDecorator(this.index, ref.def, decorator.namedChild(0)?.text || '')) {
                     replaces = true;
                 }
             }
@@ -1411,6 +1672,11 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 return owner && storage ? { ...owner, valueStorage: storage } : null;
             }
             return owner;
+        }
+        // An aliased, default or namespace-chain import (fix #434).
+        if (traits.nameReferenceFamily === 'js' && ['identifier', 'member_expression'].includes(receiver.type)) {
+            const imported = this.jsImportedOwner(file, receiver);
+            if (imported) return traits.separateStaticStorage ? { ...imported, valueStorage: 'class' } : imported;
         }
         if (!['identifier', 'type_identifier', 'package_identifier'].includes(receiver.type)) return null;
         const local = this.localBinding(file, receiver, receiver.text, true);
@@ -2174,9 +2440,20 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 verdict ||= { verdict: 'unknown', reason: 'implicit-value-owner-unresolved' };
             }
             else verdict = this.globalAt(file, node, contextualValue);
+        } else if (this.owner && this.family === 'go' && goKeyedFieldKey(node)) {
+            // `Box{limit: 5}` names Box's own field (fix #434): the
+            // literal's written type, or the element type an enclosing
+            // slice, array or map literal gives an elided one.
+            const type = goCompositeLiteralType(node);
+            const owner = type ? this.classForType(file, typeSyntax(type)) : null;
+            verdict = owner ? this.memberAt(owner) : { verdict: 'unknown', reason: 'composite-literal-type-unresolved' };
         } else verdict = role.role === 'type'
             ? { verdict: 'no', reason: 'non-value-position' }
             : { verdict: 'unknown', reason: 'value-binding-unresolved' };
+        if (!declaration && verdict.verdict === 'yes' && this.moduleVariable && file === this.def.file && !receiver &&
+            !role.binding) {
+            verdict = this.pythonStarBindingAt(file, node) || verdict;
+        }
         if (declaration && verdict.verdict === 'yes') {
             this.selectedDeclarations++;
             if (privateToken) this.privateIdentifier = true;

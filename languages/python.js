@@ -125,6 +125,23 @@ function pythonParamsBind(fn, name) {
     return false;
 }
 
+/** Whether an expression reads `receiver.name` outside nested scopes. */
+function pythonReadsReceiverAttribute(node, receiver, name) {
+    if (!node) return false;
+    let found = false;
+    traverseTree(node, child => {
+        if (found) return false;
+        if ((child.type === 'lambda' || child.type === 'function_definition') && pythonParamsBind(child, receiver)) return false;
+        if (child.type === 'attribute' && child.childForFieldName('object')?.type === 'identifier' &&
+            child.childForFieldName('object').text === receiver && child.childForFieldName('attribute')?.text === name) {
+            found = true;
+            return false;
+        }
+        return true;
+    });
+    return found;
+}
+
 /** Instance attributes the methods of a class body assign on their receiver,
  * one per name in source order, names in `declared` excluded (fix #430).
  * A static method has no receiver; a nested class has its own; a nested
@@ -150,6 +167,10 @@ function pythonInstanceAttributes(bodyNode, declared) {
                 const attr = target.childForFieldName('attribute');
                 if (object?.type !== 'identifier' || object.text !== receiver || !attr) continue;
                 if (seen.has(attr.text)) continue;
+                // `self.m = wrap(self.m)` rebinds a member a base may declare
+                // (fix #434, the JS rule): no attribute of its own.
+                if (node.type === 'assignment' && pythonReadsReceiverAttribute(node.childForFieldName('right'),
+                    receiver, attr.text)) continue;
                 seen.add(attr.text);
                 out.push({ name: attr.text, startLine: attr.startPosition.row + 1,
                     endLine: node.endPosition.row + 1, memberType: 'field', instanceAttribute: true,
@@ -2383,6 +2404,102 @@ function pythonClosureScopeLine(refNode, name) {
     return null;
 }
 
+// Methods Python calls with the class as their first argument without a
+// decorator (data model: implicit classmethods).
+const PY_IMPLICIT_CLASS_METHODS = new Set(['__init_subclass__', '__class_getitem__']);
+
+/**
+ * A construction through a method's own receiver (fix #434): `cls(..)` in a
+ * classmethod, `type(self)(..)` and `self.__class__(..)` in an instance
+ * method build the method's class or a subclass of it. The receiver must be
+ * the method's first parameter, never rebound, and read from the method
+ * itself or a closure inside it. Returns the class (by its name line), the
+ * method, the receiver binding ('class' or 'instance') and the spelling of
+ * the callee, or null.
+ */
+function pythonOwnClassConstruction(callNode) {
+    const funcNode = callNode.childForFieldName('function');
+    let receiver = null, binding = null, spelling = null;
+    if (funcNode?.type === 'identifier') {
+        receiver = funcNode; binding = 'class'; spelling = funcNode.text;
+    } else if (funcNode?.type === 'call') {
+        const inner = funcNode.childForFieldName('function');
+        const args = funcNode.childForFieldName('arguments');
+        const named = args?.type === 'argument_list'
+            ? args.namedChildren.filter(child => !child.type.endsWith('comment')) : [];
+        if (inner?.type === 'identifier' && inner.text === 'type' && named.length === 1 &&
+            named[0].type === 'identifier') {
+            receiver = named[0]; binding = 'instance'; spelling = funcNode.text;
+        }
+    } else if (funcNode?.type === 'attribute' &&
+        funcNode.childForFieldName('attribute')?.text === '__class__' &&
+        funcNode.childForFieldName('object')?.type === 'identifier') {
+        receiver = funcNode.childForFieldName('object'); binding = 'instance'; spelling = '__class__';
+    }
+    if (!receiver) return null;
+    const name = receiver.text;
+    let method = null;
+    for (let parent = callNode.parent; parent && !method; parent = parent.parent) {
+        if (parent.type === 'class_definition' || parent.type === 'module') return null;
+        if (parent.type === 'lambda') {
+            const params = parent.childForFieldName('parameters');
+            if (params && pythonParametersBindName(params, name)) return null;
+        } else if (PY_COMPREHENSIONS.has(parent.type)) {
+            for (const clause of parent.namedChildren) {
+                if (clause.type === 'for_in_clause' &&
+                    pythonTargetBindsName(clause.childForFieldName('left'), name)) return null;
+            }
+        } else if (parent.type === 'function_definition' || parent.type === 'async_function_definition') {
+            const params = parent.childForFieldName('parameters');
+            const body = parent.childForFieldName('body');
+            if (params && pythonParametersBindName(params, name)) method = parent;
+            else if (body && pythonScopeBindsName(body, name)) return null;
+        }
+    }
+    if (!method) return null;
+    const params = method.childForFieldName('parameters');
+    const first = params?.namedChildren.find(child => !child.type.endsWith('comment'));
+    const body = method.childForFieldName('body');
+    if (first?.type !== 'identifier' || first.text !== name || (body && pythonScopeBindsName(body, name)) ||
+        isPythonIterationBindingAt(receiver, name)) return null;
+    const holder = method.parent?.type === 'decorated_definition' ? method.parent : method;
+    const classNode = holder.parent?.type === 'block' && holder.parent.parent?.type === 'class_definition'
+        ? holder.parent.parent : null;
+    const className = classNode?.childForFieldName('name');
+    const methodName = method.childForFieldName('name');
+    if (!className || !methodName) return null;
+    const decorators = holder.type === 'decorated_definition'
+        ? holder.namedChildren.filter(child => child.type === 'decorator').map(child => child.namedChild(0)?.text)
+        : [];
+    const classMethod = decorators.includes('classmethod') || PY_IMPLICIT_CLASS_METHODS.has(methodName.text);
+    if (binding === 'class' ? !classMethod
+        : classMethod || decorators.includes('staticmethod') || methodName.text === '__new__') return null;
+    const own = { name: className.text, line: className.startPosition.row + 1, method: methodName.text,
+        methodLine: methodName.startPosition.row + 1, receiver: name, binding, spelling };
+    // The receiver token names the class at the site (`self` of `type(self)`).
+    Object.defineProperty(own, 'receiverNode', { value: receiver, enumerable: false });
+    return own;
+}
+
+/** The `ownClass` field of a call record (fix #434). */
+function ownClassFields(callNode) {
+    const ownClass = pythonOwnClassConstruction(callNode);
+    return ownClass ? { ownClass } : null;
+}
+
+/** Whether a parameter list binds `name`. */
+function pythonParametersBindName(params, name) {
+    for (const param of params.namedChildren) {
+        let paramName = param.type === 'identifier' ? param
+            : (param.childForFieldName('name') || param.namedChild(0));
+        if (paramName && ['dictionary_splat_pattern', 'list_splat_pattern'].includes(paramName.type)) {
+            paramName = paramName.namedChild(0);
+        }
+        if (paramName?.type === 'identifier' && paramName.text === name) return true;
+    }
+    return false;
+}
+
 /** Shadow fields of a bare reference: `localShadow`, and the enclosing
  * function a closure binds it in. */
 function pythonShadowFields(refNode, name) {
@@ -3780,8 +3897,26 @@ function findCallsInTree(code, tree, parser, sink = null) {
                         enclosingFunction,
                         uncertain,
                         ...pythonShadowFields(funcNode, funcNode.text),
+                        ...ownClassFields(node),
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
                         ...(requestConfig && { requestConfig })
+                    });
+                }
+            } else if (funcNode.type === 'call') {
+                // `type(self)(..)` constructs the method's class (fix #434).
+                const ownClass = pythonOwnClassConstruction(node);
+                if (ownClass) {
+                    calls.push({
+                        callSite: typeOrigin('call', ownClass.receiverNode),
+                        column: ownClass.receiverNode.startPosition.column,
+                        name: ownClass.name,
+                        line: node.startPosition.row + 1,
+                        isMethod: false,
+                        argCount,
+                        ...(argSpread && { argSpread: true }),
+                        enclosingFunction,
+                        uncertain,
+                        ownClass,
                     });
                 }
             } else if (funcNode.type === 'attribute') {
@@ -4046,6 +4181,22 @@ function findCallsInTree(code, tree, parser, sink = null) {
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
                         ...(requestConfig && { requestConfig })
                     });
+                    // `self.__class__(..)` constructs the method's class (fix #434).
+                    const ownClass = attrNode.text === '__class__' ? pythonOwnClassConstruction(node) : null;
+                    if (ownClass) {
+                        calls.push({
+                            callSite: typeOrigin('call', ownClass.receiverNode),
+                            column: ownClass.receiverNode.startPosition.column,
+                            name: ownClass.name,
+                            line: node.startPosition.row + 1,
+                            isMethod: false,
+                            argCount,
+                            ...(argSpread && { argSpread: true }),
+                            enclosingFunction,
+                            uncertain,
+                            ownClass,
+                        });
+                    }
                 }
             }
 

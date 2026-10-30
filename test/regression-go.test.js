@@ -9023,3 +9023,65 @@ describe('fix #431: Go index operands the grammar reads as type arguments', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #434: Go keyed composite-literal fields and literal-typed locals in value renames', () => {
+    const { tmp, rm, idx, applyRenamePlan } = require('./helpers');
+    const { execute } = require('../core/execute');
+    it('renames a field at keyed elements of literals of its type, elided inner literals, and through literal-typed locals', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/k\n\ngo 1.21\n',
+            'box.go': [
+                'package k',
+                '',
+                'type Box struct {',
+                '\tlimit int',
+                '\tname  string',
+                '}',
+                '',
+                'type Other struct {',
+                '\tlimit int',
+                '}',
+                '',
+                'func New() *Box {',
+                '\tb := Box{limit: 5, name: "x"}',
+                '\to := Other{limit: 2}',
+                '\tp := &Box{limit: 1}',
+                '\tlist := []Box{{limit: 3}}',
+                '\tm := map[string]*Box{"a": {limit: 4}}',
+                '\t_, _, _ = o, list, m',
+                '\treturn &Box{limit: b.limit + p.limit}',
+                '}',
+                '',
+                'type hooked struct {',
+                '\tfuncs []func(int) error',
+                '}',
+                '',
+                'func (h *hooked) Write(n int) error {',
+                '\tvar err error',
+                '\tfor i := range h.funcs {',
+                '\t\terr = h.funcs[i](n)',
+                '\t}',
+                '\treturn err',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'box.go:4:limit', renameTo: 'limitZ' });
+            assert.ok(r.ok, r.error);
+            assert.ok(!(r.result.changes || []).some(c => c.needsReview), JSON.stringify(r.result.changes));
+            const { contents } = applyRenamePlan(dir, r.result);
+            const text = contents['box.go'];
+            for (const expected of ['Box{limitZ: 5', 'Other{limit: 2}', '&Box{limitZ: 1}', '[]Box{{limitZ: 3}}',
+                '"a": {limitZ: 4}', '&Box{limitZ: b.limitZ + p.limitZ}']) {
+                assert.ok(text.includes(expected), `${expected}\n${text}`);
+            }
+            // `h.funcs[i](n)` reads as a generic conversion; `h` is a value,
+            // so `h.funcs` is a selector of the field.
+            const hooked = execute(index, 'plan', { name: 'box.go:23:funcs', renameTo: 'funcsZ' });
+            assert.ok(hooked.ok, hooked.error);
+            const fixed = applyRenamePlan(dir, hooked.result).contents['box.go'];
+            assert.ok(fixed.includes('h.funcsZ[i](n)') && fixed.includes('range h.funcsZ'), fixed);
+        } finally { rm(dir); }
+    });
+});

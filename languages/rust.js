@@ -3492,6 +3492,16 @@ function rustExpectedTypeFields(node) {
         const type = parent.childForFieldName('type');
         if (type) return { expectedType: type.text.replace(/\s+/g, '') };
     }
+    // An argument of a plain or path function call (`run(Default::default())`,
+    // fix #434): the callee's declared parameter type at that position.
+    if (parent?.type === 'arguments' && parent.parent?.type === 'call_expression') {
+        const callee = parent.parent.childForFieldName('function');
+        const path = callee?.type === 'identifier' ? callee.text : rustPlainPathText(callee);
+        if (!path) return null;
+        const index = parent.namedChildren.filter(child => !child.type.endsWith('comment'))
+            .findIndex(child => sameNode(child, node));
+        if (index >= 0) return { argumentOf: { callee: path, index } };
+    }
     return null;
 }
 

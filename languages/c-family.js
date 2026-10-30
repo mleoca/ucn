@@ -5578,6 +5578,7 @@ function buildVariableTypes(tree) {
     const memberReceiverUses = [];
     const ambiguousDirectInitializers = [];
     const autoElementInitializers = [];
+    const autoCopyInitializers = [];
     const decltypeDeclarations = [];
     const declaratorStaticType = (type, declarator, holder) => {
         // The declaration's type node carries only the base type. Preserve
@@ -5721,6 +5722,20 @@ function buildVariableTypes(tree) {
                     autoElementInitializers.push({
                         node, declarator, root, scope: variableBindingScope(node),
                     });
+                    continue;
+                }
+                // `auto x = b`, `auto &r = b`, `auto *p = &b` deduce b's type
+                // (fix #434): an object copied, referenced, or pointed at by
+                // the declarator's own pointer. A pointer source keeps its
+                // value untyped (the declarator would read as an object).
+                const declared = declarator.childForFieldName('declarator');
+                const pointerDeclarator = declared?.type === 'pointer_declarator';
+                const source = pointerDeclarator
+                    ? (value?.type === 'pointer_expression' && value.children.some(child => child.type === '&')
+                        ? value.childForFieldName('argument') : null)
+                    : value;
+                if (source?.type === 'identifier') {
+                    autoCopyInitializers.push({ node, declarator, source, scope: variableBindingScope(node) });
                 }
             }
             return true;
@@ -5811,6 +5826,22 @@ function buildVariableTypes(tree) {
         if (elementType) {
             addBindings(candidate.node, elementType, undefined, candidate.scope,
                 [candidate.declarator]);
+        }
+    }
+    // In source order, each sees the bindings before it (fix #434).
+    autoCopyInitializers.sort((a, b) => a.node.startIndex - b.node.startIndex);
+    for (const candidate of autoCopyInitializers) {
+        const at = candidate.source.startIndex;
+        const sources = bindings.filter(binding =>
+            binding.name === candidate.source.text &&
+            binding.scopeStart <= at && at < binding.scopeEnd &&
+            binding.declaredAt <= at);
+        sources.sort((a, b) => (a.scopeEnd - a.scopeStart) - (b.scopeEnd - b.scopeStart) ||
+            b.declaredAt - a.declaredAt);
+        const source = sources[0];
+        if (source?.type && source.valueDeclarator && !source.pointeeType) {
+            addBindings(candidate.node, source.type, undefined, candidate.scope, [candidate.declarator],
+                undefined, undefined, false);
         }
     }
     // In source order: `decltype(copy) c2` sees the binding `copy` got.

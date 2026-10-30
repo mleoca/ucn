@@ -18577,3 +18577,144 @@ describe('fix #433: C# external-type verdicts per namespace block', () => {
         });
     }
 });
+
+describe('fix #434: constructor identity never crosses languages; C# closures, constraints, static abstract members, extension type arguments', () => {
+    const { execFileSync } = require('child_process');
+    const show = (index, handle, sections = 'callers') => {
+        const r = execute(index, 'show', { name: handle, sections });
+        assert.ok(r.ok, r.error);
+        const ctx = r.result.context || r.result;
+        return {
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+            callees: (ctx.callees || []).map(c => `${c.relativePath}:${c.startLine}:${c.name}`),
+            unverifiedCallees: (ctx.unverifiedCallees || []).map(c => `${c.name}:${c.reason}`),
+        };
+    };
+
+    it('a TS constructor check never lists a construction of a same-named Python class\'s subclass', () => {
+        const ts = 'export class Node {\n  constructor(v: number) {\n    this.v = v\n  }\n  v: number\n}\n\n' +
+            'export function direct() {\n  return new Node(5)\n}\n';
+        // Sub(2) fits no Python initializer: a leaked row would surface as
+        // an overload no-fit review of the TS constructor.
+        const py = 'class Node:\n    def __init__(self, v, w):\n        self.v = v\n\n\nclass Sub(Node):\n    pass\n\n\n' +
+            'def run():\n    return Sub(2)\n';
+        const dir = tmp({ 'a.ts': ts, 'm.py': py });
+        const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args],
+            { cwd: dir, stdio: 'pipe' });
+        try {
+            git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+            fs.writeFileSync(path.join(dir, 'a.ts'), ts.replace('constructor(v: number)', 'constructor(v: number, w: number)'));
+            const index = idx(dir);
+            const r = execute(index, 'check', { name: 'a.ts:2:constructor' });
+            assert.ok(r.ok, r.error);
+            const files = [...(r.result.unverifiedSites || []), ...(r.result.mismatchDetails || [])].map(s => s.file);
+            assert.ok(!files.includes('m.py'), JSON.stringify(r.result.unverifiedSites));
+            assert.ok(show(index, 'm.py:2:__init__').unverified.some(site => site.startsWith('m.py:11:')));
+        } finally { rm(dir); }
+    });
+
+    it('C#: a local function reads the typed locals of the method around it', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace App {',
+                '    public class Conn { public int M() => 1; }',
+                '    public class Other { public int M() => 2; }',
+                '    public class S {',
+                '        public int Run() {',
+                '            var connection = new Conn();',
+                '            int Local() => connection.M();',
+                '            int Shadow() { var connection = new Other(); return connection.M(); }',
+                '            return Local() + Shadow();',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(show(index, 'A.cs:2:M').confirmed, ['A.cs:7']);
+            assert.deepStrictEqual(show(index, 'A.cs:3:M').confirmed, ['A.cs:8']);
+        } finally { rm(dir); }
+    });
+
+    it('C#: generic overloads by type-parameter constraints and generic interface arity; static abstract members through constraints', () => {
+        const dir = tmp({
+            'M.cs': [
+                'using System.Threading;',                                                          // 1
+                'using System.Threading.Tasks;',                                                    // 2
+                'namespace App {',                                                                  // 3
+                '    public interface IBaseRequest { }',                                            // 4
+                '    public interface IRequest : IBaseRequest { }',                                 // 5
+                '    public interface IRequest<out TResponse> : IBaseRequest { }',                  // 6
+                '    public interface ISender {',                                                   // 7
+                '        Task<TResponse> Send<TResponse>(IRequest<TResponse> request, CancellationToken ct = default);', // 8
+                '        Task Send<TRequest>(TRequest request, CancellationToken ct = default) where TRequest : IRequest;', // 9
+                '        Task<object?> Send(object request, CancellationToken ct = default);',      // 10
+                '    }',                                                                            // 11
+                '    public class Pong { }',                                                        // 12
+                '    public class Ping : IRequest<Pong> { }',                                       // 13
+                '    public class Notify : IRequest { }',                                           // 14
+                '    public interface IParse<TSelf> where TSelf : IParse<TSelf> {',                 // 15
+                '        static abstract TSelf Parse(string s);',                                   // 16
+                '    }',                                                                            // 17
+                '    public class Num : IParse<Num> {',                                             // 18
+                '        public static Num Parse(string s) => new Num();',                          // 19
+                '    }',                                                                            // 20
+                '    public static class Reader {',                                                 // 21
+                '        public static T Read<T>(string s) where T : IParse<T> => T.Parse(s);',     // 22
+                '    }',                                                                            // 23
+                '    public class Client {',                                                        // 24
+                '        private readonly ISender _m;',                                             // 25
+                '        public Client(ISender m) { _m = m; }',                                     // 26
+                '        public async Task Run() {',                                                // 27
+                '            await _m.Send(new Ping());',                                           // 28
+                '            await _m.Send(new Notify());',                                         // 29
+                '        }',                                                                        // 30
+                '    }',                                                                            // 31
+                '}',                                                                                // 32
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(show(index, 'M.cs:8:Send').confirmed, ['M.cs:28']);
+            assert.deepStrictEqual(show(index, 'M.cs:9:Send').confirmed, ['M.cs:29']);
+            assert.deepStrictEqual(show(index, 'M.cs:10:Send').confirmed, []);
+            assert.deepStrictEqual(show(index, 'M.cs:10:Send').unverified, []);
+            assert.deepStrictEqual(show(index, 'M.cs:16:Parse').confirmed, ['M.cs:22']);
+            assert.deepStrictEqual(show(index, 'M.cs:19:Parse').unverified, ['M.cs:22:possible-dispatch']);
+        } finally { rm(dir); }
+    });
+
+    it('C#: an extension call whose written type arguments or argument count only a sibling takes is no call of the pin', () => {
+        const dir = tmp({
+            'Q.cs': [
+                'using System;',
+                'using System.Collections.Generic;',
+                'namespace App {',
+                '    public class Conn { }',
+                '    public static class Mapper {',
+                '        public static IEnumerable<T> Query<T>(this Conn cnn, string sql) => new List<T>();',
+                '        public static IEnumerable<object> Query(this Conn cnn, string sql) => new List<object>();',
+                '        public static IEnumerable<TR> Query<TA, TB, TR>(this Conn cnn, string sql, Func<TA, TB, TR> map) => new List<TR>();',
+                '    }',
+                '    public class Use {',
+                '        public void Run(Conn c) {',
+                '            var a = c.Query<Conn>("x");',
+                '            var b = c.Query("x");',
+                '            var d = c.Query<Conn, Conn, Conn>("x", (p, q) => p);',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const [line, site] of [[6, 12], [7, 13], [8, 14]]) {
+                const answer = show(index, `Q.cs:${line}:Query`);
+                assert.deepStrictEqual(answer.confirmed, [`Q.cs:${site}`]);
+                assert.deepStrictEqual(answer.unverified, [], JSON.stringify(answer));
+            }
+        } finally { rm(dir); }
+    });
+});

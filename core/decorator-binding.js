@@ -177,12 +177,16 @@ function returnedDecorator(fnNode, family) {
 /**
  * Resolve a decorator's head name to one project callable definition, or null.
  */
-function projectDecoratorDef(index, def, head, rest) {
+function projectDecoratorDef(index, def, head, rest, implementation = false) {
     const { _nameBindingReaches, _moduleAttributeBindingReaches } = require('./callers');
     const target = rest ? rest.slice(1) : head;
     if (rest && rest.includes('.', 1)) return null;
+    // `@overload` stubs declare signatures of the implementation beside
+    // them; the implementation decides what a call returns (fix #434).
     const candidates = (index.symbols.get(target) || []).filter(candidate =>
-        !candidate.className && /function|method/.test(candidate.type || 'function'));
+        !candidate.className && /function|method/.test(candidate.type || 'function') &&
+        !(implementation && (candidate.decorators || []).some(name =>
+            /^(typing\.)?overload$/.test(String(typeof name === 'string' ? name : name?.name || '')))));
     const reaching = candidates.filter(candidate => {
         const targets = new Set([candidate.file]);
         if (!rest) {
@@ -257,4 +261,134 @@ function nameBindingDecorators(index, def, memo = new Map()) {
     return unproven;
 }
 
-module.exports = { nameBindingDecorators };
+// A Python `if` condition testing the parameter against None: true for
+// `p is None`, false for `p is not None`, null for anything else.
+function noneTest(condition, p) {
+    if (condition?.type !== 'comparison_operator' || condition.namedChildCount !== 2) return null;
+    const [left, right] = condition.namedChildren;
+    if (left.type !== 'identifier' || left.text !== p || right.type !== 'none') return null;
+    const operators = condition.children.filter(child => !child.isNamed).map(child => child.type);
+    if (operators.length === 1 && operators[0] === 'is') return true;
+    if (operators.length === 2 && operators[0] === 'is' && operators[1] === 'not') return false;
+    return null;
+}
+
+/**
+ * The return statements of a Python function body that run when the
+ * parameter `p` is None (`pIsNone`) or is a class (fix #434): branches of
+ * `if p is None` / `if p is not None` the value rules out are skipped;
+ * nested definitions, lambdas and classes run elsewhere.
+ */
+function pythonReturnsUnder(block, p, pIsNone, out = []) {
+    for (const statement of namedChildrenOf(block)) {
+        if (statement.type === 'return_statement') { out.push(statement); continue; }
+        if (/^(function_definition|class_definition|decorated_definition)$/.test(statement.type)) continue;
+        if (statement.type === 'if_statement') {
+            const test = noneTest(statement.childForFieldName('condition'), p);
+            if (test !== null) {
+                if (test === pIsNone) pythonReturnsUnder(statement.childForFieldName('consequence'), p, pIsNone, out);
+                else {
+                    for (const alternative of namedChildrenOf(statement).filter(child =>
+                        child.type === 'else_clause' || child.type === 'elif_clause')) {
+                        if (alternative.type === 'elif_clause') return null;
+                        pythonReturnsUnder(alternative.childForFieldName('body'), p, pIsNone, out);
+                    }
+                }
+                continue;
+            }
+        }
+        let invalid = false;
+        traverseTree(statement, node => {
+            if (invalid) return false;
+            if (/^(function_definition|class_definition|lambda)$/.test(node.type)) return false;
+            if (node.type === 'return_statement') out.push(node);
+            if (node.type === 'yield') invalid = true;
+            return true;
+        });
+        if (invalid) return null;
+    }
+    return out;
+}
+
+/** Nested function definitions of a body, by name (not inside other defs). */
+function nestedDefinitions(fnNode) {
+    const nested = new Map();
+    const body = fnNode.childForFieldName('body');
+    traverseTree(body, node => {
+        if (sameNode(node, body)) return true;
+        const definition = node.type === 'decorated_definition' ? node.childForFieldName('definition') : node;
+        if (definition?.type === 'function_definition') {
+            const name = definition.childForFieldName('name');
+            if (name && node.type === 'function_definition') nested.set(name.text, definition);
+            return false;
+        }
+        return !/^(class_definition|lambda)$/.test(node.type);
+    });
+    return nested;
+}
+
+/**
+ * Python: decorator `fnNode` applied to a class returns that class (fix
+ * #434): every return reachable when its first parameter holds the class
+ * returns the parameter, or passes it first to a nested function that
+ * does. `pIsNone` evaluates the factory form (`@d(..)` with the class
+ * parameter left at its None default): every reachable return then gives
+ * a decorator that returns its argument.
+ */
+function pythonReturnsItsClass(fnNode, scope, depth = 0, pIsNone = false) {
+    if (!fnNode || depth > 4) return false;
+    const p = firstParamName(fnNode, 'python');
+    const body = fnNode.childForFieldName('body');
+    if (!p || !body) return false;
+    const nested = new Map([...scope, ...nestedDefinitions(fnNode)]);
+    const returns = pythonReturnsUnder(body, p, pIsNone);
+    if (!returns || returns.length === 0) return false;
+    return returns.every(statement => {
+        const value = statement.namedChild(0);
+        if (pIsNone) {
+            const decorator = value?.type === 'identifier' ? nested.get(value.text) : null;
+            return !!decorator && pythonReturnsItsClass(decorator, nested, depth + 1);
+        }
+        if (value?.type === 'identifier') return value.text === p;
+        if (value?.type !== 'call') return false;
+        const callee = value.childForFieldName('function');
+        const first = namedChildrenOf(value.childForFieldName('arguments'))[0];
+        const inner = callee?.type === 'identifier' ? nested.get(callee.text) : null;
+        return !!inner && first?.type === 'identifier' && first.text === p &&
+            pythonReturnsItsClass(inner, nested, depth + 1);
+    });
+}
+
+/**
+ * Whether a project class decorator returns the class it decorates (fix
+ * #434): `@register` / `@rich_repr` / `@rich_repr(angular=True)` keep the
+ * class (and its synthesized initializer) in place.
+ */
+function classPreservingDecorator(index, classDef, text) {
+    const fileEntry = index.files.get(classDef.file);
+    if (fileEntry?.language !== 'python') return false;
+    const call = text.indexOf('(');
+    const expr = (call >= 0 ? text.slice(0, call) : text).trim();
+    if (!/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(expr)) return false;
+    const dot = expr.indexOf('.');
+    const head = dot < 0 ? expr : expr.slice(0, dot);
+    const rest = dot < 0 ? '' : expr.slice(dot);
+    const target = projectDecoratorDef(index, classDef, head, rest, true);
+    if (!target) return false;
+    const tree = treeOf(index, target.file);
+    const fnNode = tree ? functionNodeAt(tree, target.nameLine || target.startLine, target.name) : null;
+    if (!fnNode) return false;
+    if (call < 0) return pythonReturnsItsClass(fnNode, new Map());
+    // The factory form: the class parameter is left at its None default
+    // when no positional argument is passed.
+    const args = text.slice(call + 1, text.lastIndexOf(')')).trim();
+    const positional = args.length > 0 && args.split(',').some(arg => !/^\s*[A-Za-z_]\w*\s*=/.test(arg));
+    const firstParam = namedChildrenOf(fnNode.childForFieldName('parameters'))[0];
+    if (!positional && firstParam?.type === 'default_parameter' &&
+        firstParam.childForFieldName('value')?.type === 'none') {
+        return pythonReturnsItsClass(fnNode, new Map(), 0, true);
+    }
+    return pythonReturnsItsClass(returnedDecorator(fnNode, 'python'), new Map());
+}
+
+module.exports = { nameBindingDecorators, classPreservingDecorator };

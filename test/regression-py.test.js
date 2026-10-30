@@ -9938,8 +9938,9 @@ describe('fix #424: Python rename closure, nested scopes and configuration items
             const callees = findCallees(index, up, { collectAccount: true, includeMethods: true });
             assert.ok(!callees.some(c => c.name === 'update'));
             assert.ok((callees.unverifiedCallees || []).some(c => c.name === 'update'));
-            // A class-qualified call through that class stays visible.
-            assert.ok(show('pkg/std.py:5:get_lock').unverified.includes('use.py:9'));
+            // A class-qualified call through that class reaches the member
+            // every configuration alternative inherits from std (fix #434).
+            assert.ok(show('pkg/std.py:5:get_lock').confirmed.includes('use.py:9'));
             // Renaming the base class keeps the item's name in the module
             // whose import alternative binds it, and its importers' tokens.
             const { contents } = applied(dir, index, 'pkg/std.py:1:tqdm', 'TqdmZ');
@@ -10123,9 +10124,11 @@ describe('fix #431: Python value accesses by what each token reads', () => {
             assert.deepStrictEqual(lines(band(12)), [31]);
             // An explicit __init__ takes a parameter of its own.
             assert.deepStrictEqual(lines(band(15)), [17]);
-            // A class decorator may replace the class; a class's own
-            // `__init__` takes its parameters whatever its decorators.
-            assert.deepStrictEqual(unverified(band(27)), ['34:class-decorator']);
+            // A project class decorator that returns its class keeps the
+            // synthesized initializer (fix #434); a class's own `__init__`
+            // takes its parameters whatever its decorators.
+            assert.deepStrictEqual(lines(band(27)), [34]);
+            assert.deepStrictEqual(unverified(band(27)), []);
             assert.deepStrictEqual(lines(band(38)), [40]);
             assert.deepStrictEqual(unverified(band(38)), []);
             const plan = execute(index, 'plan', { name: 'm.py:6:style', renameTo: 'tone' });
@@ -10199,6 +10202,188 @@ describe('fix #431: Python value accesses by what each token reads', () => {
             assert.ok(plan.ok, plan.error);
             const edited = new Set((plan.result.changes || []).map(c => c.line));
             for (const line of [2, 4, 7, 9, 12, 14, 16, 19, 22]) assert.ok(edited.has(line), `line ${line}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #434: Python own-class constructions, star imports, configuration bases, rebindings, class decorators', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const { execFileSync } = require('child_process');
+    const show = (index, handle, sections = 'callers') => {
+        const r = execute(index, 'show', { name: handle, sections });
+        assert.ok(r.ok, r.error);
+        const ctx = r.result.context || r.result;
+        return {
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+            callees: (ctx.callees || []).map(c => `${c.relativePath}:${c.startLine}:${c.name}`),
+        };
+    };
+    const OWN = [
+        'class Node:',                              // 1
+        '    def __init__(self, v):',               // 2
+        '        self.v = v',                       // 3
+        '',                                         // 4
+        '    @classmethod',                         // 5
+        '    def make(cls, v):',                    // 6
+        '        return cls(v)',                    // 7
+        '',                                         // 8
+        '    def copy(self):',                      // 9
+        '        return type(self)(self.v)',        // 10
+        '',                                         // 11
+        '    def again(self):',                     // 12
+        '        return self.__class__(self.v)',    // 13
+        '',                                         // 14
+        '    @staticmethod',                        // 15
+        '    def static(cls):',                     // 16
+        '        return cls(1)',                    // 17
+        '',                                         // 18
+        '',                                         // 19
+        'class Sub(Node):',                         // 20
+        '    def __init__(self, v):',               // 21
+        '        super().__init__(v)',              // 22
+        '',                                         // 23
+        '',                                         // 24
+        'def run():',                               // 25
+        '    return Sub.make(1).copy(), Node(5)',   // 26
+    ].join('\n');
+
+    it('cls(..), type(self)(..) and self.__class__(..) construct the method\'s class; subclass initializers see them as possible dispatch', () => {
+        const dir = tmp({ 'm.py': OWN });
+        try {
+            const index = idx(dir);
+            const init = show(index, 'm.py:2:__init__');
+            for (const line of [7, 10, 13]) assert.ok(init.confirmed.includes(`m.py:${line}`), JSON.stringify(init));
+            assert.ok(!init.confirmed.includes('m.py:17'));
+            const sub = show(index, 'm.py:21:__init__');
+            for (const line of [7, 10, 13]) assert.ok(sub.unverified.includes(`m.py:${line}:possible-dispatch`), JSON.stringify(sub));
+            assert.ok(show(index, 'm.py:6:make', 'callees').callees.includes('m.py:1:Node'));
+            // A class rename has no token to edit at these sites.
+            const plan = execute(index, 'plan', { name: 'm.py:1:Node', renameTo: 'NodeZ' });
+            assert.ok(plan.ok, plan.error);
+            const lines = new Set((plan.result.changes || []).map(c => c.line));
+            for (const line of [7, 10, 13]) assert.ok(!lines.has(line), JSON.stringify(plan.result.changes));
+        } finally { rm(dir); }
+    });
+
+    it('check reports an own-class construction that a changed __init__ breaks', () => {
+        const dir = tmp({ 'm.py': OWN });
+        const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args],
+            { cwd: dir, stdio: 'pipe' });
+        try {
+            git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+            fs.writeFileSync(path.join(dir, 'm.py'), OWN.replace('def __init__(self, v):\n        self.v', 'def __init__(self, v, w):\n        self.v'));
+            const index = idx(dir);
+            const r = execute(index, 'check', { name: 'm.py:2:__init__' });
+            assert.ok(r.ok, r.error);
+            const lines = (r.result.mismatchDetails || []).map(m => m.line);
+            for (const line of [7, 10, 13, 26]) assert.ok(lines.includes(line), JSON.stringify(r.result.mismatchDetails));
+        } finally { rm(dir); }
+    });
+
+    it('a module-time read before the variable\'s first binding reads what a star import binds', () => {
+        const dir = tmp({
+            'other.py': 'LIMIT = 1\n',
+            'm.py': 'from other import *\n\nBEFORE = LIMIT + 1\nLIMIT = 5\n\n\ndef f():\n    return LIMIT\n',
+        });
+        try {
+            const index = idx(dir);
+            const { contents } = applyRenamePlan(dir, execute(index, 'plan', { name: 'm.py:4:LIMIT', renameTo: 'LIMITZ' }).result);
+            assert.match(contents['m.py'], /BEFORE = LIMIT \+ 1/);
+            assert.match(contents['m.py'], /LIMITZ = 5/);
+            assert.match(contents['m.py'], /return LIMITZ/);
+        } finally { rm(dir); }
+    });
+
+    it('a member every configuration alternative of a base inherits from one definition is known by name', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/std.py': 'class tqdm:\n    def format_meter(self):\n        return 1\n    def display(self):\n        return 0\n',
+            'pkg/nb.py': 'from .std import tqdm as std_tqdm\n\nclass tqdm_notebook(std_tqdm):\n' +
+                '    def display(self):\n        return 2\n\ntqdm = tqdm_notebook\n',
+            'pkg/autonb.py': 'try:\n    import IPython\nexcept ImportError:\n    from .std import tqdm\nelse:\n' +
+                '    from .nb import tqdm\n',
+            'tele.py': 'from pkg.autonb import tqdm as tqdm_auto\n\nclass tqdm_t(tqdm_auto):\n' +
+                '    def show(self):\n        return self.format_meter() + self.display()\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(show(index, 'pkg/std.py:2:format_meter').confirmed.includes('tele.py:5'));
+            // display: the alternatives' lookups find two definitions.
+            assert.ok(!show(index, 'pkg/std.py:4:display').confirmed.includes('tele.py:5'));
+        } finally { rm(dir); }
+    });
+
+    it('self.m = wrap(self.m) rebinds an inherited member; it declares no attribute', () => {
+        const dir = tmp({
+            'm.py': 'import functools\n\n\nclass Base:\n    def write(self, s):\n        return s\n\n\n' +
+                'class W(Base):\n    def __init__(self):\n        self.write = functools.partial(self.write)\n' +
+                '        self.size = 1\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual((index.symbols.get('write') || []).map(d => d.type), ['method']);
+            assert.ok((index.symbols.get('size') || []).some(d => d.instanceAttribute));
+        } finally { rm(dir); }
+    });
+
+    it('a project class decorator that returns its class keeps synthesized keywords; a class alias constructs the class', () => {
+        const dir = tmp({
+            'repr_.py': [
+                'from typing import overload',
+                '',
+                '@overload',
+                'def rich_repr(cls): ...',
+                '@overload',
+                'def rich_repr(*, angular=False): ...',
+                'def rich_repr(cls=None, *, angular=False):',
+                '    def do_replace(cls, angular=False):',
+                '        cls.angular = angular',
+                '        return cls',
+                '    if cls is None:',
+                '        def _wrapper(cls):',
+                '            return do_replace(cls, angular=angular)',
+                '        return _wrapper',
+                '    else:',
+                '        return do_replace(cls, angular=False)',
+                '',
+                'def replace(cls):',
+                '    return object',
+            ].join('\n'),
+            'seg.py': [
+                'from dataclasses import dataclass',             // 1
+                'from repr_ import rich_repr, replace',         // 2
+                '',                                              // 3
+                '@rich_repr',                                    // 4
+                '@dataclass',                                    // 5
+                'class Segment:',                                // 6
+                '    style: str = ""',                           // 7
+                '',                                              // 8
+                '@rich_repr(angular=True)',                      // 9
+                '@dataclass',                                    // 10
+                'class Span:',                                   // 11
+                '    style: str = ""',                           // 12
+                '',                                              // 13
+                '@replace',                                      // 14
+                '@dataclass',                                    // 15
+                'class Odd:',                                    // 16
+                '    style: str = ""',                           // 17
+                '',                                              // 18
+                'Seg = Segment',                                 // 19
+                '',                                              // 20
+                'a = Segment(style="a")',                        // 21
+                'b = Span(style="b")',                           // 22
+                'c = Odd(style="c")',                            // 23
+                'd = Seg(style="d")',                            // 24
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = line => index.impact('style', { file: 'seg.py', line }).valueAccesses;
+            const confirmed = b => (b.byFile || []).flatMap(f => f.sites.map(s => s.line));
+            assert.deepStrictEqual(confirmed(band(7)), [21, 24]);
+            assert.deepStrictEqual(confirmed(band(12)), [22]);
+            assert.ok((band(17).unverifiedSites || []).some(s => s.line === 23 && s.reason === 'class-decorator'));
         } finally { rm(dir); }
     });
 });

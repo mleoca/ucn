@@ -1399,7 +1399,8 @@ function sitesReboundByChange(index, name, def, rawCallers, confirmed, unverifie
         seen.add(key);
         const { occurrenceIdentity } = require('./provenance-facts');
         const calls = (getCachedCalls(index, site.file) || []).filter(call => call.line === site.line &&
-            (call.name === name || call.resolvedName === name || call.name === site.calledAs));
+            (call.name === name || call.resolvedName === name || call.name === site.calledAs ||
+                call.ownClass && call.ownClass.spelling === site.calledAs));
         const exact = calls.filter(call => siteKey({ ...occurrenceIdentity(site.file, call), file: site.file }) === key);
         const call = exact.length === 1 ? exact[0] : calls.length === 1 ? calls[0] : null;
         const language = index.files.get(site.file)?.language;
@@ -1574,6 +1575,7 @@ function computePlanCallSites(index, name, def, options = {}) {
             ...(c.macroExpansion && { macroExpansion: c.macroExpansion }),
             ...(c.targetTyped && { targetTyped: true }),
             ...(c.keywordDelegation && { keywordDelegation: true }),
+            ...(c.ownClassConstruction && { ownClassConstruction: true }),
             ...(c.destructured && { destructured: c.destructured }),
             ...(c.importAliasSpelling && { importAliasSpelling: true }),
         });
@@ -3711,7 +3713,9 @@ function plan(index, name, options = {}) {
             // A target-typed `new(..)` or a keyword delegation (`base(..)`)
             // spells no name: the type written at its declaration site is
             // what the rename edits (fixes #393, #421).
-            if (incoming.targetTyped || incoming.keywordDelegation) continue;
+            // `cls(..)` / `type(self)(..)` / `new this(..)` spell the
+            // method's receiver, never the class (fix #434).
+            if (incoming.targetTyped || incoming.keywordDelegation || incoming.ownClassConstruction) continue;
             // A call of a name destructured from the member (`const { run }
             // = make(); run()`) spells the member at the pattern key (fix
             // #397): the key is renamed and the local binding kept
@@ -3744,6 +3748,11 @@ function plan(index, name, options = {}) {
                 }
                 continue;
             }
+            // A call spelled by an import alias (`h()` after `const h =
+            // require('./a').helper`) keeps its spelling; the import's
+            // source-side name is the edit (fix #434: it made a same-line
+            // spelled call a manual review).
+            if (incoming.calledAs && incoming.calledAs !== name && incoming.calledAs !== 'bound') continue;
             const lineKey = `${incoming.file}:${incoming.line}`;
             const site = emittedRenameCalls.get(lineKey) || {
                 file: incoming.file,
@@ -3930,7 +3939,8 @@ function plan(index, name, options = {}) {
                 // An import from a module outside the project (`const parse =
                 // require('parseurl')`, fix #397) binds that module's value,
                 // never the renamed definition; a resolver gap keeps the edit.
-                if (!abs && !require('./callers')._unresolvedModuleIsGap(index, binding.module, binding)) return false;
+                if (!abs && (!require('./callers')._unresolvedModuleIsGap(index, binding.module, binding) ||
+                    require('./callers')._nonSourceModuleFile(index, filePath, binding.module))) return false;
                 if (!abs) return filePath !== def.file;
                 if (abs === filePath) return false;
                 // A module binding the name through one alternative of a

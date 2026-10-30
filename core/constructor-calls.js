@@ -281,6 +281,58 @@ function constructionAliasBinding(index, file, call, targets) {
     return { owner, provenance: { rule: 'construction-type', rules: ['construction-type'], facts } };
 }
 
+const OWN_CLASS_KINDS = new Set(['class', 'struct', 'record']);
+const namedAt = (def, line) => def.nameLine === line || def.startLine === line;
+
+/**
+ * The class a construction through a method's own receiver builds (fix
+ * #434): `cls(..)` in a Python classmethod, `type(self)(..)`,
+ * `self.__class__(..)`, JS `new this(..)` in a static method and `new
+ * this.constructor(..)`. The site builds the method's class, or a subclass
+ * of it when the method runs through one; the witness replays the method's
+ * class from the recorded declarations.
+ */
+function ownClassBinding(index, file, call) {
+    const own = call.ownClass;
+    const entry = index.files.get(file);
+    if (!own || !entry || !langTraits(entry.language)?.ownClassMethod) return null;
+    const owner = (entry.symbols || []).find(def => def.name === own.name && OWN_CLASS_KINDS.has(def.type) &&
+        namedAt(def, own.line));
+    if (!owner) return null;
+    const { occurrenceIdentity } = require('./provenance-facts');
+    const site = occurrenceIdentity(entry.relativePath, call);
+    const witness = require('./provenance-type').captureTypeLookup(index, { file, relativePath: site.file,
+        line: site.line, column: site.column, name: call.name, ownClass: own, construction: true }, owner);
+    if (!witness) return null;
+    return { owner, provenance: { rule: 'construction-type', rules: ['construction-type'],
+        facts: { language: entry.language, site, targets: [declarationIdentity(owner)], constructionBinding: witness } } };
+}
+
+// Ancestors of the owners by resolved base identity, same name family, in
+// breadth-first order (fix #434).
+function resolvedAncestors(index, owners) {
+    const { classDefsNamed, parentRefsOf } = require('./class-identity');
+    const keyOf = def => classDefsNamed(index, def.name).entries.find(entry => entry.def === def)?.key || null;
+    const seen = new Set(owners.map(def => identityKey(declarationIdentity(def))));
+    const out = [];
+    const queue = owners.map(def => ({ name: def.name, key: keyOf(def), def }));
+    while (queue.length && out.length < 64) {
+        const ref = queue.shift();
+        if (!ref.key) continue;
+        for (const parent of parentRefsOf(index, ref)) {
+            if (parent.external || !parent.key) continue;
+            const def = classDefsNamed(index, parent.name).entries.find(entry => entry.key === parent.key)?.def;
+            if (!def || nameFamily(index, def) !== nameFamily(index, ref.def)) continue;
+            const id = identityKey(declarationIdentity(def));
+            if (seen.has(id)) continue;
+            seen.add(id);
+            out.push(def);
+            queue.push({ name: def.name, key: parent.key, def });
+        }
+    }
+    return out;
+}
+
 function isConstruction(call, site, language) {
     return !site?.isFunctionReference && !site?.isTypeReference && !call.isFunctionReference &&
         !call.isPotentialCallback && !call.isTypeReference && (call.isConstructor ||
@@ -376,7 +428,12 @@ function constructionEvidenceUncached(index, owner, call, classBinding) {
             line: site.line, column: site.column, name: call.name,
             qualifier: call.constructorQualifier || call.receiver || null, nameScopeOnly: true,
         }, owner) : null;
-    const typeLookup = (call.isConstructor || functional || langTraits(language)?.classesCallableWithoutNew) && site &&
+    const typeLookup = call.ownClass && site
+        ? require('./provenance-type').captureTypeLookup(index, {
+            file: path.resolve(index.root, site.file), relativePath: site.file,
+            line: site.line, column: site.column, name: call.name, ownClass: call.ownClass, construction: true,
+        }, owner)
+        : (call.isConstructor || functional || langTraits(language)?.classesCallableWithoutNew) && site &&
         (functional || langTraits(language)?.typeSystem === 'structural' ||
             validateConfirmation(classBinding, declarationIdentity(owner)).verdict !== 'establishes-target')
         ? require('./provenance-type').captureTypeLookup(index, {
@@ -568,6 +625,30 @@ function classConstructionCalls(index, owner, options) {
     return memo.get(key);
 }
 
+const nameFamily = (index, def) => {
+    const language = index.files.get(def.file)?.language;
+    return langTraits(language)?.nameReferenceFamily || language;
+};
+
+// Whether a class the inheritance graph lists under `parentName` derives
+// from this owner (fix #434). The graph is keyed by the parent's spelling
+// only: a class of another language never derives from the owner, and a
+// base that resolves to another definition of the name is another class.
+// An unresolved base stays a candidate.
+function extendsOwner(index, candidate, parentName, owner) {
+    if (nameFamily(index, candidate) !== nameFamily(index, owner)) return false;
+    const { classDefsNamed, parentRefsOf } = require('./class-identity');
+    const ownerKey = classDefsNamed(index, owner.name).entries.find(entry => entry.def === owner)?.key;
+    const childKey = classDefsNamed(index, candidate.name).entries.find(entry => entry.def === candidate)?.key;
+    if (!ownerKey || !childKey) return true;
+    const spelled = parentRefsOf(index, { name: candidate.name, key: childKey, def: candidate })
+        .filter(parent => parent.name === parentName);
+    // A base naming no class definition (a value alias of the owner) stays
+    // a candidate.
+    return !spelled.length || spelled.some(parent => !parent.external && (!parent.key || parent.key === ownerKey ||
+        classDefsNamed(index, parent.name).entries.every(entry => entry.key !== parent.key)));
+}
+
 /** Add class constructions to a constructor's ordinary, explicitly named calls. */
 function projectConstructorCallers(index, name, options, result) {
     if (options.constructorProjectionSource || options.constructorProjection === false) return result;
@@ -582,12 +663,15 @@ function projectConstructorCallers(index, name, options, result) {
         const owner = owners[at];
         if (!langTraits(index.files.get(owner.file)?.language)?.constructorInheritance) continue;
         const parentNames = [owner.name, ...constructionAliasNames(index, [owner])];
-        for (const child of parentNames.flatMap(name => index.extendedByGraph.get(name) || [])) {
-            const name = typeof child === 'string' ? child : child.name;
-            for (const candidate of index.symbols.get(name) || []) {
-                if (candidate.type !== 'class' || child.file && candidate.file !== child.file ||
-                    owners.some(other => sameDeclaration(declarationIdentity(candidate), declarationIdentity(other)))) continue;
-                owners.push(candidate);
+        for (const parentName of parentNames) {
+            for (const child of index.extendedByGraph.get(parentName) || []) {
+                const name = typeof child === 'string' ? child : child.name;
+                for (const candidate of index.symbols.get(name) || []) {
+                    if (candidate.type !== 'class' || child.file && candidate.file !== child.file ||
+                        owners.some(other => sameDeclaration(declarationIdentity(candidate), declarationIdentity(other))) ||
+                        !extendsOwner(index, candidate, parentName, owner)) continue;
+                    owners.push(candidate);
+                }
             }
         }
     }
@@ -600,6 +684,8 @@ function projectConstructorCallers(index, name, options, result) {
             let records = callsOnLine(index, site.file, site.line).filter(call => sameSite(call, site));
             if (records.length > 1 && records.some(call => call.implicitBase)) records = records.filter(call => call.implicitBase &&
                 call.name === (site.calledAs || owner.name) && constructionAliasBinding(index, site.file, call, [owner]));
+            // `type(self)(..)` starts where its inner `type(self)` call does.
+            if (records.length > 1 && site.ownClassConstruction) records = records.filter(call => call.ownClass);
             if (records.length !== 1) continue;
             let call = records[0];
             if (!isConstruction(call, site, language)) continue;
@@ -623,6 +709,27 @@ function projectConstructorCallers(index, name, options, result) {
                 ...(call.implicitBase && { implicitConstruction: true }),
                 provenance: choice.provenance, ...(reason ? { tier: 'unverified', reason } : { tier: 'confirmed' }) };
             (reason ? uncertain : promoted).push(row);
+        }
+    }
+    // A construction through an ancestor method's own receiver (`cls(..)`,
+    // `type(self)(..)`, `new this(..)`) builds the class the method runs
+    // through: possibly an owner below that ancestor (fix #434).
+    if (options.collectAccount && owners.some(owner => langTraits(index.files.get(owner.file)?.language)?.ownClassMethod)) {
+        for (const ancestor of resolvedAncestors(index, owners)) {
+            const entry = index.files.get(ancestor.file);
+            for (const call of index.getCachedCalls(ancestor.file) || []) {
+                if (call.ownClass?.name !== ancestor.name || !namedAt(ancestor, call.ownClass.line)) continue;
+                const binding = ownClassBinding(index, ancestor.file, call);
+                if (!binding || !sameDeclaration(declarationIdentity(binding.owner), declarationIdentity(ancestor))) continue;
+                const caller = index.findEnclosingFunction(ancestor.file, call.line, true, call);
+                uncertain.push({ file: ancestor.file, relativePath: entry.relativePath, line: call.line,
+                    ...(Number.isInteger(call.callSite?.column) && { column: call.callSite.column }),
+                    content: index._getFileLines(ancestor.file)?.[call.line - 1] ?? '',
+                    callerName: caller?.name || null, callerFile: caller ? ancestor.file : null,
+                    callerStartLine: caller?.startLine ?? null, callerEndLine: caller?.endLine ?? null,
+                    isMethod: false, calledAs: call.ownClass.spelling, ownClassConstruction: true,
+                    provenance: binding.provenance, tier: 'unverified', reason: 'possible-dispatch' });
+            }
         }
     }
     const confirmed = [];
@@ -662,5 +769,5 @@ function projectConstructorCallers(index, name, options, result) {
 }
 
 module.exports = { isConstructor, ownConstructors, isConstruction, constructionChoice, constructionTypeParameter,
-    projectConstructorCallers, projectConstructorCalleeSites, constructionAliasNames, constructionAliasBinding,
+    projectConstructorCallers, projectConstructorCalleeSites, constructionAliasNames, constructionAliasBinding, ownClassBinding,
     constructionTypeCandidates, constructionAliasPossibilities, ownMembers };

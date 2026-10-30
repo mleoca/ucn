@@ -653,7 +653,8 @@ function parentRefsOf(index, ref) {
     const out = [];
     const seen = new Set();
     const push = parent => {
-        const k = parent.key || `?${parent.name}${parent.external ? '!' : ''}`;
+        const k = parent.key || `?${parent.name}${parent.external ? '!' : ''}` +
+            (parent.alternatives ? `#${parent.alternatives.map(alternative => alternative.key).join('#')}` : '');
         if (seen.has(k)) return;
         seen.add(k);
         out.push(parent);
@@ -757,11 +758,99 @@ function _importBoundParents(index, contextFile, rawParents, childRef) {
         if (verdicts.includes('unknown')) continue;
         const hits = entries.filter((e, i) => verdicts[i] === 'yes');
         out.names.add(binding.name);
-        out.refs.push(hits.length === 1 && verdicts.filter(v => v !== 'no').length === 1
-            ? { name: binding.name, key: hits[0].key, def: hits[0].def }
-            : { name: binding.name, key: null, def: null, importUnresolved: true });
+        if (hits.length === 1 && verdicts.filter(v => v !== 'no').length === 1) {
+            out.refs.push({ name: binding.name, key: hits[0].key, def: hits[0].def });
+            continue;
+        }
+        // One class per runtime configuration (fix #434): members every
+        // alternative declares through one definition are known by name.
+        const alternatives = _pythonClassDenotations(index, moduleFile, binding.name, 0);
+        if (alternatives?.length === 1 && hits.length === 0) {
+            out.refs.push(_refOfDefinition(index, alternatives[0]));
+            continue;
+        }
+        out.refs.push({ name: binding.name, key: null, def: null, importUnresolved: true,
+            ...(alternatives?.length > 1 && { alternatives: alternatives.map(def => _refOfDefinition(index, def)) }) });
     }
     return out;
+}
+
+function _refOfDefinition(index, def) {
+    const entry = classDefsNamed(index, def.name).entries.find(candidate => candidate.def === def);
+    return { name: def.name, key: entry?.key || null, def };
+}
+
+/**
+ * The class definitions a Python module-scope name denotes, one per runtime
+ * configuration (fix #434): a class statement, a value naming a class, an
+ * import of a class, or a configuration item whose every alternative is
+ * one of those. Null when any alternative is no class or cannot be followed.
+ */
+function _pythonClassDenotations(index, file, name, depth) {
+    const entry = index.files.get(file);
+    if (!entry || depth > 6 || !/^[A-Za-z_]\w*$/.test(String(name))) return null;
+    const classAt = line => {
+        const found = classDefsNamed(index, name).entries.filter(candidate => candidate.def.file === file &&
+            !candidate.def.className && candidate.def.lexicalScopeStartLine == null &&
+            (line == null || candidate.def.startLine === line || candidate.def.nameLine === line));
+        return found.length === 1 ? found[0].def : null;
+    };
+    const imported = (target, line = null) => {
+        const bindings = (entry.importBindings || []).filter(binding => binding.module != null &&
+            binding.name !== '*' && binding.kind !== 'import' && (binding.alias || binding.name) === target &&
+            (line == null || binding.line === line));
+        if (bindings.length !== 1) return null;
+        const rel = entry.moduleResolved?.[bindings[0].module];
+        if (!rel) return null;
+        return _pythonClassDenotations(index, path.isAbsolute(rel) ? rel : path.join(index.root, rel),
+            bindings[0].name, depth + 1);
+    };
+    const { moduleItemNamed } = require('./configuration-items');
+    const item = moduleItemNamed(index, file, name);
+    if (item) {
+        const out = [];
+        for (const site of item.sites) {
+            let defs = null;
+            if (site.kind === 'class') {
+                const def = classAt(site.line);
+                defs = def ? [def] : null;
+            } else if (site.kind === 'value' && site.target) {
+                defs = site.target === name ? null : _pythonClassDenotations(index, file, site.target, depth + 1);
+            } else if (site.kind === 'import') {
+                defs = imported(name, site.line);
+            }
+            if (!defs) return null;
+            for (const def of defs) if (!out.includes(def)) out.push(def);
+        }
+        return out.length > 0 ? out : null;
+    }
+    const own = classAt(null);
+    if (own) return [own];
+    if ((entry.symbols || []).some(def => def.name === name && !def.className && def.lexicalScopeStartLine == null &&
+        def.type !== 'state')) return null;
+    const alias = (entry.moduleValueAliases || []).filter(value => value.name === name);
+    if (alias.length === 1 && alias[0].target && !alias[0].alternatives?.length && alias[0].target !== name &&
+        !alias[0].target.includes('.')) return _pythonClassDenotations(index, file, alias[0].target, depth + 1);
+    if (alias.length > 0) return null;
+    return imported(name);
+}
+
+/**
+ * The member lookup every configuration alternative of a base agrees on
+ * (fix #434): the declaring class and members when each alternative finds
+ * the same definitions certainly, else null.
+ */
+function alternativesDeclare(index, ref, definitions, opts = {}) {
+    if (!ref?.alternatives?.length) return null;
+    let agreed = null;
+    for (const alternative of ref.alternatives) {
+        const found = _findDeclaringClass(index, alternative, definitions, { ...opts, parentsOnly: false });
+        if (!found || found.uncertain) return null;
+        if (!agreed) { agreed = found; continue; }
+        if (found.members.length !== agreed.members.length ||
+            found.members.some(member => !agreed.members.includes(member))) return null;
+    }
+    return agreed;
 }
 
 /**
@@ -1017,7 +1106,10 @@ function _findDeclaringClass(index, startRef, definitions, opts) {
         visited.add(vk);
         // A base its import leaves undecided (fix #424) may declare the
         // member under any class name.
-        if (ref.importUnresolved) return { ref, uncertain: true, members: check(ref)?.members || [] };
+        if (ref.importUnresolved) {
+            return alternativesDeclare(index, ref, definitions, opts) ||
+                { ref, uncertain: true, members: check(ref)?.members || [] };
+        }
         const hit = check(ref);
         if (hit) {
             // An unresolved parent can only yield an uncertain match.
@@ -1116,6 +1208,14 @@ function descendsFromTargets(index, ref, targetDefs) {
         if (visited.has(vk)) continue;
         visited.add(vk);
         if (matches(parent)) return 'yes';
+        if (parent.alternatives?.length) {
+            // A base per runtime configuration (fix #434) descends when
+            // every alternative does.
+            const verdicts = parent.alternatives.map(alternative => descendsFromTargets(index, alternative, targetDefs));
+            if (verdicts.every(verdict => verdict === 'yes')) return 'yes';
+            if (!verdicts.every(verdict => verdict === 'no')) maybe = true;
+            continue;
+        }
         if (parent.key || parent.def) {
             queue.push(...parentRefsOf(index, parent));
         } else {
@@ -1193,6 +1293,8 @@ function shareDescendant(index, matchedRef, targetDefs) {
 
 module.exports = {
     OWNER_CLASS_KINDS,
+    alternativesDeclare,
+    pythonClassDenotations: _pythonClassDenotations,
     resetClassIdentity,
     ownerNameOf,
     classKeyOf,

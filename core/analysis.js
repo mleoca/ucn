@@ -2246,6 +2246,7 @@ function diffImpact(index, options = {}) {
         let oldCallables = null;        // old symbols WITH ranges — deleted lines are old-file coordinates
         let oldParsed = null;
         let oldLines = null;
+        let oldText = null;
         if (change.deletedLines.length > 0 || change.addedLines.length > 0) {
             const ref = staged ? 'HEAD' : base;
             try {
@@ -2256,6 +2257,7 @@ function diffImpact(index, options = {}) {
                 const fileLang = detectLanguage(change.filePath);
                 if (fileLang) {
                     oldParsed = parse(oldContent, fileLang);
+                    oldText = oldContent;
                     oldLines = oldContent.split('\n');
                     oldSymbolIdentities = new Set();
                     oldCallables = extractCallableSymbols(oldParsed);
@@ -2270,17 +2272,61 @@ function diffImpact(index, options = {}) {
 
         collectNonCallableChanges(index, change, oldParsed, fileEntry.symbols, symbolChanges, oldLines);
 
+        // Several callables can share a changed line (`class Box {
+        // constructor(v) {..} get w() {..} }`, fix #434): the line belongs
+        // to each whose own source changed, a callable whose text equals its
+        // base twin's is unchanged by it.
+        let currentText = null;
+        const spanText = (text, s) => text != null && s?.sourceSpan &&
+            Number.isInteger(s.sourceSpan.start) && Number.isInteger(s.sourceSpan.end)
+            ? text.slice(s.sourceSpan.start, s.sourceSpan.end) : null;
+        const unchangedMemo = new Map();
+        const unchangedCallable = symbol => {
+            if (unchangedMemo.has(symbol)) return unchangedMemo.get(symbol);
+            let unchanged = false;
+            if (oldCallables !== null && symbol.sourceSpan) {
+                if (currentText === null) {
+                    try { currentText = index._readFile(change.filePath); } catch { currentText = undefined; }
+                }
+                const text = spanText(currentText, symbol);
+                unchanged = text != null && oldCallables.some(old => old.name === symbol.name &&
+                    (old.className || '') === (symbol.className || '') && spanText(oldText, old) === text);
+            }
+            unchangedMemo.set(symbol, unchanged);
+            return unchanged;
+        };
         for (const line of change.addedLines) {
             // Arrow fields are indexed as fields but their bodies still need
             // callable impact once declaration-only changes are separated out.
-            const symbol = index.findEnclosingFunction(change.filePath, line, true) ||
+            const primary = index.findEnclosingFunction(change.filePath, line, true) ||
                 fileEntry.symbols.find(s => isDiffCallable(s) && s.startLine <= line && s.endLine >= line);
-            if (symbol) {
-                const key = `${symbol.name}:${symbol.startLine}`;
-                if (!affectedSymbols.has(key)) {
-                    affectedSymbols.set(key, { symbol, addedLines: [], deletedLines: [] });
+            let lineSymbols = primary ? [primary] : [];
+            if (primary) {
+                const disjoint = (a, b) => a.sourceSpan && b.sourceSpan &&
+                    (a.sourceSpan.end <= b.sourceSpan.start || b.sourceSpan.end <= a.sourceSpan.start);
+                const siblings = fileEntry.symbols.filter(s => s !== primary && isDiffCallable(s) &&
+                    s.startLine <= line && s.endLine >= line && disjoint(s, primary) &&
+                    !fileEntry.symbols.some(inner => inner !== s && isDiffCallable(inner) && inner.sourceSpan && s.sourceSpan &&
+                        inner.sourceSpan.start >= s.sourceSpan.start && inner.sourceSpan.end <= s.sourceSpan.end &&
+                        inner.startLine <= line && inner.endLine >= line));
+                // Only a line inside the callable's own source span: an
+                // attribute or decorator line outside it changes the callable.
+                const spans = s => s.sourceSpan?.startLine != null && s.sourceSpan.startLine <= line &&
+                    line <= s.sourceSpan.endLine;
+                lineSymbols = [primary, ...siblings].filter(s => !(spans(s) && unchangedCallable(s)));
+            }
+            if (lineSymbols.length > 0) {
+                for (const symbol of lineSymbols) {
+                    const key = `${symbol.name}:${symbol.startLine}`;
+                    if (!affectedSymbols.has(key)) {
+                        affectedSymbols.set(key, { symbol, addedLines: [], deletedLines: [] });
+                    }
+                    affectedSymbols.get(key).addedLines.push(line);
                 }
-                affectedSymbols.get(key).addedLines.push(line);
+            } else if (primary) {
+                // Every callable on the line is unchanged: the line's other
+                // tokens changed.
+                continue;
             } else {
                 // Module-level change
                 const existing = moduleLevelChanges.find(m => m.filePath === change.filePath);
@@ -2338,11 +2384,16 @@ function diffImpact(index, options = {}) {
                         for (const c of candidates) {
                             if (Math.abs(c.startLine - bestOld.startLine) < Math.abs(cur.startLine - bestOld.startLine)) cur = c;
                         }
-                        const key = `${cur.name}:${cur.startLine}`;
-                        if (!affectedSymbols.has(key)) {
-                            affectedSymbols.set(key, { symbol: cur, addedLines: [], deletedLines: [] });
+                        // A callable whose own text is unchanged is not
+                        // what the deleted line changed (fix #434).
+                        if (!(bestOld.sourceSpan?.startLine != null && bestOld.sourceSpan.startLine <= line &&
+                            line <= bestOld.sourceSpan.endLine && unchangedCallable(cur))) {
+                            const key = `${cur.name}:${cur.startLine}`;
+                            if (!affectedSymbols.has(key)) {
+                                affectedSymbols.set(key, { symbol: cur, addedLines: [], deletedLines: [] });
+                            }
+                            affectedSymbols.get(key).deletedLines.push(line);
                         }
-                        affectedSymbols.get(key).deletedLines.push(line);
                     }
                     // Identity gone → the whole function was deleted; the
                     // deletion detection below reports it. Its body lines are
@@ -2771,13 +2822,15 @@ function extractCallableSymbols(parsed) {
     const signature = s => ({ params: s.params, paramsStructured: s.paramsStructured, generics: s.generics });
     for (const fn of parsed.functions) {
         const className = fn.className || (fn.receiver ? fn.receiver.replace(/^\*/, '') : '');
-        symbols.push({ name: fn.name, className, startLine: fn.startLine, endLine: fn.endLine, ...signature(fn) });
+        symbols.push({ name: fn.name, className, startLine: fn.startLine, endLine: fn.endLine, ...signature(fn),
+            ...(fn.sourceSpan && { sourceSpan: fn.sourceSpan }) });
     }
     for (const cls of parsed.classes) {
         if (cls.members) {
             for (const m of cls.members) {
                 if (!isDiffCallable(m)) continue;
-                symbols.push({ name: m.name, className: cls.name, startLine: m.startLine, endLine: m.endLine, ...signature(m) });
+                symbols.push({ name: m.name, className: cls.name, startLine: m.startLine, endLine: m.endLine, ...signature(m),
+                    ...(m.sourceSpan && { sourceSpan: m.sourceSpan }) });
             }
         }
     }

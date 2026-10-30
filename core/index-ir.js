@@ -176,7 +176,7 @@ function createFileEntryFromIR({
 
 const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'sourceSpan', 'returnedFunctionResult', 'isFunctionVariable', 'paramTypes', 'isAsync',
-    'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent', 'isNested',
+    'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'typeParameterConstraints', 'extends', 'implements', 'indent', 'isNested',
     'enclosingType', 'isMethod', 'receiver', 'memberType', 'fieldType', 'embedded',
     'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
     'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',

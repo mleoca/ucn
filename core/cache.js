@@ -988,7 +988,10 @@ function clearAllCaches() {
 // v319 (fix #433): a saved symbol keeps `file` (and a default `bindingId`)
 // as a 0 placeholder at its built position, so a loaded symbol has the key
 // order of a fresh build.
-const CACHE_FORMAT_VERSION = 319;
+// v320 (fix #434): call records of constructions through a method's own
+// receiver (`cls(..)`, `type(self)(..)`, `self.__class__(..)`, `new
+// this(..)`, `new this.constructor(..)`) carry `ownClass`.
+const CACHE_FORMAT_VERSION = 320;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

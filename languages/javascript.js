@@ -131,6 +131,9 @@ const FUNCTION_NODE_TYPES = new Set([
     'method_definition', 'generator_function', 'generator_function_declaration',
 ]);
 
+const JS_VALUE_WRAPPERS = new Set(['parenthesized_expression', 'as_expression', 'non_null_expression',
+    'satisfies_expression', 'type_assertion']);
+
 function unwrapValueExpression(node) {
     while (node && (node.type === 'parenthesized_expression' || node.type === 'as_expression' ||
         node.type === 'non_null_expression' || node.type === 'satisfies_expression' ||
@@ -1024,7 +1027,10 @@ function _processFunction(node, functions, processedRanges, lines) {
             const declarator = node.namedChild(i);
             if (declarator.type === 'variable_declarator') {
                 const nameNode = declarator.childForFieldName('name');
-                const valueNode = declarator.childForFieldName('value');
+                // A function wrapped in parentheses, a cast or a satisfies
+                // clause (`((next) => ..) as Middleware`, fix #434) is the
+                // value the declaration binds.
+                const valueNode = unwrapValueExpression(declarator.childForFieldName('value'));
 
                 if (nameNode && valueNode) {
                     const isArrow = valueNode.type === 'arrow_function';
@@ -2658,6 +2664,40 @@ function jsLiteralRequireModule(node) {
     return first?.type === 'string' ? first.text.slice(1, -1) : undefined;
 }
 
+// Functions with their own `this`; an arrow function reads its enclosing one.
+const JS_THIS_FUNCTIONS = new Set(['function_declaration', 'function_expression', 'function',
+    'generator_function', 'generator_function_declaration']);
+
+/**
+ * A construction through a method's own receiver (fix #434): `new this(..)`
+ * in a static method and `new this.constructor(..)` in an instance method
+ * build the method's class or a subclass of it. Returns the class (by its
+ * name line), the method, the receiver binding and the callee spelling.
+ */
+function jsOwnClassConstruction(newNode, ctorNode) {
+    let binding;
+    if (ctorNode.type === 'this') binding = 'class';
+    else if (ctorNode.type === 'member_expression' && ctorNode.childForFieldName('object')?.type === 'this' &&
+        ctorNode.childForFieldName('property')?.text === 'constructor') binding = 'instance';
+    else return null;
+    let method = null;
+    for (let parent = newNode.parent; parent && !method; parent = parent.parent) {
+        if (JS_THIS_FUNCTIONS.has(parent.type) || parent.type === 'class_body' || parent.type === 'program' ||
+            parent.type === 'class_static_block') return null;
+        if (parent.type === 'method_definition') method = parent;
+    }
+    const classNode = method?.parent?.type === 'class_body' ? method.parent.parent : null;
+    const className = classNode && ['class_declaration', 'abstract_class_declaration'].includes(classNode.type)
+        ? classNode.childForFieldName('name') : null;
+    const methodName = method?.childForFieldName('name');
+    if (!className || !methodName) return null;
+    const isStatic = method.children.some(child => child.type === 'static');
+    if ((binding === 'class') !== isStatic) return null;
+    return { name: className.text, line: className.startPosition.row + 1, method: methodName.text,
+        methodLine: methodName.startPosition.row + 1, receiver: 'this', binding,
+        spelling: binding === 'class' ? 'this' : 'constructor' };
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
@@ -3208,8 +3248,10 @@ function findCallsInCode(code, parser) {
             return nameNode?.text || '<anonymous>';
         }
         if (node.type === 'arrow_function') {
-            // Arrow functions don't have names, but check parent for variable assignment
-            const parent = node.parent;
+            // Arrow functions don't have names, but check parent for variable
+            // assignment, through parentheses and casts (fix #434).
+            let parent = node.parent;
+            while (parent && JS_VALUE_WRAPPERS.has(parent.type)) parent = parent.parent;
             if (parent?.type === 'variable_declarator') {
                 const nameNode = parent.childForFieldName('name');
                 return nameNode?.text || '<anonymous>';
@@ -4543,7 +4585,21 @@ function findCallsInCode(code, parser) {
                 // fix #366: `new Router({ prefix: '/api' })` (koa-router)
                 // carries a constructor mount prefix.
                 const ctorPrefix = hasObjectKeyArg(node, 'prefix');
-                if (ctorNode.type === 'identifier') {
+                const ownClass = jsOwnClassConstruction(node, ctorNode);
+                if (ctorNode.type === 'this' && ownClass) {
+                    // `new this(..)` in a static method builds the method's
+                    // class or a subclass of it (fix #434).
+                    calls.push({
+                        callSite: typeOrigin('call', ctorNode),
+                        ...argumentsShape,
+                        name: ownClass.name,
+                        line: node.startPosition.row + 1,
+                        isMethod: false,
+                        isConstructor: true,
+                        ownClass,
+                        enclosingFunction
+                    });
+                } else if (ctorNode.type === 'identifier') {
                     calls.push({
                         callSite: typeOrigin('call', ctorNode),
                         ...argumentsShape,
@@ -4567,6 +4623,7 @@ function findCallsInCode(code, parser) {
                             isMethod: true,
                             isConstructor: true,
                             ...memberReceiverFacts(ctorNode.childForFieldName('object'), propNode.text),
+                            ...(ownClass && { ownClass }),
                             ...(ctorPrefix && { prefixOption: true }),
                             enclosingFunction
                         });

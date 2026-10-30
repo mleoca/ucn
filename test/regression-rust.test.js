@@ -9519,8 +9519,8 @@ describe('fix #422: Rust item scopes, namespaces, path values, trait paths', () 
             const inner = callers(index, 'src/lib.rs:3:default');
             assert.ok(inner.confirmed.includes('src/lib.rs:11'), JSON.stringify(inner));
             assert.ok(!inner.confirmed.includes('src/lib.rs:13'));
-            // No written type decides an argument: visible, with its reason.
-            assert.ok(inner.unverified.includes('src/lib.rs:15:trait-self-unknown'), JSON.stringify(inner));
+            // An argument takes the callee's declared parameter type (fix #434).
+            assert.ok(inner.confirmed.includes('src/lib.rs:15'), JSON.stringify(inner));
             assert.ok(callers(index, 'src/lib.rs:7:default').confirmed.includes('src/lib.rs:13'));
             assert.ok(callers(index, 'src/lib.rs:11:default').callees.includes('src/lib.rs:3:default'));
             assert.ok(inner.conserved);
@@ -9722,6 +9722,47 @@ describe('fix #433: deps --cycles labels Rust module cycles static', () => {
             assert.match(text, /src\/a\.rs, src\/b\.rs {2}\[1 static\]/);
             assert.match(text, /STATIC CYCLES \(1\)/);
             assert.match(text, /IMPORT-TIME CYCLES \(1\)/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #434: Rust Self-returning trait members in argument position', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const CARGO = '[package]\nname = "fx"\nversion = "0.1.0"\nedition = "2021"\n';
+    it('Default::default() as an argument takes the callee\'s declared parameter type; a generic parameter decides nothing', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub struct Opts { pub n: u32 }',                                        // 1
+                'pub struct Other { pub m: u32 }',                                       // 2
+                'impl Default for Opts {',                                               // 3
+                '    fn default() -> Self { Opts { n: 1 } }',                            // 4
+                '}',                                                                     // 5
+                'impl Default for Other {',                                              // 6
+                '    fn default() -> Self { Other { m: 2 } }',                           // 7
+                '}',                                                                     // 8
+                'fn run(opts: Opts, other: Other) -> u32 { opts.n + other.m }',          // 9
+                'fn generic<T: Default>(v: T) -> T { v }',                               // 10
+                'pub fn go() -> u32 {',                                                  // 11
+                '    let _g: Opts = generic(Default::default());',                       // 12
+                '    run(Default::default(), Default::default())',                       // 13
+                '}',                                                                     // 14
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callers = handle => {
+                const r = execute(index, 'show', { name: handle, sections: 'callers' });
+                assert.ok(r.ok, r.error);
+                const ctx = r.result.context || r.result;
+                return { confirmed: (ctx.callers || []).map(c => c.line),
+                    unverified: (ctx.unverifiedCallers || []).map(c => `${c.line}:${c.reason}`) };
+            };
+            const opts = callers('src/lib.rs:4:default');
+            assert.deepStrictEqual(opts.confirmed, [13]);
+            assert.deepStrictEqual(opts.unverified, ['12:trait-self-unknown']);
+            assert.deepStrictEqual(callers('src/lib.rs:7:default').confirmed, [13]);
         } finally { rm(dir); }
     });
 });

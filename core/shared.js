@@ -524,6 +524,7 @@ function calleeNames(calls) {
         names.add(call.name);
         if (call.resolvedName) names.add(call.resolvedName);
         for (const name of call.resolvedNames || []) names.add(name);
+        if (call.ownClass) names.add(call.ownClass.name);
         if (call.receiverIsTypeQualified && call.receiver) names.add(call.receiver);
     }
     return names;

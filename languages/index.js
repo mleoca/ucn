@@ -107,6 +107,13 @@ const STRUCTURAL_TRAITS = {
     // class's bases, skipping its own members (`super.m()`, Python
     // `super().m()`, C# `base.M()`), or null (fix #428).
     superReceiver: 'super',
+    // The methods whose own receiver constructs their class (fix #434):
+    // `new this(..)` in a static method, `new this.constructor(..)` in an
+    // instance method. `binding` is the parser's 'class' or 'instance'.
+    ownClassMethod: (method, binding) => binding === 'class' ? method.type === 'static' : method.type !== 'static',
+    // Whether files without module syntax share one global scope (classic
+    // scripts): their top-level declarations are globals (fix #434).
+    scriptsShareGlobalScope: true,
     plainQueryTree: true,
     physicalCallTokenSyntax: true,
     scopeAlternativeBindings: false,
@@ -351,6 +358,8 @@ const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
     importsRunModules: false,
     superReceiver: null,
+    ownClassMethod: null,
+    scriptsShareGlobalScope: false,
     hasConstructors: false,
     fixedConstructorName: null,
     constructorInheritance: null,
@@ -621,11 +630,19 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['self', 'cls'],
+            // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
+            // and `self.__class__(..)` in an instance method construct the
+            // method's class through its first parameter (fix #434).
+            ownClassMethod: (method, binding, receiver) => method.paramsStructured?.[0]?.name === receiver &&
+                (binding === 'class'
+                    ? method.type === 'classmethod' || ['__init_subclass__', '__class_getitem__'].includes(method.name)
+                    : !['classmethod', 'staticmethod'].includes(method.type) && method.name !== '__new__'),
             // An inherited member shadows other bases' members in the MRO,
             // no interface contract: not modeled as slot evidence (fix #426).
             inheritedMemberFillsSlots: false,
             fixedConstructorName: null,
             nameReferenceFamily: 'python',
+            scriptsShareGlobalScope: false,
             separateStaticStorage: false,
             // fix #224: `from pkg import name` may bind a SUBMODULE file, not
             // a symbol — graph-build resolves the composed dotted specifier

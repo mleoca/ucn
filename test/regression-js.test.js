@@ -12908,3 +12908,154 @@ describe('fix #431: JS/TS value accesses by what each token reads', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #434: JS/TS own-class constructions, non-source imports, wrapped arrows, module scope, import-chased owners, one-line classes', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const { execFileSync } = require('child_process');
+    const { findCallees } = require('../core/callers');
+    const show = (index, handle, sections = 'callers') => {
+        const r = execute(index, 'show', { name: handle, sections });
+        assert.ok(r.ok, r.error);
+        const ctx = r.result.context || r.result;
+        return {
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+        };
+    };
+    const planOf = (index, handle, renameTo) => {
+        const r = execute(index, 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result;
+    };
+
+    it('new this(..) in a static method and new this.constructor(..) construct the method\'s class', () => {
+        const dir = tmp({
+            'a.js': [
+                'class Node {',                                   // 1
+                '  constructor(v) { this.v = v }',                // 2
+                '  static make(v) { return new this(v) }',        // 3
+                '  copy() { return new this.constructor(this.v) }', // 4
+                '  helper() { return function () { return new this() } }', // 5
+                '}',                                              // 6
+                'class Sub extends Node {',                       // 7
+                '  constructor(v) { super(v) }',                  // 8
+                '}',                                              // 9
+                'module.exports = { Node, Sub }',                 // 10
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const node = show(index, 'a.js:2:constructor');
+            assert.ok(node.confirmed.includes('a.js:3') && node.confirmed.includes('a.js:4'), JSON.stringify(node));
+            assert.ok(!node.confirmed.includes('a.js:5'));
+            const sub = show(index, 'a.js:8:constructor');
+            assert.ok(sub.unverified.includes('a.js:3:possible-dispatch'), JSON.stringify(sub));
+        } finally { rm(dir); }
+    });
+
+    it('a default import of a file the index does not read binds that file, never the renamed declaration', () => {
+        const dir = tmp({
+            'src/FormGroup.svelte': '<script>export let form</script>\n<div>{form}</div>\n',
+            'src/a.ts': 'export function FormGroup(x: number) {\n  return x\n}\n',
+            'src/b.ts': "import FormGroup from './FormGroup.svelte'\nimport { FormGroup as G } from './a'\n\n" +
+                'export function use() {\n  G(1)\n  return FormGroup\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { contents } = applyRenamePlan(dir, planOf(index, 'src/a.ts:1:FormGroup', 'FormGroupZ'));
+            assert.match(contents['src/b.ts'], /import FormGroup from '\.\/FormGroup\.svelte'/);
+            assert.match(contents['src/b.ts'], /return FormGroup\n/);
+            assert.match(contents['src/b.ts'], /import \{ FormGroupZ as G \} from '\.\/a'/);
+        } finally { rm(dir); }
+    });
+
+    it('a function wrapped in parentheses or a cast is the declaration\'s value', () => {
+        const dir = tmp({
+            'a.ts': [
+                'type M = (next: (k: string) => number) => (k: string) => number',
+                'export const infinite = ((useNext) => (key: string) => {',
+                '  helper(key)',
+                '  return useNext(key)',
+                '}) as M',
+                'export const plain = <M>((useNext) => (key: string) => useNext(key))',
+                'function helper(x: string) { return x }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.ok((index.symbols.get('infinite') || []).some(d => d.type === 'function'));
+            assert.ok((index.symbols.get('plain') || []).some(d => d.type === 'function'));
+            const callers = show(index, 'a.ts:7:helper');
+            assert.ok(callers.confirmed.includes('a.ts:3'), JSON.stringify(callers));
+        } finally { rm(dir); }
+    });
+
+    it('a bare call a module neither declares nor imports never names another module\'s function', () => {
+        const dir = tmp({
+            'a.js': 'function outer() {\n  function helper() { return 1 }\n  return helper()\n}\n' +
+                'function other() {\n  return helper()\n}\nmodule.exports = { outer, other }\n',
+            'b.js': 'function helper() { return 2 }\nmodule.exports = { helper }\n',
+        });
+        try {
+            const index = idx(dir);
+            const other = index.symbols.get('other')[0];
+            const callees = findCallees(index, other, { collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'helper'), JSON.stringify(callees.map(c => c.relativePath)));
+            assert.strictEqual(callees.calleeAccount?.excluded?.byReason?.['name-not-in-scope'], 1);
+        } finally { rm(dir); }
+    });
+
+    it('an enum member through an aliased import, a namespace import chain and a TS namespace is renamed', () => {
+        const dir = tmp({
+            'e.ts': 'export enum Color {\n  Red,\n  Green,\n}\nexport namespace E {\n' +
+                '  export enum Shade { Red = 1, Dark = 2 }\n}\nexport const s = E.Shade.Red\n',
+            'u.ts': "import { Color as C } from './e'\nimport * as ns from './e'\n" +
+                'export const x = C.Red\nexport const z = ns.Color.Red\n',
+        });
+        try {
+            const index = idx(dir);
+            const color = applyRenamePlan(dir, planOf(index, 'e.ts:2:Red', 'RedZ'));
+            assert.match(color.contents['u.ts'], /C\.RedZ/);
+            assert.match(color.contents['u.ts'], /ns\.Color\.RedZ/);
+            assert.match(color.contents['e.ts'] || 'E.Shade.Red', /E\.Shade\.Red\n/);
+        } finally { rm(dir); }
+        const dir2 = tmp({
+            'e.ts': 'export namespace E {\n  export enum Shade { Red = 1, Dark = 2 }\n}\nexport const s = E.Shade.Red\n',
+        });
+        try {
+            const index = idx(dir2);
+            const shade = applyRenamePlan(dir2, planOf(index, 'e.ts:2:Red', 'RedZ'));
+            assert.match(shade.contents['e.ts'], /E\.Shade\.RedZ/);
+        } finally { rm(dir2); }
+    });
+
+    it('require(\'./m\').name reads what the module binds; a same-line alias call keeps its spelling', () => {
+        const dir = tmp({
+            'a.js': 'export function helper(x) {\n  return x\n}\nexport const LIMIT = 5\n',
+            'b.js': "const h = require('./a').helper\nconst n = require('./a').LIMIT\n" +
+                "module.exports = function run() {\n  return require('./a').helper(1) + h(2) + n\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            const fn = applyRenamePlan(dir, planOf(index, 'a.js:1:helper', 'helperZ'));
+            assert.match(fn.contents['b.js'], /require\('\.\/a'\)\.helperZ\(1\) \+ h\(2\)/);
+            const value = applyRenamePlan(dir, planOf(index, 'a.js:4:LIMIT', 'LIMITZ'));
+            assert.match(value.contents['b.js'], /require\('\.\/a'\)\.LIMITZ/);
+        } finally { rm(dir); }
+    });
+
+    it('target-less check lists a getter added to a one-line class, nothing else on its line', () => {
+        const dir = tmp({ 'a.js': 'class Box { constructor(v) { this.v = v } }\nmodule.exports = { Box }\n' });
+        const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args],
+            { cwd: dir, stdio: 'pipe' });
+        try {
+            git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+            fs.writeFileSync(path.join(dir, 'a.js'), 'class Box { constructor(v) { this.v = v } get w() { return 1 } }\nmodule.exports = { Box }\n');
+            const index = idx(dir);
+            const r = execute(index, 'check', {});
+            assert.ok(r.ok, r.error);
+            const changed = (r.result.changed || []).map(c => `${c.name}:${c.kind}`);
+            assert.deepStrictEqual(changed, ['w:added']);
+        } finally { rm(dir); }
+    });
+});

@@ -249,7 +249,33 @@ function constructionDenotes(index, resolver, query, definition, seen = new Set(
         name: links[0].name }, definition, visited);
 }
 
+// A construction through a method's own receiver (fix #434): the class
+// whose method holds the site, by its recorded name line, with the method
+// and receiver binding its language gives such a construction (`cls` of a
+// classmethod, `this` of a static method, `type(self)` of an instance
+// method). No class declared between them holds the method.
+const OWN_CLASS_KINDS = new Set(['class', 'struct', 'record']);
+function ownClassDenotes(index, query, owner) {
+    const own = query.ownClass;
+    const entry = index.files.get(query.file);
+    const ownClassMethod = require('../languages').langTraits(entry?.language)?.ownClassMethod;
+    if (!own || !ownClassMethod || !entry) return false;
+    const symbols = entry.symbols || [];
+    const named = (def, line) => def.nameLine === line || def.startLine === line;
+    const holds = (outer, inner) => outer.startLine <= inner.startLine && outer.endLine >= inner.endLine;
+    const definition = symbols.find(def => OWN_CLASS_KINDS.has(def.type) &&
+        sameDeclaration(declarationIdentity(def), owner));
+    if (!definition || definition.name !== own.name || !named(definition, own.line)) return false;
+    const method = symbols.find(def => def.className === definition.name && def.name === own.method &&
+        named(def, own.methodLine) && holds(definition, def));
+    if (!method || query.line < method.startLine || query.line > method.endLine) return false;
+    if (symbols.some(def => def !== definition && OWN_CLASS_KINDS.has(def.type) && holds(definition, def) &&
+        holds(def, method) && !(def.startLine === definition.startLine && def.endLine === definition.endLine))) return false;
+    return !!ownClassMethod(method, own.binding, own.receiver);
+}
+
 function resolve(index, query, owner) {
+    if (query.ownClass) return ownClassDenotes(index, query, owner) && !index.hasMissingProvenanceFacts;
     if (query.nameScopeOnly) {
         if (!constructionNameScope(index, query)) return false;
         const language = index.files.get(query.file)?.language;

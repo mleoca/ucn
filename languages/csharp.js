@@ -579,27 +579,33 @@ function memberFromNode(node, className, lines) {
     const explicitInterface = explicitInterfaceOf(node);
     const paramsStructured = structuredParams(paramsNode);
     const generics = typeParameterNames(node);
+    const typeParameterConstraints = generics ? typeParameterConstraintMap(node) : null;
     // fix #380: an extension receiver typed by a METHOD type parameter
     // (`static T Ext<T>(this T e) where T : Exception`) accepts any type
     // satisfying the parameter's constraints.
-    const receiverParam = paramsStructured[0];
-    if (receiverParam?.extensionReceiver && receiverParam.type) {
-        const typeParams = node.childForFieldName('type_parameters');
-        const isTypeParam = (typeParams?.namedChildren || []).some(child =>
-            child.type === 'type_parameter' && child.childForFieldName('name')?.text === receiverParam.type);
-        if (isTypeParam) {
+    // fix #434: every parameter typed by a method type parameter carries
+    // that parameter's type constraints (`Send<TRequest>(TRequest r) where
+    // TRequest : IRequest`): an argument of a type that satisfies none of
+    // them makes the method inapplicable (C# 7.3 candidate pruning).
+    const typeParams = node.childForFieldName('type_parameters');
+    const ownTypeParams = new Set((typeParams?.namedChildren || []).filter(child => child.type === 'type_parameter')
+        .map(child => child.childForFieldName('name')?.text).filter(Boolean));
+    if (ownTypeParams.size > 0) {
+        paramsStructured.forEach((param, position) => {
+            const type = String(param?.type || '').replace(/\?$/, '');
+            if (!ownTypeParams.has(type)) return;
             const constraints = [];
             for (const clause of node.namedChildren) {
                 if (clause.type !== 'type_parameter_constraints_clause') continue;
-                if (clause.namedChild(0)?.text !== receiverParam.type) continue;
+                if (clause.namedChild(0)?.text !== type) continue;
                 for (const constraint of clause.namedChildren.slice(1)) {
                     const typeNode = constraint.childForFieldName('type');
                     if (typeNode) constraints.push(nodeTextWithoutComments(typeNode));
                 }
             }
-            paramsStructured[0] = { ...receiverParam, typeParameter: true,
+            paramsStructured[position] = { ...param, typeParameter: true,
                 ...(constraints.length > 0 && { constraints }) };
-        }
+        });
     }
     return {
         name,
@@ -613,6 +619,7 @@ function memberFromNode(node, className, lines) {
         indent,
         modifiers,
         ...(generics && { generics }),
+        ...(typeParameterConstraints && { typeParameterConstraints }),
         memberType: isConstructor ? 'constructor' : 'method',
         isMethod: true,
         isConstructor,
@@ -739,6 +746,28 @@ function typeParameterNames(node) {
         if (name?.text) names.push(name.text);
     }
     return names.length > 0 ? `<${names.join(', ')}>` : null;
+}
+
+/**
+ * The type constraints a declaration's `where` clauses give its type
+ * parameters (fix #434): { T: ['IParsable<T>'] }, types only (`class`,
+ * `struct`, `new()` and `notnull` constrain no member lookup), or null.
+ */
+function typeParameterConstraintMap(node) {
+    const out = {};
+    let any = false;
+    for (const clause of node?.namedChildren || []) {
+        if (clause.type !== 'type_parameter_constraints_clause') continue;
+        const target = clause.namedChild(0)?.text;
+        if (!target) continue;
+        for (const constraint of clause.namedChildren.slice(1)) {
+            const typeNode = constraint.childForFieldName('type');
+            if (!typeNode) continue;
+            (out[target] ||= []).push(nodeTextWithoutComments(typeNode));
+            any = true;
+        }
+    }
+    return any ? out : null;
 }
 
 // fix #390: the line of the declared name when attributes on their own lines
@@ -929,6 +958,7 @@ function findClassesInTree(code, tree) {
             for (const member of members) member.ownerTypeArity = typeArity;
         }
         const generics = typeParameterNames(node);
+        const typeParameterConstraints = generics ? typeParameterConstraintMap(node) : null;
         // A primary constructor's parameters (`class C(int a)`, positional
         // records): the constructor the type declares in its header (fix #400).
         const primaryList = node.namedChildren.find(child => child.type === 'parameter_list');
@@ -943,6 +973,7 @@ function findClassesInTree(code, tree) {
             indent,
             modifiers: modifiersOf(node),
             ...(typeArity > 0 && { typeArity }),
+            ...(typeParameterConstraints && { typeParameterConstraints }),
             ...(generics && { generics }),
             ...(enclosingType && { enclosingType }),
             ...(namespaceOf(node, tree) && { namespace: namespaceOf(node, tree) }),
@@ -1459,15 +1490,52 @@ const CALLABLE_SCOPE_NODES = new Set([
     'local_function_statement', 'accessor_declaration',
 ]);
 
-function variableScopeKey(node) {
+// Names a local function declares itself (parameters, locals, pattern
+// and foreach variables, catch and query variables): they hide the
+// enclosing callable's (fix #434).
+const CS_DECLARING_NODES = new Set(['parameter', 'variable_declarator', 'single_variable_designation',
+    'foreach_statement', 'catch_declaration', 'from_clause', 'let_clause', 'join_clause']);
+function csDeclaredNames(scopeNode) {
+    const names = new Set();
+    traverseTree(scopeNode, node => {
+        if (!CS_DECLARING_NODES.has(node.type)) return true;
+        const name = node.type === 'single_variable_designation'
+            ? node.namedChild(0) || node
+            : node.childForFieldName('name') || node.childForFieldName('left') ||
+                node.namedChildren.find(child => child.type === 'identifier');
+        if (name?.type === 'identifier') names.add(name.text);
+        return true;
+    });
+    return names;
+}
+
+/**
+ * The variable types in scope at a node (fix #434): a local function
+ * also reads the typed locals of the callables around it (C# closures
+ * capture them), except the names it declares itself.
+ */
+function scopedVariableTypes(byScope, node, memo) {
+    let scopeNode = null;
     for (let parent = node?.parent; parent; parent = parent.parent) {
-        if (CALLABLE_SCOPE_NODES.has(parent.type)) {
-            if (isControlFlowLocalArtifact(parent)) continue;
-            return parent.startPosition.row + 1;
-        }
-        if (parent.type === 'global_statement') return 'global';
+        if (CALLABLE_SCOPE_NODES.has(parent.type) && !isControlFlowLocalArtifact(parent)) { scopeNode = parent; break; }
+        if (parent.type === 'global_statement') break;
     }
-    return 'global';
+    const own = (scopeNode && byScope.get(scopeNode.startPosition.row + 1)) || byScope.get('global');
+    if (scopeNode?.type !== 'local_function_statement') return own;
+    const key = scopeNode.startPosition.row + 1;
+    if (memo.has(key)) return memo.get(key);
+    const outer = scopedVariableTypes(byScope, scopeNode, memo);
+    let merged = own;
+    if (outer && outer !== own && outer.size > 0) {
+        const declared = csDeclaredNames(scopeNode);
+        merged = new ReceiverTypeMap();
+        for (const [name, type] of outer) {
+            if (!declared.has(name) && !own?.has(name)) merged.set(name, type, outer.origins.get(name) || 'unknown');
+        }
+        for (const [name, type] of own || []) merged.set(name, type, own.origins.get(name) || 'unknown');
+    }
+    memo.set(key, merged);
+    return merged;
 }
 
 const localBindingFactsByTree = new WeakMap();
@@ -2366,8 +2434,8 @@ function findCallsInTree(code, parser, tree, reaches = null) {
     const calls = [];
     // The variable types in scope at a call (only call nodes ask: the scope
     // walk climbs parents).
-    const typesAt = node => variableTypesByScope.get(variableScopeKey(node)) ||
-        variableTypesByScope.get('global');
+    const scopeMemo = new Map();
+    const typesAt = node => scopedVariableTypes(variableTypesByScope, node, scopeMemo);
     traverseTree(tree.rootNode, node => {
         if (reaches && !reaches(node)) return false;
         if (isControlFlowLocalArtifact(node)) {
@@ -2790,6 +2858,7 @@ function usagesInTree(code, name, parser, tree) {
     const usages = [];
     const receiverBindings = new Map();
     let variableTypesByScope;
+    const scopeMemo = new Map();
     visitNameNodes(tree, code, name, node => {
         if (!IDENTIFIER_NODES.has(node.type) || node.text !== name) return;
         let usageType = 'reference';
@@ -2820,8 +2889,7 @@ function usagesInTree(code, name, parser, tree) {
                 if (receiverNode?.type === 'identifier' &&
                     (variableTypesByScope || possibleReceiverBinding(node, receiver, receiverBindings))) {
                     variableTypesByScope ||= buildVariableTypes(tree, parser);
-                    const scopeTypes = variableTypesByScope.get(variableScopeKey(node)) ||
-                        variableTypesByScope.get('global');
+                    const scopeTypes = scopedVariableTypes(variableTypesByScope, node, scopeMemo);
                     declared = normalizeReceiverType(scopeTypes?.get(receiver));
                 }
                 const sameClass = ['this', 'base'].includes(receiver)

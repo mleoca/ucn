@@ -727,6 +727,11 @@ function goParamNames(list, out) {
  * field `b` indexes `x` (fix #431). */
 function goExpressionTypeArgument(qualifiedType) {
     let current = qualifiedType?.parent;
+    // `h.funcs[i](n)` reads as a conversion to the generic type `h.funcs[i]`
+    // (fix #434): its base is a selector when `h` is a value.
+    if (current?.type === 'generic_type' && sameNode(current.childForFieldName('type'), qualifiedType) &&
+        current.parent?.type === 'type_conversion_expression' &&
+        sameNode(current.parent.childForFieldName('type'), current)) return true;
     if (current?.type === 'type_elem') current = current.parent;
     if (current?.type !== 'type_arguments') return false;
     current = current.parent;

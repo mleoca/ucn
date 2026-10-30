@@ -7923,3 +7923,32 @@ describe('fix #431: C++ accesses in macro-generated scopes and qualified templat
         } finally { rm(dir); }
     });
 });
+
+describe('fix #434: C++ auto locals deduce the type of the object they copy, reference or point at', () => {
+    it('types auto copies, references and &object pointers as receivers', () => {
+        const dir = tmp({
+            'a.cpp': [
+                'struct A { int m() { return 1; } };',
+                'struct B { int m() { return 2; } };',
+                '',
+                'int f() {',
+                '    B b;',
+                '    auto x = b;',
+                '    auto &r = b;',
+                '    const auto *p = &b;',
+                '    return x.m() + r.m() + p->m();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'show', { name: 'a.cpp:2:m', sections: 'callers' });
+            assert.ok(r.ok, r.error);
+            const ctx = r.result.context || r.result;
+            assert.strictEqual((ctx.callers || []).filter(c => c.line === 9).length, 3, JSON.stringify(ctx.unverifiedCallers));
+            const other = execute(index, 'show', { name: 'a.cpp:1:m', sections: 'callers' });
+            const otherCtx = other.result.context || other.result;
+            assert.strictEqual((otherCtx.callers || []).length, 0);
+        } finally { rm(dir); }
+    });
+});
