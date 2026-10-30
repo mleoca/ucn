@@ -5,8 +5,14 @@ const { CANONICAL_COMMANDS } = require('./registry');
 const NAME_COMMANDS = new Set(['show', 'find', 'usages', 'trace', 'tests', 'plan']);
 
 function parseSourceTarget(arg, params) {
-    if (params.range) return { ...params, file: params.file, range: params.range };
     const value = String(arg || '').trim();
+    // `source <file> --range=N-M`: the positional is the file (fix #433). A
+    // positional beside an explicit file stays a name, which the handler
+    // refuses with the range.
+    if (params.range) {
+        if (!params.file && value) return { ...params, file: value, range: params.range };
+        return { ...params, ...(value && { name: value }), range: params.range };
+    }
     const twoPart = value.match(/^(.+?)\s+(\d+(?:-\d+)?)$/);
     if (twoPart) return { ...params, file: params.file || twoPart[1], range: twoPart[2] };
     // A single-colon file:range target is a line request. Stable symbol
@@ -14,6 +20,15 @@ function parseSourceTarget(arg, params) {
     const inline = value.match(/^([^:]+(?:\/[^:]*)?):(\d+(?:-\d+)?)$/);
     if (inline) return { ...params, file: params.file || inline[1], range: inline[2] };
     return { ...params, name: arg };
+}
+
+/** MCP and direct execute() params: with a range and no file, `name` is the
+ * file (`source` with name=<file>, range="N-M"; fix #433). */
+function sourceRangeTarget(params) {
+    if (params.range == null || (params.file && String(params.file).trim()) ||
+        typeof params.name !== 'string' || !params.name.trim()) return params;
+    const { name, ...rest } = params;
+    return { ...rest, file: name.trim() };
 }
 
 /** Build normalized execute() params from the shared CLI-style positional arg. */
@@ -47,4 +62,4 @@ function isPublicCommand(command) {
     return CANONICAL_COMMANDS.includes(command);
 }
 
-module.exports = { buildPublicParams, isPublicCommand, parseSourceTarget };
+module.exports = { buildPublicParams, isPublicCommand, parseSourceTarget, sourceRangeTarget };

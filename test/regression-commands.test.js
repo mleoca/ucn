@@ -8665,3 +8665,41 @@ describe('fix #428: impact of a class lists its type reference sites, accounted 
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// fix #433: `source <file> --range=N-M` takes the positional as the file, on
+// the CLI (project and file targets), interactive mode and execute() (MCP:
+// name=<file>, range="N-M"), as the help and the v4 `lines` hint document.
+// ============================================================================
+describe('fix #433: source <file> --range=N-M', () => {
+    const files = { 'src/a.js': 'function a() {\n  return 1;\n}\nfunction b() { return a(); }\nmodule.exports = { a, b };\n' };
+    it('CLI and interactive accept the positional file', () => {
+        const dir = tmp(files);
+        try {
+            for (const args of [['src/a.js', '--range=2-3'], ['--file=src/a.js', '--range=2-3'], ['src/a.js:2-3']]) {
+                const out = runCli(dir, 'source', args);
+                assert.match(out, /src\/a\.js:2-3/, args.join(' '));
+                assert.match(out, /return 1;/, args.join(' '));
+            }
+            const fileTarget = runCli(path.join(dir, 'src/a.js'), 'source', ['--range=2-3']);
+            assert.match(fileTarget, /return 1;/);
+            const both = runCli(dir, 'source', ['a', '--file=src/a.js', '--range=2-3']);
+            assert.match(both, /either a symbol target or a file range/);
+            const repl = runInteractive(dir, ['source src/a.js --range=2-3']);
+            assert.match(repl, /return 1;/);
+        } finally { rm(dir); }
+    });
+    it('execute() reads name as the file of a range request', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const viaName = execute(index, 'source', { name: 'src/a.js', range: '2-3' });
+            assert.strictEqual(viaName.ok, true, viaName.error);
+            assert.deepStrictEqual(viaName.result.lines, ['  return 1;', '}']);
+            const viaFile = execute(index, 'source', { file: 'src/a.js', range: '2-3' });
+            assert.deepStrictEqual(viaFile.result.lines, viaName.result.lines);
+            const both = execute(index, 'source', { name: 'a', file: 'src/a.js', range: '2-3' });
+            assert.strictEqual(both.ok, false);
+        } finally { rm(dir); }
+    });
+});

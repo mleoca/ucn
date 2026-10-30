@@ -53,6 +53,7 @@
 const fs = require('fs');
 const path = require('path');
 const { codeUnitCompare, literalNameRegex } = require('./shared');
+const { compareNames } = require('./discovery');
 
 // Unsupported-language site listings are capped so a Rails-sized repo cannot
 // flood the account object; the counts always cover the full set.
@@ -446,9 +447,13 @@ const RANK = { call: 0, import: 1, definition: 2, reference: 3 };
  */
 function buildAccount(index, name, parts) {
     const { groundSet } = parts;
-    const confirmedEntries = parts.confirmedEntries || [];
-    const unverifiedEntries = parts.unverifiedEntries || [];
-    const excludedEntries = parts.excludedEntries || [];
+    // Entries in (file, line) order, stable (fix #407): samples, the evidence
+    // list and the reason of a line excluded twice must not follow the order
+    // the engine visited files in, which a warm session's derivation history
+    // changes.
+    const confirmedEntries = sortedSites(parts.confirmedEntries || []);
+    const unverifiedEntries = sortedSites(parts.unverifiedEntries || []);
+    const excludedEntries = sortedSites(parts.excludedEntries || []);
 
     // (file, line) keys, kept per file (fix #405b: one composed string per
     // ground line and per entry); a line is keyed by its text, as the
@@ -573,6 +578,16 @@ function buildAccount(index, name, parts) {
 function relPath(index, filePath) {
     const fileEntry = index.files.get(filePath);
     return fileEntry ? fileEntry.relativePath : path.relative(index.root, filePath);
+}
+
+/** Sites by (file in the index's canonical order, line), stable; the input
+ * itself when already in that order, else a sorted copy (fix #407). */
+function sortedSites(entries) {
+    const before = (a, b) => compareNames(String(a.file), String(b.file)) || ((a.line || 0) - (b.line || 0));
+    for (let i = 1; i < entries.length; i++) {
+        if (before(entries[i - 1], entries[i]) > 0) return [...entries].sort(before);
+    }
+    return entries;
 }
 
 module.exports = {

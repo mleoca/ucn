@@ -46,7 +46,8 @@ const POSIX_CLASSES = {
     lower: 'a-z',
     print: '\\x20-\\x7e',
     punct: '!-\\/:-@\\[-`{-~',
-    space: ' \\t\\n\\v\\f\\r',
+    // git's sane ctype isspace: space, \t, \n and \r, never \v or \f (fix #433).
+    space: ' \\t\\n\\r',
     upper: 'A-Z',
     xdigit: '0-9A-Fa-f',
 };

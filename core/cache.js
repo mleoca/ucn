@@ -985,7 +985,10 @@ function clearAllCaches() {
 // indexed as fields (`instanceAttribute`); value-reference records read
 // destructuring assignment targets as writes, parameter defaults as reads
 // and Python dict keys as values.
-const CACHE_FORMAT_VERSION = 318;
+// v319 (fix #433): a saved symbol keeps `file` (and a default `bindingId`)
+// as a 0 placeholder at its built position, so a loaded symbol has the key
+// order of a fresh build.
+const CACHE_FORMAT_VERSION = 319;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {
@@ -1160,14 +1163,18 @@ function saveCache(index, cachePath) {
     const strippedSymbols = [];
     for (const [name, defs] of index.symbols) {
         const stripped = defs.map(s => {
-            const { file, bindingId, ...rest } = s;
             const defaultBindingId = s.relativePath && s.type && s.startLine
                 ? `${s.relativePath}:${s.type}:${s.startLine}`
                 : null;
-            if (bindingId && bindingId !== defaultBindingId) {
-                rest.bindingId = bindingId;
+            // `file` and a default `bindingId` are rebuilt on load; their 0
+            // placeholders keep the key order of the built symbol (fix #433).
+            const out = {};
+            for (const key in s) {
+                if (key === 'file') out.file = 0;
+                else if (key === 'bindingId') out.bindingId = s.bindingId && s.bindingId !== defaultBindingId ? s.bindingId : 0;
+                else out[key] = s[key];
             }
-            return rest;
+            return out;
         });
         strippedSymbols.push([name, stripped]);
     }

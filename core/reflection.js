@@ -928,6 +928,14 @@ function _longestFragment(pattern) {
     return best;
 }
 
+/** Whether a pattern entry names members by some literal text (fix #433):
+ * a fully dynamic name (`eval(code)`, `globals()[key]` with no literal
+ * part) reaches every top-level name of its module alike and is attributed
+ * to none of them; deadcode still withholds what it may reach. */
+function patternIsAttributable(pattern) {
+    return _longestFragment(String(pattern || '').split('\u0000').join('')) !== '';
+}
+
 function _family(language) {
     return langTraits(language)?.reflectionApi?.family || language;
 }
@@ -1116,6 +1124,7 @@ module.exports = {
     reflectionEntryReaches,
     reflectionPatternReferences,
     reflectionPatternIndex,
+    patternIsAttributable,
     resetReflectionIndex,
     resolveKeyParameter,
 };

@@ -4280,3 +4280,77 @@ describe('fix #419: record header constructors survive index persistence', () =>
         }
     });
 });
+
+// ============================================================================
+// fix #433: test processes honor UCN_CACHE_DIR and never use the user's real
+// cache root: the root is a fresh directory inside UCN_CACHE_DIR when it is
+// set, else under the OS temp dir, removed when the process exits; a child
+// that inherits it reuses it and leaves it to its owner.
+// ============================================================================
+describe('fix #433: test cache root', () => {
+    const { spawnSync } = require('child_process');
+    const script = `const r = require(${JSON.stringify(path.join(__dirname, 'helpers', 'cache-root.js'))});
+        const fs = require('fs'); process.stdout.write(JSON.stringify({ root: r.TEST_CACHE_ROOT, exists: fs.existsSync(r.TEST_CACHE_ROOT) }));`;
+    const probe = env => {
+        const res = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
+        assert.strictEqual(res.status, 0, res.stderr);
+        return JSON.parse(res.stdout);
+    };
+    it('inside UCN_CACHE_DIR when set, removed on exit', () => {
+        const parent = fs.mkdtempSync(path.join(require('os').tmpdir(), 'ucn-433-root-'));
+        const home = fs.mkdtempSync(path.join(require('os').tmpdir(), 'ucn-433-home-'));
+        try {
+            const env = { ...process.env, HOME: home, UCN_CACHE_DIR: parent };
+            delete env.UCN_TEST_CACHE_ROOT;
+            const set = probe(env);
+            assert.ok(set.exists && set.root.startsWith(parent + path.sep), set.root);
+            assert.ok(!fs.existsSync(set.root), 'removed on exit');
+            delete env.UCN_CACHE_DIR;
+            delete env.XDG_CACHE_HOME;
+            const unset = probe(env);
+            assert.ok(unset.root.startsWith(require('os').tmpdir()), unset.root);
+            assert.ok(!fs.existsSync(path.join(home, 'Library')) && !fs.existsSync(path.join(home, '.cache')),
+                'the default root under HOME is never created');
+            // A child of a test process shares its root and leaves it in place.
+            const own = probe({ ...process.env });
+            assert.strictEqual(own.root, process.env.UCN_CACHE_DIR);
+            assert.ok(fs.existsSync(process.env.UCN_CACHE_DIR));
+        } finally {
+            fs.rmSync(parent, { recursive: true, force: true });
+            fs.rmSync(home, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// fix #433: a loaded index holds every symbol with the key order a fresh build
+// gives it (saving dropped `file` and the default `bindingId` and loading
+// appended them, which reordered every symbol-bearing JSON answer; they are
+// saved as 0 placeholders at their built positions).
+// ============================================================================
+describe('fix #433: loaded symbols keep the build key order', () => {
+    it('every symbol serializes identically after a cache round-trip', () => {
+        const dir = tmp({
+            'a.js': 'class A { m() { return 1; } }\nfunction f() { return new A().m(); }\nmodule.exports = { f, A };\n',
+            'b.py': 'class B:\n    def m(self):\n        return 1\n\ndef g():\n    return B().m()\n',
+            'c.go': 'package main\ntype T struct{ X int }\nfunc (t T) M() int { return t.X }\nfunc main() { _ = T{}.M() }\n',
+            'd.rs': 'struct S;\nimpl S { fn m(&self) -> i32 { 1 } }\nfn f() -> i32 { S.m() }\nfn h() -> i32 { 1 } fn k() -> i32 { 2 }\n',
+            'E.java': 'class E { int m() { return 1; } int n() { return m(); } }\n',
+            'f.cpp': 'struct F { int m(); };\nint F::m() { return 1; }\nint use() { F f; return f.m(); }\n',
+        });
+        try {
+            const built = idx(dir);
+            const cachePath = path.join(dir, '.probe-cache', 'index.json');
+            built.saveCache(cachePath);
+            const loaded = new ProjectIndex(dir);
+            loaded.loadCache(cachePath);
+            const dump = index => [...index.symbols].map(([name, defs]) => [name, defs.map(d => JSON.stringify(d))]);
+            assert.deepStrictEqual(dump(loaded), dump(built));
+            const execute = require('../core/execute').execute;
+            for (const handle of ['a.js:2:f', 'd.rs:3:f', 'f.cpp:3:use']) {
+                assert.strictEqual(JSON.stringify(execute(loaded, 'show', { name: handle }).result),
+                    JSON.stringify(execute(built, 'show', { name: handle }).result), handle);
+            }
+        } finally { rm(dir); }
+    });
+});

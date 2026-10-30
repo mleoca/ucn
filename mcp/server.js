@@ -35,6 +35,7 @@ const {
     formatSurfaceMessage,
 } = require('../core/registry');
 const { execute } = require('../core/execute');
+const { sourceRangeTarget } = require('../core/public-command');
 const { describeError, UcnError } = require('../core/errors');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
 
@@ -245,7 +246,7 @@ Use UCN for semantic questions: exact definitions, symbol-aware callers/callees,
 - check: symbol signature check when name is set; precommit check when omitted. plan previews the selected declaration plus indexed call/import/export edits.
 - deadcode/audit_async/stacktrace: focused audits and runtime evidence. Computed dispatch is reported as a health/deletion blind spot; unknown decorators and member-assigned handlers are withheld from default dead-code claims.
 
-CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review; when same-name definitions compete, show returns their stable handles once above the sites. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Release evaluation cross-checks overlapping stable-handle claims across find, show, source, impact, tests, check, and caller trace, and compares pinned real-repository samples with ts-morph, Pyright, gopls, rust-analyzer, JDT LS, clangd, and Roslyn.` + generateMcpParamSection();
+CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review; when same-name definitions compete, show returns their stable handles once above the sites. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Releases are gated on pinned real repositories: sampled callers, callees, value references, and dead-code claims are compared with ts-morph, Pyright, gopls, rust-analyzer, JDT LS, Roslyn, and clangd, and one handle's claims must agree across find, show, source, impact, tests, check, and caller trace.` + generateMcpParamSection();
 
 // The default description is the only public contract. The former verbose
 // description is intentionally not selectable: it documented retired commands
@@ -306,7 +307,7 @@ const INPUT_SHAPE = {
     rename_to: stringParam('New name for the function, method, or type (plan command)'),
     default_value: stringParam('Default value for added parameter (plan command)'),
     stack: stringParam('The stack trace text to parse (stacktrace command)'),
-    range: stringParam('source line range, e.g. "10-20" or "15"; requires file.'),
+    range: stringParam('source line range, e.g. "10-20" or "15", of the file given as file or name.'),
     base: stringParam('Git ref (default: HEAD). impact/check without a symbol: diff against it; check with a symbol: compare the declaration with its version there. E.g. "HEAD~3", "main", a commit SHA'),
     staged: booleanParam('impact/check without a symbol: analyze staged changes.'),
     deep: booleanParam('repo: include health and sample the ordinal resolution-evidence profile, not accuracy.'),
@@ -473,6 +474,11 @@ server.registerTool(
             // Post-result checks are still retained below for symbol-derived
             // paths, but a range request may point at a real file outside the
             // project and must fail before any content leaves the process.
+            // `name` is the file of a range request (name=<file>, range="N-M").
+            if (canonicalCommand === 'source') {
+                const target = sourceRangeTarget(ep);
+                if (target !== ep) { delete ep.name; ep.file = target.file; }
+            }
             if (canonicalCommand === 'source' && ep.file) {
                 const sourcePath = resolveAndValidatePath(index, ep.file);
                 if (typeof sourcePath !== 'string') return sourcePath;

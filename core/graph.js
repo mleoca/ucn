@@ -1002,6 +1002,11 @@ function circularDeps(index, options = {}) {
                         }),
                     });
                 }
+                // Go/Rust/Java/C#/C/C++ files run no module code when they
+                // are imported or included: their cycles are static
+                // dependency cycles, neither import-time nor deferred.
+                const runsModules = rotatedAbs.some(file =>
+                    langTraits(index.files.get(file)?.language)?.importsRunModules !== false);
                 const deferredEdges = edges.filter(edge => edge.deferred)
                     .map(edge => ({
                         from: edge.from,
@@ -1013,7 +1018,7 @@ function circularDeps(index, options = {}) {
                 uniqueCycles.push({
                     files: rotated,
                     length: rotated.length,
-                    classification: deferredEdges.length > 0 ? 'deferred' : 'eager',
+                    classification: !runsModules ? 'static' : deferredEdges.length > 0 ? 'deferred' : 'eager',
                     edges,
                     deferredEdges,
                 });
@@ -1034,8 +1039,10 @@ function circularDeps(index, options = {}) {
             if (targets && targets.size > 0) filesWithImports++;
         }
 
-        const eagerCycles = result.filter(cycle => cycle.classification !== 'deferred').length;
-        const deferredCycles = result.length - eagerCycles;
+        const eagerCycles = result.filter(cycle => cycle.classification !== 'deferred' &&
+            cycle.classification !== 'static').length;
+        const deferredCycles = result.filter(cycle => cycle.classification === 'deferred').length;
+        const staticCycles = result.length - eagerCycles - deferredCycles;
         const groupOf = new Map();
         componentSummaries.forEach((group, i) => { for (const f of group.files) groupOf.set(f, i); });
         for (const group of componentSummaries) { group.eagerCycles = 0; group.deferredCycles = 0; }
@@ -1043,6 +1050,7 @@ function circularDeps(index, options = {}) {
             const group = componentSummaries[groupOf.get(cycle.files[0])];
             if (!group) continue;
             if (cycle.classification === 'deferred') group.deferredCycles++;
+            else if (cycle.classification === 'static') group.staticCycles = (group.staticCycles || 0) + 1;
             else group.eagerCycles++;
         }
         const cycleGroups = fileFilter
@@ -1061,6 +1069,7 @@ function circularDeps(index, options = {}) {
                 filesInCycles: new Set(cycleGroups.flatMap(c => c.files)).size,
                 eagerCycles,
                 deferredCycles,
+                ...(staticCycles > 0 && { staticCycles }),
                 componentCount: cycleGroups.length,
                 ...(truncated && { truncated: true, cycleLimit,
                     maxComponentSize: MAX_ENUMERATED_COMPONENT,

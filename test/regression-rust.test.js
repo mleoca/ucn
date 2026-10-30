@@ -9693,3 +9693,35 @@ describe('fix #431: a Rust type path never names a struct field', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// fix #433: `deps --cycles` splits import-time from deferred cycles only where
+// an import runs module code (JS/TS, Python); a cycle of Rust (or Go, Java,
+// C#, C, C++) files is a static dependency cycle.
+// ============================================================================
+describe('fix #433: deps --cycles labels Rust module cycles static', () => {
+    it('Rust cycles are static, Python cycles keep the import-time split', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "cyc"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'mod a;\nmod b;\npub fn root() { a::f(); }\n',
+            'src/a.rs': 'use crate::b::g;\npub fn f() { g(); }\n',
+            'src/b.rs': 'use crate::a::f;\npub fn g() {}\npub fn h() { f(); }\n',
+            'p/__init__.py': '',
+            'p/x.py': 'from p import y\ndef f(): return y.g()\n',
+            'p/y.py': 'from p import x\ndef g(): return x\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'deps', { cycles: true });
+            assert.strictEqual(result.ok, true, result.error);
+            const byFiles = Object.fromEntries(result.result.cycles.map(c => [c.files.join(','), c.classification]));
+            assert.deepStrictEqual(byFiles, { 'p/x.py,p/y.py': 'eager', 'src/a.rs,src/b.rs': 'static' });
+            assert.strictEqual(result.result.summary.staticCycles, 1);
+            assert.strictEqual(result.result.summary.eagerCycles, 1);
+            const text = require('../core/output').formatPublicText('deps', result.result, { cycles: true });
+            assert.match(text, /src\/a\.rs, src\/b\.rs {2}\[1 static\]/);
+            assert.match(text, /STATIC CYCLES \(1\)/);
+            assert.match(text, /IMPORT-TIME CYCLES \(1\)/);
+        } finally { rm(dir); }
+    });
+});

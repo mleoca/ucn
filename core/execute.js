@@ -16,6 +16,7 @@ const { addTestExclusions, pickBestDefinition, parseSymbolHandle, looksLikeHandl
 const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
 const { renderExpandItem } = require('./expand-cache');
 const { CANONICAL_COMMANDS } = require('./registry');
+const { sourceRangeTarget } = require('./public-command');
 const { isAccessorDefinition } = require('./accessors');
 const { describeError } = require('./errors');
 
@@ -2519,6 +2520,7 @@ function execute(index, command, params = {}) {
     // logged params object; a frozen object silently no-oped the
     // normalizers and returned wrong not-found answers).
     params = { ...params };
+    if (command === 'source') params = sourceRangeTarget(params);
     // Listing completeness belongs to execution, including direct API calls.
     if (params.lines) params.all = true;
     try {

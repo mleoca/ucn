@@ -8,12 +8,9 @@ const fs = require('fs');
 const os = require('os');
 
 // Keep default-cache tests and spawned CLI/MCP processes out of the real user
-// cache. Each test worker gets an isolated root that is removed on exit.
-const TEST_CACHE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-cache-'));
-process.env.UCN_CACHE_DIR = TEST_CACHE_ROOT;
-process.once('exit', () => {
-    fs.rmSync(TEST_CACHE_ROOT, { recursive: true, force: true });
-});
+// cache: each test process gets an isolated root inside UCN_CACHE_DIR when it
+// is set, else under the OS temp dir, removed on exit (./cache-root.js).
+const { TEST_CACHE_ROOT } = require('./cache-root');
 
 const { ProjectIndex } = require('../../core/project');
 const { LANGUAGES, langTraits } = require('../../languages');

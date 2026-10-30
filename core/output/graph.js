@@ -443,8 +443,9 @@ function formatCircularDeps(result) {
         return lines.join('\n');
     }
 
-    const eager = result.cycles.filter(cycle => cycle.classification !== 'deferred');
+    const eager = result.cycles.filter(cycle => cycle.classification !== 'deferred' && cycle.classification !== 'static');
     const deferred = result.cycles.filter(cycle => cycle.classification === 'deferred');
+    const staticCycles = result.cycles.filter(cycle => cycle.classification === 'static');
 
     // Groups first: a strongly connected file set is the unit a refactor has
     // to break, and a 14-file tangle can hold hundreds of elementary cycles.
@@ -454,8 +455,12 @@ function formatCircularDeps(result) {
         lines.push(`CYCLE GROUPS (${groups.length}) — every member reaches every other member:`);
         for (const group of groups) {
             const counts = [];
-            if (group.eagerCycles != null) counts.push(`${group.eagerCycles} import-time`);
-            if (group.deferredCycles != null) counts.push(`${group.deferredCycles} deferred`);
+            // A group of files that run no module code on import has only
+            // static cycles; the import-time/deferred split does not apply.
+            const onlyStatic = group.staticCycles > 0 && !group.eagerCycles && !group.deferredCycles;
+            if (group.eagerCycles != null && !onlyStatic) counts.push(`${group.eagerCycles} import-time`);
+            if (group.deferredCycles != null && !onlyStatic) counts.push(`${group.deferredCycles} deferred`);
+            if (group.staticCycles > 0) counts.push(`${group.staticCycles} static`);
             const suffix = counts.length > 0 ? `  [${counts.join(', ')}${result.summary.truncated ? '; enumerated counts only' : ''}]` : '';
             lines.push(`  ${group.size} files: ${group.files.join(', ')}${suffix}`);
         }
@@ -489,6 +494,7 @@ function formatCircularDeps(result) {
     };
     renderGroup('IMPORT-TIME CYCLES', eager, false, EAGER_CYCLE_DISPLAY_LIMIT);
     renderGroup('DEFERRED CYCLES', deferred, true, DEFERRED_CYCLE_DISPLAY_LIMIT);
+    renderGroup('STATIC CYCLES', staticCycles, false, EAGER_CYCLE_DISPLAY_LIMIT);
 
     lines.push('');
     const { totalCycles, filesInCycles } = result.summary;
@@ -501,6 +507,9 @@ function formatCircularDeps(result) {
             lines.push(`Enumeration stopped at ${result.summary.cycleLimit} elementary cycles.`);
         }
         lines.push('The CYCLE GROUPS list and files-in-cycles count are complete; enumerated cycle counts are lower bounds.');
+    }
+    if (staticCycles.length > 0) {
+        lines.push(`${staticCycles.length} chain${staticCycles.length === 1 ? ' links' : 's link'} only files whose imports and includes run no module code (Go, Rust, Java, C#, C, C++): static dependency cycles, not import-time cycles.`);
     }
     if (deferred.length > 0) {
         lines.push(`${deferred.length} chain${deferred.length === 1 ? '' : 's'} close only through deferred edges (function-local, TYPE_CHECKING-only, or type-only imports); they are not unconditional import-time cycles, but a function-local edge may still matter if invoked during initialization.`);

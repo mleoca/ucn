@@ -1,5 +1,6 @@
 'use strict';
 
+require('./helpers/cache-root'); // isolated cache root (fix #433)
 const { afterEach, describe, it } = require('node:test');
 const assert = require('node:assert');
 const { spawn } = require('child_process');

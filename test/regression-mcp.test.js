@@ -936,3 +936,35 @@ describe('fix #341: lines and raw over MCP', () => {
         }
     });
 });
+
+// ============================================================================
+// fix #433: MCP `source` with name=<file>, range="N-M" (the v4 `lines` hint),
+// still path-checked before any content leaves the server; the tool
+// description states what releases are gated on.
+// ============================================================================
+describe('fix #433: MCP source range by name, release sentence', () => {
+    it('reads name as the file of a range request and keeps the path boundary', async () => {
+        const dir = tmp({ 'src/a.js': 'function a() {\n  return 1;\n}\nmodule.exports = { a };\n' });
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const text = async args => (await client.callTool('ucn', { command: 'source', project_dir: dir, ...args }))
+                .result?.content?.map(c => c.text).join('') || '';
+            assert.match(await text({ name: 'src/a.js', range: '2-3' }), /return 1;/);
+            assert.match(await text({ file: 'src/a.js', range: '2-3' }), /return 1;/);
+            assert.doesNotMatch(await text({ name: '../../../../etc/hosts', range: '1-2' }), /localhost/);
+            const res = await client.send('tools/list', {});
+            const description = res.result?.tools?.find(t => t.name === 'ucn')?.description || '';
+            const sentence = description.slice(description.indexOf('Releases are gated'));
+            for (const word of ['callers', 'callees', 'value references', 'dead-code claims',
+                'ts-morph', 'Pyright', 'gopls', 'rust-analyzer', 'JDT LS', 'Roslyn', 'clangd',
+                'find, show, source, impact, tests, check, and caller trace']) {
+                assert.ok(sentence.includes(word), `${word}: ${sentence.slice(0, 400)}`);
+            }
+        } finally {
+            client.stop();
+            rm(dir);
+        }
+    });
+});

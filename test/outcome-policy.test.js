@@ -5,6 +5,7 @@
  * eval (proposal extraction, mechanical edits, judge parsing, aggregation).
  */
 
+require('./helpers/cache-root'); // isolated cache root (fix #433)
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
 

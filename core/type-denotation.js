@@ -369,7 +369,10 @@ function externalTypeDenotation(index, filePath, name, qualifier, line, options 
     // `unscoped`: the site's spelling of the name is unknown (the parser kept
     // only the last segment), so package/namespace scoping cannot apply.
     const unscoped = options.unscoped === true;
-    const key = `${filePath}\x00${name}\x00${qualifier || ''}\x00${scoped ?? ''}\x00${unscoped ? 1 : 0}`;
+    // Java/C# scoping reads the site's package or namespace (fix #433): a
+    // C# file with several namespace blocks decides a name per block.
+    const siteScope = !qualifier && !unscoped ? scopingSiteKey(index, filePath, line) : '';
+    const key = `${filePath}\x00${name}\x00${qualifier || ''}\x00${scoped ?? ''}\x00${unscoped ? 1 : 0}\x00${siteScope}`;
     return memoized(index, key, () => {
         const fileEntry = index.files.get(filePath);
         if (!fileEntry) return null;
@@ -494,6 +497,19 @@ function scopedTypeDenotation(index, fileEntry, filePath, name, line, scoping) {
     const external = [...usings].filter(module =>
         !projectHas(index, 'cs-declared-namespaces', module, live => csharpDeclaredNames(live).namespaces));
     return { original: name, via: external.length > 0 ? `${external.sort()[0]}.${name}` : name };
+}
+
+/** What `scopedTypeDenotation` reads of the site: its package/namespace
+ * (`siteNamespaceOf`), constant for a file whose types share one namespace;
+ * '' for a language without type-name scoping. */
+function scopingSiteKey(index, filePath, line) {
+    const fileEntry = index.files.get(filePath);
+    if (!fileEntry || !langTraits(fileEntry.language)?.typeNameScoping) return '';
+    const namespaces = memoized(index, `\x01site-ns\x00${filePath}`, () => new Set((fileEntry.symbols || [])
+        .filter(symbol => TYPE_KINDS.has(symbol.type)).map(symbol => symbol.namespace || '')));
+    if (namespaces.size <= 1) return '\x01';
+    const namespace = siteNamespaceOf(fileEntry, line);
+    return namespace === undefined ? '\x02' : `\x03${namespace}`;
 }
 
 /** Could a project type named `name` be the type `fqn` names? Only a type

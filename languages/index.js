@@ -99,6 +99,10 @@ const JAVA_LANG_NOT_SERIALIZABLE = ['Object', 'Runnable', 'AutoCloseable', 'Comp
 
 const STRUCTURAL_TRAITS = {
     typeSystem: 'structural',
+    // Whether importing a module runs its top-level code when the importer
+    // loads (JS/TS/HTML scripts, Python): only then is an import cycle an
+    // import-time cycle (fix #433).
+    importsRunModules: true,
     // The receiver keyword whose member lookup starts at the enclosing
     // class's bases, skipping its own members (`super.m()`, Python
     // `super().m()`, C# `base.M()`), or null (fix #428).
@@ -345,6 +349,7 @@ const STRUCTURAL_TRAITS = {
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
+    importsRunModules: false,
     superReceiver: null,
     hasConstructors: false,
     fixedConstructorName: null,

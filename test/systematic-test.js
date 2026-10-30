@@ -7,6 +7,7 @@
  * Run with: node test/systematic-test.js [--verbose] [--language=<lang>] [--command=<cmd>]
  */
 
+require('./helpers/cache-root'); // isolated cache root (fix #433)
 const { execSync, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');

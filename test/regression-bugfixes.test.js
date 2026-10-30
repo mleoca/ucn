@@ -3205,3 +3205,20 @@ describe('fix #404: a ** run that is not a whole path segment is an ordinary *',
             { 'a': false, 'a/x': true, 'a/x/y': true, 'ax/y': false });
     });
 });
+
+// ============================================================================
+// fix #433: `[[:space:]]` is git's sane-ctype isspace: space, \t, \n and \r.
+// Vertical tab and form feed are control characters there, not spaces.
+// ============================================================================
+describe('fix #433: [[:space:]] matches only space, tab, newline and carriage return', () => {
+    const { IgnoreRules } = require('../core/ignore-rules');
+    it('admits \\t \\n \\r and space, never \\v or \\f', () => {
+        const rules = new IgnoreRules([{ base: '', content: 'a[[:space:]]b\n' }]);
+        const verdicts = Object.fromEntries(['a b', 'a\tb', 'a\nb', 'a\rb', 'a\vb', 'a\fb', 'axb']
+            .map(p => [JSON.stringify(p), rules.isIgnored(p, false)]));
+        assert.deepEqual(verdicts, {
+            '"a b"': true, '"a\\tb"': true, '"a\\nb"': true, '"a\\rb"': true,
+            '"a\\u000bb"': false, '"a\\fb"': false, '"axb"': false,
+        });
+    });
+});

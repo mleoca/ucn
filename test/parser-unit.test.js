@@ -5,6 +5,7 @@
  * Extracted from parser.test.js lines 20-441.
  */
 
+require('./helpers/cache-root'); // isolated cache root (fix #433)
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
 

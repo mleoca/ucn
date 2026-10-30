@@ -18431,3 +18431,149 @@ describe('fix #430: C/C++ members of unnamed structs and unions, variable templa
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// fix #433 (#407): answers do not depend on the order files enter a name's
+// callee set. A Rust file whose macro-expansion calls are derived later joins
+// that set at its end, so a warm session visited files in derivation order:
+// which unverified entries carried line text, the excluded samples and the
+// order of excluded evidence followed it.
+// ============================================================================
+describe('fix #433: caller answers in canonical order whatever the callee-set order', () => {
+    const files = {};
+    for (let i = 0; i < 14; i++) {
+        const name = `m${String(i).padStart(2, '0')}`;
+        // obj.run() on an untyped receiver: an unverified candidate per file.
+        files[`src/${name}.js`] = `function use${i}(obj) { return obj.run(); }\nmodule.exports = { use${i} };\n`;
+    }
+    files['src/worker.js'] = 'class Worker { run() { return 1; } }\nmodule.exports = { Worker };\n';
+    files['src/other.py'] = 'class Other:\n    def run(self):\n        return 2\n\ndef go(o: Other):\n    return o.run()\n';
+    const strip = (k, v) => (k === 'buildTime' || k === 'buildTimeNote' ? undefined : v);
+
+    it('show and impact JSON are identical when the callee set is reversed', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const ask = () => ['show', 'impact'].map(cmd =>
+                JSON.stringify(execute(index, cmd, { name: 'src/worker.js:1:run' }).result, strip));
+            const forward = ask();
+            index.buildCalleeIndex();
+            const set = index.calleeIndex.get('run');
+            assert.ok(set && set.size >= 14, 'run is called in every file');
+            index.calleeIndex.set('run', new Set([...set].reverse()));
+            index._opFindCallersCaches = null;
+            assert.deepStrictEqual(ask(), forward);
+        } finally { rm(dir); }
+    });
+
+    it('the account orders samples and evidence by file and line', () => {
+        const { buildAccount } = require('../core/account');
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const { computeGroundSet } = require('../core/account');
+            const groundSet = computeGroundSet(index, 'run');
+            const fileOf = i => path.join(index.root, `src/m${String(i).padStart(2, '0')}.js`);
+            const excluded = [];
+            for (let i = 0; i < 14; i++) {
+                excluded.push({ file: fileOf(i), line: 1, reason: 'receiver-target-different',
+                    provenance: { rule: 'test' } });
+            }
+            const a = buildAccount(index, 'run', { groundSet, excludedEntries: excluded });
+            const b = buildAccount(index, 'run', { groundSet, excludedEntries: [...excluded].reverse() });
+            assert.deepStrictEqual(b, a);
+            assert.deepStrictEqual(a.excluded.byReason['receiver-target-different'].sample.map(s => s.file),
+                ['src/m00.js', 'src/m01.js', 'src/m02.js']);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #433: declarations sharing a line keep distinct binding ids in every
+// language, after a cache load too, so a callee list shows both.
+// ============================================================================
+describe('fix #433: two declarations on one line are two callees', () => {
+    const cases = {
+        'm.js': ['function a() { return 1; } function b() { return 2; }', 'function c() { return a() + b(); }', 'module.exports = { c };'],
+        'g.go': ['package main', 'func a() int { return 1 }; func b() int { return 2 }', 'func c() int { return a() + b() }'],
+        'K.java': ['class K { int a() { return 1; } int b() { return 2; } int c() { return a() + b(); } }'],
+        'r.rs': ['fn a() -> i32 { 1 } fn b() -> i32 { 2 }', 'fn c() -> i32 { a() + b() }'],
+        'c.c': ['int a(void) { return 1; } int b(void) { return 2; }', 'int c(void) { return a() + b(); }'],
+    };
+    it('ids are unique and callees list both, fresh and after a cache load', () => {
+        const dir = tmp(Object.fromEntries(Object.entries(cases).map(([f, l]) => [f, l.join('\n') + '\n'])));
+        try {
+            const index = idx(dir);
+            const cachePath = path.join(dir, '.probe-cache', 'index.json');
+            index.saveCache(cachePath);
+            const loaded = new ProjectIndex(dir);
+            loaded.loadCache(cachePath);
+            for (const ix of [index, loaded]) {
+                for (const [file] of Object.entries(cases)) {
+                    const entry = [...ix.files.values()].find(fe => fe.relativePath === file);
+                    const ids = entry.symbols.map(s => s.bindingId);
+                    assert.strictEqual(new Set(ids).size, ids.length, `${file}: ${ids.join(', ')}`);
+                    const c = entry.symbols.find(s => s.name === 'c');
+                    const callees = execute(ix, 'show', { name: `${file}:${c.startLine}:c`, sections: 'callees' });
+                    const names = (callees.result.context.callees || []).map(x => `${x.name}:${x.bindingId}`).sort();
+                    assert.deepStrictEqual(names.map(n => n.split(':')[0]), ['a', 'b'], `${file} callees`);
+                    assert.notStrictEqual(names[0].slice(2), names[1].slice(2), `${file} distinct callee ids`);
+                }
+            }
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #433: a fully dynamic namespace lookup (`eval(code)`, `globals()[key]`,
+// no literal part) is counted and warned, never listed as a caller of every
+// top-level name of its module; a pattern with a literal part still is, and
+// deadcode still withholds what either may reach.
+// ============================================================================
+describe('fix #433: fully dynamic module-namespace reflection is not a caller of each name', () => {
+    it('Python and JavaScript', () => {
+        const dir = tmp({
+            'mod.py': 'import sys\n\ndef alpha():\n    return 1\n\ndef beta():\n    return alpha()\n\nresult = eval(sys.argv[1])\nglobals()[sys.argv[2]]()\n',
+            'lit.py': 'def handler_x():\n    return 1\n\ndef go(kind):\n    return eval("handler_" + kind)()\n',
+            'm.js': 'function alpha() { return 1; }\nfunction beta() { return alpha(); }\neval(process.argv[2]);\nmodule.exports = { beta };\n',
+        });
+        try {
+            const index = idx(dir);
+            const unverified = handle => JSON.stringify(execute(index, 'show', { name: handle, sections: 'callers' }).result);
+            assert.ok(!unverified('mod.py:3:alpha').includes('reflection-pattern'), 'python eval/globals');
+            assert.ok(!unverified('m.js:1:alpha').includes('reflection-pattern'), 'js eval');
+            assert.ok(unverified('lit.py:1:handler_x').includes('handler_*'), 'literal fragment stays a caller');
+            const dead = execute(index, 'deadcode', { includeExported: true }).result;
+            assert.ok(!(dead.results || dead).some?.(d => d.name === 'beta' && d.file === 'm.js'),
+                'm.js beta stays withheld by the module-namespace pattern');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #433: a C# type name is decided by the namespace block it is written in.
+// The external-type verdict was memoized per file and name, so the first
+// block's answer decided every block of the file.
+// ============================================================================
+describe('fix #433: C# external-type verdicts per namespace block', () => {
+    const widget = 'namespace A\n{\n    public class Widget\n    {\n        public void Run() { }\n    }\n}\n';
+    const block = ns => `namespace ${ns}\n{\n    public class User_${ns.replace('.', '_')}\n    {\n` +
+        '        public void M()\n        {\n            var w = new Widget();\n            w.Run();\n        }\n    }\n}\n';
+    for (const order of [['B', 'A.Sub'], ['A.Sub', 'B']]) {
+        it(`blocks ${order.join(', ')}`, () => {
+            const dir = tmp({ 'src/Widget.cs': widget, 'src/Users.cs': `using Ext;\n\n${order.map(block).join('\n')}` });
+            try {
+                const index = idx(dir);
+                const r = execute(index, 'show', { name: 'src/Widget.cs:5:Run', sections: 'callers' }).result;
+                const text = JSON.stringify(r);
+                // In A.Sub, Widget is A.Widget (an enclosing namespace precedes
+                // the using); in B it is Ext.Widget.
+                const subLine = order[0] === 'A.Sub' ? 10 : 22;
+                const bLine = order[0] === 'B' ? 10 : 22;
+                assert.deepStrictEqual(r.context.callers.map(c => c.line), [subLine], text.slice(0, 400));
+                const excluded = r.context.meta.account.excluded;
+                assert.deepStrictEqual(excluded.byReason['external-receiver'].sample.map(s => s.line), [bLine]);
+            } finally { rm(dir); }
+        });
+    }
+});

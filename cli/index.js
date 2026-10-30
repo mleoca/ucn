@@ -960,7 +960,7 @@ Commands:
 Common flags:
   --file=PATH --exclude=a,b --in=PATH --depth=N --top=N --limit=N
   --all --compact --no-compact --json --include-tests --class-name=X --line=N
-  --range=N-M (source with --file=PATH)
+  --range=N-M (source <file> --range=N-M, or --file=PATH)
   --base=REF --staged --no-cache --clear-cache [--all] --max-files=N --workers=N
   --max-chars=N (text characters, not UTF-8 bytes; default 10K targeted / 3K broad, ceiling 100K)
   --lines  find/usages/search/show/impact: grep -n shape, one path:line:text

@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
 const { genericArityOf, hasParameterizedQualifier, goPathPackageName } = require('../languages/utils');
-const { isTestFile } = require('./discovery');
+const { isTestFile, compareNames } = require('./discovery');
 const { NON_CALLABLE_TYPES, isCallableMember, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS,
     isMacroNamespaceDefinition } = require('./shared');
 const { _resolveJavaPackageImport, _rustWalkUsePath, splitParentList } = require('./graph-build');
@@ -32,7 +32,7 @@ const { rustWrapperContract, validateRustWrapperContract } = require('./rust-res
 const { pythonFixtureReceiver, pythonFixtureType } = require('./python-fixture-flow');
 const { sameConfigurationItem, itemsNamed, moduleItemNamed, siteExcludedAt, sitesReachableAt,
     DEFINITION_KINDS: CONFIGURATION_DEFINITION_KINDS } = require('./configuration-items');
-const { reflectionPatternReferences: _reflectionPatternReferences } = require('./reflection');
+const { reflectionPatternReferences: _reflectionPatternReferences, patternIsAttributable } = require('./reflection');
 const {
     ownerRefOf, lexicalClassRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
     shareDescendant: shareClassDescendant, parentRefsOf: parentRefsOfClass,
@@ -597,6 +597,27 @@ function _renameSurfaceIndex(index) {
     const view = { files: index.files, renamingFiles, defaultLikeByModule };
     if (scope) _renameSurfaceMemos.set(scope, view);
     return view;
+}
+
+/** File paths in the index's canonical order (discovery's compareNames, as
+ * `_canonicalizeOrder` sorts the files map), sorted in place only when a
+ * pair is out of order (fix #407). */
+function _canonicalFileOrder(paths) {
+    for (let i = 1; i < paths.length; i++) {
+        if (compareNames(paths[i - 1], paths[i]) > 0) return paths.sort(compareNames);
+    }
+    return paths;
+}
+
+/** One file's pending caller sites by (line, column), stable, sorted in place
+ * only when a pair is out of order (fix #407). */
+function _sortPendingSites(pending) {
+    const before = (a, b) => (a.call.line - b.call.line) ||
+        ((Number.isInteger(a.call.column) ? a.call.column : -1) - (Number.isInteger(b.call.column) ? b.call.column : -1));
+    for (let i = 1; i < pending.length; i++) {
+        if (before(pending[i - 1], pending[i]) > 0) return pending.sort(before);
+    }
+    return pending;
 }
 
 /**
@@ -1292,8 +1313,14 @@ function findCallers(index, name, options = {}) {
         const candidateFiles = options.candidateFiles;
         calleeFiles = [...(calleeFiles || index.files.keys())].filter(fp => candidateFiles.has(fp));
     }
+    // Files are visited in the index's canonical file order (fix #407): a
+    // name's callee set gains a Rust file when that file's macro-expansion
+    // calls are derived, at the END of the set, and pending files are
+    // appended above, so set order is derivation history. The visit order
+    // decides which unverified entries are enriched, the maxResults cut and
+    // the order of excluded entries.
     const fileIterator = calleeFiles
-        ? [...calleeFiles].map(fp => [fp, index.files.get(fp)]).filter(([, fe]) => fe)
+        ? _canonicalFileOrder([...calleeFiles]).map(fp => [fp, index.files.get(fp)]).filter(([, fe]) => fe)
         : index.files;
 
     for (const [filePath, fileEntry] of fileIterator) {
@@ -7945,6 +7972,10 @@ function findCallers(index, name, options = {}) {
 
     // Phase 2: Read content only for files with matching calls (eliminates ~98% of file reads)
     for (const [filePath, pending] of pendingByFile) {
+        // Sites in source order (fix #407): a Rust file read through its
+        // pending macro-expansion view lists derived records by line, the
+        // composed calls of a derived file by expansion pass.
+        _sortPendingSites(pending);
         let content = null;
         for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference,
             isTypeReference, receiver, receiverType, calledAs, _evidence, _tier,
@@ -8190,6 +8221,9 @@ function findCallers(index, name, options = {}) {
         const seenReflection = new Set(unverifiedEntries.map(e => `${e.file}:${e.line}`));
         for (const target of reflectionTargets) {
             for (const entry of _reflectionPatternReferences(index, target)) {
+                // A fully dynamic name is counted and warned, never listed as
+                // a caller of each name it may reach (fix #433).
+                if (!patternIsAttributable(entry.pattern)) continue;
                 const key = `${entry.file}:${entry.site.line}`;
                 if (seenReflection.has(key)) continue;
                 seenReflection.add(key);
