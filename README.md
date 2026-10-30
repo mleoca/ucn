@@ -190,8 +190,8 @@ npm run trust:gate
 | Likely missing awaits | `audit-async` |
 | Stack-trace frame resolution | `stacktrace <text>` |
 
-`deps --cycles` groups circular dependencies and distinguishes eager imports
-from deferred or type-only edges. Enumeration limits are disclosed. `repo`
+`deps --cycles` groups circular dependencies and, in JS/TS and Python,
+distinguishes eager imports from deferred or type-only edges. Enumeration limits are disclosed. `repo`
 reports source coverage as well as project structure; its HOT ranking counts
 confirmed production callers exactly (a refinement budget only binds on very
 large repositories, and is disclosed), and `repo --sections=stats --hot` ranks
@@ -208,8 +208,8 @@ Run `ucn --help` for flags, or use the
 ## Shell output
 
 Records and code go to stdout; accounting and notes go to stderr. Unverified
-records carry a tab-separated reason. An empty listing exits 1, an error
-exits 2, and a successful listing exits 0. `--lines` supports `find`, `show`,
+records carry a tab-separated reason. An empty `--lines` listing exits 1, an
+error exits 2, and a successful listing exits 0. `--lines` supports `find`, `show`,
 `usages`, `search`, and `impact`; `show --lines` lists callers by default.
 Use `--json` when the script needs structured fields or a tree result.
 
