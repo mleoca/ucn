@@ -7924,6 +7924,163 @@ describe('fix #431: C++ accesses in macro-generated scopes and qualified templat
     });
 });
 
+describe('fix #437: generic C# constructor delegations keep type identity', () => {
+    it('retains nested generic constructions as review and nested annotation test links', () => {
+        const dir = tmp({
+            'Nested.cs': 'namespace N {\n public class Outer<T> { public class Inner<V> { public Inner() {} } }\n}\nnamespace Other {\n public class Outer { public class Inner<V> { public Inner() {} } }\n}\n',
+            'NestedTests.cs': 'using Other;\nclass NestedTests {\n object Make() => new N.Outer<int>.Inner<string>();\n void Accept(N.Outer<int>.Inner<string> value) {}\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'NestedTests.cs'));
+            const construction = calls.find(call => call.isConstructor);
+            assert.strictEqual(construction.name, 'Inner');
+            assert.strictEqual(construction.constructorQualifier, 'N.Outer<int>');
+            assert.strictEqual(construction.typeArgs, 1);
+            for (const line of [2, 5]) {
+                const context = index.context('Inner', { file: 'Nested.cs', line });
+                assert.deepStrictEqual(context.callers, []);
+                assert.ok(context.unverifiedCallers.some(call => call.relativePath === 'NestedTests.cs' && call.line === 3));
+            }
+            const { execute } = require('../core/execute');
+            const tests = execute(index, 'tests', { name: 'Nested.cs:2:Inner' });
+            assert.strictEqual(tests.ok, true);
+            assert.ok(tests.result.some(file => file.file === 'NestedTests.cs' && file.matches.some(match => match.line === 4)));
+        } finally { rm(dir); }
+    });
+
+    it('this and base initializers reach the right arity across partial declarations and cache histories', () => {
+        const files = {
+            'A.cs': 'namespace N;\npublic partial class Box<T> {\n public Box() : this(1) {}\n public Box(int n) {}\n}\n',
+            'B.cs': 'namespace N;\npublic partial class Box<T> { public int Value => 1; }\n',
+            'C.cs': 'namespace N;\npublic class Box { public Box(int n) {} }\n',
+            'D.cs': 'namespace N;\npublic class Child : Box<int> {\n public Child() : base(2) {}\n}\n',
+            'E.cs': 'namespace Other;\npublic class Box<T> { public Box(int n) {} }\n',
+        };
+        for (let n = 0; n < 101; n++) files[`padding/${n}.cs`] = `class Padding${n} {}`;
+        const dir = tmp(files);
+        try {
+            const { ProjectIndex } = require('../core/project');
+            const check = index => {
+                for (const file of ['A.cs', 'B.cs']) {
+                    const result = index.context('Box', { file, line: 2 });
+                    assert.deepStrictEqual(result.callers.map(call => [call.relativePath, call.line]),
+                        [['A.cs', 3], ['D.cs', 3]]);
+                    assert.strictEqual(result.meta.account.conserved, true);
+                }
+                for (const file of ['C.cs', 'E.cs']) {
+                    const result = index.context('Box', { file, line: 2 });
+                    assert.deepStrictEqual(result.callers, []);
+                }
+                return ['A.cs', 'D.cs'].map(file => index.getCachedCalls(path.join(dir, file))
+                    .filter(call => call.constructorSyntax === 'delegation'));
+            };
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const records = check(sequential);
+            assert.deepStrictEqual(records.map(calls => calls.map(call => call.typeArgs)), [[1], [1]]);
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.deepStrictEqual(check(parallel), records);
+            parallel.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(check(loaded), records);
+        } finally { rm(dir); }
+    });
+});
+
+describe('C# enclosing namespace receivers and nested generic locals', () => {
+    it('looks up the first namespace segment from the nearest scope and respects member shadows', () => {
+        const dir = tmp({
+            'Types.cs': [
+                'namespace N.Tools { public class Helper { public static void Make() {} public static void Build() {} } }',
+                'namespace Tools { public class Helper { public static void Make() {} } }',
+                'namespace N.Inner.Tools { public class Helper { public static void Make() {} } }',
+                'namespace N.Types { public class Holder { public Helper Helper; }',
+                'public class Helper { public void Make() {} } }',
+            ].join('\n'),
+            'Calls.cs': [
+                'namespace N.Tests { class Client { void Run() { Tools.Helper.Make(); Tools.Helper.Build(); } } }',
+                'namespace N.Inner.Tests { class Client { void Run() { Tools.Helper.Make(); } } }',
+                'namespace N.Tests { class Shadow { N.Types.Holder Tools;',
+                'void Run() { Tools.Helper.Make(); }',
+                'void Explicit() { this.Tools.Helper.Make(); } } }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const [line, expected] of [[1, [1]], [2, []], [3, [2]], [5, [4, 5]]]) {
+                const result = index.context('Make', { file: 'Types.cs', line });
+                if (line === 5) assert.deepStrictEqual(result.callers.map(call => call.line), expected);
+                else {
+                    // Competing same-named owners can remain undecided, but
+                    // cannot confirm one another or lose the actual call.
+                    assert.ok(result.callers.every(call => expected.includes(call.line)));
+                    const visible = [...result.callers, ...result.unverifiedCallers].map(call => call.line);
+                    assert.ok(expected.every(site => visible.includes(site)));
+                }
+                assert.ok(result.meta.account.conserved);
+            }
+            assert.deepStrictEqual(index.context('Build', { file: 'Types.cs', line: 1 }).callers.map(call => call.line), [1]);
+        } finally { rm(dir); }
+    });
+
+    it('retains the terminal declared type for parameters, casts, locals and out declarations', () => {
+        const dir = tmp({
+            'Types.cs': 'namespace N;\nclass Outer<T> { public class Inner { public void Run() {} } }\n' +
+                'class Outer { public class Inner { public void Run() {} } }\n',
+            'Calls.cs': [
+                'namespace N;',
+                'class Client {',
+                'void Make(out Outer<int>.Inner value) { value = new Outer<int>.Inner(); }',
+                'void Use(Outer<int>.Inner parameter, object obj) {',
+                ' parameter.Run();',
+                ' Make(out Outer<int>.Inner super);',
+                ' super.Run();',
+                ' ((Outer<int>.Inner)obj).Run();',
+                ' Outer<int>.Inner assigned = parameter;',
+                ' assigned.Run();',
+                '} }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const line of [2, 3]) {
+                const result = index.context('Run', { file: 'Types.cs', line });
+                assert.deepStrictEqual(result.callers, []);
+                assert.deepStrictEqual(result.unverifiedCallers.map(call => call.line), [5, 7, 8, 10]);
+                assert.ok(result.meta.account.conserved);
+            }
+            const records = index.getCachedCalls(path.join(dir, 'Calls.cs')).filter(call => call.name === 'Run');
+            assert.ok(records.every(call => call.receiverType === 'Inner' &&
+                call.receiverTypeNamespace === 'Outer<int>' && !call.receiverFields));
+        } finally { rm(dir); }
+    });
+});
+
+describe('ordinary variables named super use their declared receiver type', () => {
+    for (const [file, source] of [
+        ['a.cs', 'class Target { public void Run() {} }\nclass Client { void Use(Target super) { super.Run(); } }'],
+        ['a.cpp', 'struct Target { void Run() {} };\nstruct Client { void Use(Target super) { super.Run(); } };'],
+        ['a.go', 'package main\ntype Target struct{}\nfunc (t Target) Run() {}\nfunc Use(super Target) { super.Run() }'],
+    ]) {
+        it(file, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir);
+                const result = index.context('Run');
+                const line = source.split('\n').length;
+                assert.ok([...result.callers, ...result.unverifiedCallers].some(call => call.line === line));
+                const down = index.context('Use');
+                assert.ok(down.callees.some(call => call.name === 'Run') ||
+                    down.unverifiedCallees?.some(call => call.name === 'Run'));
+                assert.ok(result.meta.account.conserved);
+            } finally { rm(dir); }
+        });
+    }
+});
+
 describe('fix #434: C++ auto locals deduce the type of the object they copy, reference or point at', () => {
     it('types auto copies, references and &object pointers as receivers', () => {
         const dir = tmp({

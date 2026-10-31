@@ -1770,15 +1770,27 @@ function tests(index, nameOrFile, options = {}) {
         // receiver identity the accessor engine proves are test links; the
         // unverified ones join only for a globally unique name, as above.
         const accessorDefs = targetDefs.filter(isAccessorDefinition);
-        if (accessorDefs.length > 0) {
+        // A nested type's annotations and qualifiers are type references,
+        // not instance-member accesses of its containing class. Reuse the
+        // same language lookup as impact instead of requiring a receiver.
+        const nestedTypeDefs = targetDefs.filter(def => def.enclosingType &&
+            ['class', 'struct', 'interface', 'type', 'enum', 'trait', 'record', 'union'].includes(def.type));
+        if (accessorDefs.length > 0 || nestedTypeDefs.length > 0) {
             const testPaths = new Set(testFiles.map(t => t.path));
             const globallyUnique = index.find(searchTerm, { exact: true }).length === 1;
-            for (const def of accessorDefs) {
-                const refs = findAccessorReferences(index, searchTerm, def, { files: testPaths });
+            for (const def of [...accessorDefs, ...nestedTypeDefs]) {
+                const types = nestedTypeDefs.includes(def)
+                    ? require('./analysis').findTypeReferences(index, searchTerm, def, { files: testPaths }) : null;
+                const typeSite = site => ({ ...site, absoluteFile: path.join(index.root, site.file) });
+                const refs = types ? {
+                    confirmed: types.byFile.flatMap(group => group.sites).map(typeSite),
+                    unverified: types.unverifiedSites.map(typeSite),
+                } : findAccessorReferences(index, searchTerm, def, { files: testPaths });
                 if (!refs) continue;
                 const rows = [
                     ...refs.confirmed.map(r => ({ ...r, tierName: 'confirmed' })),
-                    ...(globallyUnique ? refs.unverified.map(r => ({ ...r, tierName: 'unverified' })) : []),
+                    ...(globallyUnique || types && options.definition
+                        ? refs.unverified.map(r => ({ ...r, tierName: 'unverified' })) : []),
                 ];
                 for (const ref of rows) {
                     const info = testInfo.get(ref.absoluteFile);

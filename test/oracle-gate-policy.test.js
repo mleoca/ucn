@@ -907,6 +907,59 @@ describe('fix #429: Roslyn oracle project universe and framework cap', () => {
     });
 });
 
+describe('fix #437: Roslyn identity through a linked project root', () => {
+    const fs = require('fs');
+    const { spawnSync } = require('child_process');
+    const { tmp, rm } = require('./helpers');
+    const { roslynOracle } = require('../eval/oracles/roslyn-oracle');
+    const sdk = spawnSync('dotnet', ['--version'], {
+        cwd: path.join(__dirname, '../eval/oracles/roslyn-helper'), encoding: 'utf8',
+    });
+    const major = Number(sdk.stdout?.match(/^(\d+)\./)?.[1]);
+
+    it('unifies compiler project references and every partial declaration without merging namesakes', {
+        skip: sdk.status !== 0 || major < 9 ? '.NET 9+ SDK unavailable' : false,
+        timeout: 120000,
+    }, async () => {
+        const project = extra => `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net${major}.0</TargetFramework></PropertyGroup>${extra}</Project>`;
+        const root = tmp({
+            'lib/Lib.csproj': project(''),
+            'app/App.csproj': project('<ItemGroup><ProjectReference Include="../lib/Lib.csproj" /></ItemGroup>'),
+            'lib/A.cs': 'namespace N;\npublic partial class Box<T> { public Box() : this(1) {} public Box(int n) {} }\n',
+            'lib/B.cs': 'namespace N;\npublic partial class Box<T> { public int Value => 1; }\n',
+            'lib/C.cs': 'namespace N;\npublic class Box { public Box() {} }\n',
+            'app/Use.cs': 'class Use {\n object A() => new N.Box<int>();\n object B() => new N.Box<string>(2);\n object C() => new N.Box();\n}\n',
+        });
+        const alias = root + '-link';
+        let handle;
+        try {
+            fs.symlinkSync(root, alias, 'dir');
+            handle = await roslynOracle.prepare(alias);
+            assert.strictEqual(handle.root, fs.realpathSync(root));
+            assert.strictEqual(handle.projection.units.length, 2);
+            const symbols = await roslynOracle.listSymbols(handle);
+            assert.ok(symbols.every(symbol => !symbol.file.startsWith('../')));
+            for (const file of ['lib/A.cs', 'lib/B.cs']) {
+                const target = { file, line: 2, name: 'Box' };
+                const calls = (await roslynOracle.findReferences(handle, target))
+                    .filter(ref => ref.kind === 'call').map(ref => `${ref.file}:${ref.line}`).sort();
+                assert.deepStrictEqual(calls, ['app/Use.cs:2', 'app/Use.cs:3', 'lib/A.cs:2']);
+                const definitions = await roslynOracle.resolveDefinition(handle, target);
+                assert.deepStrictEqual(definitions, [{ file: 'lib/A.cs', line: 2 }, { file: 'lib/B.cs', line: 2 }]);
+            }
+            const definitions = await roslynOracle.resolveDefinition(handle, {
+                file: 'app/Use.cs', line: 2, name: 'Box',
+            });
+            assert.ok(definitions.some(def => def.file === 'lib/B.cs'));
+            assert.ok(definitions.every(def => def.file !== 'lib/C.cs'));
+        } finally {
+            if (handle) await roslynOracle.dispose(handle);
+            if (fs.existsSync(alias)) fs.unlinkSync(alias);
+            rm(root);
+        }
+    });
+});
+
 describe('fix #429: clangd oracle answers stay bounded and copy-aware', () => {
     const { pruneToLine, declarationHasBody } = require('../eval/oracles/clangd-oracle');
     it('a cached line AST keeps the line slice and every child position', () => {

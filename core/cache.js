@@ -994,7 +994,8 @@ function clearAllCaches() {
 // v321 (fix #436): file entries carry `computedDispatchSites`, extracted
 // from the literal parse at index time (the doctor read them by parsing every
 // file on the first `repo` of a process).
-const CACHE_FORMAT_VERSION = 321;
+// v322: C# constructions retain terminal names and arity; nested generic receivers retain their qualifier.
+const CACHE_FORMAT_VERSION = 322;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

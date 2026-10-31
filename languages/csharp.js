@@ -14,6 +14,7 @@ const {
     containsOwnNode,
     parseErrorRegions,
     genericArityOf,
+    hasParameterizedQualifier,
 } = require('./utils');
 
 // An iterator method (`yield return` in its OWN body) returns an enumerable /
@@ -729,6 +730,24 @@ function typeParameterCount(node) {
     const list = node?.namedChildren?.find(child => child.type === 'type_parameter_list');
     if (!list) return 0;
     return list.namedChildren.filter(child => child.type === 'type_parameter').length;
+}
+
+// The constructed type is the terminal AST name. A generic containing
+// type keeps its written arguments in the qualifier for identity lookup.
+function constructionType(node) {
+    let name = node, qualifier = null;
+    if (name?.type === 'qualified_name') {
+        qualifier = name.childForFieldName('qualifier');
+        name = name.childForFieldName('name');
+    } else if (name?.type === 'alias_qualified_name') {
+        qualifier = name.childForFieldName('alias');
+        name = name.childForFieldName('name');
+    }
+    const typeArgs = name?.type === 'generic_name'
+        ? name.namedChildren.find(child => child.type === 'type_argument_list')?.namedChildCount || 0 : 0;
+    if (name?.type === 'generic_name') name = name.namedChild(0);
+    if (name?.type !== 'identifier') return null;
+    return { name: name.text, node: name, qualifier: qualifier?.text, typeArgs };
 }
 
 // fix #390: the declared type parameter NAMES, in order (`<TState, TResult>`;
@@ -1841,6 +1860,21 @@ function buildVariableTypes(tree, parser) {
     return byScope;
 }
 
+// Type spellings held in local bindings have no retained AST node. Parse
+// them on demand and keep bounded data, never nodes, across worker files.
+const constructedTypeSyntax = new Map();
+function constructionTypeText(text) {
+    if (constructedTypeSyntax.has(text)) return constructedTypeSyntax.get(text);
+    const tree = safeParse(require('./index').getParser('csharp'), `class TypeSlot { ${text} field; }`);
+    const type = tree && !tree.rootNode.hasError
+        ? tree.rootNode.descendantsOfType('variable_declaration')[0]?.childForFieldName('type') : null;
+    const shape = constructionType(type);
+    const result = shape ? { name: shape.name, qualifier: shape.qualifier, typeArgs: shape.typeArgs } : null;
+    if (constructedTypeSyntax.size >= 256) constructedTypeSyntax.delete(constructedTypeSyntax.keys().next().value);
+    constructedTypeSyntax.set(text, result);
+    return result;
+}
+
 function normalizeReceiverType(raw) {
     if (!raw) return null;
     let value = String(raw).trim().replace(/\?$/, '');
@@ -1849,6 +1883,10 @@ function normalizeReceiverType(raw) {
     // this index cannot attribute (fix #401): no receiver type.
     if (/^(?!global::)[A-Za-z_]\w*::/.test(value)) return null;
     value = value.replace(/^global::/, '').replace(/::/g, '.');
+    if (hasParameterizedQualifier(value)) {
+        const shape = constructionTypeText(value);
+        return shape ? { name: shape.name, namespace: shape.qualifier, typeArgs: shape.typeArgs } : null;
+    }
     const match = value.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:<.*>)?$/s);
     if (!match) return null;
     const parts = match[1].split('.');
@@ -2464,12 +2502,15 @@ function findCallsInTree(code, parser, tree, reaches = null) {
             const baseList = owner?.namedChildren.find(child => child.type === 'base_list');
             const type = isBase ? baseList?.namedChild(0) : owner?.childForFieldName('name');
             if (!type) return true;
-            const raw = type.text.replace(/<.*>$/, ''), parts = raw.split('.'), name = parts.pop();
+            const constructed = constructionType(type);
+            if (!constructed) return true;
+            const typeArgs = isBase ? constructed.typeArgs : typeParameterCount(owner);
             const args = callArgs(node, typesAt(node));
-            calls.push({ callSite: typeOrigin('call', node), name,
+            calls.push({ callSite: typeOrigin('call', node), name: constructed.name,
                 line: node.startPosition.row + 1, isMethod: false, isConstructor: true,
                 constructorSyntax: 'delegation', ctorDelegation: isBase ? 'super' : 'this',
-                ...(parts.length && { constructorQualifier: parts.join('.') }),
+                ...(constructed.qualifier && { constructorQualifier: constructed.qualifier }),
+                ...(typeArgs > 0 && { typeArgs }),
                 argCount: args.argCount, ...(args.argKinds && { argKinds: args.argKinds }),
                 enclosingFunction: enclosingFunctionOf(node) });
             return true;
@@ -2689,13 +2730,13 @@ function findCallsInTree(code, parser, tree, reaches = null) {
             }
             if (!typeNode) return true;
             const args = callArgs(node, typesAt(node));
-            const raw = typeNode.text.replace(/<.*>$/, '');
-            const name = raw.split('.').pop();
-            const typeArgs = genericArityOf(typeNode.text);
+            const constructed = typeNode.type ? constructionType(typeNode) : constructionTypeText(typeNode.text);
+            if (!constructed) return true;
+            const { name, typeArgs } = constructed;
             // A target-typed site is the `new` token; its type is written
             // elsewhere.
             const targetTyped = !node.childForFieldName('type');
-            const siteNode = targetTyped ? (node.child(0) || node) : typeNode;
+            const siteNode = targetTyped ? (node.child(0) || node) : constructed.node;
             calls.push({
                 callSite: typeOrigin('call', siteNode),
                 name,
@@ -2703,7 +2744,7 @@ function findCallsInTree(code, parser, tree, reaches = null) {
                 ...(targetTyped && { targetTyped: true }),
                 isMethod: false,
                 isConstructor: true,
-                ...(raw.includes('.') && { constructorQualifier: raw.split('.').slice(0, -1).join('.') }),
+                ...(constructed.qualifier && { constructorQualifier: constructed.qualifier }),
                 ...(typeArgs > 0 && { typeArgs }),
                 argCount: args.argCount,
                 ...(args.argKinds && { argKinds: args.argKinds }),

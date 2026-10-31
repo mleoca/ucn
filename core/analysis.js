@@ -1030,7 +1030,10 @@ function findTypeReferences(index, name, def, options = {}) {
     const { getCachedCalls, _recordIsNoCall } = require('./callers');
     const resolver = new TypeReferenceResolver(index, def, name);
     resolver.collectRoles = true;
-    const { files } = typeReferenceSites(index, def, name, computeGroundSet(index, name), resolver);
+    const ground = computeGroundSet(index, name);
+    const scopedGround = options.files ? { ...ground,
+        perFile: new Map([...ground.perFile].filter(([file]) => options.files.has(file))) } : ground;
+    const { files } = typeReferenceSites(index, def, name, scopedGround, resolver);
     const confirmed = [], unverified = [], excluded = [];
     let tokens = 0, lineCount = 0, textLines = 0, constructions = 0, declarations = 0;
     const scannedFiles = new Set();
@@ -3695,4 +3698,6 @@ module.exports = {
     // Shared with tracing.js (trace/blast/reverseTrace root accounts) — the
     // tree commands compose the same text-ground account at their root hop.
     composeAccount,
+    // Test discovery shares impact's per-token type-reference evidence.
+    findTypeReferences,
 };

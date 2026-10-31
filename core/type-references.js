@@ -2237,6 +2237,11 @@ class TypeReferenceResolver {
     }
 
     resolveCSharpQualified(file, line, text, tok) {
+        // A constructed containing type has an arity at every owner
+        // segment. Erasing those arguments would merge Outer.Inner with
+        // Outer<T>.Inner. Until that owner chain is proven, keep the site
+        // visible without supplying a type-identity witness.
+        if (text.includes('<')) return { verdict: 'unknown', reason: 'generic-containing-type' };
         // An `extern alias` qualifier (`Old::Lib.Core.Widget`, fix #401)
         // names an assembly reference: a project namespace of that spelling
         // may or may not be the assembly's.

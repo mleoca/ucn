@@ -20,7 +20,7 @@ const {
     JAVA_PLATFORM_METHOD_RETURNS, JAVA_PLATFORM_ANCESTOR_MEMBERS, JAVA_PLATFORM_SUPERTYPES,
     JAVA_MODELED_PLATFORM_TYPES, platformAssignable: _javaPlatformAssignable,
 } = require('../languages/java-platform');
-const { externalTypeGate, stripExternalReceiverType, externalTypeDenotation, externalProducerVia, externalReceiverVerdict, csharpUsings, siteNamespaceOf } = require('./type-denotation');
+const { externalTypeGate, stripExternalReceiverType, externalTypeDenotation, externalProducerVia, externalReceiverVerdict, csharpUsings, csharpResolveUsingName, siteNamespaceOf } = require('./type-denotation');
 const { scoreEdge, tierForResolution, TIER, validateConfirmation } = require('./confidence');
 const { summarizeProvenance, declarationIdentity, sameDeclaration } = require('./provenance');
 const { confirmationFacts, occurrenceIdentity, definitionsInFile, definitionAt, partialTypeParts } = require('./provenance-facts');
@@ -208,12 +208,16 @@ function _confirmationFactsUncached(index, file, call, targets, options) {
     });
 }
 
-// `base` is a contextual receiver keyword only in C#. TypeScript and the
-// other supported languages may bind an ordinary local named base; treating
-// it as reserved globally suppresses otherwise exact assignment flow.
+// Parent-receiver keywords belong to their source language. For example,
+// a C# local named super and a TypeScript local named base are ordinary
+// variables, so their assignment flow must remain available.
 function _isReservedReceiver(language, receiver) {
-    if (receiver === 'base') return language === 'csharp';
+    if (receiver === 'base' || receiver === 'super') return _isSuperReceiver(language, receiver);
     return RESERVED_RECEIVER_NAMES.has(receiver);
+}
+
+function _isSuperReceiver(language, receiver) {
+    return !!receiver && receiver === langTraits(language)?.superReceiver;
 }
 
 /** Set.some() helper — like Array.some() but for Sets */
@@ -2995,7 +2999,7 @@ function findCallers(index, name, options = {}) {
                         // (fix #395): that lookup decides, as for a
                         // `this.m()` call.
                         let cbThisReached = false;
-                        if ((call.receiver === 'this' || call.receiver === 'super') &&
+                        if ((call.receiver === 'this' || _isSuperReceiver(fileEntry.language, call.receiver)) &&
                             langTraits(fileEntry.language)?.bareCallReachesMethods) {
                             const cbCaller = index.findEnclosingFunction(filePath, call.line, true, call);
                             const cbStart = cbCaller?.className ? ownerRefOf(index, cbCaller) : null;
@@ -3004,7 +3008,7 @@ function findCallers(index, name, options = {}) {
                                 (call.enclosingFunction.name === cbCaller.name &&
                                     call.enclosingFunction.startLine === cbCaller.startLine))
                                 ? findDeclaringClass(index, cbStart, cbMembers,
-                                    call.receiver === 'super' ? { parentsOnly: true } : {})
+                                    _isSuperReceiver(fileEntry.language, call.receiver) ? { parentsOnly: true } : {})
                                 : null;
                             if (cbDeclaring && !cbDeclaring.uncertain) {
                                 if (!cbDeclaring.members.some(member => cbTargetDefs.includes(member))) {
@@ -4004,8 +4008,8 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                         }
-                    } else if (['self', 'cls', 'this', 'super'].includes(call.receiver) ||
-                               (call.receiver === 'base' && fileEntry.language === 'csharp') ||
+                    } else if (['self', 'cls', 'this'].includes(call.receiver) ||
+                               _isSuperReceiver(fileEntry.language, call.receiver) ||
                                (call.receiver === 'Self' && fileEntry.language === 'rust')) {
                         // self/this/super.method() — resolve to same-class or parent method.
                         // Rust `Self::method()` (fix #232) is the path-call same-class form:
@@ -4022,8 +4026,7 @@ function findCallers(index, name, options = {}) {
                             }
                         } else {
                             // For super(), skip same-class — only check parent chain
-                            const parentOnlyReceiver = call.receiver === 'super' ||
-                                (call.receiver === 'base' && fileEntry.language === 'csharp');
+                            const parentOnlyReceiver = _isSuperReceiver(fileEntry.language, call.receiver);
                             // fix #358: resolve by class DEFINITION identity, not
                             // class name. `self.len()` inside slice.Chunks never
                             // reaches iter.Chunks.len just because both classes
@@ -9757,8 +9760,7 @@ function findCallees(index, definition, options = {}) {
                            (call.receiver === 'Self' && language === 'rust')) {
                     // self.method() / cls.method() / this.method() — resolve to same-class method below
                     // Rust Self::method() resolves same-impl the same way (fix #236, the #232 callee analog)
-                } else if (call.receiver === 'super' ||
-                    (call.receiver === 'base' && language === 'csharp')) {
+                } else if (_isSuperReceiver(language, call.receiver)) {
                     // super().method() — resolve to parent class method below
                 } else if (directReceiverFlow?.externalVia) {
                     if (directReceiverFlow.externalConcrete) {
@@ -10317,8 +10319,7 @@ function findCallees(index, definition, options = {}) {
 
             // Collect super().method() calls for parent-class resolution
             if (call.isMethod &&
-                (call.receiver === 'super' ||
-                 (call.receiver === 'base' && language === 'csharp'))) {
+                _isSuperReceiver(language, call.receiver)) {
                 if (!selfMethodCalls) selfMethodCalls = [];
                 selfMethodCalls.push({ call, siteId });
                 continue;
@@ -11319,8 +11320,7 @@ function findCallees(index, definition, options = {}) {
                 }
 
                 // For super().method(), skip same-class — start from parent
-                const parentOnlyReceiver = call.receiver === 'super' ||
-                    (call.receiver === 'base' && language === 'csharp');
+                const parentOnlyReceiver = _isSuperReceiver(language, call.receiver);
                 // fix #358: members are owned by class DEFINITIONS. A same-name
                 // class in another module/package/namespace never contributes
                 // candidates; an unresolved owner stays a candidate (and so
@@ -16217,18 +16217,7 @@ function _csharpTypeRootedPath(index, call, enclosing, filePath) {
         String(call.receiver || '').startsWith('this.')) return null;
     const first = call.receiverFields[0];
     if (!/^[A-Z]/.test(first)) return null;
-    const members = (index.symbols.get(first) || []).filter(d => d.className &&
-        (d.type === 'field' || d.type === 'property' || d.memberType === 'field' ||
-            d.memberType === 'property' || d.type === 'event' || d.type === 'constant'));
-    if (members.length > 0) {
-        const startRef = enclosing?.className ? ownerRefOf(index, enclosing) : null;
-        if (!startRef?.key) return null;
-        const declaring = findDeclaringClass(index, startRef, members);
-        if (declaring) return null;
-        // An outer class of a nested one supplies its members too.
-        if (members.some(d => startRef.def && d.className === startRef.def.enclosingType)) return null;
-        if (parentRefsOfClass(index, startRef).some(parent => parent.external || !parent.key)) return null;
-    }
+    if (_csharpReceiverRootShadowed(index, first, enclosing)) return null;
     const ref = resolveClassRef(index, first, filePath || call.file, { line: call.line });
     if (!ref?.key || !ref.def) return null;
     const rest = call.receiverFields.slice(1);
@@ -16245,6 +16234,22 @@ function _csharpTypeRootedPath(index, call, enclosing, filePath) {
     };
 }
 
+function _csharpReceiverRootShadowed(index, first, enclosing) {
+    const members = (index.symbols.get(first) || []).filter(d => d.className &&
+        (d.type === 'field' || d.type === 'property' || d.memberType === 'field' ||
+            d.memberType === 'property' || d.type === 'event' || d.type === 'constant'));
+    if (members.length > 0) {
+        const startRef = enclosing?.className ? ownerRefOf(index, enclosing) : null;
+        if (!startRef?.key) return true;
+        const declaring = findDeclaringClass(index, startRef, members);
+        if (declaring) return true;
+        // An outer class of a nested one supplies its members too.
+        if (members.some(d => startRef.def && d.className === startRef.def.enclosingType)) return true;
+        if (parentRefsOfClass(index, startRef).some(parent => parent.external || !parent.key)) return true;
+    }
+    return false;
+}
+
 /**
  * fix #353: C# namespace-qualified type receivers. `Beta.Helper.Widget()` is
  * recorded by the parser as a this-rooted field hop (Beta is not a local);
@@ -16255,7 +16260,9 @@ function _csharpTypeRootedPath(index, call, enclosing, filePath) {
  */
 function _csharpNamespaceQualifiedReceiver(index, call, enclosing) {
     if (!call.isMethod || call.receiverType || !Array.isArray(call.receiverFields) ||
-        call.receiverFields.length < 2 || call.receiverRoot !== 'this') return null;
+        call.receiverFields.length < 2 || call.receiverRoot !== 'this' ||
+        String(call.receiver || '').startsWith('this.')) return null;
+    if (_csharpReceiverRootShadowed(index, call.receiverFields[0], enclosing)) return null;
     const typeName = call.receiverFields[call.receiverFields.length - 1];
     if (!/^[A-Z]/.test(typeName)) return null;
     const prefix = call.receiverFields.slice(0, -1).join('.');
@@ -16263,9 +16270,8 @@ function _csharpNamespaceQualifiedReceiver(index, call, enclosing) {
         IDENTITY_TYPE_KINDS.has(d.type) && d.namespace);
     if (typeDefs.length === 0) return null;
     const enclosingNs = enclosing?.namespace || null;
-    const candidates = enclosingNs ? [prefix, `${enclosingNs}.${prefix}`] : [prefix];
-    const ns = candidates.find(c => typeDefs.some(d => d.namespace === c));
-    if (!ns) return null;
+    const ns = csharpResolveUsingName(index, prefix, enclosingNs);
+    if (!typeDefs.some(d => d.namespace === ns)) return null;
     const { receiverRoot, receiverField, receiverFields, receiverRootType, receiverRootNamespace, ...rest } = call;
     void receiverRoot; void receiverField; void receiverFields; void receiverRootType; void receiverRootNamespace;
     return { ...rest, receiver: typeName, receiverIsTypeQualified: true, receiverTypeQualifier: ns };
@@ -16392,6 +16398,10 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
     let typeDefs = (index.symbols.get(knownType) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
     const fileEntry = index.files.get(filePath);
     const language = fileEntry?.language;
+    // A constructed containing type carries its own type arguments. The
+    // namespace/import fallback below cannot prove that owner's identity;
+    // in particular it must not borrow an unrelated imported namesake.
+    if (langTraits(language)?.genericArityIsIdentity && namespaceHint?.includes('<')) return 'unknown';
     // Function-local types (fix #381) are visible only inside their scope:
     // an in-scope local type shadows every other type of the name, and one
     // declared elsewhere is never the type a name denotes here.

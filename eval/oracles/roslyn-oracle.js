@@ -31,6 +31,10 @@ const roslynOracle = {
     languages: ['csharp'],
 
     async prepare(repoDir) {
+        // MSBuild canonicalizes project references. Keep the roots, source
+        // files and project-unit keys in that same physical-path identity,
+        // including when the caller reached the repository through a link.
+        repoDir = fs.realpathSync(repoDir);
         resolveDotnet();
         const sdk = sdkVersion();
         const projectConfig = prepareProjectConfig(repoDir, sdk);
@@ -293,12 +297,13 @@ function prepareProjectConfig(repoDir, sdk) {
         }
         const files = (evaluated.Items?.Compile || [])
             .map(item => item.FullPath || path.resolve(path.dirname(project), item.Identity))
-            .filter(file => file.endsWith('.cs') && fs.existsSync(file));
+            .filter(file => file.endsWith('.cs') && fs.existsSync(file))
+            .map(file => fs.realpathSync(file));
         const references = [];
         const projectReferences = [];
         for (const item of evaluated.Items?.ReferencePath || []) {
             if (item.ReferenceSourceTarget === 'ProjectReference' && item.MSBuildSourceProjectFile) {
-                const dependency = path.resolve(item.MSBuildSourceProjectFile);
+                const dependency = fs.realpathSync(item.MSBuildSourceProjectFile);
                 const dependencyFramework = item.NearestTargetFramework ||
                     String(item.SetTargetFramework || '').replace(/^TargetFramework=/, '');
                 if (!dependencyFramework) continue;

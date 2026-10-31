@@ -251,6 +251,17 @@ internal sealed class RoslynOracle
             return new { ok = true, definitions = Array.Empty<object>(), outsideProjection = true };
         }
         var definitions = new Dictionary<string, object>(StringComparer.Ordinal);
+        void AddLocations(ISymbol? symbol)
+        {
+            if (NormalizeSymbol(symbol) is not ISymbol normalized) return;
+            foreach (var location in normalized.Locations.Where(loc => loc.IsInSource))
+            {
+                var span = location.GetLineSpan();
+                var rel = Relative(span.Path);
+                var defLine = span.StartLinePosition.Line + 1;
+                definitions[$"{rel}:{defLine}"] = new { file = rel, line = defLine };
+            }
+        }
         foreach (var (unit, tree) in located)
         {
             var source = tree.GetText();
@@ -279,6 +290,38 @@ internal sealed class RoslynOracle
             foreach (var position in positions)
             {
                 var node = tree.GetRoot().FindToken(position).Parent;
+                // Declaration identifiers are tokens directly owned by the
+                // declaration, not SimpleNameSyntax expressions. A partial
+                // type's declaration resolves to all its compiler-owned parts.
+                var declared = node switch
+                {
+                    BaseTypeDeclarationSyntax declaration when declaration.Identifier.Span.Contains(position)
+                        => model.GetDeclaredSymbol(declaration),
+                    MethodDeclarationSyntax declaration when declaration.Identifier.Span.Contains(position)
+                        => model.GetDeclaredSymbol(declaration),
+                    ConstructorDeclarationSyntax declaration when declaration.Identifier.Span.Contains(position)
+                        => model.GetDeclaredSymbol(declaration),
+                    PropertyDeclarationSyntax declaration when declaration.Identifier.Span.Contains(position)
+                        => model.GetDeclaredSymbol(declaration),
+                    VariableDeclaratorSyntax declaration when declaration.Identifier.Span.Contains(position)
+                        => model.GetDeclaredSymbol(declaration),
+                    _ => (ISymbol?)null,
+                };
+                if (declared is not null)
+                {
+                    AddLocations(declared);
+                    if (declared is IMethodSymbol method)
+                    {
+                        AddLocations(method.PartialDefinitionPart);
+                        AddLocations(method.PartialImplementationPart);
+                    }
+                    if (declared is IPropertySymbol property)
+                    {
+                        AddLocations(property.PartialDefinitionPart);
+                        AddLocations(property.PartialImplementationPart);
+                    }
+                    continue;
+                }
                 var ancestors = node?.AncestorsAndSelf().ToArray() ?? Array.Empty<SyntaxNode>();
                 // Prefer the complete call expression. Querying the nested
                 // SimpleNameSyntax returns an overload group and
@@ -313,26 +356,13 @@ internal sealed class RoslynOracle
                     {
                         symbol = constructor.ContainingType;
                     }
-                    foreach (var location in NormalizeSymbol(symbol)!.Locations.Where(loc => loc.IsInSource))
-                    {
-                        var span = location.GetLineSpan();
-                        var rel = Relative(span.Path);
-                        var defLine = span.StartLinePosition.Line + 1;
-                        definitions[$"{rel}:{defLine}"] = new { file = rel, line = defLine };
-                    }
+                    AddLocations(symbol);
                     // A construction names both its type and the selected
                     // constructor (fix #429): the class target and the
                     // constructor target each resolve here.
                     if (symbol is IMethodSymbol { MethodKind: MethodKind.Constructor } created)
                     {
-                        foreach (var location in created.ContainingType.OriginalDefinition.Locations
-                            .Where(loc => loc.IsInSource))
-                        {
-                            var span = location.GetLineSpan();
-                            var rel = Relative(span.Path);
-                            var defLine = span.StartLinePosition.Line + 1;
-                            definitions[$"{rel}:{defLine}"] = new { file = rel, line = defLine };
-                        }
+                        AddLocations(created.ContainingType);
                     }
                 }
             }
