@@ -3978,6 +3978,10 @@ function plan(index, name, options = {}) {
                 // importer's token names the item, not the renamed pin.
                 const verdict = _nameBindingReaches(index, abs, name, renameTargetFiles, 4,
                     { configurationVerdict: true });
+                // The value-token pass can review an unresolved import. Do
+                // not preempt it with an automatic import edit, especially
+                // one that preserves a configuration item's local name.
+                if (isValueDefinition(def)) return verdict === 'yes';
                 return verdict !== 'no' && verdict !== 'configuration';
             });
         };

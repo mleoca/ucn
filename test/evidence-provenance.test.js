@@ -727,3 +727,39 @@ it('callee JSON retains each occurrence and derives its summary from the weakest
         assert.deepEqual(edge.sites, [4, 5, 7]);
     } finally { rm(dir); }
 });
+
+describe('fix #440: casting this does not prove an interface implementation', () => {
+    for (const qualifier of ['', 'Api.']) it(`retains dispatch through ${qualifier}I when a subclass can reimplement it`, () => {
+        const dir = tmp({ 'Box.cs': [
+            qualifier ? 'class Api { public interface I { void Run(); } }' : 'interface I { void Run(); }',
+            `class Box : ${qualifier}I {`,
+            `    void ${qualifier}I.Run() {}`,
+            `    public void Call() { ((${qualifier}I)this).Run(); }`,
+            '    public void Direct() { Plain(); }',
+            '    private void Plain() {}',
+            '}',
+            `class Sub : Box, ${qualifier}I { public void Run() {} }`,
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('Run').find(def => def.className === 'Box');
+            const calls = index.findCallers('Run', { targetDefinitions: [target], collectAccount: true });
+            assert.ok(!calls.some(call => call.line === 4));
+            assert.ok(!calls.accountRaw.excludedEntries.some(call => call.line === 4));
+            const site = calls.unverifiedEntries.find(call => call.line === 4);
+            assert.ok(site);
+            assert.strictEqual(site.provenance.diagnostic, 'receiver-this-cast-dispatch');
+            const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+            const facts = JSON.parse(JSON.stringify(site.provenance.facts));
+            assert.strictEqual(validateConfirmation({ facts }, declarationIdentity(target)).verdict, 'incomplete');
+            facts.receiverCastThis.interfaceType = 'Different';
+            assert.strictEqual(validateConfirmation({ facts }, declarationIdentity(target)).verdict, 'inconsistent');
+            const callees = index.findCallees(index.symbols.get('Call')[0], { collectAccount: true });
+            assert.ok(!callees.some(callee => callee.className === 'Box' && callee.name === 'Run'));
+            assert.ok(callees.unverifiedCallees.some(callee => callee.sites.includes(4)));
+            const plain = index.symbols.get('Plain')[0];
+            assert.ok(index.findCallers('Plain', { targetDefinitions: [plain], collectAccount: true })
+                .some(call => call.line === 5));
+        } finally { rm(dir); }
+    });
+});

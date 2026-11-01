@@ -6406,6 +6406,8 @@ function isEntryPoint(symbol) {
 }
 
 module.exports = {
+    // Query-time type lookup uses the same lexical ribs as call extraction.
+    typePathScopeBinding: (node, written) => rustReceiverScopeBindingField(node, written)?.receiverScopeBinding || null,
     getPrimitiveTypeInfo,
     primeDeclarationTrees,
     DECLARATION_NODE_TYPES,

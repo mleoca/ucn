@@ -1327,13 +1327,33 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         const matches = [];
         let uncertain = parameters;
         if (this.ambiguousClassFamily({ name: syntax.name })) uncertain = true;
-        if (!parameters) for (const entry of classDefsNamed(this.index, syntax.name).entries) {
+        let classes = classDefsNamed(this.index, syntax.name).entries;
+        let aliases = (this.index.symbols.get(syntax.name) || []).filter(d => d.type === 'type');
+        let namedTypes = null;
+        const language = this.index.files.get(file)?.language;
+        if (!parameters && langTraits(language)?.itemScopeResolution) {
+            const written = [syntax.qualifierText, syntax.name].filter(Boolean).join('::');
+            const binding = LANGUAGES[language].module().typePathScopeBinding?.(syntax.node, written);
+            const named = require('./rust-names').resolveRustPathQualifier(this.index, file,
+                syntax.node.startPosition.row + 1, written, binding);
+            // Type lookup follows import aliases; a rename of the original
+            // type deliberately leaves those aliases alone. Reuse the name
+            // resolver's binding here instead of its rename-token verdict.
+            if (named) {
+                namedTypes = new Set(named.defs || []);
+                classes = [...namedTypes].flatMap(def => classDefsNamed(this.index, def.name).entries
+                    .filter(entry => entry.def === def));
+                aliases = [...namedTypes].filter(def => def.type === 'type');
+            } else if (binding) return null;
+        }
+        if (!parameters) for (const entry of classes) {
             if (entry.def.file === file && this.scopeRelation(file,
                 entry.def.nameLine || entry.def.startLine, syntax.node) !== 'yes') {
                 uncertain = true;
                 continue;
             }
-            const verdict = this.typeVerdict(file, syntax, entry.def, useFile);
+            const verdict = namedTypes?.has(entry.def) ? { verdict: 'yes' }
+                : this.typeVerdict(file, syntax, entry.def, useFile);
             if (entry.def.forwardDeclaration && verdict.verdict !== 'no') this.sawForwardDeclaration = true;
             if (verdict.verdict === 'yes') {
                 const complete = completeForwardDeclaration(this.index, entry.def, useFile);
@@ -1344,8 +1364,9 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             }
             if (verdict.verdict === 'unknown') uncertain = true;
         }
-        if (!parameters) for (const alias of (this.index.symbols.get(syntax.name) || []).filter(d => d.type === 'type')) {
-            const verdict = this.typeVerdict(file, syntax, alias, useFile);
+        if (!parameters) for (const alias of aliases) {
+            const verdict = namedTypes?.has(alias) ? { verdict: 'yes' }
+                : this.typeVerdict(file, syntax, alias, useFile);
             if (verdict.verdict === 'unknown') uncertain = true;
             if (verdict.verdict !== 'yes') continue;
             const declaration = this.declarationNode(alias);
@@ -1362,7 +1383,14 @@ class ValueReferenceResolver extends TypeReferenceResolver {
     }
 
     enclosingOwner(file, node, fallback = true) {
+        const implementation = langTraits(this.index.files.get(file)?.language)?.implementationOwnerSyntax;
         for (let current = node.parent; current; current = current.parent) {
+            if (implementation && current.type === implementation.node) {
+                // A separately declared implementation may name an imported
+                // or aliased type. A project namesake is no owner evidence.
+                const owner = this.classForType(file, typeSyntax(current.childForFieldName(implementation.field)));
+                return owner ? { ...owner, node: current } : null;
+            }
             if (!TYPE_BODIES.has(current.type)) continue;
             const nameNode = current.childForFieldName('name');
             const name = typeSyntax(nameNode)?.name || nameNode?.text;

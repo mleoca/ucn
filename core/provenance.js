@@ -377,6 +377,18 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         }
         return verdictFor(reference.declaration);
     }
+    const castThis = facts.receiverCastThis;
+    if (castThis) {
+        const receiver = facts.lookup?.receiver;
+        if (!validIdentity(castThis.enclosing) || castThis.interfaceType !== facts.receiverType ||
+            (receiver && (castThis.enclosing.className !== receiver.name ||
+                castThis.enclosing.file !== receiver.file))) return inconsistent('receiver-this-cast-mismatch');
+        // Knowing the enclosing class does not prove the implementation an
+        // interface cast of this invokes. A subclass may reimplement it.
+        // This also applies when a qualified cast prevented member lookup:
+        // that missing lookup must not fall through as an unsupported proof.
+        return incomplete('receiver-this-cast-dispatch');
+    }
     if (facts.lookup) {
         const { receiver, steps, selected } = facts.lookup;
         if (!validIdentity(receiver) || !validIdentity(selected) || !Array.isArray(steps) || !steps.length) {
@@ -414,10 +426,6 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             !bound.bounds?.includes(typeDeclaration.name) || !sameDeclaration(bound.selected, typeDeclaration))) {
             return inconsistent('receiver-generic-bound-mismatch');
         }
-        const castThis = facts.receiverCastThis;
-        if (castThis && (!validIdentity(castThis.enclosing) ||
-            castThis.enclosing.className !== receiver.name || castThis.enclosing.file !== receiver.file ||
-            castThis.interfaceType !== facts.receiverType)) return inconsistent('receiver-this-cast-mismatch');
         const overload = facts.lookup.overload;
         const group = overload && lazyProvenanceOverloadModule().overloadMemberGroup(steps);
         if (overload && !group) return incomplete('missing-overload-declarations');

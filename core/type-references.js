@@ -1345,7 +1345,10 @@ class TypeReferenceResolver {
         // configuration item keeps the item's name (fix #424, the #398F
         // import rule): its importers' and attribute readers' tokens name
         // the item, never the renamed pin.
-        return reach === 'configuration' ? 'no' : reach;
+        // Value dependencies still reach the chosen alternative at runtime.
+        // Its importers keep the chooser's name, so they are review sites,
+        // never automatic edits of one alternative's declaration.
+        return reach === 'configuration' ? (this.valueReferences ? 'unknown' : 'no') : reach;
     }
 
     moduleFile(entry, module) {

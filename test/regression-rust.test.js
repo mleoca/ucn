@@ -9766,3 +9766,51 @@ describe('fix #434: Rust Self-returning trait members in argument position', () 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #440: field owners follow the type written in an impl', () => {
+    it('keeps external and shadowed owners separate while resolving project aliases', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'mod external;',
+                'mod owned;',
+                'pub struct Range { pub end: u8 }',
+                'impl Range { pub fn get(&self) -> u8 { self.end } }',
+                'fn local() {',
+                '    struct Range { end: u8 }',
+                '    impl Range { fn get(&self) -> u8 { self.end } }',
+                '}',
+            ].join('\n'),
+            'src/external.rs': [
+                'use core::ops::Range;',
+                'trait Local { fn get(&self) -> usize; }',
+                'impl Local for Range<usize> {',
+                '    fn get(&self) -> usize { self.end }',
+                '}',
+                'use core::ops::Range as External;',
+                'impl Local for External<u8> {',
+                '    fn get(&self) -> usize { self.end as usize }',
+                '}',
+            ].join('\n'),
+            'src/owned.rs': [
+                'use crate::Range as Owned;',
+                'trait Local { fn get(&self) -> u8; }',
+                'impl Local for Owned {',
+                '    fn get(&self) -> u8 { self.end }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('end', { file: 'src/lib.rs', line: 3 }).valueAccesses;
+            const confirmed = band.byFile.flatMap(group => group.sites.map(site => `${site.file}:${site.line}`));
+            assert.deepStrictEqual(confirmed, ['src/lib.rs:4', 'src/owned.rs:4']);
+            for (const line of [4, 8]) assert.ok(band.unverifiedSites.some(site =>
+                site.file === 'src/external.rs' && site.line === line && site.reason === 'member-owner-unresolved'));
+            assert.strictEqual(band.account.conserved, true);
+            const plan = index.plan('end', { file: 'src/lib.rs', line: 3, renameTo: 'finish' });
+            assert.ok(!plan.changes.some(change => change.file === 'src/external.rs' && change.newExpression));
+            assert.ok(plan.changes.some(change => change.file === 'src/owned.rs' && change.newExpression));
+        } finally { rm(dir); }
+    });
+});

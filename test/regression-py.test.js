@@ -10387,3 +10387,30 @@ describe('fix #434: Python own-class constructions, star imports, configuration 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #440: conditional value reexports remain dependency reviews', () => {
+    it('keeps imports through a chooser visible without renaming its stable binding', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "fixture"\nversion = "0.1.0"\n',
+            'first.py': 'value = 1\n',
+            'second.py': 'value = 2\n',
+            'choose.py': 'try:\n    import missing\nexcept ImportError:\n    from first import value\nelse:\n    from second import value\n',
+            'use.py': 'from choose import value as chosen\nprint(chosen)\n',
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('value', { file: 'first.py', line: 1 }).valueAccesses;
+            assert.ok(band.unverifiedSites.some(site => site.file === 'use.py' && site.line === 1 &&
+                site.reason === 'import-chain'), JSON.stringify(band));
+            assert.strictEqual(band.account.conserved, true);
+            const plan = index.plan('value', { file: 'first.py', line: 1, renameTo: 'renamed' });
+            const direct = plan.changes.find(change => change.file === 'choose.py' && change.line === 4);
+            assert.strictEqual(direct.newExpression.trim(), 'from first import renamed as value');
+            for (const [file, line] of [['use.py', 1], ['choose.py', 6]]) {
+                const review = plan.changes.find(change => change.file === file && change.line === line);
+                assert.ok(review?.needsReview, JSON.stringify(plan));
+                assert.strictEqual(review.newExpression, undefined);
+            }
+        } finally { rm(dir); }
+    });
+});

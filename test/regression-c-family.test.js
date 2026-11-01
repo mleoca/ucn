@@ -1895,7 +1895,7 @@ describe('C# language support', () => {
         }
     });
 
-    it('distinguishes exact C# explicit-this casts from interface dispatch', () => {
+    it('keeps C# explicit-this casts and interface receivers unverified for implementations', () => {
         const dir = tmp({
             'Fixture.cs': [
                 'interface ISink { void Add(Token item); }',
@@ -1914,10 +1914,10 @@ describe('C# language support', () => {
                 file: 'Fixture.cs',
                 line: 4,
             });
-            assert.deepEqual(result.callers.map(call => call.line), [5]);
+            assert.deepEqual(result.callers.map(call => call.line), []);
             assert.deepEqual(result.unverifiedCallers.map(call => [
                 call.line, call.reason, call.dispatchVia,
-            ]), [[6, 'possible-dispatch', 'ISink']]);
+            ]), [[5, 'provenance-incomplete', undefined], [6, 'possible-dispatch', 'ISink']]);
             assert.equal(result.meta.account.conserved, true);
         } finally {
             rm(dir);

@@ -148,6 +148,7 @@ const STRUCTURAL_TRAITS = {
     typeNameScoping: null,
     typeNameSourceCanonical: null,
     typeNameOwnersAt: null,
+    implementationOwnerSyntax: null,
     // Types every file imports on demand without writing it (Java java.lang,
     // JLS 7.3): { module, names }. A project type of the same name in another
     // package is visible only through an import.
@@ -393,6 +394,7 @@ const NOMINAL_TRAITS = {
     typeNameSourceCanonical: null,
     typeNameOwnersAt: null,
     implicitTypeImport: null,
+    implementationOwnerSyntax: null,
     methodCallInclusion: 'auto',
     packageScope: 'file',
     hasReceiverPackageCalls: false,
@@ -778,6 +780,9 @@ const LANGUAGES = {
             ...NOMINAL_TRAITS,
             selfParam: ['self', '&self', '&mut self', 'mut self'],
             nameReferenceFamily: 'rust',
+            // Members live in impl blocks, separate from the declaration
+            // of the type. Resolve the written self type in the impl scope.
+            implementationOwnerSyntax: { node: 'impl_item', field: 'type' },
             staticEnumReferenceSyntax: true,
             valuePatternConstants: true,
             moduleValueLookup: true,
