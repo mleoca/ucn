@@ -3108,6 +3108,55 @@ describe('fix #415: reuse the file traversal for class fields', () => {
     });
 });
 
+describe('fix #438: composed commands share one operation and witness encoding preserves data', () => {
+    it('show reads each source once across summary and relationships, then releases the operation', () => {
+        const dir = tmp({ 'a.js': 'export function run() { return 1; }\nrun();\n' });
+        try {
+            const index = idx(dir), original = index._readFile;
+            const reads = new Map();
+            index._readFile = function (file) {
+                if (!this._opContentCache?.has(file)) reads.set(file, (reads.get(file) || 0) + 1);
+                return original.call(this, file);
+            };
+            const { execute } = require('../core/execute');
+            const answer = execute(index, 'show', { name: 'a.js:1:run' });
+            assert.ok(answer.ok, answer.error);
+            assert.strictEqual(reads.get(path.join(dir, 'a.js')), 1);
+            assert.strictEqual(index._opContentCache, null);
+            assert.strictEqual(index._opMemos, null);
+            assert.strictEqual(execute(index, 'show', { name: 'run', sections: 'unknown' }).ok, false);
+            assert.strictEqual(index._opContentCache, null, 'an early validation return closes its scope');
+            index.resolveSymbol = () => { throw new Error('deliberate test failure'); };
+            const failure = execute(index, 'show', { name: 'run' });
+            assert.strictEqual(failure.ok, false);
+            assert.match(failure.error, /Internal error:/);
+            assert.strictEqual(index._opContentCache, null, 'an exception closes its scope');
+        } finally { rm(dir); }
+    });
+
+    it('witnesses round-trip own property names and mutable collections without prototype changes', () => {
+        const { factIndex } = require('../core/provenance-overload');
+        const dir = tmp({ 'a.js': 'export class Box {}\n' });
+        try {
+            const index = idx(dir), symbol = index.symbols.get('Box')[0];
+            symbol.extra = JSON.parse('{"__proto__":{"marker":1},"constructor":"value","nil":null}');
+            symbol.extra.map = new Map([['x', { value: 1 }]]);
+            symbol.extra.set = new Set(['old']);
+            index._beginOp();
+            try {
+                const reads = {}, first = factIndex(reads, index).symbols.get('Box')[0];
+                assert.deepStrictEqual(first.extra, symbol.extra);
+                assert.strictEqual(Object.getPrototypeOf(first.extra), Object.prototype);
+                assert.ok(Object.hasOwn(first.extra, '__proto__'));
+                first.extra.map.get('x').value = 9;
+                first.extra.set.add('new');
+                const second = factIndex(JSON.parse(JSON.stringify(reads))).symbols.get('Box')[0];
+                assert.deepStrictEqual(second.extra, symbol.extra);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #418: witnesses share recorded facts, record project facts once and replay once', () => {
     const { factIndex, captureOverload, validateOverload, provenanceWork, sharedRead } = require('../core/provenance-overload');
     const { captureTypeLookup, validateTypeLookup } = require('../core/provenance-type');

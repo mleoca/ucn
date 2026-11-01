@@ -2523,7 +2523,15 @@ function execute(index, command, params = {}) {
     if (command === 'source') params = sourceRangeTarget(params);
     // Listing completeness belongs to execution, including direct API calls.
     if (params.lines) params.all = true;
+    // Composed commands share one source snapshot and its derived facts.
+    // Child operations still balance their scopes; the outer command owns
+    // the lifetime so summary/relationships/source do not repeat reads.
+    let operation = false;
     try {
+        if (typeof index?._beginOp === 'function' && typeof index?._endOp === 'function') {
+            index._beginOp();
+            operation = true;
+        }
         if (PUBLIC_COMMAND_SET.has(command)) {
             const validationError = validatePublicParams(command, params);
             if (validationError) return { ok: false, error: validationError };
@@ -2570,6 +2578,8 @@ function execute(index, command, params = {}) {
         // A deliberate refusal keeps its message; an exception inside the
         // engine is marked internal on every surface (fix #394).
         return { ok: false, ...describeError(e) };
+    } finally {
+        if (operation) index._endOp();
     }
 }
 

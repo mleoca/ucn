@@ -61,9 +61,19 @@ function encode(value, frozen = null) {
         return seal({ $map: seal([...value].map(([k, v]) => seal([encode(k, frozen), encode(v, frozen)]))) });
     }
     if (Array.isArray(value)) return seal(value.map(item => encode(item, frozen)));
-    if (value && typeof value === 'object') return seal(Object.fromEntries(
-        Object.entries(value).filter(([, v]) => v !== undefined && typeof v !== 'function')
-            .map(([k, v]) => [k, encode(v, frozen)])));
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const key of Object.keys(value)) {
+            const item = value[key];
+            if (item === undefined || typeof item === 'function') continue;
+            const encoded = encode(item, frozen);
+            if (key === '__proto__') Object.defineProperty(out, key, {
+                value: encoded, enumerable: true, writable: true, configurable: true,
+            });
+            else out[key] = encoded;
+        }
+        return seal(out);
+    }
     return value;
 }
 function decode(value, freeze = false) {
@@ -73,8 +83,17 @@ function decode(value, freeze = false) {
     if (value?.$set) return new Set(value.$set.map(item => decode(item)));
     if (value?.$map) return new Map(value.$map.map(([k, v]) => [decode(k), decode(v)]));
     if (Array.isArray(value)) return seal(value.map(item => decode(item, freeze)));
-    if (value && typeof value === 'object') return seal(Object.fromEntries(
-        Object.entries(value).map(([k, v]) => [k, decode(v, freeze)])));
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const key of Object.keys(value)) {
+            const decoded = decode(value[key], freeze);
+            if (key === '__proto__') Object.defineProperty(out, key, {
+                value: decoded, enumerable: true, writable: true, configurable: true,
+            });
+            else out[key] = decoded;
+        }
+        return seal(out);
+    }
     return value;
 }
 
