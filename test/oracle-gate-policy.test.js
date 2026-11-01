@@ -927,7 +927,7 @@ describe('fix #437: Roslyn identity through a linked project root', () => {
             'app/App.csproj': project('<ItemGroup><ProjectReference Include="../lib/Lib.csproj" /></ItemGroup>'),
             'lib/A.cs': 'namespace N;\npublic partial class Box<T> { public Box() : this(1) {} public Box(int n) {} }\n',
             'lib/B.cs': 'namespace N;\npublic partial class Box<T> { public int Value => 1; }\n',
-            'lib/C.cs': 'namespace N;\npublic class Box { public Box() {} }\n',
+            'lib/C.cs': 'namespace N;\npublic class Box { public Box() {}\n[System.Obsolete]\npublic int Field;\n}\n',
             'app/Use.cs': 'class Use {\n object A() => new N.Box<int>();\n object B() => new N.Box<string>(2);\n object C() => new N.Box();\n}\n',
         });
         const alias = root + '-link';
@@ -939,6 +939,12 @@ describe('fix #437: Roslyn identity through a linked project root', () => {
             assert.strictEqual(handle.projection.units.length, 2);
             const symbols = await roslynOracle.listSymbols(handle);
             assert.ok(symbols.every(symbol => !symbol.file.startsWith('../')));
+            // fix #439: field handles start at their declarator, not an
+            // attribute list on an earlier line of the field statement.
+            const field = symbols.find(symbol => symbol.name === 'Field');
+            assert.strictEqual(field?.line, 4);
+            assert.deepStrictEqual(await roslynOracle.resolveDefinition(handle, field),
+                [{ file: 'lib/C.cs', line: 4 }]);
             for (const file of ['lib/A.cs', 'lib/B.cs']) {
                 const target = { file, line: 2, name: 'Box' };
                 const calls = (await roslynOracle.findReferences(handle, target))

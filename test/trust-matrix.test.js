@@ -147,7 +147,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         }
         assert.match(readme, /ten-repository/i);
         assert.match(readme, new RegExp(`${REPOS.length} pinned repositories`, 'i'));
-        assert.strictEqual(REPOS.length, 27);
+        assert.strictEqual(REPOS.length, 37);
         for (const name of RELEASE_REPO_NAMES) {
             assert.ok(readme.includes(name), `README must name release repository ${name}`);
         }
@@ -172,8 +172,9 @@ describe('command trust matrix: fail-closed proof coverage', () => {
             assert.strictEqual(repo.commit, undefined, `${repo.name}: fresh repositories are unpinned`);
             assert.ok(repo.url && Array.isArray(repo.targetCandidates), repo.name);
         }
-        // Graduated after driving fixes #403 and #406.
-        for (const name of ['dayjs', 'rand']) {
+        // Repositories used for tuning belong on the pinned board.
+        for (const name of ['dayjs', 'rand', 'pino', 'tanstack-form', 'tqdm', 'zap', 'nom',
+            'guice', 'dapper', 'lz4', 'pugixml', 'stateless']) {
             assert.ok(pinned.has(name) && !fresh.includes(name), name);
         }
         const languages = new Set(FRESH_POOL.map(repo => repo.language));

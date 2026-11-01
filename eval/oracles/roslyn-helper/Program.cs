@@ -537,7 +537,7 @@ internal sealed class RoslynOracle
                         case FieldDeclarationSyntax field:
                             foreach (var variable in field.Declaration.Variables)
                             {
-                                Add(variable.Identifier.Text, tree, field,
+                                Add(variable.Identifier.Text, tree, variable,
                                     field.Modifiers.Any(SyntaxKind.ConstKeyword) ? "constant" : "field",
                                     model.GetDeclaredSymbol(variable), variable.Identifier);
                             }

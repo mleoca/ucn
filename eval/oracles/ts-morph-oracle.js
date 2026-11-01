@@ -59,7 +59,7 @@ const tsMorphOracle = {
      * @param {string} repoDir - the analysis target directory (same dir UCN indexes)
      * @returns {{ project, root, SyntaxKind }}
      */
-    async prepare(repoDir) {
+    async prepare(repoDir, { repo = {} } = {}) {
         const { Project, ts } = require('ts-morph');
         // ProjectIndex roots at the nearest manifest so imports and callers
         // in sibling source/test directories remain visible even when the
@@ -67,30 +67,56 @@ const tsMorphOracle = {
         // otherwise the oracle sees declarations but silently misses tests.
         const projectRoot = findProjectRoot(repoDir);
         const tsConfigPath = findTsConfig(repoDir);
+        // A JavaScript package can keep a tsconfig for declaration tests or
+        // tooling. Its presence must not remove the implementation from the
+        // compiler's file universe.
+        const isJsProject = repo.language === 'javascript' || !tsConfigPath;
         let project;
         if (tsConfigPath) {
             project = new Project({
                 tsConfigFilePath: tsConfigPath,
                 skipAddingFilesFromTsConfig: true,
+                ...(isJsProject && { compilerOptions: { allowJs: true, checkJs: false } }),
             });
         } else {
             project = new Project({
                 compilerOptions: { allowJs: true, checkJs: false, target: 99, module: 199 },
             });
         }
+        // Some source workspaces export build output that is absent from a
+        // clean checkout. The pinned manifest may supply the build's source
+        // entry points, as it supplies include paths for C/C++. These are
+        // compiler inputs, never bindings inferred from UCN's answers.
+        if (repo.tsPaths) {
+            const paths = { ...project.getCompilerOptions().paths };
+            for (const [name, sources] of Object.entries(repo.tsPaths)) {
+                if (!Array.isArray(sources) || sources.length === 0) {
+                    throw new Error(`TypeScript source mapping ${name} has no entry points`);
+                }
+                paths[name] = sources.map(source => {
+                    const file = path.resolve(projectRoot, source);
+                    const relative = path.relative(projectRoot, file);
+                    if (relative === '..' || relative.startsWith(`..${path.sep}`) ||
+                        !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+                        throw new Error(`TypeScript source mapping ${name} is not a project file: ${source}`);
+                    }
+                    return file;
+                });
+            }
+            project.compilerOptions.set({ paths });
+        }
         // Add exactly the files UCN would index under the target dir, so the
         // file universes align (normalization happens again at scoring time).
-        // No tsconfig = plain-JavaScript project (express): add the JS
-        // extensions UCN indexes. Gated on the tsconfig check so TS repos'
-        // symbol universes (and therefore their historical samples) stay
-        // byte-stable.
+        // Plain-JavaScript mode adds the implementation extensions even
+        // when a tooling tsconfig exists. Typed projects retain their own
+        // source-language universe.
         const globs = [
             path.join(projectRoot, '**/*.ts'),
             path.join(projectRoot, '**/*.tsx'),
             '!' + path.join(projectRoot, '**/node_modules/**'),
             '!' + path.join(projectRoot, '**/*.d.ts'),
         ];
-        if (!tsConfigPath) {
+        if (isJsProject) {
             globs.push(
                 path.join(projectRoot, '**/*.js'),
                 path.join(projectRoot, '**/*.mjs'),
@@ -98,18 +124,18 @@ const tsMorphOracle = {
                 path.join(projectRoot, '**/*.jsx'));
         }
         project.addSourceFilesAtPaths(globs);
-        // No tsconfig = plain-JavaScript oracle mode: reference search still
+        // Plain-JavaScript oracle mode: reference search still
         // works through the language service, but definition lookup mostly
         // returns [] (an explicit abstention). Declare that capability so the
         // coverage gate can contextualize the definition-unresolved ratio
         // instead of failing every plain-JS repo on oracle blindness
         // (fix #286h, dayjs-measured: 54% unresolved, every engine gate green).
-        return { project, root: projectRoot, ts, isJsProject: !tsConfigPath,
-            definitionLookupWeak: !tsConfigPath,
+        return { project, root: projectRoot, ts, isJsProject,
+            definitionLookupWeak: isJsProject,
             // dayjs-measured at 54%. Keep an explicit ceiling so declaring a
             // weaker capability never turns total oracle blindness into a
             // passing release board.
-            ...(!tsConfigPath && { definitionUnresolvedRatioCeiling: 0.60 }) };
+            ...(isJsProject && { definitionUnresolvedRatioCeiling: 0.60 }) };
     },
 
     /**

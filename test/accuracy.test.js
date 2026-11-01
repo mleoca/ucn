@@ -462,6 +462,49 @@ describe('Oracle contract', () => {
         } finally { rm(d); }
     });
 
+    it('fix #439: a JavaScript package keeps its implementation beside a tooling tsconfig', async () => {
+        const d = tmp({
+            'package.json': '{"name":"fixture"}',
+            'tsconfig.json': '{"compilerOptions":{"strict":true,"target":"ES2022"},"include":["tool.ts"]}',
+            'tool.ts': 'export const tool = 1;',
+            'main.js': 'export function run() { return 1; }\nrun();\n',
+        });
+        try {
+            const handle = await tsMorphOracle.prepare(d, { repo: { language: 'javascript' } });
+            const symbols = await tsMorphOracle.listSymbols(handle);
+            assert.ok(symbols.some(s => s.name === 'run' && s.file === 'main.js'));
+            const refs = await tsMorphOracle.findReferences(handle, { name: 'run', file: 'main.js', line: 1 });
+            assert.ok(refs.some(r => r.file === 'main.js' && r.line === 2 && r.kind === 'call'));
+            assert.ok(handle.project.getSourceFile(path.join(d, 'tool.ts')));
+            assert.strictEqual(handle.isJsProject, true);
+        } finally { rm(d); }
+    });
+
+    it('fix #439: declared workspace source entries resolve through the compiler on a clean checkout', async () => {
+        const d = tmp({
+            'package.json': '{"name":"workspace","workspaces":["packages/*"]}',
+            'tsconfig.json': '{"compilerOptions":{"strict":true,"moduleResolution":"Bundler","module":"ESNext"}}',
+            'packages/core/package.json': '{"name":"@scope/core","exports":{".":"./dist/index.js"}}',
+            'packages/core/src/index.ts': 'export function run() { return 1; }',
+            'use.ts': 'import { run } from "@scope/core";\nrun();',
+        });
+        try {
+            const tsPaths = { '@scope/core': ['packages/core/src/index.ts'] };
+            const handle = await tsMorphOracle.prepare(d, { repo: { language: 'typescript', tsPaths } });
+            const refs = await tsMorphOracle.findReferences(handle, {
+                name: 'run', file: 'packages/core/src/index.ts', line: 1,
+            });
+            assert.ok(refs.some(r => r.file === 'use.ts' && r.line === 2 && r.kind === 'call'));
+            const defs = await tsMorphOracle.resolveDefinition(handle, { name: 'run', file: 'use.ts', line: 2 });
+            assert.ok(defs.some(r => r.file === 'packages/core/src/index.ts' && r.line === 1));
+            assert.strictEqual(handle.isJsProject, false);
+            await assert.rejects(tsMorphOracle.prepare(d, { repo: { tsPaths: { missing: ['absent.ts'] } } }),
+                /not a project file/);
+            await assert.rejects(tsMorphOracle.prepare(d, { repo: { tsPaths: { outside: ['../outside.ts'] } } }),
+                /not a project file/);
+        } finally { rm(d); }
+    });
+
     it('ts-morph sampling excludes nested runtime-object monkey patches', async () => {
         const d = tmp({
             'plain.js': [

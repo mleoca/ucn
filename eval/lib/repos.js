@@ -423,6 +423,101 @@ const REPOS = [
         language: 'rust',
         targetCandidates: ['.'],
     },
+    // Source families used for engine development belong on the reproducible
+    // board. Both deadcode arms were checked before these graduations.
+    {
+        name: 'pino',
+        url: 'https://github.com/pinojs/pino',
+        commit: 'b29dbe97820630e7128e464c50263b427965ec99',
+        language: 'javascript',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'tanstack-form',
+        url: 'https://github.com/TanStack/form',
+        commit: '2216fdedf0a5ff17e4ef8567e1321442639b96ca',
+        language: 'typescript',
+        targetCandidates: ['.'],
+        // Workspace package exports name dist files. These are the source
+        // entry points of the packages' builds.
+        // Keep the clean checkout intact and give the compiler those inputs.
+        tsPaths: {
+            '@tanstack/angular-form': ['packages/angular-form/src/index.ts'],
+            '@tanstack/form-core': ['packages/form-core/src/index.ts'],
+            '@tanstack/form-devtools': ['packages/form-devtools/src/index.ts'],
+            '@tanstack/lit-form': ['packages/lit-form/src/index.ts'],
+            '@tanstack/preact-form': ['packages/preact-form/src/index.ts'],
+            '@tanstack/react-form': ['packages/react-form/src/index.ts'],
+            '@tanstack/react-form-devtools': ['packages/react-form-devtools/src/index.ts'],
+            '@tanstack/react-form-nextjs': ['packages/react-form-nextjs/src/index.ts'],
+            '@tanstack/react-form-remix': ['packages/react-form-remix/src/index.ts'],
+            '@tanstack/react-form-start': ['packages/react-form-start/src/index.ts'],
+            '@tanstack/solid-form': ['packages/solid-form/src/index.tsx'],
+            '@tanstack/solid-form-devtools': ['packages/solid-form-devtools/src/index.ts'],
+            '@tanstack/svelte-form': ['packages/svelte-form/src/index.ts'],
+            '@tanstack/vue-form': ['packages/vue-form/src/index.ts'],
+        },
+    },
+    {
+        name: 'tqdm',
+        url: 'https://github.com/tqdm/tqdm',
+        commit: '9cf5a12b1f955468a17f0ba3c59092b23e4258ac',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'zap',
+        url: 'https://github.com/uber-go/zap',
+        commit: '4892335e05f14bce8a98a69a577fcf3844a42623',
+        language: 'go',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'nom',
+        url: 'https://github.com/rust-bakery/nom',
+        commit: '51c3c4e44fa78a8a09b413419372b97b2cc2a787',
+        language: 'rust',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'guice',
+        url: 'https://github.com/google/guice',
+        commit: 'b8cab7e4e947adb82e343586c267c5c367cf5cf1',
+        language: 'java',
+        targetCandidates: ['core'],
+    },
+    {
+        name: 'dapper',
+        url: 'https://github.com/DapperLib/Dapper',
+        commit: 'eb47546a408bbf6c178bda4f04dc205bc51ffbfe',
+        language: 'csharp',
+        targetCandidates: ['Dapper'],
+    },
+    {
+        name: 'lz4',
+        url: 'https://github.com/lz4/lz4',
+        commit: '48bfbfe351c5d6ea87d4af5557705e87755844e0',
+        language: 'c',
+        targetCandidates: ['.'],
+        clangFlags: ['-Ilib', '-Iprograms', '-Itests', '-Iossfuzz'],
+    },
+    {
+        name: 'pugixml',
+        url: 'https://github.com/zeux/pugixml',
+        commit: '61421263d199c749b21fb1907b23d79ddd8285a1',
+        language: 'cpp',
+        targetCandidates: ['.'],
+        clangFlags: ['-Isrc', '-Itests', '-std=c++17'],
+    },
+    {
+        // Partial generic state machines, nested types and constructor
+        // delegation. This former holdout now supplies regression evidence.
+        name: 'stateless',
+        url: 'https://github.com/dotnet-state-machine/stateless',
+        commit: '39060018baadd6c992ed1aea926921bce4630fce',
+        language: 'csharp',
+        targetCandidates: ['.'],
+    },
 ];
 
 // Publish-blocking board. Keep this as a named subset of REPOS so every
@@ -485,7 +580,7 @@ const FRESH_POOL = [
     { name: 'rust-url', url: 'https://github.com/servo/rust-url', language: 'rust', targetCandidates: ['.'] },
     { name: 'indicatif', url: 'https://github.com/console-rs/indicatif', language: 'rust', targetCandidates: ['.'] },
     { name: 'commons-csv', url: 'https://github.com/apache/commons-csv', language: 'java', targetCandidates: ['.'] },
-    { name: 'stateless', url: 'https://github.com/dotnet-state-machine/stateless', language: 'csharp', targetCandidates: ['.'] },
+    { name: 'sprache', url: 'https://github.com/sprache/Sprache', language: 'csharp', targetCandidates: ['.'] },
     { name: 'http-parser', url: 'https://github.com/nodejs/http-parser', language: 'c', targetCandidates: ['.'] },
     { name: 'tinyxml2', url: 'https://github.com/leethomason/tinyxml2', language: 'cpp', targetCandidates: ['.'] },
 ];

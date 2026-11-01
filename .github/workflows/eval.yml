@@ -1,7 +1,7 @@
 name: Eval
 
 # Reliability/accuracy evaluation on pinned real repos:
-#  - conservation: account invariant + engine-gap metrics (27 pinned repos,
+#  - conservation: account invariant + engine-gap metrics (37 pinned repos,
 #    covering JavaScript/TypeScript, Python, Go, Rust, Java, C/C++, and C#)
 #  - oracle: tiered caller answers vs compiler/LSP ground truth (ts-morph for
 #    TS repos; pyright-langserver over LSP for Python, jedi available as a
