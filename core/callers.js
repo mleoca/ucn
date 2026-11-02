@@ -24094,6 +24094,13 @@ function _javaCallReturnType(index, kind, contextFile = null) {
 
 function _javaCallReturnInfo(index, kind, contextFile = null) {
     if (contextFile) contextFile = path.resolve(index.root, contextFile);
+    // Producer types are queried by receiver inference and by each argument
+    // witness. Share the answer and its reads for this operation only.
+    return lazyProvenanceOverloadModule().sharedRead(index, `java-call-return\0${kind}\0${contextFile ?? ''}`,
+        view => _javaCallReturnInfoUncached(view, kind, contextFile));
+}
+
+function _javaCallReturnInfoUncached(index, kind, contextFile) {
     if (kind?.startsWith('chain:')) {
         const [path, originEncoded] = kind.slice('chain:'.length).split('|');
         const parts = path.split('#');

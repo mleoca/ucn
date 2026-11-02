@@ -3308,6 +3308,52 @@ describe('fix #418: witnesses share recorded facts, record project facts once an
         assert.strictEqual(replay.hasMissingProvenanceFacts, false);
     });
 
+    it('shared Java producer types keep each witness self-contained and refresh between operations', () => {
+        const dir = tmp({
+            'p/Use.java': 'package p; import shared.Target;\nclass Factory { static String make() { return ""; } }\nclass Use { void run() { Target.pick(Factory.make()); } }\n',
+            'q/Use.java': 'package q; import shared.Target;\nclass Factory { static Integer make() { return 1; } }\nclass Use { void run() { Target.pick(Factory.make()); } }\n',
+            'shared/Target.java': 'package shared; public class Target {\n public static void pick(String value) {}\n public static void pick(Integer value) {}\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { selectProvenanceOverload } = require('../core/callers');
+            const candidates = index.symbols.get('pick');
+            const capture = (relativePath) => {
+                const file = path.join(dir, relativePath);
+                const call = index.getCachedCalls(file).find(c => c.name === 'pick');
+                return captureOverload(index, { ...call, argumentFile: file }, candidates, 'java', selectProvenanceOverload);
+            };
+            const assertSelected = (witness, line) => {
+                assert.strictEqual(witness.outcome, 'selected');
+                assert.deepStrictEqual(witness.selected, declarationIdentity(candidates.find(d => d.startLine === line)));
+                assert.strictEqual(validateOverload(JSON.parse(JSON.stringify(witness)),
+                    candidates.map(declarationIdentity), witness.selected), true, 'a copied witness replays without the live cache');
+            };
+            index._beginOp();
+            try {
+                assertSelected(capture('p/Use.java'), 2);
+                const repeated = capture('p/Use.java');
+                assertSelected(repeated, 2);
+                assertSelected(capture('q/Use.java'), 3);
+                const changed = JSON.parse(JSON.stringify(repeated));
+                function changeReturn(value) {
+                    if (!value || typeof value !== 'object') return;
+                    if (value.name === 'make' && value.returnType === 'String') value.returnType = 'Integer';
+                    for (const child of Object.values(value)) changeReturn(child);
+                }
+                changeReturn(changed.reads);
+                assert.strictEqual(validateOverload(changed, candidates.map(declarationIdentity), repeated.selected), false,
+                    'changing the producer fact invalidates the selected consumer overload');
+            } finally { index._endOp(); }
+            fs.writeFileSync(path.join(dir, 'p/Use.java'),
+                'package p; import shared.Target;\nclass Factory { static Integer make() { return 1; } }\nclass Use { void run() { Target.pick(Factory.make()); } }\n');
+            index.build(null, { quiet: true, workers: 0 });
+            index._beginOp();
+            try { assertSelected(capture('p/Use.java'), 3); }
+            finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
     it('the call-name cache states each file once per operation', () => {
         const dir = tmp({ 'a.js': 'function a() { return 1; }\n', 'b.js': 'function b() { return a(); }\n' });
         try {
