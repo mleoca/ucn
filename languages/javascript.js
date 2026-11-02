@@ -1022,6 +1022,7 @@ function _processFunction(node, functions, processedRanges, lines) {
     // Variable declarations with arrow functions or function expressions
     if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
         if (processedRanges.has(rangeKey)) return false;
+        const declarators = node.namedChildren.filter(child => child.type === 'variable_declarator');
 
         for (let i = 0; i < node.namedChildCount; i++) {
             const declarator = node.namedChild(i);
@@ -1041,7 +1042,10 @@ function _processFunction(node, functions, processedRanges, lines) {
                         processedRanges.add(rangeKey);
                         const paramsNode = valueNode.childForFieldName('parameters') ||
                             valueNode.childForFieldName('parameter');
-                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                        // A comma-separated declaration binds distinct functions.
+                        // Its other declarators are outside this callable's extent.
+                        const { startLine, endLine, indent } = nodeToLocation(
+                            declarators.length === 1 ? node : declarator, lines);
                         const returnType = extractReturnType(valueNode);
                         const generics = extractGenerics(valueNode);
                         const docstring = extractJSDocstring(lines, startLine);
@@ -1065,6 +1069,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                             params: extractParams(paramsNode),
                             paramsStructured,
                             startLine,
+                            nameLine: nameNode.startPosition.row + 1,
                             endLine, sourceSpan: nodeToLocation(valueNode, lines).sourceSpan,
                             indent,
                             isArrow,
@@ -1102,7 +1107,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                                     if (innerFn && (innerFn.type === 'arrow_function' || innerFn.type === 'function_expression')) {
                                         processedRanges.add(rangeKey);
                                         const paramsNode = innerFn.childForFieldName('parameters');
-                                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                                        const { startLine, endLine, indent } = nodeToLocation(
+                                            declarators.length === 1 ? node : declarator, lines);
                                         const returnType = extractReturnType(innerFn);
                                         const generics = extractGenerics(innerFn);
                                         const docstring = extractJSDocstring(lines, startLine);
@@ -1117,12 +1123,14 @@ function _processFunction(node, functions, processedRanges, lines) {
                                             params: extractParams(paramsNode),
                                             paramsStructured,
                                             startLine,
+                                            nameLine: nameNode.startPosition.row + 1,
                                             endLine,
                                             sourceSpan: nodeToLocation(innerFn, lines).sourceSpan,
                                             indent,
                                             isArrow: innerFn.type === 'arrow_function',
                                             isGenerator: false,
                                             modifiers,
+                                            ...lexicalOwnerRange(node),
                                             ...typeAnno,
                                             ...(generics && { generics }),
                                             ...(docstring && { docstring })
@@ -2112,6 +2120,7 @@ function _processState(node, objects, lines) {
                         objects.push({ name: binding.text,
                             startLine: binding.startPosition.row + 1,
                             endLine: declarator.endPosition.row + 1,
+                            sourceSpan: nodeToLocation(declarator, lines).sourceSpan,
                             ...(moduleScope.namespace && { namespace: moduleScope.namespace }),
                         });
                     }

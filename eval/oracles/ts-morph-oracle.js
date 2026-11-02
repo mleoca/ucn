@@ -436,6 +436,18 @@ function expandAliasDefinitions(initial, SyntaxKind) {
         const key = `${node.getSourceFile().getFilePath()}:${node.getStart()}`;
         if (seen.has(key)) continue;
         seen.add(key);
+        if ([SyntaxKind.ImportSpecifier, SyntaxKind.ImportClause,
+            SyntaxKind.NamespaceImport, SyntaxKind.ImportEqualsDeclaration].includes(node.getKind())) {
+            // Navigation can stop on an unresolved import, especially in
+            // files mixing ES imports and CommonJS exports. That token is
+            // an alias, not evidence for another callable's identity.
+            const symbol = (node.getNameNode?.() || node).getSymbol();
+            const target = symbol?.isAlias() ? symbol.getAliasedSymbol() : null;
+            if (depth < 4) for (const declaration of target?.getDeclarations() || []) {
+                queue.push({ node: declaration, depth: depth + 1 });
+            }
+            continue;
+        }
         out.push(node);
         if (depth >= 4 || node.getKind() !== SyntaxKind.VariableDeclaration) continue;
         let value = node.getInitializer?.();

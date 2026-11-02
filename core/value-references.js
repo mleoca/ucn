@@ -717,7 +717,7 @@ class ValueReferenceResolver extends TypeReferenceResolver {
     }
 
     localBinding(file, node, name, includeModule = false, contextualValue = false) {
-        const language = this.index.files.get(file)?.language;
+        const language = GRAMMAR_LANGUAGES.get(node.tree.language?.name) || this.index.files.get(file)?.language;
         const memo = this.lexicalMemo(node);
         if (langTraits(language)?.assignmentDeclaresLocal) {
             return this.pythonLocalBinding(file, node, name, this.pythonScope(node, name), includeModule);
@@ -1316,8 +1316,23 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         const key = `${file}\0${syntax.node.startIndex}\0${syntax.name}\0${syntax.qualifierText || ''}\0${runtime}\0${unit}`;
         if (this.typeMemo.has(key)) return this.typeMemo.get(key);
         this.typeMemo.set(key, null); // Alias cycles never prove an owner.
+        let localTypes = null;
         if (runtime && langTraits(this.index.files.get(file)?.language)?.typeSystem === 'structural') {
-            if (this.localBinding(file, syntax.node, syntax.name, true)) return null;
+            const local = this.localBinding(file, syntax.node, syntax.name, true);
+            if (local) {
+                const scope = referenceScope(syntax.node,
+                    GRAMMAR_LANGUAGES.get(syntax.node.tree.language?.name) || this.index.files.get(file)?.language,
+                    this.lexicalMemo(syntax.node), syntax.name, { includeClasses: true });
+                // A local class declaration is the constructor binding,
+                // not a shadow of it. Parameters, assignments and mixed
+                // bindings have no declaration-only scope proof.
+                if (local.binding || !scope?.local || !scope.defRows?.length) return null;
+                const rows = new Set(scope.defRows.map(row => row + 1));
+                localTypes = new Set(classDefsNamed(this.index, syntax.name).entries
+                    .filter(entry => entry.def.file === file &&
+                        rows.has(entry.def.nameLine || entry.def.startLine)).map(entry => entry.def));
+                if (localTypes.size !== 1 || rows.size !== 1) return null;
+            }
             const rebound = this.syntaxNodes(file, syntax.node.tree, syntax.name).some(token =>
                 isWrittenBinding(token.node) && !this.localBinding(file, token.node, syntax.name, true));
             if (rebound) return null;
@@ -1329,7 +1344,11 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         if (this.ambiguousClassFamily({ name: syntax.name })) uncertain = true;
         let classes = classDefsNamed(this.index, syntax.name).entries;
         let aliases = (this.index.symbols.get(syntax.name) || []).filter(d => d.type === 'type');
-        let namedTypes = null;
+        let namedTypes = localTypes;
+        if (localTypes) {
+            classes = classes.filter(entry => localTypes.has(entry.def));
+            aliases = [];
+        }
         const language = this.index.files.get(file)?.language;
         if (!parameters && langTraits(language)?.itemScopeResolution) {
             const written = [syntax.qualifierText, syntax.name].filter(Boolean).join('::');
@@ -1512,7 +1531,7 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 owner = { name: aliased.type, key: entries[0].key, def: entries[0].def };
             }
         }
-        if (!owner?.key || !owner.def) return other;
+        if (!owner?.key || !owner.def) return { verdict: 'unknown', reason: 'construction-owner-unresolved' };
         const declaring = findDeclaringClass(this.index, owner, this.memberCandidates);
         if (!declaring) return other;
         if (declaring.uncertain || declaring.members.length !== 1) {

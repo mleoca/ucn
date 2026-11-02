@@ -16,6 +16,42 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
+describe('fix #441: local synthesized initializer owners', () => {
+    it('binds local class keywords by lexical identity and reviews rebinding or parameter receivers', () => {
+        const dir = tmp({ 'local.py': [
+            'from typing import NamedTuple',
+            'def create():',
+            '    class Case(NamedTuple):',
+            '        slice: int',
+            '    result = Case(slice=1)',
+            '    def closure(): return Case(slice=2)',
+            '    def shadow(Case): return Case(slice=3)',
+            '    return result, closure, shadow',
+            'def other():',
+            '    class Case(NamedTuple):',
+            '        slice: int',
+            '    return Case(slice=4)',
+            'def rebound(replacement):',
+            '    class Case(NamedTuple):',
+            '        slice: int',
+            '    Case = replacement',
+            '    return Case(slice=5)',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const band = index.impact('slice', { file: 'local.py', line: 4 }).valueAccesses;
+            const sites = band.byFile.flatMap(group => group.sites);
+            assert.deepStrictEqual(sites.filter(site => site.tier === 'confirmed').map(site => site.line), [5, 6]);
+            assert.deepStrictEqual(band.unverifiedSites.map(site => [site.line, site.reason]),
+                [[7, 'construction-owner-unresolved'], [17, 'construction-owner-unresolved']]);
+            const plan = execute(index, 'plan', { name: 'local.py:4:slice', renameTo: 'span' });
+            assert.ok(plan.ok, plan.error);
+            assert.deepStrictEqual(plan.result.changes.filter(change => !change.needsReview).map(change => change.line), [4, 5, 6]);
+            assert.ok(!plan.result.changes.some(change => change.line === 12));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #398: stored coroutines are checked at their uses', () => {
     it('proves imported producers without borrowing builtin, unbound or nested namesakes', () => {
         const dir = tmp({

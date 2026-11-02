@@ -17,6 +17,34 @@ const {
     oracleCallerScope,
 } = require('../eval/oracle-gate-policy');
 
+describe('fix #441: unresolved TypeScript import navigation is an abstention', () => {
+    it('keeps unresolved aliases distinct from compiler-resolved function declarations', async () => {
+        const { tmp, rm } = require('./helpers');
+        const { tsMorphOracle } = require('../eval/oracles/ts-morph-oracle');
+        const dir = tmp({
+            'mixed.js': 'import { present } from "./esm";\nexports.version = function () { return present(); };\n',
+            'esm.js': 'export function present() { return 1; }\nexport function other() { return 2; }\n',
+            'use.js': [
+                'import { version } from "./mixed";',
+                'import { present as renamed, other, missing } from "./esm";',
+                'version();',
+                'renamed();',
+                'other();',
+                'missing();',
+            ].join('\n'),
+        });
+        try {
+            const handle = await tsMorphOracle.prepare(dir, { repo: { language: 'javascript' } });
+            const definitions = (name, line) => tsMorphOracle.resolveDefinition(handle,
+                { file: 'use.js', name, line, kind: 'function' });
+            assert.deepStrictEqual(await definitions('version', 3), []);
+            assert.deepStrictEqual(await definitions('missing', 6), []);
+            assert.deepStrictEqual(await definitions('renamed', 4), [{ file: 'esm.js', line: 1 }]);
+            assert.deepStrictEqual(await definitions('other', 5), [{ file: 'esm.js', line: 2 }]);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #417: clangd class adjudication follows an alias construction type', () => {
     const { tmp, rm } = require('./helpers');
     const { pathToFileURL } = require('url');

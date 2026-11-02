@@ -30,6 +30,8 @@ In JS/TS, Python and Rust a type's identity is its module: `Shared::init()` / `S
 
 A module-level `Alias = Box` (Python: bound once, or on every module-level `if`/`try` path to the same class; JS/TS: `const`, or a `let`/`var` never assigned again) names Box in annotations and constructor calls, also when imported, and `Alias(..)` / `new Alias(..)` is a caller of the class; an alias whose paths name different classes stays `possible-dispatch`.
 
+Value-owner lookup accepts a function-local class when lexical scope proves that exact declaration and no assignment or parameter can replace it. Python keywords of its synthesized initializer name its fields. A construction with an unresolved owner stays `construction-owner-unresolved`, including a class name shadowed by a parameter or rebound to another value.
+
 Type aliases and import renames are the same type on both the caller and callee side: a receiver annotated with Go `type IntFlag = FlagBase[int]`, TS `import { Box as B }`, Rust `use crate::Wrap as W` or C# `using IntBox = G.Box<int>` reaches the original type's methods; a Go alias of an external type (`type Ctx = context.Context`) is not a same-named project type.
 
 ### Constructors

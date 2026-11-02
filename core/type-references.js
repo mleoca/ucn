@@ -1253,6 +1253,9 @@ class TypeReferenceResolver {
         let best = null;
         for (const s of entry?.symbols || []) {
             if (s === d || s.startLine == null || s.endLine == null) continue;
+            if (s.sourceSpan && d.sourceSpan &&
+                (s.sourceSpan.start > d.sourceSpan.start ||
+                 s.sourceSpan.end < d.sourceSpan.end)) continue;
             if (s.startLine > d.startLine || s.endLine < d.endLine) continue;
             if (s.startLine === d.startLine && s.endLine === d.endLine) continue;
             if (s.type === 'impl' || s.type === 'field') continue;

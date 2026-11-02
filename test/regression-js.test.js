@@ -18,6 +18,95 @@ const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = req
 
 const os = require('os');
 
+describe('fix #441: separate declarator extents', () => {
+    for (const extension of ['js', 'ts', 'tsx', 'html']) {
+        it(`keeps sibling functions and module values separate in ${extension}`, () => {
+            const code = [
+                'const seed = 1, first = () => {',
+                '  return seed;',
+                '},',
+                'second = function () { return first(); },',
+                'count = first(),',
+                'wrapped = memo(() => count);',
+                'console.log(seed, count);',
+                'function shadow(seed, count) { return seed + count; }',
+            ].join('\n');
+            const file = `values.${extension}`;
+            const offset = extension === 'html' ? 1 : 0;
+            const dir = tmp({ [file]: offset ? `<script>\n${code}\n</script>` : code });
+            try {
+                const index = idx(dir);
+                for (const [name, start, end] of [['first', 1, 3], ['second', 4, 4], ['wrapped', 6, 6]]) {
+                    const def = index.symbols.get(name)[0];
+                    assert.deepStrictEqual([def.startLine, def.nameLine, def.endLine],
+                        [start + offset, start + offset, end + offset]);
+                    const answer = execute(index, 'source', { name: `${file}:${start + offset}:${name}` });
+                    assert.ok(answer.ok, answer.error);
+                }
+                const sites = name => index.impact(name, { file, line: (name === 'seed' ? 1 : 5) + offset })
+                    .valueAccesses.byFile.flatMap(group => group.sites.filter(site => site.verdict === 'yes' ||
+                        site.tier === 'confirmed').map(site => site.line));
+                assert.deepStrictEqual(sites('seed'), [2 + offset, 7 + offset]);
+                assert.deepStrictEqual(sites('count'), [6 + offset, 7 + offset]);
+                const second = index.symbols.get('second')[0];
+                assert.deepStrictEqual(index.findCallees(second).map(callee => callee.name), ['first']);
+                const plan = execute(index, 'plan', { name: `${file}:${1 + offset}:seed`, renameTo: 'origin' });
+                assert.ok(plan.ok, plan.error);
+                assert.ok(!plan.result.changes.some(change => change.line === 8 + offset && !change.needsReview));
+            } finally { rm(dir); }
+        });
+
+        it(`resolves a local class construction without accepting a rebound class in ${extension}`, () => {
+            const code = [
+                'function build() {',
+                '  class Box { value = 1; }',
+                '  const item = new Box();',
+                '  return item.value;',
+                '}',
+                'function rebound(replacement) {',
+                '  class Box { value = 2; }',
+                '  Box = replacement;',
+                '  const item = new Box();',
+                '  return item.value;',
+                '}',
+            ].join('\n');
+            const file = `local.${extension}`, offset = extension === 'html' ? 1 : 0;
+            const dir = tmp({ [file]: offset ? `<script>\n${code}\n</script>` : code });
+            try {
+                const index = idx(dir);
+                const band = index.impact('value', { file, line: 2 + offset }).valueAccesses;
+                assert.deepStrictEqual(band.byFile.flatMap(group => group.sites.map(site => site.line)), [4 + offset]);
+                assert.ok(band.unverifiedSites.some(site => site.line === 10 + offset));
+            } finally { rm(dir); }
+        });
+    }
+
+    it('retains declaration positions in workers and saved indexes', () => {
+        const { saveCache, loadCache } = require('../core/cache');
+        const { indexSnapshot } = require('./helpers');
+        const files = { 'values.js': 'const value = 1, read = () => value,\n next = () => read();\nconsole.log(value);\n' };
+        for (let n = 0; n < 101; n++) files[`padding/${n}.js`] = `function padding${n}() {}`;
+        const dir = tmp(files);
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.strictEqual(parallel.lastBuildWorkerCount, 2);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const cache = path.join(dir, 'saved');
+            saveCache(sequential, cache);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loadCache(loaded, cache));
+            assert.strictEqual(indexSnapshot(loaded), indexSnapshot(sequential));
+            assert.deepStrictEqual(loaded.symbols.get('next')[0].nameLine, 2);
+            const answer = index => JSON.stringify(execute(index, 'impact', { name: 'values.js:1:value' }));
+            assert.strictEqual(answer(loaded), answer(sequential));
+            assert.strictEqual(answer(parallel), answer(sequential));
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // CALLERS should exclude definitions
 // ============================================================================
