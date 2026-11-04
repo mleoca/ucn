@@ -3,7 +3,7 @@
 const { declarationIdentity, sameDeclaration } = require('./provenance');
 const { symbolsSpanning } = require('./shared');
 const { factIndex, sealFacts, replayed, seedReplay, refusedProof, sharedRead } = require('./provenance-overload');
-const { BoundedMap, SourceMemo, parsedSource, typeNamesCanonical } = require('./source-memo');
+const { BoundedMap, SourceMemo, parsedSource, typeNamesCanonical, indexedContent } = require('./source-memo');
 
 // Modules read lazily (load cycles), each resolved once: a require() per
 // call in hot paths was measurable (fix #436).
@@ -321,13 +321,10 @@ function resolve(index, query, owner) {
     const resolver = new TypeReferenceResolver(index, definition, owner.name);
     if (Number.isInteger(query.arity)) resolver.siteSyntax = { arity: query.arity };
     if (query.position) {
-        const language = index.files.get(query.file)?.language;
-        const tree = parsedSource(language, index._readFile(query.file));
-        const at = query.position;
-        let node = tree?.rootNode.descendantForIndex(at.start);
-        while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.nodeType)) node = node.parent;
-        if (!node || node.startPosition.row + 1 !== query.line || node.startPosition.column !== query.column) return false;
-        resolver.siteNode = node; resolver.siteFile = query.file;
+        const site = positionedSite(index, query);
+        if (!site) return false;
+        resolver.siteNode = site.node; resolver.siteFile = query.file;
+        resolver.siteContextSyntax = site.record;
     }
     return resolveAt(index, query, owner, definition, resolver);
 }
@@ -366,6 +363,31 @@ function resolveAt(index, query, owner, definition, resolver) {
     return !index.hasMissingProvenanceFacts;
 }
 
+// A matching source-only record avoids reparsing a whole file for one base
+// clause. Witnesses still read the source, and copied replays derive the
+// node from it without consulting a live index or a recorded lookup verdict.
+function positionedSite(index, query) {
+    const language = index.files.get(query.file)?.language;
+    const source = index._readFile(query.file);
+    const at = query.position;
+    const matches = row => row.start === at.start && row.end === at.end && row.nodeType === at.nodeType &&
+        row.line === query.line && row.column === query.column;
+    if (lazyLanguagesModule().langTraits(language)?.functionalTypeConstruction) {
+        const hint = live => {
+            const entry = live.files.get(query.file);
+            if (!Array.isArray(entry?.cppBaseSyntax) || !indexedContent(live, query.file, entry, source)) return null;
+            return entry.cppBaseSyntax.find(matches) || null;
+        };
+        const record = index.isProvenanceFactIndex ? index.unrecordedHint(hint) : hint(index);
+        if (record) return record.syntax ? { record, node: null } : null;
+    }
+    const tree = parsedSource(language, source);
+    let node = tree?.rootNode.descendantForIndex(at.start);
+    while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.nodeType)) node = node.parent;
+    return node && node.startPosition.row + 1 === query.line && node.startPosition.column === query.column
+        ? { node } : null;
+}
+
 // The classes a C/C++ construction at a source position names (an omitted
 // base initializer's header), looked up once per operation on the live
 // index. A position lookup reads the site's tree node and the index, never
@@ -378,14 +400,12 @@ function cppPositionConstructionClasses(index, query) {
     const key = `${query.file}\0${query.line}\0${query.column}\0${query.name}\0${query.qualifier ?? ''}\0` +
         `${at.start}\0${at.end}\0${at.nodeType}`;
     if (memo?.has(key)) return memo.get(key);
-    const language = index.files.get(query.file)?.language;
-    const tree = parsedSource(language, index._readFile(query.file));
-    let node = tree?.rootNode.descendantForIndex(at.start);
-    while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.nodeType)) node = node.parent;
+    const site = positionedSite(index, query);
     let classes = null;
-    if (node && node.startPosition.row + 1 === query.line && node.startPosition.column === query.column) {
+    if (site) {
         const { resolveQualifier, includeClosure } = lazyCppScopeModule();
-        const context = require('./type-references').cppSiteContextOf(index, node, query.file, query.file, query.line);
+        const context = require('./type-references').cppSiteContextOf(index, site.node, query.file, query.file,
+            query.line, site.record?.syntax);
         const found = resolveQualifier(index, { file: query.file, line: query.line, ...context },
             query.qualifier ? `${query.qualifier}::${query.name}` : query.name, includeClosure(index, query.file));
         classes = found.kind === 'type' && found.visible ? found.classes : [];

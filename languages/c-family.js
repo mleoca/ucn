@@ -2051,8 +2051,9 @@ const KNOWN_MACRO_ROUNDS = 3;
  * statements again), so a few rounds run. Returns { source, tree,
  * invocations }; `blank` stays set only on invocations the source blanks.
  */
-function knownMacroInvocationRecovery(parser, source) {
+function knownMacroInvocationRecovery(parser, source, rawCapture = null) {
     let tree = safeParse(parser, source, undefined, PARSE_OPTIONS);
+    if (rawCapture?.source === source) rawCapture.tree = tree;
     const own = directiveFunctionMacros(source);
     // The project's attribute and return-type macros matter only where the
     // grammar failed (fix #396).
@@ -2084,7 +2085,7 @@ function knownMacroInvocationRecovery(parser, source) {
             for (const invocation of blanks) kept.set(invocation.start, { ...invocation, blank: null });
             break;
         }
-        tree.delete?.();
+        if (tree !== rawCapture?.tree) tree.delete?.();
         tree = candidate;
         current = blanked;
     }
@@ -2114,7 +2115,7 @@ function withExternalFunctionMacros(macros) {
     return { defs, undefs: merged.undefs };
 }
 
-function parseTree(parser, code) {
+function parseTree(parser, code, rawCapture = null) {
     const cacheKey = treeCacheKey(code);
     const cached = cachedCFamilyTree(parser, cacheKey);
     if (cached) return cached;
@@ -2139,7 +2140,7 @@ function parseTree(parser, code) {
     // Invocations of the file's own function-like macros that the grammar
     // read as declarations are the preprocessor's view before any other
     // recovery (fix #385).
-    const known = knownMacroInvocationRecovery(parser, pinnedSource);
+    const known = knownMacroInvocationRecovery(parser, pinnedSource, rawCapture);
     const source = known.source;
     const tree = known.tree;
     const knownSource = source !== pinnedSource ? source : null;
@@ -2187,7 +2188,7 @@ function parseTree(parser, code) {
     const releaseTree = candidate => {
         if (!candidate || !liveTrees.has(candidate)) return;
         liveTrees.delete(candidate);
-        candidate.delete?.();
+        if (candidate !== rawCapture?.tree) candidate.delete?.();
     };
     // Misreads a damage hid (fix #396): once a configuration or a directive
     // repair restores the structure around them, the decoration rules and
@@ -7512,7 +7513,8 @@ function parse(code, parser, mode, options = {}) {
     if (options.externalMacros && !externalMacroContext) {
         return withExternalMacros(options.externalMacros, () => parse(code, parser, mode, options));
     }
-    const tree = parseTree(parser, code);
+    const rawCapture = mode === 'cpp' ? { source: code, tree: null } : null;
+    const tree = parseTree(parser, code, rawCapture);
     const literal = literalRecoveryTree(parser, code, tree);
     try {
         const lines = code.split('\n');
@@ -7606,6 +7608,9 @@ function parse(code, parser, mode, options = {}) {
             result.externalMacroNames = [...externalMacroContext.consulted].sort();
         }
         if (mode === 'cpp') {
+            result.cppBaseSyntax = require('./cpp-site-syntax').cppBaseSyntax(code, parser,
+                calls.filter(call => call.implicitBase?.header).map(call => call.implicitBase.header),
+                rawCapture.tree || (selectedSourceByTree.get(tree) === code ? tree : null));
             result.typeParameterNames = require('./utils').declaredTypeParameterNames(tree, literal);
             const markers = findMacroScopeMarkers(code, tree, lines);
             if (markers.length > 0) result.macroScopeMarkers = markers;
@@ -7629,6 +7634,7 @@ function parse(code, parser, mode, options = {}) {
         });
         return result;
     } finally {
+        if (rawCapture?.tree && rawCapture.tree !== tree && rawCapture.tree !== literal) rawCapture.tree.delete?.();
         if (options.releaseAnalysisTree) {
             releaseCFamilyTree(parser, code, tree);
         }

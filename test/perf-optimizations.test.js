@@ -3881,6 +3881,93 @@ describe('fix #435: query-board costs without answer changes', () => {
         } finally { rm(dir); }
     });
 
+    it('cpp: persisted raw base syntax avoids a first parse but copied proofs still replay', () => {
+        const source = 'namespace a { struct Base { Base() {} }; }\n' +
+            'namespace b { struct Base { Base() {} };\nstruct Outer { struct Child : Base { Child(int) {} }; }; }\n';
+        const dir = tmp({ 'raw-base.cpp': source });
+        try {
+            const built = idx(dir), file = path.join(dir, 'raw-base.cpp');
+            saveCache(built);
+            const { ProjectIndex } = require('../core/project');
+            const index = new ProjectIndex(dir);
+            assert.ok(index.loadCache());
+            const entry = index.files.get(file);
+            assert.deepStrictEqual(entry.cppBaseSyntax, built.files.get(file).cppBaseSyntax);
+            const call = index.getCachedCalls(file).find(record => record.implicitBase);
+            const header = call.implicitBase.header;
+            const query = { file, relativePath: 'raw-base.cpp', line: header.line, column: header.column,
+                name: call.name, qualifier: call.constructorQualifier || null, arity: call.implicitBase.arity,
+                position: header, construction: true };
+            const own = index.symbols.get('Base').find(def => def.type === 'struct' && def.namespace === 'b');
+            const { captureTypeLookup, validateTypeLookup } = require('../core/provenance-type');
+            const { declarationIdentity } = require('../core/provenance');
+            let proof;
+            const syntax = JSON.stringify(entry.cppBaseSyntax);
+            const parses = countParses('cpp', () => {
+                index._beginOp();
+                try { proof = captureTypeLookup(index, query, own); }
+                finally { index._endOp(); }
+            });
+            assert.ok(proof);
+            assert.strictEqual(parses, 0, 'the first query uses the persisted source-only position');
+            assert.strictEqual(JSON.stringify(entry.cppBaseSyntax), syntax, 'owner augmentation does not mutate syntax');
+            assert.strictEqual(validateTypeLookup(JSON.parse(JSON.stringify(proof)), declarationIdentity(own),
+                { file: 'raw-base.cpp', line: query.line, column: query.column, start: header.start, end: header.end }), true);
+            // A changed source with unchanged token positions cannot use the old hint.
+            fs.writeFileSync(file, source.replace('namespace b', 'namespace c'));
+            index._beginOp();
+            try { assert.strictEqual(captureTypeLookup(index, query, own), null); }
+            finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
+    it('cpp: raw base syntax is identical through recovery, workers and rebuilding', () => {
+        const files = {};
+        for (let n = 0; n < 8; n++) files[`raw${n}.cpp`] = `
+#define DECORATE
+namespace n${n} {
+struct Base { Base() {} };
+struct DECORATE Outer {
+#if FEATURE
+  struct Child : Base { Child(int) {} };
+#else
+  struct Other : Base { Other(double) {} };
+#endif
+};
+}
+`;
+        const dir = tmp(files);
+        try {
+            const { ProjectIndex } = require('../core/project');
+            const { indexSnapshot } = require('./helpers');
+            const sequential = new ProjectIndex(dir), parallel = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const facts = index => [...index.files].map(([file, entry]) => [file, entry.cppBaseSyntax]);
+            const before = facts(sequential);
+            assert.ok(before.every(([, rows]) => rows.length > 0));
+            assert.deepStrictEqual(facts(parallel), before);
+            const { getParser, safeParse } = require('../languages');
+            const { cppSiteSyntax } = require('../languages/cpp-site-syntax');
+            for (const [file, rows] of before) {
+                const tree = safeParse(getParser('cpp'), fs.readFileSync(file, 'utf8'));
+                for (const row of rows) {
+                    let node = tree.rootNode.descendantForIndex(row.start);
+                    while (node && !(node.startIndex === row.start && node.endIndex === row.end && node.type === row.nodeType)) node = node.parent;
+                    const matches = node && node.startPosition.row + 1 === row.line && node.startPosition.column === row.column;
+                    assert.deepStrictEqual(row.syntax, matches ? cppSiteSyntax(node) : null);
+                }
+                tree.delete?.();
+            }
+            const first = path.join(dir, 'raw0.cpp');
+            fs.writeFileSync(first, files['raw0.cpp'].replace('namespace n0', 'namespace changed'));
+            sequential.build(null, { quiet: true, workers: 0 });
+            assert.notDeepStrictEqual(sequential.files.get(first).cppBaseSyntax, before[0][1]);
+        } finally { rm(dir); }
+    });
+
     it('enclosing callables from the per-line index equal the symbol scan', () => {
         const lines = ['class Outer {'];
         for (let i = 0; i < 12; i++) lines.push(`    void M${i}(int v) {`, `        System.Func<int, int> f${i} = x => x + v;`, '        Use(f' + i + '(v));', '    }');

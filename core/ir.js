@@ -307,6 +307,9 @@ function createFileIR({
         }),
         // The byte ranges the C/C++ recovery blanked (fix #387): a query
         // rebuilds the recovered tree with one parse.
+        ...(Array.isArray(parsed.cppBaseSyntax) && { cppBaseSyntax: parsed.cppBaseSyntax.map(row => ({
+            ...row, syntax: row.syntax && { ...row.syntax, namespaces: [...row.syntax.namespaces], classes: [...row.syntax.classes] },
+        })) }),
         ...(Array.isArray(parsed.recoveryBlanks) && {
             recoveryBlanks: parsed.recoveryBlanks.map(range => [...range]),
         }),

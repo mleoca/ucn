@@ -1079,44 +1079,14 @@ function enclosingClassIn(index, file, line) {
 
 // The namespace and class a C/C++ site's lookup starts in: from the site's
 // own tree node when it has one (no pinned type takes part).
-function cppSiteContextOf(index, siteNode, siteFile, file, line) {
+function cppSiteContextOf(index, siteNode, siteFile, file, line, syntax = null) {
     const node = siteNode && siteFile === file && siteNode.startPosition.row + 1 === line
         ? siteNode : null;
     const { macroNamespacePrefixAt, namespaceAt } = lazyCppScopeModule();
-    if (!node) return { namespace: namespaceAt(index, file, line), className: enclosingClassIn(index, file, line) };
-    const namespaces = [];
-    const classes = [];
-    let memberOf = null;
-    let recovered = false;
-    for (let current = node.parent; current; current = current.parent) {
-        if (current.type === 'ERROR') recovered = true;
-        if (current.type === 'namespace_definition') {
-            const nameNode = current.childForFieldName('name');
-            if (nameNode) namespaces.unshift(textOf(nameNode));
-        } else if (C_TYPE_SPECIFIERS.has(current.type)) {
-            const body = current.childForFieldName('body');
-            const nameNode = current.childForFieldName('name');
-            if (body && contains(body, node) && nameNode) {
-                // Specializations keep their arguments (`Acc<double>`), as
-                // the index names them; an out-of-class nested definition
-                // (`struct List<K>::Node`) is in its owner's scope too
-                // (fix #396).
-                const segments = textOf(nameNode).split('::');
-                classes.unshift(segments.slice(-2).join('::'));
-            }
-        } else if (current.type === 'function_definition' && !memberOf && classes.length === 0) {
-            let declarator = current.childForFieldName('declarator');
-            while (declarator && declarator.type !== 'function_declarator' && declarator.childForFieldName?.('declarator')) {
-                declarator = declarator.childForFieldName('declarator');
-            }
-            const qualified = declarator?.childForFieldName?.('declarator');
-            if (qualified?.type === 'qualified_identifier') {
-                const scope = qualified.childForFieldName('scope');
-                // `List<K>::Node::f`: Node's scope, then List's (fix #396).
-                if (scope) memberOf = qualifiedScopeText(qualified) || textOf(scope).split('::').pop();
-            }
-        }
-    }
+    if (!node && !syntax) return { namespace: namespaceAt(index, file, line), className: enclosingClassIn(index, file, line) };
+    const facts = syntax || require('../languages/cpp-site-syntax').cppSiteSyntax(node);
+    const { namespaces, memberOf, recovered } = facts;
+    const classes = [...facts.classes];
     // A class body the raw tree lost (macro-heavy headers, conditional
     // members): the indexed nested classes around the line (parsed from
     // the recovered source) still name their owners (fix #396: `union
@@ -2057,7 +2027,11 @@ class TypeReferenceResolver {
      * definition qualifies (`void Widget::f() {}`). Template headers and
      * other lines outside every indexed symbol keep their real scope.
      */
-    cppSiteContext(file, line) { return cppSiteContextOf(this.index, this.siteNode, this.siteFile, file, line); }
+    cppSiteContext(file, line) {
+        const syntax = this.siteFile === file && this.siteContextSyntax?.line === line
+            ? this.siteContextSyntax.syntax : null;
+        return cppSiteContextOf(this.index, this.siteNode, this.siteFile, file, line, syntax);
+    }
 
     // ── Qualified names ──
 
@@ -2875,20 +2849,6 @@ function statementHasError(node) {
         }
     }
     return false;
-}
-
-/** The class path a qualified declarator's scope names, without its
- * leading namespace-looking segments: `ns::List<K>::Node::f` -> the scope
- * segments `List<K>::Node` (the last two at most). */
-function qualifiedScopeText(qualified) {
-    const scopes = [];
-    let current = qualified;
-    while (current?.type === 'qualified_identifier') {
-        const scope = current.childForFieldName('scope');
-        if (scope) scopes.push(textOf(scope));
-        current = current.childForFieldName('name');
-    }
-    return scopes.length > 0 ? scopes.slice(-2).join('::') : null;
 }
 
 /** Does a persisted recovery blank fall inside the declaration or

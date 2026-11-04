@@ -995,7 +995,8 @@ function clearAllCaches() {
 // from the literal parse at index time (the doctor read them by parsing every
 // file on the first `repo` of a process).
 // v322: C# constructions retain terminal names and arity; nested generic receivers retain their qualifier.
-const CACHE_FORMAT_VERSION = 325;
+// v326: C++ files retain raw base-clause positions and their syntactic scopes.
+const CACHE_FORMAT_VERSION = 326;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {
