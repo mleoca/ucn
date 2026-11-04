@@ -1540,6 +1540,23 @@ function rustRawPointerTypeOf(typeNode) {
 }
 
 const primitiveTypeInfoCache = new (require('../core/source-memo').BoundedMap)({ maxEntries: 256 });
+const derefTypeInfoCache = new (require('../core/source-memo').BoundedMap)({ maxEntries: 256 });
+
+/** Source-only target of a written deref wrapper; core verifies its binding. */
+function getDerefTypeInfo(text, parser) {
+    if (typeof text !== 'string' || !text.includes('<')) return null;
+    if (derefTypeInfoCache.has(text)) return derefTypeInfoCache.get(text);
+    const tree = parseTree(parser, `type __ucn_type = ${text};`);
+    const items = tree.rootNode.namedChildren.filter(node => !node.type.endsWith('comment'));
+    const item = items.length === 1 && items[0].type === 'type_item' ? items[0] : null;
+    const declared = !tree.rootNode.hasError && item?.childForFieldName('type');
+    const chain = declared && rustStdDerefChain(declared);
+    const info = chain ? Object.freeze({
+        via: Object.freeze([...chain.via]), innerText: chain.inner.text,
+    }) : null;
+    derefTypeInfoCache.set(text, info);
+    return info;
+}
 
 /** Primitive identity of a declared type, independent of nominal names. */
 function getPrimitiveTypeInfo(text, parser) {
@@ -2782,7 +2799,10 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
         // associated-call shape `Type::default()`. It is still an AST token,
         // so admitting it here preserves the AST-first rule while recovering
         // calls nested inside macro token trees (assert_eq!, matches!, ...).
-        if (tok.type !== 'identifier' && tok.type !== 'default') continue;
+        // Primitive type words can also name value-namespace functions and
+        // methods (`width.char(...)`). The following call-shape check still
+        // requires argument tokens, so type annotations are not calls.
+        if (tok.type !== 'identifier' && tok.type !== 'default' && tok.type !== 'primitive_type') continue;
         const next = children[i + 1];
         const prev = children[i - 1];
         // $metavariable(...) — a macro fragment, not a named call
@@ -6409,6 +6429,7 @@ module.exports = {
     // Query-time type lookup uses the same lexical ribs as call extraction.
     typePathScopeBinding: (node, written) => rustReceiverScopeBindingField(node, written)?.receiverScopeBinding || null,
     getPrimitiveTypeInfo,
+    getDerefTypeInfo,
     primeDeclarationTrees,
     DECLARATION_NODE_TYPES,
     rustExpandedItemRecovery,

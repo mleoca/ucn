@@ -29,6 +29,7 @@ const OPTIONAL_HELPERS = Object.freeze([
     'getBuiltinCallReturnType',
     'getBuiltinFieldType',
     'getPrimitiveTypeInfo',
+    'getDerefTypeInfo',
     'findPytestFunctions',
     'findPythonModuleEvidence',
     'findScopeAlternativeBindings',

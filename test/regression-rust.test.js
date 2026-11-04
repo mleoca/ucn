@@ -6322,10 +6322,13 @@ describe('fix #368: Rust trait-heavy receiver typing', () => {
         try {
             const index = idx(dir);
             const range = tiers(index, 'src/lib.rs:3:into_par');
-            assert.deepStrictEqual(range.confirmed.sort(), ['src/lib.rs:7', 'src/lib.rs:8']);
-            assert.deepStrictEqual(range.unverified, []);
+            // Literal typing still identifies Range, but the index cannot
+            // inventory that outside type's inherent methods (fix #444).
+            assert.deepStrictEqual(range.confirmed, []);
+            assert.deepStrictEqual(range.unverified, ['src/lib.rs:7:autoref-dispatch', 'src/lib.rs:8:autoref-dispatch']);
             const inclusive = tiers(index, 'src/lib.rs:4:into_par');
-            assert.deepStrictEqual(inclusive.confirmed.sort(), ['src/lib.rs:7', 'src/lib.rs:9']);
+            assert.deepStrictEqual(inclusive.confirmed, []);
+            assert.deepStrictEqual(inclusive.unverified, ['src/lib.rs:7:autoref-dispatch', 'src/lib.rs:9:autoref-dispatch']);
             const ownedVec = tiers(index, 'src/lib.rs:5:into_par');
             assert.deepStrictEqual([...new Set(ownedVec.confirmed)], ['src/lib.rs:10'],
                 'vec![..] and a Vec<i32> local take the owned impl');
@@ -9811,6 +9814,153 @@ describe('fix #440: field owners follow the type written in an impl', () => {
             const plan = index.plan('end', { file: 'src/lib.rs', line: 3, renameTo: 'finish' });
             assert.ok(!plan.changes.some(change => change.file === 'src/external.rs' && change.newExpression));
             assert.ok(plan.changes.some(change => change.file === 'src/owned.rs' && change.newExpression));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #444: producer values, macro calls and impl ownership', () => {
+    it('Self roots and declared field suffixes resolve the value that receives the method', () => {
+        const dir = tmp({ 'model.rs': [
+            'use std::sync::MutexGuard;',
+            'struct Leaf; impl Leaf { fn work(&self) {} }',
+            'struct State { leaf: Leaf } impl State { fn work(&self) {} }',
+            'struct Maker;',
+            'impl Maker {',
+            ' fn make() -> Leaf { Leaf }',
+            ' fn work(&self) {}',
+            ' fn static_chain() { Self::make().work(); }',
+            ' fn state(&self) -> State { todo!() }',
+            " fn guard(&self) -> MutexGuard<'_, State> { todo!() }",
+            ' fn direct(&self) { self.state().leaf.work(); }',
+            ' fn locked(&self) { self.guard().leaf.work(); }',
+            ' fn unknown(&self) { self.state().missing.work(); }',
+            '}',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const members = index.find('work', { exact: true });
+            const leaf = members.find(d => d.className === 'Leaf');
+            const callers = index.findCallers('work', { targetDefinitions: [leaf], collectAccount: true });
+            assert.deepStrictEqual(callers.map(c => c.line), [8, 11, 12]);
+            assert.ok(callers.unverifiedEntries.some(c => c.line === 13));
+            for (const target of members.filter(d => d !== leaf)) {
+                const wrong = index.findCallers('work', { targetDefinitions: [target], collectAccount: true });
+                assert.deepStrictEqual(wrong.map(c => c.line), []);
+            }
+            for (const name of ['static_chain', 'direct', 'locked', 'unknown']) {
+                const source = index.find(name, { exact: true })[0];
+                const callees = index.findCallees(source, { collectAccount: true, includeMethods: true });
+                const work = callees.filter(c => c.name === 'work');
+                assert.deepStrictEqual(work.map(c => c.className), name === 'unknown' ? [] : ['Leaf']);
+                if (name === 'unknown') assert.ok(callees.unverifiedCallees.some(c => c.name === 'work'));
+                assert.strictEqual(callees.calleeAccount.conserved, true);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a wrapper name or generic payload alone does not prove its deref target', () => {
+        const dir = tmp({ 'model.rs': [
+            'struct Leaf; impl Leaf { fn work(&self) {} }',
+            'struct State { leaf: Leaf }',
+            'struct MutexGuard<T> { data: T }',
+            'fn shadowed() -> MutexGuard<State> { todo!() }',
+            'fn use_shadow() { shadowed().leaf.work(); }',
+            "fn generic<State>() -> std::sync::MutexGuard<'static, State> { todo!() }",
+            'fn use_generic() { generic().leaf.work(); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const target = index.find('work', { exact: true })[0];
+            const callers = index.findCallers('work', { targetDefinitions: [target], collectAccount: true });
+            assert.deepStrictEqual(callers.map(c => c.line), []);
+            for (const line of [5, 7]) assert.ok(callers.unverifiedEntries.some(c => c.line === line));
+        } finally { rm(dir); }
+    });
+
+    it('primitive-spelled value calls inside macros retain their receiver and exact spans', () => {
+        const dir = tmp({ 'model.rs': [
+            'struct Width; impl Width { fn char(&self, n: u8) -> u8 { n } }',
+            'fn char() -> u8 { 1 }',
+            'fn use_it(w: Width) {',
+            ' assert_eq!(w.char(1), char());',
+            " assert_eq!(char::from(1), 'x');",
+            ' arbitrary!(let value: char = char());',
+            '}',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'model.rs'));
+            const names = calls.filter(c => c.name === 'char');
+            assert.deepStrictEqual(names.map(c => [c.line, c.receiver || null]), [[4, 'w'], [4, null], [6, null]]);
+            assert.ok(names.every(c => c.inMacro && c.callEnd > c.callStart));
+            assert.ok(calls.some(c => c.name === 'from' && c.receiver === 'char'));
+            for (const target of index.find('char', { exact: true })) {
+                const up = index.findCallers('char', { targetDefinitions: [target], collectAccount: true });
+                assert.deepStrictEqual(up.map(c => c.line), target.className ? [4] : [4, 6]);
+            }
+            const down = index.findCallees(index.find('use_it', { exact: true })[0],
+                { collectAccount: true, includeMethods: true });
+            assert.strictEqual(down.filter(c => c.name === 'char').length, 2);
+            assert.strictEqual(down.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('an impl block cannot bind a struct literal in place of the imported declaration', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
+            'src/lib.rs': 'mod model; mod builder;\npub use model::Item;',
+            'src/builder.rs': 'use crate::Item;\ntrait Build {}\nimpl Build for Item {}\nimpl Item { fn make() -> Self { Item { value: 1 } } }\nfn use_it() { let _ = Item { value: 2 }; }',
+            'src/model.rs': 'pub struct Item { pub value: u8 }',
+        });
+        try {
+            const index = idx(dir);
+            for (const name of ['make', 'use_it']) {
+                const down = index.findCallees(index.find(name, { exact: true })[0],
+                    { collectAccount: true, includeMethods: true });
+                assert.deepStrictEqual(down.map(c => [c.type, c.relativePath, c.startLine]),
+                    [['struct', 'src/model.rs', 1]]);
+                assert.strictEqual(down.calleeAccount.conserved, true);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('self calls on an external impl owner may select an unknown inherent method', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nupstream="1"\n',
+            'src/lib.rs': [
+                'use upstream::Terminal;',
+                'trait Local { fn clear(&self); }',
+                'impl Local for Terminal { fn clear(&self) { self.clear(); } }',
+                'struct Owned;',
+                'impl Owned { fn clear(&self) {} fn use_it(&self) { self.clear(); } }',
+                'fn external(t: Terminal) { t.clear(); }',
+                'fn explicit(t: Terminal) { <Terminal as Local>::clear(&t); }',
+                'impl TerminalBridge for Terminal { fn via_type(&self) { Self::clear(self); } }',
+                'trait TerminalBridge { fn via_type(&self); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.find('clear', { exact: true }).find(d => d.className === 'Terminal');
+            const up = index.findCallers('clear', { targetDefinitions: [target], collectAccount: true });
+            assert.deepStrictEqual(up.map(c => c.line), []);
+            for (const line of [3, 6, 8]) assert.ok(up.unverifiedEntries.some(c =>
+                c.line === line && c.reason === 'autoref-dispatch'));
+            const down = index.findCallees(target, { collectAccount: true, includeMethods: true });
+            assert.deepStrictEqual(down.map(c => c.name), []);
+            assert.ok(down.unverifiedCallees.some(c => c.name === 'clear' && c.reason === 'autoref-dispatch'));
+            const owned = index.find('clear', { exact: true }).find(d => d.className === 'Owned');
+            assert.deepStrictEqual(index.findCallers('clear', { targetDefinitions: [owned], collectAccount: true })
+                .map(c => c.line), [5]);
+            const explicit = index.findCallees(index.find('explicit', { exact: true })[0],
+                { collectAccount: true, includeMethods: true });
+            assert.ok(explicit.some(c => c.name === 'clear') ||
+                explicit.unverifiedCallees.some(c => c.name === 'clear'));
+            assert.ok(!explicit.unverifiedCallees.some(c => c.reason === 'autoref-dispatch'));
+            const typePath = index.findCallees(index.find('via_type', { exact: true }).find(d => d.traitImpl),
+                { collectAccount: true, includeMethods: true });
+            assert.ok(!typePath.some(c => c.name === 'clear'));
+            assert.ok(typePath.unverifiedCallees.some(c => c.name === 'clear' && c.reason === 'autoref-dispatch'));
         } finally { rm(dir); }
     });
 });

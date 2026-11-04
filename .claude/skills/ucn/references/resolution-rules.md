@@ -128,6 +128,10 @@ A Go package-level variable has one static type across its package: `var Command
 
 ## Rust
 
+A chain starting with `Self::make()` uses the producer's return type for later methods. Recorded field suffixes, including one field, use the field's declared type; an unresolved hop remains unverified. Field access through a returned standard deref wrapper such as `MutexGuard<State>` uses `State` only after proving the wrapper's binding and payload identity. A project namesake or generic payload supplies no such proof.
+
+Calls to a trait impl on an external type stay `autoref-dispatch` when the type's unseen inherent methods could precede it, including `self.method()` or `Self::method(self)` inside the impl. Explicit trait paths retain their own lookup. Struct literals never bind an impl block.
+
 A field access through `self` in an `impl` uses the type written on that implementation, including scoped imports and aliases. An external type never borrows a project namesake's fields; an unresolved owner stays `member-owner-unresolved`.
 
 Rust receivers are typed from annotations, closure parameters of the called function's `Fn` bounds, `Self::Assoc` returns, tuple `let` patterns, trait-provided methods, and range, tuple, slice, `vec!`, and `Some`/`Ok` values; owned versus `&` impls are told apart by the receiver's reference layer, and at one probe step an inherent method precedes a trait method (`self.key_mut()` inside a trait impl's own `key_mut` calls the inherent `key_mut`), on the caller and callee side; where a bound-conditional impl, a trait not provably in scope or a private inherent method could intervene, the site stays unverified.
@@ -151,6 +155,8 @@ A Rust name resolves through the scopes that bind it, innermost first: a block's
 Rust `crate::f()`, `super::f()`, `self::m::f()` and child-module paths resolve through the module tree (`mod` files in both layouts, `#[path]`, inline modules) and confirm as `module-owned`; a type path (`crate::tests::memchr::Runner::new()`) names the type that module declares, and a type a glob import (`use super::*`) brings in is that module's type; a bare call never resolves to a struct field.
 
 ### Rust macros
+
+Primitive-spelled value names such as `width.char()` and `char()` are recorded inside macro token trees; a primitive type annotation alone is not a call.
 
 Invocations of project `macro_rules!` macros are expanded (rules matched over token trees, nested and recursive project macros, hygiene for locals the macro introduces, `$crate`, every `cfg` alternative): functions, impls and calls the expansion generates are indexed at the invocation, marked `[via macro NAME]`. A call written in the invocation keeps its own line and is typed in its expanded context; an unresolved call from the macro's template joins the target's `macro template` family in the compile-time band, and `plan` edits a generated declaration only through the argument or template token that spells it. Macros that only pass their arguments along (logging, `try!`-style matches) keep the invocation's token-tree view. Macros from dependencies are never expanded; project invocations that cannot be expanded are listed in `repo --sections=health` and warned by `deadcode`.
 

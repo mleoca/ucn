@@ -1622,6 +1622,10 @@ describe('index reliability: parallel build equals sequential build', () => {
             '}',
             'pub fn lit() -> usize { "abc".parse().unwrap() }',
             'pub fn chain(g: Greeter) -> usize { g.hello().len() }',
+            'impl Greeter { fn char(&self) -> u8 { 1 } }',
+            'struct Holder { value: Greeter }',
+            'fn holder() -> Holder { todo!() }',
+            'fn primitive_macro(g: Greeter) { assert_eq!(g.char(), 1); holder().value.char(); }',
         ].join('\n');
         // fix #220 call-field shapes: Go chained receivers
         // (receiverCall/receiverCallIsMethod/receiverCallReceiver),
@@ -1689,6 +1693,14 @@ describe('index reliability: parallel build equals sequential build', () => {
                 'the parity fixture must actually produce a reflection pattern');
             assert.strictEqual(indexSnapshot(par), indexSnapshot(seq),
                 'parallel and sequential builds must produce identical indexes');
+            const rustCalls = par.getCachedCalls(path.join(dir, 'rich2.rs'));
+            assert.ok(rustCalls.some(call => call.name === 'char' && call.inMacro && call.callEnd > call.callStart));
+            assert.ok(rustCalls.some(call => call.name === 'char' && call.receiverCall === 'holder' && call.receiverField === 'value'));
+            par.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(loaded.getCachedCalls(path.join(dir, 'rich2.rs')),
+                JSON.parse(JSON.stringify(rustCalls)));
             for (const file of ['rich0.ts', 'rich1.py']) {
                 const bindings = par.files.get(path.join(dir, file)).importBindings
                     .filter(b => b.name === 'Imported').map(b => b.alias || b.name).sort();

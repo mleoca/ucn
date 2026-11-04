@@ -4008,9 +4008,11 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                         }
-                    } else if (['self', 'cls', 'this'].includes(call.receiver) ||
+                    } else if (!call.receiverIsChainRoot && (['self', 'cls', 'this'].includes(call.receiver) ||
                                _isSuperReceiver(fileEntry.language, call.receiver) ||
-                               (call.receiver === 'Self' && fileEntry.language === 'rust')) {
+                               (call.receiver === 'Self' && fileEntry.language === 'rust'))) {
+                        // A synthetic chain root names the producer's receiver,
+                        // not the value on which the terminal method runs.
                         // self/this/super.method() — resolve to same-class or parent method.
                         // Rust `Self::method()` (fix #232) is the path-call same-class form:
                         // Self IS the enclosing impl's type, so the #202b pinning check
@@ -7564,6 +7566,15 @@ function findCallers(index, name, options = {}) {
                     rustImplSelected = selection?.decision === 'confirm';
                 }
 
+                if (fileEntry.language === 'rust' && options.targetDefinitions?.length === 1 &&
+                    _rustExternalInherentPossible(index, filePath, call, options.targetDefinitions[0])) {
+                    if (collectAccount) routeUnverified(filePath, fileEntry, call, 'autoref-dispatch', calledAs, {
+                        uncertaintyClass: 'compile-time-dispatch',
+                        dispatchFamily: `${name} inherent methods of an external type`,
+                    });
+                    continue;
+                }
+
                 // Method probing by reference layer (fix #392, bytes-measured:
                 // `self.as_ref()` in a `&mut self` method reaches std's
                 // `impl AsRef<U> for &mut T` at the autoref step, before the
@@ -9756,11 +9767,11 @@ function findCallees(index, definition, options = {}) {
             if (call.isMethod) {
                 if (call.selfAttribute && language === 'python') {
                     // Will be resolved in second pass below
-                } else if (['self', 'cls', 'this'].includes(call.receiver) ||
-                           (call.receiver === 'Self' && language === 'rust')) {
+                } else if (!call.receiverIsChainRoot && (['self', 'cls', 'this'].includes(call.receiver) ||
+                           (call.receiver === 'Self' && language === 'rust'))) {
                     // self.method() / cls.method() / this.method() — resolve to same-class method below
                     // Rust Self::method() resolves same-impl the same way (fix #236, the #232 callee analog)
-                } else if (_isSuperReceiver(language, call.receiver)) {
+                } else if (!call.receiverIsChainRoot && _isSuperReceiver(language, call.receiver)) {
                     // super().method() — resolve to parent class method below
                 } else if (directReceiverFlow?.externalVia) {
                     if (directReceiverFlow.externalConcrete) {
@@ -10082,7 +10093,7 @@ function findCallees(index, definition, options = {}) {
                     // producers (`require("./lib").target()`) stay on the
                     // stronger name-aware module route below.
                     let chained = _foldChainedReceiverType(index, fileEntry, def.file, call, foldCtx());
-                    if ((!chained || (!chained.type && !chained.externalVia)) &&
+                    if ((!chained || (!chained.type && !chained.externalVia && !chained.suppressFallback)) &&
                         langTraits(language)?.typeSystem === 'nominal') {
                         chained = _nominalChainedReceiverType(index, call, fileEntry, def.file);
                     }
@@ -10291,7 +10302,7 @@ function findCallees(index, definition, options = {}) {
 
             // Collect self/this.method() calls for same-class resolution
             // (Rust Self::method() resolves the same way — fix #236)
-            if (call.isMethod && (['self', 'cls', 'this'].includes(call.receiver) ||
+            if (call.isMethod && !call.receiverIsChainRoot && (['self', 'cls', 'this'].includes(call.receiver) ||
                 (call.receiver === 'Self' && language === 'rust'))) {
                 if (!selfMethodCalls) selfMethodCalls = [];
                 selfMethodCalls.push({ call, siteId });
@@ -10299,7 +10310,7 @@ function findCallees(index, definition, options = {}) {
             }
 
             // Collect super().method() calls for parent-class resolution
-            if (call.isMethod &&
+            if (call.isMethod && !call.receiverIsChainRoot &&
                 _isSuperReceiver(language, call.receiver)) {
                 if (!selfMethodCalls) selfMethodCalls = [];
                 selfMethodCalls.push({ call, siteId });
@@ -10535,7 +10546,7 @@ function findCallees(index, definition, options = {}) {
                 // also named ReadConfig. Otherwise the bare wrapper steals the
                 // exact callee before receiver evidence is considered.
                 const receiverBlindMethodBinding = call.isMethod &&
-                    !_isReservedReceiver(language, call.receiver);
+                    (call.receiverIsChainRoot || !_isReservedReceiver(language, call.receiver));
                 let bindings = receiverBlindMethodBinding ? [] :
                     _arityCompatibleBindings(index, language, call,
                         _dropOutOfScopeBindings(index, def.file, call.name, call.line,
@@ -10545,7 +10556,7 @@ function findCallees(index, definition, options = {}) {
                 // A module is a name of the type namespace (fix #422).
                 if (langTraits(language)?.macroInvocationSyntax === 'marked') {
                     bindings = bindings.filter(b => (b.type === 'macro') === !!call.isMacro &&
-                        b.type !== 'module');
+                        b.type !== 'module' && b.type !== 'impl');
                 }
                 if (macroBindingsInert) bindings = bindings.filter(b => b.type !== 'macro');
                 // For Go, also check sibling files in same directory (same
@@ -11586,9 +11597,11 @@ function findCallees(index, definition, options = {}) {
             // another class spelled like the type (fix #393: C# `new
             // Logger(..)` beside a static `Log.Logger` property).
             if (isConstructor && !bindingId) {
-                const constructible = resolutionSymbols.filter(s =>
+                // An impl adds members to a type; it declares no constructor
+                // name, even when its block is nearer than the actual type.
+                const constructible = resolutionSymbols.filter(s => s.type !== 'impl' && (
                     !(s.className || s.receiver) || s.type === 'constructor' ||
-                    IDENTITY_TYPE_KINDS.has(s.type) || s.type === 'record' || s.type === 'type');
+                    IDENTITY_TYPE_KINDS.has(s.type) || s.type === 'record' || s.type === 'type'));
                 if (constructible.length === 0) {
                     claimSites('external', null);
                     continue;
@@ -11742,6 +11755,19 @@ function findCallees(index, definition, options = {}) {
                     if (calleeFileEntry && isTestFile(calleeFileEntry.relativePath, calleeFileEntry.language)) {
                         claimSites('excluded', 'test-file-no-import-link');
                         continue;
+                    }
+                }
+
+                if (language === 'rust' && callee.traitImpl) {
+                    const undecided = siteIds.filter(siteId => _rustExternalInherentPossible(
+                        index, def.file, siteEvidence.get(siteId).call, callee));
+                    for (const siteId of undecided) noteUnverified(siteId,
+                        siteEvidence.get(siteId).call, 'autoref-dispatch');
+                    if (undecided.length === siteIds.length) continue;
+                    if (undecided.length) {
+                        siteIds = siteIds.filter(siteId => !undecided.includes(siteId));
+                        sites = siteIds.map(siteId => siteEvidence.get(siteId).call.line);
+                        count = siteIds.length;
                     }
                 }
 
@@ -21722,6 +21748,7 @@ function _rustProvidedMethodPossible(index, name, members) {
  * layer is unknown, the target is found first, or nothing can intervene).
  */
 function _rustReceiverProbe(index, filePath, call, target, callerSymbol) {
+    if (_rustExternalInherentPossible(index, filePath, call, target)) return 'unverified';
     if (!target || !target.className || !target.selfParamKind || target.implSelfRef) return null;
     const layerOf = kind => (kind === '&' || kind === '&mut') ? kind : kind === 'value' || kind === 'owned' ? '' : null;
     let receiverLayer = null;
@@ -21787,6 +21814,21 @@ function _rustReceiverProbe(index, filePath, call, target, callerSymbol) {
         }
     }
     return null;
+}
+
+/** Outside inherent methods may precede a project trait impl, even for Self::m. */
+function _rustExternalInherentPossible(index, file, call, target) {
+    if (!target?.traitImpl || !call.isMethod || call.isConstructor) return false;
+    if (!externalTypeDenotation(index, target.file, target.className,
+        target.implSelfQualifier || null, target.startLine)) return false;
+    if (call.isPathCall) {
+        // `<T as Trait>::m` and a path proven to name a trait explicitly
+        // select that trait. A type's path still performs inherent lookup.
+        if (call.receiverQualifiedSelf) return false;
+        const named = _rustCallQualifier(index, file, call);
+        if (named?.defs?.length && named.defs.every(def => def.type === 'trait')) return false;
+    }
+    return true;
 }
 
 /**
@@ -31938,8 +31980,13 @@ function _chainedProducerRecords(ctx, call) {
 function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
     const prods = _chainedProducerRecords(ctx, call);
     if (prods.length === 0) return null;
-    const results = prods.map(r =>
+    const fields = call.receiverFields?.length ? call.receiverFields
+        : call.receiverField ? [call.receiverField] : [];
+    let results = prods.map(r =>
         _typeOfCallResultFold(index, fileEntry, filePath, r, ctx, call.receiverCallAwaited));
+    if (fields.length && fileEntry.language === 'rust') {
+        results = results.map(result => _rustFieldReceiverType(index, result));
+    }
     if (results.some(r => r?.suppressFallback)) return { suppressFallback: true };
     if (!results.every(Boolean)) {
         // A module owns its exported name. If module-qualified producer
@@ -31986,10 +32033,10 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
         }),
         ...(results.every(r => r.stdLiteral) && { stdLiteral: true }),
     };
-    if (call.receiverFields?.length) {
+    if (fields.length) {
         const fieldInfo = {};
         const fieldType = _declaredFieldPathType(
-            index, result.type, call.receiverFields,
+            index, result.type, fields,
             fileEntry.language, fieldInfo, undefined, null, filePath);
         if (fieldType) {
             result = {
@@ -32002,10 +32049,30 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
                 ...(fieldInfo.externalConcrete && { externalConcrete: true }),
             };
         } else {
-            return null;
+            // The field's value is unknown. Reusing the producer's outer
+            // type would invent a method edge on the object holding it.
+            return { suppressFallback: true };
         }
     }
     return result;
+}
+
+/** Field access auto-dereferences a proven standard wrapper's target. */
+function _rustFieldReceiverType(index, result) {
+    const producer = result?.rustReturnDeclaration;
+    if (!producer) return result;
+    const syntax = getLanguageAdapter('rust').getDerefTypeInfo(producer.returnType, getParser('rust'));
+    if (!syntax) return result;
+    if (!syntax.via.every(written => _rustStdWrapperDenoted(index,
+        producer.file, written, producer.startLine))) return { suppressFallback: true };
+    const definition = (index.symbols.get(producer.name) || []).find(candidate =>
+        sameDeclaration(declarationIdentity(candidate), declarationIdentity(producer)));
+    if (!definition) return { suppressFallback: true };
+    const parsed = _returnTypeNameNominal(syntax.innerText, 'rust', { selfClass: definition.className });
+    if (!parsed || _declaredTypeParameterNames(definition).has(parsed.name)) return { suppressFallback: true };
+    const origin = _returnTypeOrigin(index, producer.file, parsed);
+    if (!origin) return { suppressFallback: true };
+    return { type: parsed.name, ...origin };
 }
 
 // A lower-case named import can be a namespace-like API object (`z.string()`)

@@ -870,3 +870,42 @@ describe('fix #443: inherited method values precede instance writes', () => {
         });
     }
 });
+
+describe('fix #444: a producer field is not its outer receiver', () => {
+    const sources = {
+        rs: 'struct Leaf; impl Leaf {fn work(&self){}}\nstruct Holder {leaf: Leaf} impl Holder {fn work(&self){}}\nfn make()->Holder{todo!()}\nfn use_it(){make().leaf.work();}\n',
+        go: 'package model\ntype Leaf struct{}\nfunc (l Leaf) work(){}\ntype Holder struct{leaf Leaf}\nfunc (h Holder) work(){}\nfunc makeHolder() Holder{return Holder{}}\nfunc use_it(){makeHolder().leaf.work()}\n',
+        java: 'class Leaf {void work(){}}\nclass Holder {Leaf leaf; void work(){}}\nclass Use {Holder make(){return new Holder();} void use_it(){make().leaf.work();}}\n',
+        cs: 'class Leaf {public void work(){}}\nclass Holder {public Leaf leaf; public void work(){}}\nclass Use {Holder make(){return new Holder();} void use_it(){make().leaf.work();}}\n',
+        cpp: 'struct Leaf {void work(){}};\nstruct Holder {Leaf leaf; void work(){}};\nHolder make(){return Holder();}\nvoid use_it(){make().leaf.work();}\n',
+        py: 'class Leaf:\n def work(self): pass\nclass Holder:\n leaf: Leaf\n def work(self): pass\ndef make() -> Holder: return Holder()\ndef use_it(): make().leaf.work()\n',
+        ts: 'class Leaf {work(){}}\nclass Holder {leaf: Leaf; work(){}}\nfunction make(): Holder {return new Holder();}\nfunction use_it(){make().leaf.work();}\n',
+        js: 'class Leaf {work(){}}\nclass Holder {\n/** @type {Leaf} */\nleaf;\nwork(){}\n}\n/** @returns {Holder} */\nfunction make(){return new Holder();}\nfunction use_it(){make().leaf.work();}\n',
+    };
+    sources.tsx = sources.ts;
+    sources.jsx = sources.js;
+    sources.html = `<script>\n${sources.js}</script>`;
+    for (const [ext, source] of Object.entries(sources)) {
+        it(ext, () => {
+            const dir = tmp({ [`model.${ext}`]: source });
+            try {
+                const index = idx(dir);
+                const work = index.find('work', { exact: true });
+                const leaf = work.find(d => d.className === 'Leaf');
+                const outer = work.find(d => d.className === 'Holder');
+                assert.ok(leaf && outer);
+                const callers = index.findCallers('work', { targetDefinitions: [leaf], collectAccount: true });
+                // Parsers without a producer-field record keep the call visible.
+                assert.strictEqual(callers.length + callers.unverifiedEntries.length, 1);
+                if (ext === 'rs') assert.strictEqual(callers.length, 1);
+                assert.strictEqual(index.findCallers('work', { targetDefinitions: [outer], collectAccount: true }).length, 0);
+                const down = index.findCallees(index.find('use_it', { exact: true })[0],
+                    { collectAccount: true, includeMethods: true });
+                assert.ok(down.some(c => c.name === 'work' && c.className === 'Leaf') ||
+                    down.unverifiedCallees.some(c => c.name === 'work'));
+                assert.ok(!down.some(c => c.name === 'work' && c.className === 'Holder'));
+                assert.strictEqual(down.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+});
