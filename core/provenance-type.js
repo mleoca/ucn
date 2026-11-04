@@ -394,14 +394,15 @@ function cppPositionConstructionClasses(index, query) {
     return classes;
 }
 
-// A position-based C/C++ construction lookup (`resolve`) holds only when the
-// site's classes are exactly the owner; when they are not, no witness can be
-// captured for this owner and none is attempted.
-function cppPositionConstructionDenied(index, query, identity) {
-    if (index.isProvenanceFactIndex || !query.construction || !query.position || query.functional ||
+// A C/C++ construction lookup holds only when the site's classes are
+// exactly the owner. This necessary condition does not depend on the rename
+// group or functional-call binding check; a failed lookup cannot capture a
+// witness for this owner. Keep the caller's ordinary unverified result.
+function cppConstructionDenied(index, query, identity) {
+    if (index.isProvenanceFactIndex || !query.construction ||
         query.ownClass || query.nameScopeOnly || query.localShadow) return false;
     if (!lazyLanguagesModule().langTraits(index.files.get(query.file)?.language)?.functionalTypeConstruction) return false;
-    const classes = cppPositionConstructionClasses(index, query);
+    const classes = query.position ? cppPositionConstructionClasses(index, query) : cppConstructionClasses(index, query);
     return !classes || !(classes.length > 0 && classes.every(def => sameDeclaration(declarationIdentity(def), identity)));
 }
 
@@ -428,7 +429,7 @@ function captureTypeLookup(index, query, owner) {
         seedReplay(saved.reads, JSON.stringify(['type-lookup', query, identity]), true);
         return { query: globalThis.structuredClone(query), owner: { ...saved.owner }, reads: saved.reads };
     }
-    if (cppPositionConstructionDenied(index, query, identity)) {
+    if (cppConstructionDenied(index, query, identity)) {
         memo?.set(key, null);
         return null;
     }

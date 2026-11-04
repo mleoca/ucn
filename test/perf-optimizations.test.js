@@ -3806,6 +3806,39 @@ describe('fix #435: query-board costs without answer changes', () => {
         } finally { rm(dir); }
     });
 
+    it('cpp: explicit and functional constructions of another type capture no doomed witness', () => {
+        const dir = tmp({
+            'a.hpp': 'namespace a { struct Box { Box(int) {} }; }\n',
+            'b.hpp': 'namespace b { struct Box { Box(int) {} }; }\n',
+            'use.cpp': '#include "a.hpp"\na::Box make() { return a::Box(1); }\n' +
+                'a::Box* more() { return new a::Box(2); }\n',
+        });
+        try {
+            const index = idx(dir), file = path.join(dir, 'use.cpp');
+            const { provenanceWork } = require('../core/provenance-overload');
+            const { declarationIdentity } = require('../core/provenance');
+            const { captureTypeLookup, validateTypeLookup } = require('../core/provenance-type');
+            const own = index.symbols.get('Box').find(def => def.type === 'struct' && def.relativePath === 'a.hpp');
+            const other = index.symbols.get('Box').find(def => def.type === 'struct' && def.relativePath === 'b.hpp');
+            const calls = index.getCachedCalls(file).filter(call => call.name === 'Box');
+            assert.strictEqual(calls.length, 2);
+            index._beginOp();
+            try {
+                for (const call of calls) {
+                    const query = { file, relativePath: 'use.cpp', line: call.line, column: call.column,
+                        name: 'Box', qualifier: 'a', construction: true, functional: call.line === 2 };
+                    const before = provenanceWork().captures;
+                    assert.strictEqual(captureTypeLookup(index, query, other), null);
+                    assert.strictEqual(provenanceWork().captures, before, 'lookup already disproved this owner');
+                    const proof = captureTypeLookup(index, query, own);
+                    assert.ok(proof, 'the selected owner still has its complete proof');
+                    assert.strictEqual(validateTypeLookup(JSON.parse(JSON.stringify(proof)), declarationIdentity(own),
+                        { file: 'use.cpp', line: call.line, column: call.column }), true);
+                }
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
     it('enclosing callables from the per-line index equal the symbol scan', () => {
         const lines = ['class Outer {'];
         for (let i = 0; i < 12; i++) lines.push(`    void M${i}(int v) {`, `        System.Func<int, int> f${i} = x => x + v;`, '        Use(f' + i + '(v));', '    }');
