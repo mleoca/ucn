@@ -8,8 +8,9 @@
  * value-member queries regressed by up to two orders of magnitude (its own
  * fmt p95 7.7x, C++ class `find` 126x, Java overloaded `show` 23x). This
  * board measures those query classes on PINNED
- * handles and compares each class with the same handles measured on the last
- * release, on the same host class:
+ * handles and retains each class's comparison with the last release on the
+ * same host class. Impact queries that gained a reference band additionally
+ * use the first working implementation of that capability, by pinned cohort:
  *
  *   orientation       `repo`
  *   class-find        `find <TypeName>`
@@ -31,11 +32,16 @@
  * are pinned per host class from the LAST RELEASE (`--engine-root <release
  * tree> --pin-query-baseline`), never from the tree under test, so the gate
  * reads "this tree against the release", not "this tree against itself".
+ * The separate performance-capabilities.json records the historical impact
+ * cohorts; it never replaces these raw release baselines. Existing impact
+ * capabilities still use their original release measurements, and every
+ * cohort keeps the same ratio and absolute-delta limits.
  * Re-pin only at a release boundary, from that release's tree; a red row is
  * never a reason to re-pin.
  */
 
 const crypto = require('crypto');
+const { CAPABILITY_PINS, BANDS, evaluateCapabilityCohorts } = require('./performance-capabilities');
 
 // Plural keys: a group named `constructor` would read Object.prototype's.
 const QUERY_GROUPS = Object.freeze(['types', 'constructors', 'overloads', 'values']);
@@ -269,6 +275,10 @@ function summarizeQueryClasses(runs, hostFactor = 1) {
             boardKey: boardKey(handles),
             processSamples: perRun.length,
             bestMs: best.map(round3),
+            normalizedBestMs: best.map(value => round3(value / factor)),
+            // Every process must supply the band, including a slower sample.
+            capabilities: handles.map((_, i) => Object.fromEntries(BANDS.map(band =>
+                [band, perRun.every(run => run.handles[i] === handles[i] && run.capabilities?.[i]?.[band] === true)]))),
             p50Ms: round3(p50),
             p95Ms: round3(p95),
             normalizedP50Ms: round3(p50 / factor),
@@ -294,7 +304,7 @@ function summarizeQueryClasses(runs, hostFactor = 1) {
  * baseline's (`boardKey`) fails on gating runs, because the ratio would
  * compare different symbols.
  */
-function evaluateQueryClasses(summary, baseline, budgets, { repo, hostClass } = {}) {
+function evaluateQueryClasses(summary, baseline, budgets, { repo, hostClass, capabilities = true, capabilityPins = CAPABILITY_PINS } = {}) {
     const failures = [];
     const warnings = [];
     const rows = {};
@@ -314,7 +324,10 @@ function evaluateQueryClasses(summary, baseline, budgets, { repo, hostClass } = 
         const base = baseline?.classes?.[classId];
         if (!baseline) continue;
         if (!base) {
-            warnings.push(`${classId}: no release baseline for this class`);
+            if (capabilities && capabilityPins.repos?.[repo]?.classes?.[classId]) {
+                gate(`${classId}: missing release baseline for capability comparison`);
+                row.failed = true;
+            } else warnings.push(`${classId}: no release baseline for this class`);
             continue;
         }
         row.baseline = base;
@@ -326,14 +339,25 @@ function evaluateQueryClasses(summary, baseline, budgets, { repo, hostClass } = 
         }
         row.p50Ratio = base.p50Ms > 0 ? round3(measured.normalizedP50Ms / base.p50Ms) : null;
         row.p95Ratio = base.p95Ms > 0 ? round3(measured.normalizedP95Ms / base.p95Ms) : null;
+        const releaseFailures = [];
         for (const [label, ratio, value, reference] of [
             ['p50', row.p50Ratio, measured.normalizedP50Ms, base.p50Ms],
             ['p95', row.p95Ratio, measured.normalizedP95Ms, base.p95Ms],
         ]) {
             if (ratio == null || ratio <= budgets.maxQueryClassRatio) continue;
             if (value - reference <= budgets.minQueryClassDeltaMs) continue;
-            gate(`${classId} ${label} ${value}ms is ${ratio}x the release ${baseline.engine || 'baseline'} ` +
+            releaseFailures.push(`${classId} ${label} ${value}ms is ${ratio}x the release ${baseline.engine || 'baseline'} ` +
                 `${reference}ms (limit ${budgets.maxQueryClassRatio}x and +${budgets.minQueryClassDeltaMs}ms)`);
+        }
+        const cohorts = capabilities ? evaluateCapabilityCohorts(classId, measured, baseline, budgets,
+            { repo, hostClass, pinnedCommit: QUERY_BOARD_PINS[repo]?.commit, capabilityPins }) : null;
+        if (cohorts) {
+            row.releaseComparison = { failed: releaseFailures.length > 0, failures: releaseFailures };
+            row.capabilityCohorts = cohorts.rows;
+            row.comparisonBasis = 'capability-cohorts';
+        }
+        for (const failure of cohorts ? cohorts.failures : releaseFailures) {
+            gate(failure);
             row.failed = true;
         }
     }

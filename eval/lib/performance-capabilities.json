@@ -1,0 +1,733 @@
+{
+  "schemaVersion": 1,
+  "releaseEngine": "5.5.1 (a274a48)",
+  "referenceHost": "darwin-arm64",
+  "origins": {
+    "release": {
+      "kind": "release",
+      "commit": "a274a48b6ddbc73b148c80052e169e0a8f30c60c",
+      "measuredAt": "2026-10-30",
+      "processSamples": 6,
+      "hostFactors": [
+        0.9496,
+        0.9766
+      ]
+    },
+    "type-references": {
+      "kind": "first-capability",
+      "commit": "291387b431fc3e686c96c2558d7cd1ce9947ca35",
+      "capability": "typeReferences",
+      "measuredAt": "2026-11-04",
+      "processSamples": 3,
+      "hostFactors": [
+        0.9727
+      ],
+      "runnerSha256": "7b160b2e65103e7c8beb5be4739a85acb376b1c84568e91b9e10e2993b17cb0f"
+    },
+    "value-accesses": {
+      "kind": "first-capability",
+      "commit": "5b7259c752c7f51b7980968761a3913f9ddece71",
+      "capability": "valueAccesses",
+      "measuredAt": "2026-11-04",
+      "processSamples": 3,
+      "hostFactors": [
+        0.9591
+      ],
+      "runnerSha256": "7b160b2e65103e7c8beb5be4739a85acb376b1c84568e91b9e10e2993b17cb0f"
+    },
+    "value-accesses-first-success": {
+      "kind": "first-success",
+      "commit": "cf4eeb1f31e9ce1e94e3db5dda48eebd42854d6e",
+      "capability": "valueAccesses",
+      "measuredAt": "2026-11-04",
+      "processSamples": 3,
+      "reason": "The introducing revision errors for this handle; this revision first returns its value-access band.",
+      "hostFactors": [
+        0.9842
+      ],
+      "runnerSha256": "7b160b2e65103e7c8beb5be4739a85acb376b1c84568e91b9e10e2993b17cb0f"
+    }
+  },
+  "repos": {
+    "preact-signals": {
+      "commit": "e0ce9fdf92df7f0ece2c89d44554c39f36dc6882",
+      "classes": {
+        "class-impact": {
+          "boardKey": "2713947aa480",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "src/index.ts:269:Signal",
+                "src/index.ts:591:Computed",
+                "src/index.ts:840:Effect"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  7.146088,
+                  1.24396,
+                  2.095199
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "typeReferences",
+              "handles": [
+                "src/index.ts:324:SignalOptions",
+                "src/index.ts:740:ReadonlySignal",
+                "src/index.ts:858:EffectOptions"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  1.04956,
+                  1.193938,
+                  0.737252
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "2bf8ac03a7e6",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "src/index.ts:17:_source",
+                "src/index.ts:30:_version",
+                "src/index.ts:271:_value",
+                "src/index.ts:318:brand",
+                "src/index.ts:594:_globalVersion",
+                "src/index.ts:843:_sources"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  8.886456,
+                  5.491607,
+                  3.466792,
+                  6.049421,
+                  2.318841,
+                  6.506099
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "httpx": {
+      "commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+      "classes": {
+        "class-impact": {
+          "boardKey": "94ebce837c8e",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "httpx/_models.py:515:Response",
+                "httpx/_client.py:594:Client",
+                "httpx/_auth.py:22:Auth",
+                "httpx/_decoders.py:44:IdentityDecoder",
+                "httpx/_exceptions.py:187:ConnectError",
+                "httpx/_models.py:1261:_CookieCompatResponse"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  38.838285,
+                  22.883726,
+                  2.756246,
+                  1.166855,
+                  2.580446,
+                  0.797779
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "a777dee1b588",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "httpx/_client.py:114:USE_CLIENT_DEFAULT",
+                "httpx/_config.py:20:UNSET",
+                "httpx/_decoders.py:381:SUPPORTED_DECODERS",
+                "httpx/_urlparse.py:32:UNRESERVED_CHARACTERS",
+                "httpx/_urlparse.py:49:QUERY_SAFE",
+                "httpx/_urlparse.py:89:USERINFO_SAFE"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  22.692107,
+                  5.022417,
+                  12.716088,
+                  5.894067,
+                  2.720259,
+                  2.538838
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "cobra": {
+      "commit": "ad460ea8f249db69c943a365fb84f3a59042d54e",
+      "classes": {
+        "class-impact": {
+          "boardKey": "139a405e02e6",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "command.go:54:Command",
+                "doc/man_docs.go:94:GenManHeader",
+                "command.go:45:Group",
+                "completions.go:47:flagCompError",
+                "doc/yaml_docs.go:30:cmdOption"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  68.714917,
+                  1.891642,
+                  3.395703,
+                  0.719646,
+                  0.730955
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "typeReferences",
+              "handles": [
+                "completions.go:311:SliceValue"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  3.099529
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "1b363f6ce906",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "bash_completions.go:30:BashCompFilenameExt",
+                "command.go:80:Long",
+                "command.go:149:commandgroups",
+                "command.go:200:outWriter",
+                "command.go:259:SuggestionsMinimumDistance",
+                "doc/man_docs.go:86:Path"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  18.299447,
+                  33.20196,
+                  6.918987,
+                  6.514441,
+                  6.130748,
+                  2.344907
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "viper": {
+      "commit": "528f7416c4b56a4948673984b190bf8713f0c3c4",
+      "classes": {
+        "class-impact": {
+          "boardKey": "076d9c12ad0a",
+          "cohorts": [
+            {
+              "origin": "release",
+              "capability": "typeReferences",
+              "handles": [
+                "encoding.go:27:Codec",
+                "encoding.go:16:Encoder"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  2.959246,
+                  2.016179
+                ]
+              }
+            },
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "internal/encoding/dotenv/codec.go:16:Codec",
+                "errors.go:20:ConfigFileNotFoundError",
+                "flags.go:22:pflagValueSet",
+                "remote.go:25:RemoteResponse"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  2.485864,
+                  2.54138,
+                  1.454714,
+                  0.727871
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "28a1d628d129",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "encoding.go:28:Encoder",
+                "errors.go:38:locations",
+                "internal/features/finder.go:6:Finder",
+                "util.go:27:err",
+                "viper.go:128:envPrefix",
+                "viper.go:140:env"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  11.375248,
+                  5.752268,
+                  8.644563,
+                  38.362006,
+                  8.149307,
+                  12.028986
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ripgrep": {
+      "commit": "82313cf95849bfe425109ad9506a52154879b1b1",
+      "classes": {
+        "class-impact": {
+          "boardKey": "b3aa5ce1afab",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "crates/core/search.rs:19:Config",
+                "crates/printer/src/json.rs:25:Config",
+                "crates/cli/src/decompress.rs:15:DecompressionMatcherBuilder",
+                "crates/core/flags/defs.rs:5332:PCRE2"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  13.378226,
+                  7.934615,
+                  1.762105,
+                  6.250643
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "typeReferences",
+              "handles": [
+                "crates/globset/src/lib.rs:167:ErrorKind",
+                "crates/printer/src/hyperlink/mod.rs:106:State"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  17.797461,
+                  4.457301
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "610b1c5a5166",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "crates/cli/src/decompress.rs:17:commands",
+                "crates/core/flags/lowargs.rs:65:ignore_file",
+                "crates/core/search.rs:239:searcher",
+                "crates/ignore/src/walk.rs:238:path",
+                "crates/printer/src/json.rs:55:config",
+                "crates/regex/src/config.rs:31:ignore_whitespace"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  10.797623,
+                  30.203316,
+                  36.769888,
+                  117.666562,
+                  36.780315,
+                  6.200605
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "clap": {
+      "commit": "d3e59a9ab214910b9dad02921b7ef42c6400de9b",
+      "classes": {
+        "class-impact": {
+          "boardKey": "3f3ef09a29c3",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "clap_builder/src/builder/command.rs:74:Command",
+                "clap_builder/src/builder/arg.rs:60:Arg",
+                "clap_bench/benches/complex.rs:118:Args",
+                "clap_builder/src/util/flat_map.rs:179:VacantEntry",
+                "clap_lex/src/lib.rs:399:ShortFlags"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  644.448442,
+                  252.010898,
+                  22.024262,
+                  2.103423,
+                  3.73188
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "typeReferences",
+              "handles": [
+                "clap_builder/src/builder/value_parser.rs:2646:_impls_From_OsStringSealed"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  17.810772
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "1d2368d6e55f",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "clap_bench/benches/complex.rs:65:COMPLEX_ARGS",
+                "clap_builder/src/builder/arg_settings.rs:47:Hidden",
+                "clap_builder/src/error/context.rs:7:InvalidSubcommand",
+                "clap_builder/src/parser/matches/arg_matches.rs:1756:iter",
+                "clap_complete/src/lib.rs:55:INTERNAL_ERROR_MSG",
+                "clap_mangen/src/lib.rs:20:title"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  12.44083,
+                  31.237619,
+                  35.307059,
+                  93.295798,
+                  16.663539,
+                  15.374831
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "javapoet": {
+      "commit": "b9017a9503b76e11b4ad4c1a9f050e2d29112cb0",
+      "classes": {
+        "class-impact": {
+          "boardKey": "f1771ef8e7ca",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "src/main/java/com/squareup/javapoet/ClassName.java:33:ClassName",
+                "src/main/java/com/squareup/javapoet/TypeName.java:68:TypeName",
+                "src/main/java/com/squareup/javapoet/AnnotationSpec.java:44:AnnotationSpec",
+                "src/main/java/com/squareup/javapoet/CodeWriter.java:44:CodeWriter",
+                "src/main/java/com/squareup/javapoet/ParameterizedTypeName.java:31:ParameterizedTypeName"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  45.257531,
+                  23.47692,
+                  12.719235,
+                  4.885371,
+                  10.52123
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "typeReferences",
+              "handles": [
+                "src/main/java/com/squareup/javapoet/LineWrapper.java:139:FlushType"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  1.780668
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "dfc124550211",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "src/main/java/com/squareup/javapoet/AnnotationSpec.java:45:VALUE",
+                "src/main/java/com/squareup/javapoet/CodeWriter.java:55:packageName",
+                "src/main/java/com/squareup/javapoet/JavaFile.java:64:alwaysQualify",
+                "src/main/java/com/squareup/javapoet/MethodSpec.java:54:exceptions",
+                "src/main/java/com/squareup/javapoet/TypeName.java:70:BOOLEAN",
+                "src/main/java/com/squareup/javapoet/TypeSpec.java:58:enumConstants"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  6.714628,
+                  11.487853,
+                  8.737358,
+                  5.931603,
+                  7.748931,
+                  10.223126
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "newtonsoft-json": {
+      "commit": "4f73e74372445108d2c1bda37b36e6f5e43402e0",
+      "classes": {
+        "class-impact": {
+          "boardKey": "620e153620df",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "Utilities/ValidationUtils.cs:32:ValidationUtils",
+                "Utilities/MiscellaneousUtils.cs:41:MiscellaneousUtils",
+                "JsonNameTable.cs:6:JsonNameTable",
+                "Utilities/BidirectionalDictionary.cs:33:BidirectionalDictionary"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  202.538295,
+                  242.775779,
+                  1.624345,
+                  3.187005
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "typeReferences",
+              "handles": [
+                "Bson/BsonBinaryType.cs:32:BsonBinaryType",
+                "NullValueHandling.cs:35:NullValueHandling"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  36.731518,
+                  89.275484
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "1998b64275bc",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "Bson/BsonBinaryType.cs:34:Binary",
+                "JsonContainerAttribute.cs:116:_itemTypeNameHandling",
+                "Linq/JsonPath/QueryExpression.cs:35:Operator",
+                "Utilities/ConvertUtils.cs:88:TimeSpanNullable"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  27.920968,
+                  30.324262,
+                  18.528829,
+                  77.046189
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "propertyAccesses",
+              "handles": [
+                "JsonTextReader.cs:2640:LineNumber",
+                "Serialization/JsonContract.cs:237:DefaultCreator"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  120.056318,
+                  127.674585
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "cjson": {
+      "commit": "c859b25da02955fef659d658b8f324b5cde87be3",
+      "classes": {
+        "class-impact": {
+          "boardKey": "62cf8e8ac68f",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "cJSON.c:88:error",
+                "cJSON.c:156:internal_hooks",
+                "cJSON.c:289:parse_buffer",
+                "cJSON.c:473:printbuffer",
+                "cJSON.h:103:cJSON",
+                "cJSON.h:125:cJSON_Hooks"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  6.631027,
+                  11.288167,
+                  3.047188,
+                  2.569137,
+                  17.17693,
+                  3.7216
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "40d1801f7da2",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "cJSON.c:90:position",
+                "cJSON.c:292:length",
+                "cJSON.c:476:length",
+                "cJSON.c:480:format",
+                "cJSON.h:119:valuedouble",
+                "cJSON_Utils.c:740:MOVE"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  12.135335,
+                  24.725263,
+                  8.490251,
+                  8.035658,
+                  15.198624,
+                  3.854655
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "fmt": {
+      "commit": "e424e3f2e607da02742f73db84873b8084fc714c",
+      "classes": {
+        "class-impact": {
+          "boardKey": "5a5f949960e9",
+          "cohorts": [
+            {
+              "origin": "type-references",
+              "capability": "typeReferences",
+              "handles": [
+                "include/fmt/base.h:648:formatter",
+                "include/fmt/base.h:2792:formatter",
+                "include/fmt/args.h:22:is_reference_wrapper",
+                "include/fmt/base.h:2864:format_to_n_result",
+                "include/fmt/format.h:294:bytes",
+                "include/fmt/ranges.h:37:is_set"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  111.384805,
+                  33.861417,
+                  7.524417,
+                  7.941811,
+                  35.057058,
+                  7.643672
+                ]
+              }
+            }
+          ]
+        },
+        "value-impact": {
+          "boardKey": "b98abd28dccb",
+          "cohorts": [
+            {
+              "origin": "value-accesses",
+              "capability": "valueAccesses",
+              "handles": [
+                "include/fmt/args.h:40:next",
+                "include/fmt/base.h:2139:size",
+                "include/fmt/color.h:40:dark_golden_rod",
+                "include/fmt/color.h:121:pale_turquoise",
+                "include/fmt/format-inl.h:224:shift_amount"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  35.636534,
+                  381.803774,
+                  9.61735,
+                  6.385153,
+                  6.618705
+                ]
+              }
+            },
+            {
+              "origin": "value-accesses-first-success",
+              "capability": "valueAccesses",
+              "handles": [
+                "include/fmt/format.h:3882:separator_"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  13.129445
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

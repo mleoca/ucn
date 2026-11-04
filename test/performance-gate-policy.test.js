@@ -882,6 +882,8 @@ describe('fix #432: query-class performance board', () => {
             for (const [classId, row] of Object.entries(classes)) {
                 assert.equal(row.errors, 0, `${classId}: ${row.errorDetails.join('; ')}`);
                 assert.equal(row.samplesMs.length, row.handles.length);
+                if (classId === 'class-impact') assert.ok(row.capabilities.every(c => c.typeReferences));
+                if (classId === 'value-impact') assert.ok(row.capabilities.every(c => c.valueAccesses));
             }
             assert.deepEqual(Object.keys(classes), board.QUERY_CLASSES.map(c => c.id));
         } finally { rm(dir); }
@@ -901,5 +903,150 @@ describe('fix #432: query-class performance board', () => {
             { encoding: 'utf8' });
         assert.notEqual(selfPinned.status, 0);
         assert.match(selfPinned.stderr, /measures the last release/);
+    });
+});
+
+describe('impact performance capability cohorts', () => {
+    const board = require('../eval/lib/performance-query-board');
+    const { CAPABILITY_PINS, impactCapabilities } = require('../eval/lib/performance-capabilities');
+    const { queryClassMarkdownRows } = require('../eval/run-performance-gate');
+    const budgets = { ...DEFAULT_BUDGETS, requireQueryClassBaselines: true };
+    const handles = ['src/a.java:1:OldType', 'src/a.java:2:NewType'];
+    const key = board.boardKey(handles);
+    const release = { engine: '5.5.1 (a274a48)', classes: {
+        'class-impact': { boardKey: key, p50Ms: 5, p95Ms: 20 },
+    } };
+    const fixture = () => ({
+        schemaVersion: 1, releaseEngine: release.engine,
+        origins: { release: { kind: 'release', commit: '1'.repeat(40) },
+            types: { kind: 'first-capability', capability: 'typeReferences', commit: '2'.repeat(40) } },
+        repos: { fmt: { commit: board.QUERY_BOARD_PINS.fmt.commit, classes: {
+            'class-impact': { boardKey: key, cohorts: [
+                { origin: 'release', capability: 'typeReferences', handles: handles.slice(0, 1),
+                    baselineByHost: { 'darwin-arm64': [5] } },
+                { origin: 'types', capability: 'typeReferences', handles: handles.slice(1),
+                    baselineByHost: { 'darwin-arm64': [100] } },
+            ] },
+        } } },
+    });
+    const measured = (times = [5, 100]) => board.summarizeQueryClasses([{
+        'class-impact': { handles, samplesMs: times, errors: 0,
+            capabilities: handles.map(() => ({ typeReferences: true })) },
+    }]);
+    const judge = (summary = measured(), capabilityPins = fixture(), baseline = release, extra = {}) =>
+        board.evaluateQueryClasses(summary, baseline, budgets,
+            { repo: 'fmt', hostClass: 'darwin-arm64', capabilityPins, ...extra });
+
+    it('retains a failing raw release comparison beside a passing expanded-capability comparison', () => {
+        const result = judge();
+        assert.deepEqual(result.failures, []);
+        const row = result.rows['class-impact'];
+        assert.equal(row.releaseComparison.failed, true);
+        assert.equal(row.p95Ratio, 5);
+        assert.equal(row.failed, false);
+        assert.equal(row.capabilityCohorts.length, 2);
+        const text = queryClassMarkdownRows({ repo: 'fmt', queryClassRows: result.rows }).join('\n');
+        assert.match(text, /Raw release \*\*FAIL\*\*; capability gate PASS/);
+        assert.match(text, /class-impact \/ types/);
+        assert.match(text, /222222222222/);
+    });
+
+    it('still rejects regressions in either an existing or a new capability', () => {
+        assert.ok(judge(measured([5, 122])).failures.some(f => /types p95/.test(f)));
+        // A much faster new band cannot hide a slower existing band.
+        assert.ok(judge(measured([12, 30])).failures.some(f => /release p95/.test(f)));
+        assert.deepEqual(judge(measured([5, 104])).failures, []);
+    });
+
+    it('requires a consistent band in every process, even when the missing one is slower', () => {
+        const summary = board.summarizeQueryClasses([
+            { 'class-impact': { handles, samplesMs: [5, 100], errors: 0,
+                capabilities: [{ typeReferences: true }, { typeReferences: true }] } },
+            { 'class-impact': { handles, samplesMs: [6, 110], errors: 0,
+                capabilities: [{ typeReferences: true }, { typeReferences: false }] } },
+        ]);
+        assert.ok(judge(summary).failures.some(f => /typeReferences missing or inconsistent/.test(f)));
+        summary['class-impact'].errors = 1;
+        assert.ok(judge(summary).failures.some(f => /1 query error/.test(f)));
+    });
+
+    it('refuses incomplete, duplicated, mismatched or unmeasured reference data', () => {
+        const mutations = [
+            p => { p.repos.fmt.commit = '3'.repeat(40); },
+            p => { p.repos.fmt.classes['class-impact'].boardKey = 'different'; },
+            p => { p.repos.fmt.classes['class-impact'].cohorts.pop(); },
+            p => { p.repos.fmt.classes['class-impact'].cohorts[1].handles = handles.slice(0, 1); },
+            p => { p.repos.fmt.classes['class-impact'].cohorts[1].baselineByHost = {}; },
+            p => { p.repos.fmt.classes['class-impact'].cohorts[1].baselineByHost['darwin-arm64'] = 'x'; },
+            p => { p.origins.types.commit = 'working-tree'; },
+            p => { delete p.origins.types; },
+            p => { p.origins.types.capability = 'valueAccesses'; },
+        ];
+        for (const mutate of mutations) {
+            const pins = fixture(); mutate(pins);
+            assert.ok(judge(measured(), pins).failures.length > 0);
+        }
+        assert.ok(judge(measured(), fixture(), { ...release, engine: 'a later release' }).failures.length > 0);
+        assert.ok(judge(measured(), fixture(), { ...release, classes: {} }).failures.some(f => /missing release baseline/.test(f)));
+        const invalid = measured(); invalid['class-impact'].normalizedBestMs[1] = NaN;
+        assert.ok(judge(invalid).failures.length > 0);
+    });
+
+    it('historical engine measurements keep the raw release comparison', () => {
+        const result = judge(measured(), fixture(), release, { capabilities: false });
+        assert.ok(result.failures.some(f => /class-impact p95/.test(f)));
+        assert.equal(result.rows['class-impact'].capabilityCohorts, undefined);
+    });
+
+    it('checks real band structure and conservation without freezing confirmed-site counts', () => {
+        const band = { confirmedCount: 1, unverifiedCount: 1, totalCandidates: 2,
+            byFile: [{ file: 'a.java', count: 1, sites: [{ line: 3 }] }],
+            unverifiedSites: [{ file: 'b.java', line: 4 }], excluded: { total: 0 },
+            account: { conserved: true } };
+        assert.equal(impactCapabilities({ typeReferences: band }).typeReferences, true);
+        assert.equal(impactCapabilities({ typeReferences: {} }).typeReferences, false);
+        assert.equal(impactCapabilities({}).typeReferences, false);
+        for (const mutate of [
+            b => { b.totalCandidates = 0; }, b => { b.byFile[0].sites = []; },
+            b => { b.unverifiedSites = []; }, b => { b.account.conserved = false; },
+        ]) {
+            const broken = structuredClone(band); mutate(broken);
+            assert.equal(impactCapabilities({ typeReferences: broken }).typeReferences, false);
+        }
+        const demoted = { ...band, confirmedCount: 0, unverifiedCount: 2, byFile: [],
+            unverifiedSites: [{ line: 3 }, { line: 4 }] };
+        assert.equal(impactCapabilities({ typeReferences: demoted }).typeReferences, true);
+    });
+
+    it('covers all impact handles at their pinned commits without changing other query classes', () => {
+        const counts = {};
+        let classes = 0;
+        for (const repo of RELEASE_REPOS) {
+            const pin = CAPABILITY_PINS.repos[repo.name];
+            assert.equal(pin.commit, repo.commit);
+            assert.deepEqual(Object.keys(pin.classes), ['class-impact', 'value-impact']);
+            for (const [classId, group] of Object.entries(pin.classes)) {
+                classes++;
+                const queries = board.boardQueries(board.QUERY_BOARD_PINS[repo.name]).filter(q => q.classId === classId);
+                const expected = queries.map(q => q.handle);
+                const actual = group.cohorts.flatMap(c => c.handles);
+                assert.equal(group.boardKey, board.boardKey(expected));
+                assert.equal(new Set(actual).size, expected.length);
+                assert.deepEqual([...actual].sort(), [...expected].sort());
+                for (const cohort of group.cohorts) {
+                    counts[cohort.origin] = (counts[cohort.origin] || 0) + cohort.handles.length;
+                    assert.equal(cohort.baselineByHost['darwin-arm64'].length, cohort.handles.length);
+                    assert.ok(cohort.baselineByHost['darwin-arm64'].every(ms => Number.isFinite(ms) && ms >= 0));
+                }
+            }
+        }
+        assert.equal(classes, 20);
+        assert.deepEqual(counts, { 'type-references': 48, release: 14, 'value-accesses': 57,
+            'value-accesses-first-success': 1 });
+        for (const origin of Object.values(CAPABILITY_PINS.origins)) {
+            assert.match(origin.commit, /^[a-f0-9]{40}$/);
+            assert.ok(origin.processSamples >= 3);
+            assert.ok(origin.hostFactors.every(factor => factor > 0 && Number.isFinite(factor)));
+        }
     });
 });

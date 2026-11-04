@@ -171,6 +171,12 @@ npm run verify
 npm run trust:gate
 ```
 
+Performance reports retain the last release's query timings. Impact queries
+that gained a reference band also use [capability cohorts](eval/performance-capabilities.md)
+measured on the first working revision of that capability, with the same
+1.15x and +5 ms limits. Existing capabilities keep their release reference;
+missing bands fail the comparison. Raw release results remain visible.
+
 ## Commands
 
 | Task | Command |

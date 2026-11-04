@@ -51,6 +51,7 @@ const {
     selectQueryHandles,
     summarizeQueryClasses,
 } = require('./lib/performance-query-board');
+const { impactCapabilities } = require('./lib/performance-capabilities');
 
 const CALIBRATION_SCRIPT = path.join(__dirname, 'lib', 'host-calibration.js');
 
@@ -303,7 +304,7 @@ function runQueryClassBoard(index, pins) {
     for (const query of boardQueries(pins)) {
         let row = classes[query.classId];
         if (!row) {
-            row = classes[query.classId] = { handles: [], samplesMs: [], errors: 0, errorDetails: [] };
+            row = classes[query.classId] = { handles: [], samplesMs: [], capabilities: [], errors: 0, errorDetails: [] };
         }
         const started = performance.now();
         let response;
@@ -314,6 +315,7 @@ function runQueryClassBoard(index, pins) {
         }
         row.samplesMs.push(elapsed(started));
         row.handles.push(query.handle ?? query.command);
+        row.capabilities.push(query.command === 'impact' && response?.ok ? impactCapabilities(response.result) : null);
         if (!response?.ok) {
             row.errors++;
             if (row.errorDetails.length < 5) {
@@ -460,7 +462,7 @@ async function evaluateRepo(repo) {
     const queryClassSummary = queryClasses
         ? summarizeQueryClasses([queryClasses], verdict.hostFactor) : null;
     const queryClassVerdict = evaluateQueryClasses(queryClassSummary,
-        queryBaselineFor(queryPins), budgets, { repo: repo.name, hostClass: HOST_CLASS });
+        queryBaselineFor(queryPins), budgets, { repo: repo.name, hostClass: HOST_CLASS, capabilities: !engineRootArg });
     const failures = [...verdict.failures, ...queryClassVerdict.failures];
     const warnings = [...verdict.warnings, ...queryClassVerdict.warnings];
     const firstSummary = summarizeSamples(firstQuerySamplesMs);
@@ -616,7 +618,7 @@ function aggregateRepoRuns(repo, runs) {
     const queryClassSummary = classRuns.length
         ? summarizeQueryClasses(classRuns, verdict.hostFactor) : null;
     const queryClassVerdict = evaluateQueryClasses(queryClassSummary,
-        queryBaselineFor(queryBoardFor(repo)), budgets, { repo: repo.name, hostClass: HOST_CLASS });
+        queryBaselineFor(queryBoardFor(repo)), budgets, { repo: repo.name, hostClass: HOST_CLASS, capabilities: !engineRootArg });
     const failures = [...verdict.failures, ...queryClassVerdict.failures];
     const warnings = [...verdict.warnings, ...queryClassVerdict.warnings];
     const slowestQueries = runs.flatMap(run => run.slowestQueries || [])
@@ -699,19 +701,34 @@ function printResult(repo, result) {
             `${row.normalizedP50Ms}/${row.normalizedP95Ms}ms` +
             (row.baseline ? ` vs release ${row.baseline.p50Ms}/${row.baseline.p95Ms}ms = ` +
                 `${row.p50Ratio ?? '-'}x/${row.p95Ratio ?? '-'}x` : ' (no release baseline)') +
-            `${row.failed ? ' FAIL' : ''} | slowest ${row.slowest.map(item =>
+            (row.releaseComparison ? ` | raw release ${row.releaseComparison.failed ? 'FAIL' : 'PASS'}; ` +
+                `capability gate ${row.failed ? 'FAIL' : 'PASS'}` : row.failed ? ' FAIL' : '') +
+            ` | slowest ${row.slowest.map(item =>
                 `${item.handle} ${item.ms}ms`).join(', ')}\n`);
+        for (const cohort of row.capabilityCohorts || []) {
+            process.stdout.write(`    ${cohort.origin} n=${cohort.handles.length} | p50/p95 ` +
+                `${cohort.p50Ms}/${cohort.p95Ms}ms vs ${cohort.engine.slice(0, 12)} ` +
+                `${cohort.baselineP50Ms}/${cohort.baselineP95Ms}ms | ${cohort.failed ? 'FAIL' : 'PASS'}\n`);
+        }
     }
 }
 
 /** Markdown rows of the query-class board for one repository result. */
 function queryClassMarkdownRows(result) {
-    return Object.entries(result.queryClassRows || {}).map(([classId, row]) =>
-        `| ${result.repo} | ${classId} | ${row.handles.length} | ${row.normalizedP50Ms}ms | ` +
+    return Object.entries(result.queryClassRows || {}).flatMap(([classId, row]) => {
+        const status = row.errors ? `**${row.errors} error(s)**` : row.releaseComparison
+            ? `Raw release ${row.releaseComparison.failed ? '**FAIL**' : 'PASS'}; capability gate ${row.failed ? '**FAIL**' : 'PASS'}`
+            : row.failed ? '**FAIL**' : row.baseline ? 'PASS' : 'reported';
+        return [`| ${result.repo} | ${classId} | ${row.handles.length} | ${row.normalizedP50Ms}ms | ` +
         `${row.normalizedP95Ms}ms | ${row.baseline ? `${row.baseline.p50Ms}/${row.baseline.p95Ms}ms` : '-'} | ` +
         `${row.p50Ratio ?? '-'}/${row.p95Ratio ?? '-'} | ` +
-        `${row.slowest.map(item => `\`${item.handle}\` ${item.ms}ms`).join(', ')} | ` +
-        `${row.errors ? `**${row.errors} error(s)**` : row.failed ? '**FAIL**' : row.baseline ? 'PASS' : 'reported'} |`);
+        `${row.slowest.map(item => `\`${item.handle}\` ${item.ms}ms`).join(', ')} | ${status} |`,
+        ...(row.capabilityCohorts || []).map(cohort =>
+            `| ${result.repo} | ${classId} / ${cohort.origin} | ${cohort.handles.length} | ` +
+            `${cohort.p50Ms}ms | ${cohort.p95Ms}ms | ${cohort.engine.slice(0, 12)}: ` +
+            `${cohort.baselineP50Ms}/${cohort.baselineP95Ms}ms | ${cohort.p50Ratio ?? '-'}/${cohort.p95Ratio ?? '-'} | ` +
+            `- | ${cohort.failed ? '**FAIL**' : 'PASS'} |`)];
+    });
 }
 
 /**
@@ -968,14 +985,17 @@ async function main() {
             ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
             : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} (${r.normalizedColdLocPerSec}) | ${r.coldLocPerCpuSec} (${r.normalizedColdLocPerCpuSec}) | ${r.wallThroughputRatio ?? '-'}/${r.cpuThroughputRatio ?? '-'} | ${r.actualWorkerCount}${r.requestedWorkerCount == null ? '' : `/${r.requestedWorkerCount}`} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}/${r.firstQueryMaxMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.buildPeakRssMb}/${r.boardPeakRssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : r.warnings.length ? `PASS (${r.warnings.join('; ')})` : 'PASS'} |`),
         '',
-        '## Query classes vs the last release',
+        '## Query performance references',
         '',
         'Per handle the best of the isolated process samples, host-normalized; p50/p95 over the ' +
             'class\'s pinned handles, compared with the same handles measured on the release ' +
             `engine on this host class (limit ${budgets.maxQueryClassRatio}x and ` +
-            `+${budgets.minQueryClassDeltaMs}ms).`,
+            `+${budgets.minQueryClassDeltaMs}ms). Impact classes with a new reference band retain their raw ` +
+            'release comparison and gate the following capability cohorts against the first working ' +
+            'revision that supplied that band. Existing capabilities retain the release reference; ' +
+            'missing or inconsistent bands fail the comparison.',
         '',
-        '| repo | class | n | p50 | p95 | release p50/p95 | ratio p50/p95 | slowest | result |',
+        '| repo | class / cohort | n | p50 | p95 | reference p50/p95 | ratio p50/p95 | slowest | result |',
         '|---|---|---:|---:|---:|---:|---:|---|---|',
         ...results.flatMap(r => (r.error ? [] : queryClassMarkdownRows(r))),
         '',
@@ -1096,6 +1116,7 @@ module.exports = {
     evaluateRepo,
     aggregateRepoRuns,
     runQueryClassBoard,
+    queryClassMarkdownRows,
     collectPerformanceRollup,
     performanceScope,
     percentile,
