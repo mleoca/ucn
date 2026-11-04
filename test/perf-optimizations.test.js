@@ -3558,6 +3558,48 @@ describe('fix #418: witnesses share recorded facts, record project facts once an
         } finally { rm(dir); }
     });
 
+    it('producer method groups share inheritance reads across distinct argument shapes', () => {
+        const dir = tmp({
+            'p/Use.java': 'package p; import shared.Target;\nclass Base { static String make(int n) { return ""; } }\nclass Factory extends Base { static String make(String s) { return s; } }\nclass Use { void run() { Target.pick(Factory.make(1)); Target.pick(Factory.make("s")); } }\n',
+            'q/Use.java': 'package q; import shared.Target;\nclass Factory { static Integer make(int n) { return n; } }\nclass Use { void run() { Target.pick(Factory.make(1)); } }\n',
+            'shared/Target.java': 'package shared; public class Target {\n public static void pick(String value) {}\n public static void pick(Integer value) {}\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { selectProvenanceOverload } = require('../core/callers');
+            const candidates = index.symbols.get('pick');
+            const identities = candidates.map(declarationIdentity);
+            const capture = (relativePath, ordinal = 0) => {
+                const file = path.join(dir, relativePath);
+                const call = index.getCachedCalls(file).filter(c => c.name === 'pick')[ordinal];
+                return captureOverload(index, { ...call, argumentFile: file }, candidates, 'java', selectProvenanceOverload);
+            };
+            const check = (witness, line) => {
+                assert.strictEqual(witness.outcome, 'selected');
+                assert.deepStrictEqual(witness.selected, declarationIdentity(candidates.find(d => d.startLine === line)));
+                assert.strictEqual(validateOverload(JSON.parse(JSON.stringify(witness)), identities, witness.selected), true);
+            };
+            index._beginOp();
+            try {
+                check(capture('p/Use.java'), 2);
+                const second = capture('p/Use.java', 1);
+                check(second, 2);
+                check(capture('q/Use.java'), 3);
+                const copied = JSON.parse(JSON.stringify(second));
+                const inherited = Object.keys(copied.reads).filter(key => key.startsWith('symbols.get:') && key.includes('Base'));
+                assert.ok(inherited.length, 'each witness retains the inherited producer lookup');
+                for (const key of inherited) delete copied.reads[key];
+                assert.strictEqual(validateOverload(copied, identities, second.selected), false);
+            } finally { index._endOp(); }
+            fs.writeFileSync(path.join(dir, 'p/Use.java'),
+                'package p; import shared.Target;\nclass Base { static Integer make(int n) { return n; } }\nclass Factory extends Base { static Integer make(String s) { return 1; } }\nclass Use { void run() { Target.pick(Factory.make(1)); Target.pick(Factory.make("s")); } }\n');
+            index.build(null, { quiet: true, workers: 0 });
+            index._beginOp();
+            try { check(capture('p/Use.java'), 3); check(capture('p/Use.java', 1), 3); }
+            finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
     it('the call-name cache states each file once per operation', () => {
         const dir = tmp({ 'a.js': 'function a() { return 1; }\n', 'b.js': 'function b() { return a(); }\n' });
         try {

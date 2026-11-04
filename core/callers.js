@@ -24390,6 +24390,14 @@ function _javaCollectionReturnInfo(index, owner, method, origin, argCount) {
 // same-named method. A producer's return type must cover that whole lookup
 // family; an unindexed ancestor cannot establish a closed set of returns.
 function _producerReturnMethodGroup(index, owner, method, ownerFile, contextFile) {
+    // Argument shapes share the producer's lookup family. Each witness
+    // still records its complete inheritance and ownership reads.
+    const key = JSON.stringify(['producer-method-group', owner, method, ownerFile, contextFile]);
+    return lazyProvenanceOverloadModule().sharedRead(index, key,
+        view => _producerReturnMethodGroupUncached(view, owner, method, ownerFile, contextFile));
+}
+
+function _producerReturnMethodGroupUncached(index, owner, method, ownerFile, contextFile) {
     if (hasParameterizedQualifier(owner)) return null;
     const ownerSimple = owner.replace(/\?$/, '').replace(/<.*$/s, '').split('.').pop();
     const symbols = (index.symbols.get(method) || []).filter(def => def.returnType);
