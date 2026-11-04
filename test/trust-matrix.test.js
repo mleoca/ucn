@@ -127,6 +127,38 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         assert.match(weekly, /trust:gate:performance/);
         assert.match(weekly, /clangd-18/);
         assert.match(weekly, /setup-dotnet@v5/);
+        assert.ok(weekly.indexOf('run: npm run trust:gate:performance')
+            < weekly.indexOf('run: node eval/conservation-real.js'),
+        'weekly timing precedes the independent correctness arms');
+    });
+
+    it('weekly arms survive an earlier failure but stop for cancellation or missing dependencies', () => {
+        const vm = require('node:vm');
+        const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
+        const arms = workflow.split(/\n      - name: /).filter(step =>
+            /\n        run: (?:node eval\/|npm run trust:gate)/.test(step));
+        assert.strictEqual(arms.length, 8);
+        for (const step of arms) {
+            const expression = step.match(/\n        if: \$\{\{ (.+) \}\}/)?.[1];
+            assert.ok(expression?.includes('!cancelled()'), step.split('\n')[0]);
+            assert.doesNotMatch(step, /continue-on-error:/);
+            const evaluate = (event, full, cancelled, outcome) => vm.runInNewContext(expression, {
+                github: { event_name: event }, inputs: { full },
+                cancelled: () => cancelled, steps: { dependencies: { outcome } },
+                // Explicit status functions prevent the implicit success()
+                // condition from skipping all subsequent arms after failure.
+                success: () => false,
+            });
+            const pretag = step.startsWith('"Pre-tag');
+            const outcome = step.startsWith('"Outcome');
+            assert.strictEqual(evaluate('schedule', false, false, 'success'), !pretag);
+            assert.strictEqual(evaluate('workflow_dispatch', true, false, 'success'), true);
+            assert.strictEqual(evaluate('workflow_dispatch', false, false, 'success'), pretag || outcome);
+            assert.strictEqual(evaluate('schedule', true, true, 'success'), false);
+            assert.strictEqual(evaluate('workflow_dispatch', true, false, 'failure'), false);
+        }
+        assert.match(workflow, /- run: npm ci\n        id: dependencies/);
+        assert.match(workflow, /name: Upload reports\n        if: always\(\)/);
     });
 
     it('keeps one machine-readable release board across gates and documentation', () => {
@@ -147,7 +179,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         }
         assert.match(readme, /ten-repository/i);
         assert.match(readme, new RegExp(`${REPOS.length} pinned repositories`, 'i'));
-        assert.strictEqual(REPOS.length, 37);
+        assert.strictEqual(REPOS.length, 42);
         for (const name of RELEASE_REPO_NAMES) {
             assert.ok(readme.includes(name), `README must name release repository ${name}`);
         }
@@ -164,6 +196,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
             assert.match(repo.commit, /^[0-9a-f]{40}$/, `${repo.name} is pinned to a full commit`);
         }
         const fresh = FRESH_POOL.map(repo => repo.name);
+        assert.strictEqual(fresh.length, 13);
         assert.strictEqual(new Set(fresh).size, fresh.length);
         const elsewhere = new Set([...pinned, ...OUTCOME_POOL.map(repo => repo.name),
             ...OUTCOME_TUNED.map(repo => repo.name)]);
@@ -174,7 +207,8 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         }
         // Repositories used for tuning belong on the pinned board.
         for (const name of ['dayjs', 'rand', 'pino', 'tanstack-form', 'tqdm', 'zap', 'nom',
-            'guice', 'dapper', 'lz4', 'pugixml', 'stateless']) {
+            'guice', 'dapper', 'lz4', 'pugixml', 'stateless', 'luxon', 'arrow',
+            'more-itertools', 'rust-url', 'indicatif']) {
             assert.ok(pinned.has(name) && !fresh.includes(name), name);
         }
         const languages = new Set(FRESH_POOL.map(repo => repo.language));

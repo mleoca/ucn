@@ -150,11 +150,14 @@ in either the confirmed or unverified band. Unverified candidates, oracle
 abstentions, and unscored findings remain separate. These measurements do not
 establish complete runtime knowledge or identical performance on every machine.
 
-The scheduled board covers 37 pinned repositories: the ten above plus zod,
+The scheduled board covers 42 pinned repositories: the ten above plus zod,
 express, hono, zustand, fastify, dayjs, rich, click, attrs, grpc-go, chi, cursive,
 itertools, rayon, rand, gson, jsoup, pino, tanstack-form, tqdm, zap, nom, guice,
-dapper, lz4, pugixml, and stateless. A rotating fresh-repository arm checks
-codebases outside that pinned board.
+dapper, lz4, pugixml, stateless, luxon, arrow, more-itertools, rust-url, and
+indicatif. A rotating fresh-repository arm checks 13 untuned codebases.
+Repositories used to repair a finding move to the pinned board and receive
+untuned replacements. A fresh failure fails the weekly run; independent
+checks still run and upload their reports.
 
 The [repository manifest](eval/lib/repos.js) records the full commits.
 The [Publish workflow](https://github.com/mleoca/ucn/actions/workflows/publish.yml)

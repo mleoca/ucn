@@ -518,6 +518,43 @@ const REPOS = [
         language: 'csharp',
         targetCandidates: ['.'],
     },
+    // Former holdouts used to repair declaration, producer and receiver
+    // identity. Keep the measured revisions as permanent regression inputs.
+    {
+        name: 'luxon',
+        url: 'https://github.com/moment/luxon',
+        commit: 'f427515a38f6a671f8de663e6bcc040ed81f114e',
+        language: 'javascript',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'arrow',
+        url: 'https://github.com/arrow-py/arrow',
+        commit: '2224255c4acc594d734cef0bbc83360452a67983',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'more-itertools',
+        url: 'https://github.com/more-itertools/more-itertools',
+        commit: '4aeb4338ae1407d8da9723e86da99efeb446f719',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'rust-url',
+        url: 'https://github.com/servo/rust-url',
+        commit: 'cad4a844d8de6100f18b0ca17603ac3866a13c1f',
+        language: 'rust',
+        targetCandidates: ['.'],
+    },
+    {
+        name: 'indicatif',
+        url: 'https://github.com/console-rs/indicatif',
+        commit: '4925bce2ec5ffc8deaccc5658585d3fa30f23ec6',
+        language: 'rust',
+        targetCandidates: ['.'],
+    },
 ];
 
 // Publish-blocking board. Keep this as a named subset of REPOS so every
@@ -550,7 +587,7 @@ const RELEASE_REPOS = Object.freeze(RELEASE_REPO_NAMES.map(name => {
 // stress test found the deadcode base-override family exactly this way).
 // Repos here are UNPINNED — each run resolves HEAD via ls-remote, records the
 // SHA in the report (reproducible after the fact), and rotates through the
-// pool by ISO week so successive runs cover different repos. None of these
+// pool by seven-day UTC intervals since the Unix epoch. None of these
 // appear in REPOS, and none should ever be used to tune a fix — a fresh repo
 // that surfaces a family graduates INTO the pinned board if it's used for
 // engineering, and gets replaced here.
@@ -569,16 +606,20 @@ const RELEASE_REPOS = Object.freeze(RELEASE_REPO_NAMES.map(name => {
 // or installed dependencies (a TypeScript repo with npm dependencies left
 // ts-morph unable to resolve 66% of its definitions without `npm install`,
 // so the TypeScript holdout is dependency-free).
+// The 2026-11-04 replacements for luxon, arrow, more-itertools, rust-url and
+// indicatif were selected from source/build metadata, without engine-score
+// screening. A failed fresh draw remains a failure until investigated; do
+// not rotate it away or weaken the gate. Tuning it triggers graduation.
 const FRESH_POOL = [
     { name: 'jinja', url: 'https://github.com/pallets/jinja', language: 'python', targetCandidates: ['.'] },
-    { name: 'luxon', url: 'https://github.com/moment/luxon', language: 'javascript', targetCandidates: ['.'] },
+    { name: 'papaparse', url: 'https://github.com/mholt/PapaParse', language: 'javascript', targetCandidates: ['.'] },
     { name: 'superstruct', url: 'https://github.com/ianstormtaylor/superstruct', language: 'typescript', targetCandidates: ['.'] },
-    { name: 'arrow', url: 'https://github.com/arrow-py/arrow', language: 'python', targetCandidates: ['.'] },
-    { name: 'more-itertools', url: 'https://github.com/more-itertools/more-itertools', language: 'python', targetCandidates: ['.'] },
+    { name: 'cachetools', url: 'https://github.com/tkem/cachetools', language: 'python', targetCandidates: ['.'] },
+    { name: 'python-dateutil', url: 'https://github.com/dateutil/dateutil', language: 'python', targetCandidates: ['.'] },
     { name: 'toml', url: 'https://github.com/BurntSushi/toml', language: 'go', targetCandidates: ['.'] },
     { name: 'resty', url: 'https://github.com/go-resty/resty', language: 'go', targetCandidates: ['.'] },
-    { name: 'rust-url', url: 'https://github.com/servo/rust-url', language: 'rust', targetCandidates: ['.'] },
-    { name: 'indicatif', url: 'https://github.com/console-rs/indicatif', language: 'rust', targetCandidates: ['.'] },
+    { name: 'semver', url: 'https://github.com/dtolnay/semver', language: 'rust', targetCandidates: ['.'] },
+    { name: 'humantime', url: 'https://github.com/chronotope/humantime', language: 'rust', targetCandidates: ['.'] },
     { name: 'commons-csv', url: 'https://github.com/apache/commons-csv', language: 'java', targetCandidates: ['.'] },
     { name: 'sprache', url: 'https://github.com/sprache/Sprache', language: 'csharp', targetCandidates: ['.'] },
     { name: 'http-parser', url: 'https://github.com/nodejs/http-parser', language: 'c', targetCandidates: ['.'] },
