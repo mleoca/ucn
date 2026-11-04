@@ -3459,6 +3459,59 @@ describe('fix #418: witnesses share recorded facts, record project facts once an
         } finally { rm(dir); }
     });
 
+    it('shared type groups retain witness reads and independent mutable resolver collections', () => {
+        const { TypeReferenceResolver } = require('../core/type-references');
+        const { FILE_FIELDS } = require('../core/provenance-type');
+        const dir = tmp({
+            'base.hpp': 'namespace p { struct Box; }\n',
+            'box.hpp': '#include "base.hpp"\nnamespace p { struct Box { Box(int) {} }; }\n',
+            'use.cpp': '#include "box.hpp"\nnamespace q { struct Box {}; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const owner = index.symbols.get('Box').find(def => def.relativePath === 'box.hpp' && def.type === 'struct');
+            const first = {}, second = {};
+            index._beginOp();
+            try {
+                const get = index.symbols.get.bind(index.symbols);
+                let reads = 0;
+                index.symbols.get = name => { reads++; return get(name); };
+                const make = facts => new TypeReferenceResolver(factIndex(facts, index, FILE_FIELDS), owner, owner.name);
+                const a = make(first), before = reads;
+                const group = [...a.group].map(declarationIdentity), all = a.all.map(declarationIdentity);
+                assert.ok(before > 0);
+                assert.strictEqual(group.length, 3, 'the input and two declarations of its type');
+                a.group.clear(); a.all.splice(0); a.pinFiles.clear();
+                const b = make(second);
+                assert.strictEqual(reads, before, 'another witness reuses the grouping calculation');
+                assert.deepStrictEqual([...b.group].map(declarationIdentity), group);
+                assert.deepStrictEqual(b.all.map(declarationIdentity), all);
+                assert.strictEqual(b.pinFiles.size, 2);
+                assert.deepStrictEqual(second, first, 'every witness records the complete inputs');
+                const view = factIndex(JSON.parse(JSON.stringify(second)), undefined, FILE_FIELDS);
+                const replay = new TypeReferenceResolver(view, owner, owner.name);
+                assert.deepStrictEqual([...replay.group].map(declarationIdentity), group);
+                assert.strictEqual(view.hasMissingProvenanceFacts, false);
+                const missing = JSON.parse(JSON.stringify(second));
+                const symbols = Object.keys(missing).find(key => key.startsWith('symbols.get:'));
+                assert.ok(symbols);
+                delete missing[symbols];
+                const incomplete = factIndex(missing, undefined, FILE_FIELDS);
+                assert.throws(() => new TypeReferenceResolver(incomplete, owner, owner.name), /Missing provenance fact/);
+                assert.strictEqual(incomplete.hasMissingProvenanceFacts, true, 'a replay cannot borrow a missing input');
+                const other = { ...owner, namespace: 'q' };
+                const changed = new TypeReferenceResolver(index, other, other.name);
+                assert.ok([...changed.group].some(def => def.relativePath === 'use.cpp'));
+                assert.ok(![...changed.group].some(def => def.relativePath === 'base.hpp'));
+            } finally { index._endOp(); }
+            fs.writeFileSync(path.join(dir, 'base.hpp'), 'namespace r { struct Box; }\n');
+            index.build(null, { quiet: true, workers: 0 });
+            const next = index.symbols.get('Box').find(def => def.relativePath === 'box.hpp' && def.type === 'struct');
+            const resolver = new TypeReferenceResolver(index, next, next.name);
+            assert.deepStrictEqual([...resolver.group].map(def => def.relativePath), ['box.hpp']);
+        } finally { rm(dir); }
+    });
+
     it('shared Java producer types keep each witness self-contained and refresh between operations', () => {
         const dir = tmp({
             'p/Use.java': 'package p; import shared.Target;\nclass Factory { static String make() { return ""; } }\nclass Use { void run() { Target.pick(Factory.make()); } }\n',

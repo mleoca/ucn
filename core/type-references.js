@@ -42,7 +42,7 @@ const { getParser, safeParse, langTraits, LANGUAGES } = require('../languages');
 const { sameNode } = require('../languages/utils');
 const { jsPatternTarget } = require('../languages/lexical-scope');
 const { classKeyOf } = require('./class-identity');
-const { projectHas } = require('./provenance-overload');
+const { projectHas, sharedRead } = require('./provenance-overload');
 const { indexedContent } = require('./source-memo');
 
 // Modules read lazily (load cycles), each resolved once: a require() per
@@ -942,16 +942,30 @@ function typeParamScope(node) {
 // ── Identity of the pinned type ──────────────────────────────────────────
 
 function pinGroupOf(index, def, name) {
+    // Several construction witnesses may ask about the same type. Share
+    // the pure grouping calculation and all its reads, but give each
+    // resolver its own collections: value resolvers extend these groups.
+    const key = JSON.stringify(['type-pin-group', name, def]);
+    const saved = sharedRead(index, key, view => pinGroupFacts(view, def, name));
+    return { ...saved, group: new Set([def, ...saved.group]), all: [...saved.all] };
+}
+
+function pinGroupFacts(index, def, name) {
     const language = index.files.get(def.file)?.language;
     const family = familyOf(language);
-    const all = (index.symbols.get(name) || []).filter(d => TYPE_DECL_KINDS.has(d.type) &&
-        familyOf(index.files.get(d.file)?.language) === family);
+    // Different pins of one name inspect the same declarations. Their
+    // definition identities depend on the index, not on the selected pin.
+    const candidates = sharedRead(index, JSON.stringify(['type-pin-candidates', name, family]), view =>
+        (view.symbols.get(name) || []).filter(d => TYPE_DECL_KINDS.has(d.type) &&
+            familyOf(view.files.get(d.file)?.language) === family)
+            .map(d => ({ def: d, key: classKeyOf(view, d) })));
+    const all = candidates.map(candidate => candidate.def);
     const pinKey = classKeyOf(index, def);
-    const group = new Set([def]);
+    const group = new Set();
     let crossConfig = null;
-    for (const other of all) {
-        if (other === def) continue;
-        if (classKeyOf(index, other) === pinKey) {
+    for (const candidate of candidates) {
+        const other = candidate.def;
+        if (candidate.key === pinKey) {
             group.add(other);
             continue;
         }
@@ -988,7 +1002,7 @@ function pinGroupOf(index, def, name) {
             if (crossConfig(index, def.file, other.file)) group.add(other);
         }
     }
-    return { group, all, family, language };
+    return { group: [...group], all, family, language };
 }
 
 const CLASS_KEYWORD_KINDS = new Set(['class', 'struct']);
