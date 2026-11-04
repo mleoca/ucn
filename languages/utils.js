@@ -857,17 +857,16 @@ const NAMED_CHILDREN_LIST = Symbol.for('ucn.namedChildrenList');
 function _buildNodeList(rootNode) {
     const nodes = [];
     const subtreeEnds = [];
-    // Iterative DFS with subtreeEnd tracking
-    // We use a post-processing step to fill subtreeEnds
-    function collect(node) {
+    // Depth-first preorder with each subtree boundary filled on return.
+    function collect(node, parent) {
         const idx = nodes.length;
         nodes.push(node);
         subtreeEnds.push(0);
         // Batched children read — one native call instead of N+1 (see
         // traverseTree); the array stays on the node for later reads.
-        const children = node[NAMED_CHILDREN_LIST] ? node[NAMED_CHILDREN_LIST]() : node.namedChildren;
+        const children = node[NAMED_CHILDREN_LIST] ? node[NAMED_CHILDREN_LIST](parent) : node.namedChildren;
         for (let i = 0; i < children.length; i++) {
-            collect(children[i]);
+            collect(children[i], node);
         }
         subtreeEnds[idx] = nodes.length;
     }

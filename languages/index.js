@@ -1309,7 +1309,14 @@ function _installNodeFieldCaches(TS) {
             Object.defineProperty(base, NAMED_CHILDREN_LIST, {
                 configurable: true,
                 writable: true,
-                value() { return namedList(this); },
+                value(parent) {
+                    const children = namedList(this);
+                    // The traversal already knows this native child edge.
+                    // Keep leaf facts lazy: an empty list alone needs none.
+                    const facts = this[NODE_FACTS];
+                    if (parent !== undefined && facts !== undefined) facts.parent = parent;
+                    return children;
+                },
             });
             Object.defineProperty(base, 'namedChildren', {
                 configurable: true,

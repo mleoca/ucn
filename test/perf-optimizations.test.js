@@ -2607,6 +2607,49 @@ describe('fix #388: cold-build CPU and wall without answer changes', () => {
         return out;
     };
 
+    it('cached traversal preserves parent links, subtree skips and recovery nodes in every grammar', () => {
+        const samples = { ...SAMPLES,
+            typescript: 'interface I { x: string }\nclass K implements I { x = ""; m(v: I) { return v.x; } }',
+            tsx: 'class K { render() { return <div>{this.value}</div>; } }',
+            html: '<section><script>function f() { return 1; }</script><a onclick="f()">x</a></section>',
+        };
+        const { traverseTreeCached } = require('../languages/utils');
+        for (const [language, code] of Object.entries(samples)) {
+            for (const source of [code, code.slice(0, Math.floor(code.length / 2)), '', code + '\nclass {']) {
+                const tree = getParser(language).parse(source);
+                const roots = [tree.rootNode, tree.rootNode.namedChildren[0]].filter(Boolean);
+                for (const root of roots) {
+                    const expected = [], ends = [], parents = [], childLists = [];
+                    const walk = node => {
+                        const at = expected.length;
+                        expected.push(node.id);
+                        parents.push(node.parent?.id ?? null);
+                        const children = node.namedChildren;
+                        childLists.push(children.map(child => child.id));
+                        for (const child of children) walk(child);
+                        ends[at] = expected.length;
+                    };
+                    walk(root);
+                    const actual = getCachedNodeList(root);
+                    assert.deepStrictEqual(actual.nodes.map(node => node.id), expected, language);
+                    assert.deepStrictEqual(actual.subtreeEnds, ends, language);
+                    assert.deepStrictEqual(actual.nodes.map(node => node.parent?.id ?? null), parents, language);
+                    assert.deepStrictEqual(actual.nodes.map(node => node.namedChildren.map(child => child.id)), childLists, language);
+                    const kept = [], wanted = [];
+                    for (let i = 0; i < expected.length;) {
+                        wanted.push(expected[i]);
+                        i = i % 3 === 1 ? ends[i] : i + 1;
+                    }
+                    traverseTreeCached(root, node => {
+                        kept.push(node.id);
+                        return expected.indexOf(node.id) % 3 === 1 ? false : undefined;
+                    });
+                    assert.deepStrictEqual(kept, wanted, language);
+                }
+            }
+        }
+    });
+
     it('named children are read natively once per node and served exactly as the binding serves them', () => {
         for (const [language, code] of Object.entries(SAMPLES)) {
             const parser = getParser(language);
