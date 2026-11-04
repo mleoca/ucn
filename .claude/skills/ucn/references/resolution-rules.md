@@ -90,7 +90,11 @@ A function wrapped in parentheses, a cast or `satisfies` (`export const f = ((ne
 
 `plan` renames a method overwritten on a typed receiver (`cmd.m = mock` with `cmd = new Command()`) and an object-pattern key that destructures the renamed export from a module object (`const time = require('./time'); const { epochTime } = time` becomes `{ renamed: epochTime }`, the local kept). Declarations inside `declare global { }` and `declare module 'x' { }` merge with declarations outside the project and are never reported dead.
 
+A structural producer's imported alias and field path retain their own identity. When a known receiver supplies no proven return contract, chained calls and later assignments stay untyped; a same-named method elsewhere supplies no replacement evidence. Builtin-name filtering applies to bare calls, while qualified members follow receiver resolution. In Python and JavaScript, a write that wraps an inherited method creates an instance attribute. Its initializer reads the previous value before the write; field and method rename plans retain unresolved reads as `instance-attribute-before-write` reviews.
+
 ## Python
+
+Class and instance field annotations feed receiver typing. An instance write such as `self.compute = wrap(self.compute)` remains a field declaration even when its right side reads an inherited method; data-descriptor assignments still belong to their property. A qualified member value such as `selected = pkg.Type.method` enters the method-reference inventory and `tests`, with unresolved ownership shown as unverified.
 
 A value imported through a conditional reexport remains an `import-chain` dependency for review. Renaming one alternative preserves the chooser's binding name; unresolved source imports are reviewed instead of automatically edited.
 

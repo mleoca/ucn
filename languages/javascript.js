@@ -2012,19 +2012,6 @@ function extractClassMembers(classNode, codeOrLines) {
     return members;
 }
 
-/** Does an expression read `this.<name>` (outside nested own-`this` scopes)? */
-function readsThisMember(expression, name) {
-    if (!expression) return false;
-    let found = false;
-    traverseTree(expression, node => {
-        if (found || JS_OWN_THIS_SCOPES.has(node.type)) return false;
-        if (node.type === 'member_expression' && node.childForFieldName('object')?.type === 'this' &&
-            node.childForFieldName('property')?.text === name) found = true;
-        return !found;
-    });
-    return found;
-}
-
 const JS_OWN_THIS_SCOPES = new Set(['function_expression', 'function_declaration', 'function',
     'generator_function', 'generator_function_declaration', 'class', 'class_declaration',
     'abstract_class_declaration', 'method_definition']);
@@ -2050,10 +2037,9 @@ function jsInstanceProperties(bodyNode, declared) {
             const left = node.childForFieldName('left');
             const property = left?.type === 'member_expression' && left.childForFieldName('object')?.type === 'this'
                 ? left.childForFieldName('property') : null;
-            // `this.m = this.m.bind(this)` rebinds a member a base may
-            // declare: no property of its own.
-            if (property?.type === 'property_identifier' && !seen.has(property.text) &&
-                !readsThisMember(node.childForFieldName('right'), property.text)) {
+            // Reading an inherited member on the RHS still writes an own
+            // instance property, as in `this.m = this.m.bind(this)`.
+            if (property?.type === 'property_identifier' && !seen.has(property.text)) {
                 seen.add(property.text);
                 out.push({ name: property.text, startLine: property.startPosition.row + 1,
                     endLine: node.endPosition.row + 1, memberType: 'field', instanceAttribute: true });

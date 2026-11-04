@@ -10220,34 +10220,15 @@ function findCallees(index, definition, options = {}) {
                 }
             }
 
-            // Skip keywords and built-ins — EXCEPT self/super-received method
-            // calls, which the same-class/super passes below resolve to real
-            // definitions (fix #238: `super().__init__(x)` and the JS/TS
-            // `super(...)` 'constructor' record were routed external here
-            // because __init__/constructor sit in the builtin name sets).
-            const selfShaped = call.isMethod &&
-                (['self', 'cls', 'this', 'super'].includes(call.receiver) ||
-                 (call.receiver === 'base' && language === 'csharp') ||
-                 (call.receiver === 'Self' && language === 'rust'));
-            // Builtin/global names are shadowable. `Request` is a web global,
-            // but `const Request = require('./request')` owns `new Request()`
-            // in that module. Resolve explicit lexical/import bindings before
-            // classifying a same-named builtin as external.
+            // Builtin names denote globals only in a bare call. A qualified
+            // member such as `pkg.Clock.range()` names the receiver's member,
+            // even when its spelling is also a language builtin. Resolve it
+            // through the ordinary receiver rules below.
             const shadowsBuiltin = !call.receiver && (
-                fileEntry?.importBindings?.some(b => b.name === call.name) ||
+                fileEntry?.importBindings?.some(b => (b.alias || b.name) === call.name) ||
                 fileEntry?.bindings?.some(b => b.name === call.name));
-            // A method call on a receiver TYPED to a project class is
-            // evidence for a project method, not the builtin (fix #300,
-            // attrs callee arm: `c2.classmethod()` on constructor-typed
-            // C2Slots was routed external because `classmethod` sits in the
-            // Python builtin set — the #238 self-shaped exemption's typed-
-            // receiver twin). The receiver-type routing below decides.
-            const typedProjectReceiver = call.isMethod && call.receiverType &&
-                typeof call.receiverType === 'string' &&
-                (index.symbols.get(call.receiverType) || [])
-                    .some(d => IDENTITY_TYPE_KINDS.has(d.type));
-            if (!selfShaped && !typedProjectReceiver && !call.receiverIsModule &&
-                !shadowsBuiltin && index.isKeyword(call.name, language)) {
+            if (!call.isMethod && !call.receiver && !shadowsBuiltin &&
+                index.isKeyword(call.name, language)) {
                 noteSite(siteId, 'external', null, call);
                 continue;
             }
@@ -12715,6 +12696,10 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                     ? resolved[0]
                     : null;
             }
+            if (folded?.suppressFallback) {
+                invalidateAssignment(call);
+                continue;
+            }
             if (folded?.type || folded?.externalVia || folded?.rustWrapper) {
                 const scope = call.enclosingFunction
                     ? `${call.enclosingFunction.startLine}` : '';
@@ -12824,7 +12809,8 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
             }
         } else if (!nominal && language === 'python' && call.isMethod &&
             call.receiver && !call.receiverLocalBinding &&
-            !call.receiverIsModule && !call.receiverModuleComposition) {
+            !call.receiverIsModule && !call.receiverModuleComposition &&
+            !_isStructuralImportReceiver(fileEntry, call)) {
             // Exact imported class factory: `text = Text.from_markup(...)`.
             // The parser intentionally does not label every capitalized
             // receiver as an instance type. Pin the value to an indexed type
@@ -12906,7 +12892,7 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                     returnDefinition = matches[0];
                 }
             }
-        } else if (call.isMethod && ['self', 'this', 'cls'].includes(call.receiver)) {
+        } else if (call.isMethod && !call.receiverField && ['self', 'this', 'cls'].includes(call.receiver)) {
             const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
             let cls = enclosing && enclosing.className;
             let ctxFile = filePath;
@@ -13076,7 +13062,7 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
             }
         } else if (!nominal && call.isMethod &&
             (call.receiverIsModule || call.receiverModuleSpecifier ||
-                call.receiverModuleComposition) &&
+                call.receiverModuleComposition || _isStructuralImportReceiver(fileEntry, call)) &&
             (call.receiver || call.receiverModuleSpecifier)) {
             // Structural module-qualified producer (fix #209): schema =
             // z.string() — the module alias resolves through the file's
@@ -13679,7 +13665,7 @@ function _flowPackageBlock(map) {
         langTraits(map._index.files.get(map._filePath)?.language)?.packageScope === 'directory';
 }
 
-function _lookupReturnTypeFlowRaw(map, call) {
+function _lookupReturnTypeFlowRaw(map, call, includeInvalidated = false) {
     const fnScope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
     const lexicalScopes = Array.isArray(call.enclosingFunction?.scopeChain)
         ? [...call.enclosingFunction.scopeChain].reverse().map(String)
@@ -13710,7 +13696,7 @@ function _lookupReturnTypeFlowRaw(map, call) {
             // factory payload with the same local variable name.
             if (binding?.target === call.receiver && Number.isInteger(binding.assignment?.start) &&
                 (best.start == null || binding.assignment.start > best.start)) return undefined;
-            return best.invalidated ? undefined : best;
+            return best.invalidated && !includeInvalidated ? undefined : best;
         }
     }
     return undefined;
@@ -31724,6 +31710,9 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                     };
                 }
             }
+            // A field path names the field's value, never the enclosing
+            // class's same-named method. An unknown hop has no return proof.
+            if (!rt && !nominal) return { suppressFallback: true };
         }
         if (!rt && language === 'rust' && record.receiverValuePath) {
             const valueType = _rustValuePathType(index, filePath, record.receiverValuePath,
@@ -31741,9 +31730,14 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             !record.receiverPatternShadow) {
             const flowMap = ctx.getFlowMap();
             const fe = flowMap && _lookupReturnTypeFlow(flowMap, record);
+            if (!nominal && !fe && flowMap &&
+                _lookupReturnTypeFlowRaw(flowMap, record, true)?.invalidated) {
+                return { suppressFallback: true };
+            }
             if (fe && fe.externalVia) return { externalVia: fe.externalVia };
             if (fe && fe.type) rt = { type: fe.type, ...(fe.fromFile && { fromFile: fe.fromFile }) };
         }
+        if (rt?.suppressFallback) return rt;
         if (rt && rt.externalVia) return rt;
         if (rt && rt.type) {
             // Stdlib return contracts apply only when no project type shadows
@@ -31758,7 +31752,9 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             }
             const owned = _methodReturnOnType(index, rt.type, rt.fromFile, name, language,
                 { filePath, consumerAwaited, selfTypeText: rt.typeText });
-            if (owned || language !== 'rust') return owned;
+            if (owned) return owned;
+            if (!nominal) return { suppressFallback: true };
+            if (language !== 'rust') return null;
             const stdResult = _rustStdMethodResult(index, rt.type, name);
             if (stdResult) return stdResult;
             if ((index.symbols.get(name) || []).some(definition =>
@@ -31944,6 +31940,7 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
     if (prods.length === 0) return null;
     const results = prods.map(r =>
         _typeOfCallResultFold(index, fileEntry, filePath, r, ctx, call.receiverCallAwaited));
+    if (results.some(r => r?.suppressFallback)) return { suppressFallback: true };
     if (!results.every(Boolean)) {
         // A module owns its exported name. If module-qualified producer
         // resolution cannot type `z.number()`, the global same-name method
@@ -32014,12 +32011,15 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
 // A lower-case named import can be a namespace-like API object (`z.string()`)
 // even when the parser cannot label it receiverIsModule. Its terminal member
 // is still owned by that import; it must never borrow a same-named method's
-// return annotation from an unrelated class. Capitalized named imports remain
-// eligible for class/static-method resolution.
+// return annotation from an unrelated class. A capitalized import from an
+// unresolved module has the same boundary; only project imports remain
+// eligible for the class/static-method lookup below.
 function _isStructuralImportReceiver(fileEntry, record) {
     if (record?.receiverModuleSpecifier || record?.receiverModuleComposition) return true;
-    if (!record?.receiver || !/^[a-z_$]/.test(record.receiver)) return false;
-    return (fileEntry?.importBindings || []).some(b => b.name === record.receiver);
+    if (!record?.receiver || record.receiverLocalBinding || record.receiverField) return false;
+    const bindings = _structuralModuleBindings(fileEntry, record);
+    return bindings.length > 0 && (/^[a-z_$]/.test(record.receiver) ||
+        bindings.every(binding => !fileEntry.moduleResolved?.[binding.module]));
 }
 
 /**

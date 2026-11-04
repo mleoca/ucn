@@ -125,23 +125,6 @@ function pythonParamsBind(fn, name) {
     return false;
 }
 
-/** Whether an expression reads `receiver.name` outside nested scopes. */
-function pythonReadsReceiverAttribute(node, receiver, name) {
-    if (!node) return false;
-    let found = false;
-    traverseTree(node, child => {
-        if (found) return false;
-        if ((child.type === 'lambda' || child.type === 'function_definition') && pythonParamsBind(child, receiver)) return false;
-        if (child.type === 'attribute' && child.childForFieldName('object')?.type === 'identifier' &&
-            child.childForFieldName('object').text === receiver && child.childForFieldName('attribute')?.text === name) {
-            found = true;
-            return false;
-        }
-        return true;
-    });
-    return found;
-}
-
 /** Instance attributes the methods of a class body assign on their receiver,
  * one per name in source order, names in `declared` excluded (fix #430).
  * A static method has no receiver; a nested class has its own; a nested
@@ -167,14 +150,13 @@ function pythonInstanceAttributes(bodyNode, declared) {
                 const attr = target.childForFieldName('attribute');
                 if (object?.type !== 'identifier' || object.text !== receiver || !attr) continue;
                 if (seen.has(attr.text)) continue;
-                // `self.m = wrap(self.m)` rebinds a member a base may declare
-                // (fix #434, the JS rule): no attribute of its own.
-                if (node.type === 'assignment' && pythonReadsReceiverAttribute(node.childForFieldName('right'),
-                    receiver, attr.text)) continue;
+                // Reading the previous member on the RHS does not change
+                // the assignment's storage: `self.m = wrap(self.m)` creates
+                // an instance attribute even if the class inherits `m`.
                 seen.add(attr.text);
                 out.push({ name: attr.text, startLine: attr.startPosition.row + 1,
                     endLine: node.endPosition.row + 1, memberType: 'field', instanceAttribute: true,
-                    ...(type && { returnType: type.text }) });
+                    ...(type && { returnType: type.text, fieldType: type.text }) });
             }
             return true;
         });
@@ -1188,7 +1170,7 @@ function extractClassMembers(classNode, code) {
             declared.add(name.text);
             members.push({ name: name.text, startLine: name.startPosition.row + 1,
                 endLine: node.endPosition.row + 1, memberType: 'field',
-                ...(type && { returnType: type.text }) });
+                ...(type && { returnType: type.text, fieldType: type.text }) });
         }
         return true;
     });
@@ -2671,10 +2653,14 @@ function isPythonConstructorValueShadowedAt(refNode, name) {
     return classDeclarations > 1;
 }
 
+const moduleAliasesByTree = new WeakMap();
 function pythonModuleAliases(tree) {
+    const cached = moduleAliasesByTree.get(tree);
+    if (cached) return cached;
     const aliases = new Set();
-    traverseTreeCached(tree.rootNode, node => {
-        if (node.type !== 'import_statement') return true;
+    // A name query needs import statements, not a wrapper for every node
+    // in the file. Keep this source-only answer with its immutable tree.
+    for (const node of tree.rootNode.descendantsOfType('import_statement')) {
         for (let i = 0; i < node.namedChildCount; i++) {
             const child = node.namedChild(i);
             if (child.type === 'dotted_name') {
@@ -2685,8 +2671,8 @@ function pythonModuleAliases(tree) {
                 if (alias?.type === 'identifier') aliases.add(alias.text);
             }
         }
-        return true;
-    });
+    }
+    moduleAliasesByTree.set(tree, aliases);
     return aliases;
 }
 
@@ -3681,7 +3667,9 @@ function findCallsInTree(code, tree, parser, sink = null) {
                                     receiverTypeEvidence: { ...typeOrigin('constructor', objNode), type: ctor.type } };
                             }
                         }
-                        if (valueType) {
+                        const valuePath = !valueType && objNode?.type === 'attribute'
+                            ? attributeReceiverPath(objNode) : null;
+                        if (valueType || valuePath) {
                             // The receiver context a call on it carries.
                             const recv = objNode.type === 'identifier' ? objNode.text : null;
                             calls.push({
@@ -3690,19 +3678,27 @@ function findCallsInTree(code, tree, parser, sink = null) {
                                 line: attrName.startPosition.row + 1,
                                 isMethod: true,
                                 ...(recv && { receiver: recv }),
-                                receiverType: valueType,
+                                ...(valueType && { receiverType: valueType }),
                                 ...valueFields,
+                                ...(valuePath && {
+                                    receiverRoot: valuePath.root,
+                                    receiverField: valuePath.fields[valuePath.fields.length - 1],
+                                    receiverFields: valuePath.fields,
+                                    ...(localVarTypes.has(valuePath.root) && {
+                                        receiverRootType: localVarTypes.get(valuePath.root),
+                                    }),
+                                }),
                                 ...(recv && localVarTypeQualifiers.get(recv) && {
                                     receiverTypeQualifier: localVarTypeQualifiers.get(recv),
                                 }),
                                 ...(recv && localVarStdlibContracts.has(recv) && {
                                     receiverTypeStdlibModule: localVarStdlibContracts.get(recv),
                                 }),
-                                ...((!recv || constructedReceiverVars.has(recv)) && { receiverConstructed: true }),
+                                ...(((!recv && !valuePath) || constructedReceiverVars.has(recv)) && { receiverConstructed: true }),
                                 ...(recv && withBindingVars.has(recv) && { receiverWithBinding: true }),
                                 ...(recv && isShadowedByLocal(objNode, recv) && { receiverLocalBinding: true }),
                                 isFunctionReference: true,
-                                memberRead: true,
+                                ...(!valuePath && { memberRead: true }),
                                 enclosingFunction: getCurrentEnclosingFunction(),
                             });
                         }

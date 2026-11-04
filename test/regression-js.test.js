@@ -12960,8 +12960,8 @@ describe('fix #431: JS/TS value accesses by what each token reads', () => {
             assert.deepStrictEqual(fields('notMine'), []);
             assert.deepStrictEqual(fields('staticOnly'), []);
             assert.deepStrictEqual(fields('label'), ['Client:13']);
-            // A rebinding of a member a base may declare is no property.
-            assert.deepStrictEqual(fields('inherited'), []);
+            // The instance write exists even when it reads an inherited value.
+            assert.deepStrictEqual(fields('inherited'), ['Client:12:instance']);
             assert.deepStrictEqual(lines(index.impact('url', { file: 'client.js', line: 3 }).valueAccesses),
                 ['client.js:10', 'client.js:17']);
         } finally { rm(dir); }

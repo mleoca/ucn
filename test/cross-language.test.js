@@ -787,3 +787,86 @@ describe('fix #355: reusable three-band receiver contract', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #443: structural producer identity survives aliases and field paths', () => {
+    for (const extension of ['js', 'ts', 'html']) for (const alias of ['external_buffer', 'ExternalBuffer']) {
+        it(`${extension}, ${alias}: an imported alias and an untyped field never borrow a same-name method return`, () => {
+            const typed = extension === 'ts';
+            const lines = [
+                "import { Buffer as external_buffer } from 'node:buffer';",
+                'class Maker {',
+                ...(typed ? ['    child: any;'] : []),
+                '    /** @returns {Maker} */',
+                `    static from()${typed ? ': Maker' : ''} { return new Maker(); }`,
+                '    /** @returns {Maker} */',
+                `    next()${typed ? ': Maker' : ''} { return this; }`,
+                "    toString() { return 'project'; }",
+                '    use() {',
+                "        external_buffer.from('text').toString();",
+                '        this.child.next().toString();',
+                '        this.next().toString();',
+                "        const assigned = external_buffer.from('text');",
+                '        assigned.toString();',
+                '    }',
+                '}',
+            ];
+            const source = lines.join('\n').replaceAll('external_buffer', alias);
+            const code = extension === 'html' ? `<script type="module">\n${source}\n</script>` : source;
+            const dir = tmp({ [`model.${extension}`]: code });
+            try {
+                const index = idx(dir);
+                const target = index.find('toString', { exact: true })[0];
+                const calls = index.findCallers('toString', { targetDefinitions: [target], collectAccount: true });
+                const foreign = code.split('\n').findIndex(line => line.includes(`${alias}.from('text')`)) + 1;
+                const field = foreign + 1;
+                assert.ok(!calls.some(call => [foreign, field, foreign + 4].includes(call.line)), JSON.stringify(calls));
+                for (const line of [foreign, field, foreign + 4]) {
+                    assert.ok(calls.unverifiedEntries.some(call => call.line === line), `missing review at ${line}`);
+                }
+                assert.ok(calls.some(call => call.line === foreign + 2), JSON.stringify(calls));
+            } finally { rm(dir); }
+        });
+    }
+});
+
+
+describe('fix #443: inherited method values precede instance writes', () => {
+    for (const extension of ['js', 'ts', 'html']) {
+        it(`${extension}: retains the old method read as review when its new instance field is renamed`, () => {
+            const source = [
+                'class Base {',
+                '    work() { return 1; }',
+                '}',
+                'class Child extends Base {',
+                '    constructor() {',
+                '        super();',
+                '        this.work = this.work.bind(this);',
+                '    }',
+                '}',
+            ].join('\n');
+            const offset = extension === 'html' ? 1 : 0;
+            const dir = tmp({ [`model.${extension}`]: offset ? `<script>\n${source}\n</script>` : source });
+            try {
+                const index = idx(dir);
+                const { execute } = require('../core/execute');
+                const field = index.find('work', { exact: true }).find(def => def.type === 'field');
+                assert.ok(field?.instanceAttribute);
+                const result = execute(index, 'plan', {
+                    name: `model.${extension}:${7 + offset}:work`, renameTo: 'renamed',
+                });
+                assert.ok(result.ok, result.error);
+                const write = result.result.changes.find(change => change.line === 7 + offset);
+                assert.ok(write.needsReview);
+                assert.strictEqual(write.newExpression, 'this.renamed = this.work.bind(this);');
+                const method = execute(index, 'plan', {
+                    name: `model.${extension}:${2 + offset}:work`, renameTo: 'renamed',
+                });
+                assert.ok(method.ok, method.error);
+                assert.ok(method.result.reviewItems.some(item => item.line === 7 + offset &&
+                    item.reviewReason === 'instance-attribute-before-write') ||
+                    method.result.changes.some(change => change.line === 7 + offset &&
+                        change.newExpression === 'this.renamed = this.renamed.bind(this);'));
+            } finally { rm(dir); }
+        });
+    }
+});

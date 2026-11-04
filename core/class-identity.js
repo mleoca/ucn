@@ -1283,6 +1283,11 @@ function shareDescendant(index, matchedRef, targetDefs) {
     for (const td of targetDefs) {
         const tRef = ownerRefOf(index, td);
         if (!tRef) continue;
+        if (!tRef.key) return true;
+        // A leaf has no proper descendant that can combine the two
+        // owners. If it belongs to the target's descendants, the existing
+        // below-target rule skips it; otherwise the sets cannot intersect.
+        if (mine.size === 1) continue;
         const theirs = descendantKeys(index, tRef);
         if (!theirs) return true;
         if (theirs.has(matchedRef.key)) continue;

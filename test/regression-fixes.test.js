@@ -46,6 +46,8 @@ describe('fix #417: constructor facts survive worker and cache boundaries', () =
             'scope.tsx': 'function alphaTsx(){} function betaTsx(){} function leftTsx(){alphaTsx();} function rightTsx(){betaTsx();}\n',
             'scope.go': 'package p\nfunc alphaGo(){};func betaGo(){};func leftGo(){alphaGo()};func rightGo(){betaGo()}\n',
             'scope.rs': 'fn alphaRust(){} fn betaRust(){} fn leftRust(){alphaRust();} fn rightRust(){betaRust();}\n',
+            'bound.js': 'class Parent {work(){}}\nclass Child extends Parent {constructor(){super();this.work = this.work.bind(this);}}\n',
+            'members.py': 'from functools import lru_cache\nfrom pkg import model\nclass Worker:\n value: str\n def __init__(self):\n  self.count: int = 0\n  self.compute = lru_cache()(self.compute)\n def compute(self, value): return value\ndef selected():\n callback = model.Worker.compute\n',
         };
         for (let n = 0; n < 101; n++) files[`padding/${n}.js`] = `function padding${n}() {}`;
         const dir = tmp(files);
@@ -74,6 +76,12 @@ describe('fix #417: constructor facts survive worker and cache boundaries', () =
             assert.strictEqual(parallel.lastBuildWorkerCount, 2, 'the worker path must actually run');
             assert.deepStrictEqual(JSON.parse(snapshot(parallel)), JSON.parse(expected));
             const checkScopes = index => {
+                assert.equal(index.symbols.get('value').find(def => def.className === 'Worker').fieldType, 'str');
+                assert.equal(index.symbols.get('count').find(def => def.className === 'Worker').fieldType, 'int');
+                assert.ok(index.symbols.get('compute').some(def => def.instanceAttribute));
+                assert.ok(index.symbols.get('work').some(def => def.instanceAttribute));
+                assert.ok(index.getCachedCalls(path.join(dir, 'members.py')).some(call =>
+                    call.isFunctionReference && call.receiverRoot === 'model' && call.receiverField === 'Worker'));
                 const variadic = index.symbols.get('VarargNode').find(def => def.type === 'constructor');
                 assert.deepEqual(variadic.paramsStructured, [{ name: 'values', type: 'int[]', rest: true }]);
                 const variadicEdges = index.findCallees(index.symbols.get('varargBuild')[0], { collectAccount: true });

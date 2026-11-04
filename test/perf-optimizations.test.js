@@ -1432,6 +1432,54 @@ public class X {
 // token ≠ name), comment/string occurrences (non-identifier node, skipped
 // by the callbacks' type guards), and multiple occurrences per line.
 
+describe('fix #443: source facts and hierarchy reads', () => {
+    it('a Python leaf owner does not parse unrelated descendants while retaining multiple-inheritance uncertainty', () => {
+        const dir = tmp({
+            'base.py': 'class Base:\n def work(self): pass\nclass Other:\n def work(self): pass\n',
+            'leaf.py': 'from base import Base\nclass Leaf(Base):\n def work(self): pass\n',
+            'diamond.py': 'from base import Base, Other\nclass Diamond(Base, Other): pass\n',
+            'unrelated.py': 'import base\nclass Unrelated(base.Base): pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ownerRefOf, shareDescendant } = require('../core/class-identity');
+            const methods = index.find('work', { exact: true });
+            const base = methods.find(def => def.className === 'Base');
+            const other = methods.find(def => def.className === 'Other');
+            const leaf = methods.find(def => def.className === 'Leaf');
+            const read = index._getParsedTree.bind(index);
+            let unrelatedReads = 0;
+            index._getParsedTree = (file, ...args) => {
+                if (file.endsWith('/unrelated.py')) unrelatedReads++;
+                return read(file, ...args);
+            };
+            assert.strictEqual(shareDescendant(index, ownerRefOf(index, leaf), [base, other]), false);
+            assert.strictEqual(unrelatedReads, 0);
+            assert.strictEqual(shareDescendant(index, ownerRefOf(index, base), [other]), true);
+            assert.strictEqual(shareDescendant(index, { name: 'Unknown' }, [base]), true);
+        } finally { rm(dir); }
+    });
+
+    it('keeps Python module aliases and local shadows tied to the source tree across name queries', () => {
+        const { getParser, safeParse } = require('../languages');
+        const python = require('../languages/python');
+        const parser = getParser('python');
+        const source = 'try:\n import package.reader as api\nexcept ImportError:\n import fallback as api\n' +
+            'api.read()\napi.write()\ndef local(api):\n return api.read()\n';
+        const tree = safeParse(parser, source);
+        const read = () => python.findUsagesInCode(source, 'read', parser, tree);
+        const first = read();
+        assert.ok(first.find(site => site.line === 5)?.receiverIsModule);
+        assert.ok(first.find(site => site.line === 8)?.receiverLocalBinding);
+        assert.ok(python.findUsagesInCode(source, 'write', parser, tree)
+            .find(site => site.line === 6)?.receiverIsModule);
+        const changed = 'from package import api\napi.read()\n';
+        assert.ok(!python.findUsagesInCode(changed, 'read', parser, safeParse(parser, changed))
+            .find(site => site.line === 2)?.receiverIsModule);
+        assert.deepStrictEqual(read(), first);
+    });
+});
+
 describe('visitNameNodes usage scan', () => {
     it('classifies usages identically with unicode content before the occurrence', () => {
         const dir = tmp({

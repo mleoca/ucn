@@ -46,6 +46,56 @@ function mergeHolds(holds) {
     return 'unknown';
 }
 
+/** Reads of an instance member while evaluating the RHS of its first
+ * recorded write. The write has not happened yet, so the old value may be
+ * inherited or supplied by an earlier runtime initialization. */
+function instanceAttributeInitializerReads(index, definition) {
+    if (!definition?.instanceAttribute) return [];
+    const memo = index._opMemo?.('instanceAttributeInitializerReads', () => new WeakMap());
+    if (memo?.has(definition)) return memo.get(definition);
+    const file = definition.file;
+    let language = index.files.get(file)?.language;
+    let source = index._readFile(file);
+    const embedded = langTraits(language)?.embeddedSyntax;
+    if (embedded) {
+        source = embedded.source(source, getParser(language));
+        language = embedded.language;
+    }
+    const tree = embedded ? require('./source-memo').parsedSource(language, source)
+        : index._getParsedTree(file, source, language) || safeParse(getParser(language), source);
+    const reads = [];
+    if (tree) visitNameNodes(tree, source, definition.name, node => {
+        if (node.startPosition.row + 1 !== (definition.nameLine || definition.startLine)) return true;
+        const member = node.parent;
+        if (!['attribute', 'member_expression'].includes(member?.type)) return true;
+        const name = member.childForFieldName('attribute') || member.childForFieldName('property');
+        const receiver = member.childForFieldName('object');
+        if (!name || !sameNode(name, node) || !receiver) return true;
+        const assignment = member.parent;
+        if (!['assignment', 'assignment_expression'].includes(assignment?.type) ||
+            !sameNode(assignment.childForFieldName('left'), member)) return true;
+        const right = assignment.childForFieldName('right');
+        const stack = right ? [right] : [];
+        while (stack.length) {
+            const current = stack.pop();
+            if (CALLABLE_SCOPES.has(current.type) || TYPE_BODIES.has(current.type) ||
+                current.type === 'generator_expression') continue;
+            if (['attribute', 'member_expression'].includes(current.type)) {
+                const property = current.childForFieldName('attribute') || current.childForFieldName('property');
+                const object = current.childForFieldName('object');
+                if (property?.text === definition.name && object?.type === receiver.type &&
+                    object.text === receiver.text) reads.push({ line: property.startPosition.row + 1,
+                    column: property.startPosition.column, start: property.startIndex, end: property.endIndex });
+            }
+            stack.push(...current.namedChildren);
+        }
+        return true;
+    });
+    reads.sort((a, b) => a.start - b.start);
+    memo?.set(definition, reads);
+    return reads;
+}
+
 /** The template-id a name token heads (`v` in `v<T>`), else the token. */
 function templateIdOf(node) {
     const parent = node?.parent;
@@ -2519,6 +2569,18 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         } else verdict = role.role === 'type'
             ? { verdict: 'no', reason: 'non-value-position' }
             : { verdict: 'unknown', reason: 'value-binding-unresolved' };
+        if (!declaration && verdict.verdict === 'yes' && receiver) {
+            const line = node.startPosition.row + 1;
+            for (const member of this.group) {
+                if (!member.instanceAttribute || member.file !== file ||
+                    line < member.startLine || line > member.endLine) continue;
+                if (instanceAttributeInitializerReads(this.index, member).some(site =>
+                    site.line === line && site.column === node.startPosition.column)) {
+                    verdict = { verdict: 'unknown', reason: 'instance-attribute-before-write' };
+                    break;
+                }
+            }
+        }
         if (!declaration && verdict.verdict === 'yes' && this.moduleVariable && file === this.def.file && !receiver &&
             !role.binding) {
             verdict = this.pythonStarBindingAt(file, node) || verdict;
@@ -2696,4 +2758,4 @@ function hasCallableInitializer(index, definition) {
 }
 
 module.exports = { isValueDefinition, valueReferenceSites, findValueReferences, hasCallableInitializer,
-    enumValueBindingInfo, declaredFieldOwner, pythonClassBodyOf };
+    enumValueBindingInfo, declaredFieldOwner, pythonClassBodyOf, instanceAttributeInitializerReads };

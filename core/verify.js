@@ -9,7 +9,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } =
 const { sameNode } = require('../languages/utils');
 const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES, isOverrideMarked, isMacroNamespaceDefinition,
     isValueDefinition } = require('./shared');
-const { classDefsNamed, ownerDefinitionOf } = require('./class-identity');
+const { classDefsNamed, ownerDefinitionOf, ownerRefOf, descendsFromTargets } = require('./class-identity');
 const { isTypeRenamePin, referenceRole } = require('./type-references');
 const { findAccessorReferences, isAccessorDefinition } = require('./accessors');
 const { csharpLocalBinding } = require('../languages/csharp-scope');
@@ -5857,6 +5857,29 @@ function plan(index, name, options = {}) {
                 from,
                 to: pathMod.join(pathMod.dirname(from), `${options.renameTo}${extension}`),
             });
+        }
+    }
+
+    // A descendant's instance write can read the inherited method before
+    // replacing it. The field declaration is a different binding, but its
+    // initializer still needs review when this method is renamed.
+    if (options.renameTo && def.className && !isValueDefinition(def)) {
+        const { instanceAttributeInitializerReads } = require('./value-references');
+        for (const member of definitions) {
+            if (!member.instanceAttribute) continue;
+            const owner = ownerRefOf(index, member);
+            if (!owner || descendsFromTargets(index, owner, [def]) === 'no') continue;
+            for (const site of instanceAttributeInitializerReads(index, member)) {
+                const file = member.relativePath || path.relative(index.root, member.file);
+                if (changes.some(change => change.file === file && change.line === site.line &&
+                    change._edit?.columns?.includes(site.column))) continue;
+                if (reviewItems.some(item => item.file === file && item.line === site.line &&
+                    item.reviewReason === 'instance-attribute-before-write')) continue;
+                reviewItems.push({ file, line: site.line,
+                    expression: index.getLineContent(member.file, site.line).trim(),
+                    suggestion: `Review the previous ${name} value read before this instance attribute is written`,
+                    needsReview: true, reviewReason: 'instance-attribute-before-write', editKind: 'reference' });
+            }
         }
     }
 

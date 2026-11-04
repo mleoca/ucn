@@ -10350,7 +10350,7 @@ describe('fix #434: Python own-class constructions, star imports, configuration 
         } finally { rm(dir); }
     });
 
-    it('self.m = wrap(self.m) rebinds an inherited member; it declares no attribute', () => {
+    it('self.m = wrap(self.m) writes an instance attribute beside the inherited method', () => {
         const dir = tmp({
             'm.py': 'import functools\n\n\nclass Base:\n    def write(self, s):\n        return s\n\n\n' +
                 'class W(Base):\n    def __init__(self):\n        self.write = functools.partial(self.write)\n' +
@@ -10358,7 +10358,8 @@ describe('fix #434: Python own-class constructions, star imports, configuration 
         });
         try {
             const index = idx(dir);
-            assert.deepStrictEqual((index.symbols.get('write') || []).map(d => d.type), ['method']);
+            assert.deepStrictEqual((index.symbols.get('write') || []).map(d => d.type), ['method', 'field']);
+            assert.ok(index.symbols.get('write').find(d => d.type === 'field').instanceAttribute);
             assert.ok((index.symbols.get('size') || []).some(d => d.instanceAttribute));
         } finally { rm(dir); }
     });
@@ -10447,6 +10448,135 @@ describe('fix #440: conditional value reexports remain dependency reviews', () =
                 assert.ok(review?.needsReview, JSON.stringify(plan));
                 assert.strictEqual(review.newExpression, undefined);
             }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #443: producer ownership and qualified member references', () => {
+    for (const alias of ['external_clock', 'ExternalClock']) it(`${alias}: does not borrow a project return from an external alias or a field with an unknown result`, () => {
+        const dir = tmp({ 'model.py': [
+            'from datetime import datetime as external_clock',
+            'class Clock:',
+            '    value: external_clock',
+            '    def replace(self) -> "Clock":',
+            '        return self',
+            '    @classmethod',
+            '    def now(cls) -> "Clock":',
+            '        return cls()',
+            '    def use(self):',
+            '        current = self.value.replace()',
+            '        current = current.replace()',
+            '        current.replace().replace()',
+            '        external_clock.now().replace()',
+            '        self.unknown.replace().replace()',
+            '        self.replace().replace()',
+            'def consume(value: Clock):',
+            '    value.replace().replace()',
+            'def from_alias():',
+            '    current = external_clock.now()',
+            '    return current.replace()',
+        ].join('\n').replaceAll('external_clock', alias) });
+        try {
+            const index = idx(dir);
+            const target = index.find('replace', { exact: true })[0];
+            const callers = index.findCallers('replace', { targetDefinitions: [target], collectAccount: true });
+            assert.ok(!callers.some(c => [10, 11, 12, 13, 14, 20].includes(c.line)), JSON.stringify(callers));
+            assert.ok(callers.some(c => c.line === 15));
+            assert.ok(callers.some(c => c.line === 17));
+            for (const line of [11, 12, 13, 14, 20]) {
+                assert.ok(callers.unverifiedEntries.some(c => c.line === line), `missing review at ${line}`);
+            }
+            const field = index.find('value', { exact: true, type: 'field' })[0];
+            assert.strictEqual(field.fieldType, alias);
+            const use = index.find('use', { exact: true })[0];
+            const callees = index.findCallees(use, { collectAccount: true, includeMethods: true });
+            const confirmed = callees.find(c => c.name === 'replace');
+            assert.ok(!confirmed || confirmed.sites.every(line => line === 15), JSON.stringify(callees));
+        } finally { rm(dir); }
+    });
+
+    it('keeps a builtin-spelled qualified method and its value reference in callee and test answers', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/model.py': 'class Clock:\n    @classmethod\n    def range(cls): return []\n',
+            'tests/test_clock.py': [
+                'from pkg import model',
+                'def test_direct():',
+                '    model.Clock.range()',
+                'def test_value():',
+                '    selected = model.Clock.range',
+                '    return selected()',
+                'def test_builtin():',
+                '    return range(3)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.find('range', { exact: true })[0];
+            const direct = index.find('test_direct', { exact: true })[0];
+            const down = index.findCallees(direct, { collectAccount: true, includeMethods: true });
+            assert.ok(down.some(c => c.name === 'range') || down.unverifiedCallees.some(c => c.name === 'range'));
+            const result = execute(index, 'tests', { name: 'pkg/model.py:2:range' });
+            assert.ok(result.ok, result.error);
+            const matches = result.result.flatMap(f => f.matches);
+            assert.ok(matches.some(m => m.line === 3));
+            assert.ok(matches.some(m => m.line === 5));
+            const builtin = index.find('test_builtin', { exact: true })[0];
+            assert.ok(!index.findCallees(builtin, { collectAccount: true, includeMethods: true }).some(c => c.name === 'range'));
+            const callers = index.findCallers('range', { targetDefinitions: [target], collectAccount: true });
+            assert.ok(!callers.some(c => c.line === 8));
+        } finally { rm(dir); }
+    });
+
+    it('indexes an instance write that wraps its previous method value', () => {
+        const dir = tmp({ 'model.py': [
+            'from functools import lru_cache',
+            'class Worker:',
+            '    def __init__(self):',
+            '        self.compute = lru_cache()(self.compute)',
+            '    def compute(self, value): return value',
+            'def use(worker: Worker):',
+            '    return worker.compute(1)',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const defs = index.find('compute', { exact: true });
+            assert.deepStrictEqual(defs.map(d => d.type).sort(), ['field', 'method']);
+            const field = defs.find(d => d.type === 'field');
+            assert.strictEqual(field.startLine, 4);
+            assert.strictEqual(field.instanceAttribute, true);
+            const result = execute(index, 'impact', { name: 'model.py:4:compute' });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.valueAccesses);
+        } finally { rm(dir); }
+    });
+});
+
+
+describe('fix #443: instance initializer reads precede their writes', () => {
+    it('reviews the old inherited value in both field and method rename plans', () => {
+        const dir = tmp({ 'model.py': [
+            'from functools import lru_cache',
+            'class Base:',
+            '    def compute(self, value): return value',
+            'class Worker(Base):',
+            '    def __init__(self):',
+            '        self.compute = lru_cache()(',
+            '            self.compute)',
+            'def use(worker: Worker): return worker.compute(1)',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const method = execute(index, 'plan', { name: 'model.py:3:compute', renameTo: 'renamed' });
+            assert.ok(method.ok, method.error);
+            assert.ok(method.result.reviewItems.some(item => item.line === 7 &&
+                item.reviewReason === 'instance-attribute-before-write'));
+            const field = execute(index, 'plan', { name: 'model.py:6:compute', renameTo: 'renamed' });
+            assert.ok(field.ok, field.error);
+            assert.ok(field.result.changes.some(change => change.line === 6 &&
+                change.newExpression === 'self.renamed = lru_cache()('));
+            assert.ok(field.result.changes.some(change => change.line === 7 &&
+                change.needsReview && !change.newExpression));
         } finally { rm(dir); }
     });
 });
