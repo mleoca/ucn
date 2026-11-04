@@ -2,7 +2,7 @@
 
 const { declarationIdentity, sameDeclaration } = require('./provenance');
 const { symbolsSpanning } = require('./shared');
-const { factIndex, sealFacts, replayed, seedReplay, refusedProof } = require('./provenance-overload');
+const { factIndex, sealFacts, replayed, seedReplay, refusedProof, sharedRead } = require('./provenance-overload');
 const { BoundedMap, SourceMemo, parsedSource, typeNamesCanonical } = require('./source-memo');
 
 // Modules read lazily (load cycles), each resolved once: a require() per
@@ -153,7 +153,10 @@ function cppConstructionClasses(index, query, resolver = null) {
         ? index._opMemo?.('cppConstructionClasses', () => new Map()) : null;
     const key = memo ? `${query.file}\0${query.line}\0${query.column ?? ''}\0${query.name}\0${query.qualifier ?? ''}` : null;
     if (memo?.has(key)) return memo.get(key);
-    const classes = cppConstructionClassesUncached(index, query, resolver);
+    const classes = query.position ? cppConstructionClassesUncached(index, query, resolver)
+        : sharedRead(index, JSON.stringify(['cpp-construction-classes', query.file, query.line,
+            query.column, query.name, query.qualifier]),
+        view => cppConstructionClassesUncached(view, query, null));
     memo?.set(key, classes);
     return classes;
 }
@@ -330,11 +333,13 @@ function resolve(index, query, owner) {
 }
 
 function resolveAt(index, query, owner, definition, resolver) {
-    const answer = query.qualifier
-        ? resolver.resolveQualified(query.file, query.line, null, query.qualifier, { role: 'type' })
-        : resolver.resolveName(query.file, query.line, query.name);
-    if ((query.construction ? !constructionDenotes(index, resolver, query, definition) : answer.verdict !== 'yes') ||
-        index.hasMissingProvenanceFacts) return false;
+    // Construction has its own scoped lookup. The ordinary-name answer is
+    // unused there and would record unrelated facts in every witness.
+    const denotes = query.construction ? constructionDenotes(index, resolver, query, definition)
+        : (query.qualifier
+            ? resolver.resolveQualified(query.file, query.line, null, query.qualifier, { role: 'type' })
+            : resolver.resolveName(query.file, query.line, query.name)).verdict === 'yes';
+    if (!denotes || index.hasMissingProvenanceFacts) return false;
     if (query.functional) {
         if (!lazyLanguagesModule().langTraits(index.files.get(query.file)?.language)?.functionalTypeConstruction) return false;
         const visible = lazyCppScopeModule().includeClosure(index, query.file);

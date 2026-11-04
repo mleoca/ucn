@@ -24,7 +24,7 @@
  */
 
 const { codeUnitCompare, isValueDefinition, symbolsSpanning } = require('./shared');
-const { projectFact } = require('./provenance-overload');
+const { projectFact, sharedRead } = require('./provenance-overload');
 
 const TYPE_KINDS = new Set(['class', 'struct', 'union', 'enum', 'interface']);
 const MAX_ALIAS_HOPS = 8;
@@ -57,16 +57,18 @@ function includeClosure(index, file) {
     if (!state.closures) state.closures = new Map();
     const cached = state.closures.get(file);
     if (cached) return cached;
-    const visible = new Set([file]);
-    const queue = [file];
-    while (queue.length > 0) {
-        const current = queue.shift();
-        for (const imported of index.importGraph?.get(current) || []) {
-            if (visible.has(imported)) continue;
-            visible.add(imported);
-            queue.push(imported);
+    const visible = sharedRead(index, `cpp-include-closure:${file}`, view => {
+        const seen = new Set([file]);
+        const queue = [file];
+        for (let i = 0; i < queue.length; i++) {
+            for (const imported of view.importGraph?.get(queue[i]) || []) {
+                if (seen.has(imported)) continue;
+                seen.add(imported);
+                queue.push(imported);
+            }
         }
-    }
+        return seen;
+    });
     state.closures.set(file, visible);
     return visible;
 }

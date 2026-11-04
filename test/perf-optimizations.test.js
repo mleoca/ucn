@@ -3368,6 +3368,54 @@ describe('fix #418: witnesses share recorded facts, record project facts once an
         assert.strictEqual(replay.hasMissingProvenanceFacts, false);
     });
 
+    it('shared C++ construction lookups retain independent include facts and refresh after a rebuild', () => {
+        const { cppConstructionClasses, FILE_FIELDS } = require('../core/provenance-type');
+        const dir = tmp({
+            'box.hpp': 'namespace p { struct Box { Box(int) {} }; }\n',
+            'use.cpp': '#include "box.hpp"\nusing p::Box;\nBox make() { return Box(1); }\n',
+        });
+        try {
+            const index = idx(dir), file = path.join(dir, 'use.cpp');
+            const query = { file, relativePath: 'use.cpp', line: 3, column: 20,
+                name: 'Box', qualifier: null, construction: true, functional: true };
+            const owner = index.symbols.get('Box').find(def => def.type === 'struct');
+            const target = declarationIdentity(owner);
+            const first = {}, second = {};
+            index._beginOp();
+            try {
+                const graphGet = index.importGraph.get.bind(index.importGraph);
+                let reads = 0;
+                index.importGraph.get = key => { reads++; return graphGet(key); };
+                const lookup = facts => cppConstructionClasses(factIndex(facts, index, FILE_FIELDS), query);
+                assert.deepStrictEqual(lookup(first).map(declarationIdentity), [target]);
+                const before = reads;
+                assert.ok(before > 0);
+                assert.deepStrictEqual(lookup(second).map(declarationIdentity), [target]);
+                assert.strictEqual(reads, before, 'another witness does not traverse the include graph again');
+                assert.deepStrictEqual(second, first, 'each witness owns all inputs needed by its replay');
+                const copy = JSON.parse(JSON.stringify(second));
+                const replay = factIndex(copy, undefined, FILE_FIELDS);
+                assert.deepStrictEqual(cppConstructionClasses(replay, query).map(declarationIdentity), [target]);
+                assert.strictEqual(replay.hasMissingProvenanceFacts, false);
+                const proof = captureTypeLookup(index, query, owner);
+                assert.ok(proof);
+                assert.strictEqual(validateTypeLookup(JSON.parse(JSON.stringify(proof)), target,
+                    { file: 'use.cpp', line: 3, column: 20 }), true);
+                const damaged = JSON.parse(JSON.stringify(proof));
+                const includes = Object.keys(damaged.reads).filter(key => key.startsWith('importGraph.get:'));
+                assert.ok(includes.length > 0);
+                for (const key of includes) delete damaged.reads[key];
+                assert.strictEqual(validateTypeLookup(damaged, target,
+                    { file: 'use.cpp', line: 3, column: 20 }), false, 'an absent include fact cannot be borrowed from another witness');
+            } finally { index._endOp(); }
+            fs.writeFileSync(file, 'struct Box { Box(int) {} };\nBox make() { return Box(1); }\n');
+            index.build(null, { quiet: true, workers: 0 });
+            const next = index.symbols.get('Box').find(def => def.file === file && def.type === 'struct');
+            const bound = cppConstructionClasses(index, { ...query, line: 2 });
+            assert.deepStrictEqual(bound.map(declarationIdentity), [declarationIdentity(next)]);
+        } finally { rm(dir); }
+    });
+
     it('shared Java producer types keep each witness self-contained and refresh between operations', () => {
         const dir = tmp({
             'p/Use.java': 'package p; import shared.Target;\nclass Factory { static String make() { return ""; } }\nclass Use { void run() { Target.pick(Factory.make()); } }\n',
