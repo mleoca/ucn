@@ -22,6 +22,56 @@ const fs = require('fs');
 const { tmp, rm, idx, forEachLanguage } = require('./helpers');
 const { computeGroundSet, buildAccount } = require('../core/account');
 
+describe('account record eligibility', () => {
+    it('classifies only matching unclaimed constructions while preserving aliases and non-call kinds', () => {
+        const callers = require('../core/callers');
+        const { classifyGroundLines } = require('../core/account');
+        const original = { get: callers.getCachedCallsBearing, noCall: callers._recordIsNoCall };
+        const file = path.join(process.cwd(), 'account-input.cpp');
+        const calls = [
+            { name: 'unrelated', line: 1, constructorSyntax: 'default' },
+            { name: 'target', line: 2, constructorSyntax: 'default' },
+            { name: 'target', line: 3, constructorSyntax: 'default', noCall: true },
+            { name: 'target', line: 4, memberInitializer: true, noCall: true },
+            { name: 'target', line: 5, parenthesizedCallee: true, noCall: true },
+            { name: 'target', line: 6 },
+            { name: 'alias', resolvedName: 'target', line: 7, parenthesizedCallee: true },
+            { name: 'alias', resolvedNames: ['target'], line: 8 },
+            { name: 'target', line: 9, isFunctionReference: true },
+            { name: 'target', line: 10, constructorSyntax: 'implicit' },
+            { name: 'target', line: 11, isTypeReference: true },
+            { name: 'target', line: 12, constructorSyntax: 'default' },
+            { name: 'target', line: 99, memberInitializer: true },
+        ];
+        const index = {
+            files: new Map([[file, { relativePath: 'account-input.cpp' }]]),
+            symbols: new Map([['target', [{ file, startLine: 13 }]]]),
+            _getCachedUsages: () => [1, 3, 4, 5, 9, 10, 11].map(line =>
+                ({ line, usageType: line === 5 ? 'call' : 'reference' })),
+        };
+        const ground = { perFile: new Map([[file, Array.from({ length: 14 }, (_, i) => i + 1)]]) };
+        const claimed = { key: (_file, line) => line, has: line => line === 2 };
+        try {
+            for (const records of [calls, [...calls].reverse()]) {
+                const inspected = [];
+                callers.getCachedCallsBearing = () => records;
+                callers._recordIsNoCall = (_index, _file, call) => {
+                    inspected.push(call.line);
+                    return !!call.noCall;
+                };
+                const result = classifyGroundLines(index, 'target', ground, claimed);
+                assert.deepStrictEqual(result.nonCall,
+                    { imports: 0, definitions: 1, references: 7, unclassifiedText: 1, total: 9 });
+                assert.deepStrictEqual(result.callNotResolved.map(site => site.line), [6, 7, 8, 12]);
+                assert.deepStrictEqual(inspected.sort((a, b) => a - b), [3, 4, 5, 12]);
+            }
+        } finally {
+            callers.getCachedCallsBearing = original.get;
+            callers._recordIsNoCall = original.noCall;
+        }
+    });
+});
+
 /**
  * Build the account for a symbol. Prefers the ENGINE-composed account
  * (ctx.meta.account from collectAccount instrumentation); falls back to a

@@ -366,13 +366,18 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         // Cheap pass: calls cache + symbol table (only records bearing the
         // name on unclaimed lines are read below).
         if (!getCachedCallsBearing) getCachedCallsBearing = require('./callers').getCachedCallsBearing;
-        const cachedCalls = getCachedCallsBearing(index, filePath, name, new Set(unclaimed));
+        const unclaimedLines = new Set(unclaimed);
+        const cachedCalls = getCachedCallsBearing(index, filePath, name, unclaimedLines);
         const recordIsNoCall = require('./callers')._recordIsNoCall;
         const callLines = new Set();
         // `(T)(x)` casts: uses of the type, not calls (fix #427).
         let castLines = null;
         if (Array.isArray(cachedCalls)) {
             for (const c of cachedCalls) {
+                // The ordinary cache can return the whole file. Only these
+                // name-bearing, unclaimed lines can affect this account.
+                if (!(c.name === name || c.resolvedName === name ||
+                    (c.resolvedNames && c.resolvedNames.includes(name))) || !unclaimedLines.has(c.line)) continue;
                 // Unclaimed callback/type references have no invocation
                 // syntax. Let the usage AST classify them as references;
                 // merely entering the candidate cache is not a call fact.
@@ -385,10 +390,7 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
                     (castLines ||= new Set()).add(c.line);
                     continue;
                 }
-                if (c.name === name || c.resolvedName === name ||
-                    (c.resolvedNames && c.resolvedNames.includes(name))) {
-                    callLines.add(c.line);
-                }
+                callLines.add(c.line);
             }
         }
         const defLines = defLinesByFile.get(filePath);
