@@ -7408,6 +7408,9 @@ function findUsagesInCode(code, name, parser, existingTree, options = {}) {
         safeParse(parser, code, undefined, PARSE_OPTIONS);
     const usages = [];
     const scopeMemo = options.lexicalScopes && options.mode === 'c' ? new Map() : null;
+    // Occurrence accounts consume positions and kinds, never receiver facts.
+    // Keep the same invocation classifier while omitting unrelated ownership.
+    const kindsOnly = options.usageKindsOnly && !options.lexicalScopes;
     const seenUsages = new Set();
     const addUsage = usage => {
         const key = `${usage.line}:${usage.column ?? ''}:${usage.usageType}:${usage.receiver || ''}`;
@@ -7422,8 +7425,9 @@ function findUsagesInCode(code, name, parser, existingTree, options = {}) {
         const parent = node.parent;
         if (parent) {
             const expression = usageNameExpression(node);
-            const identity = callIdentity(expression);
-            if (invokesNameExpression(expression) && sameNode(identity.nameNode, node)) {
+            const invoked = invokesNameExpression(expression);
+            const identity = kindsOnly && !invoked ? null : callIdentity(expression);
+            if (invoked && sameNode(identity.nameNode, node)) {
                 usageType = 'call';
             } else if ((parent.type === 'function_declarator' ||
                 parent.type === 'parameter_declaration') &&
@@ -7447,13 +7451,13 @@ function findUsagesInCode(code, name, parser, existingTree, options = {}) {
                 usageType = 'import';
             }
             // A generic wrapper does not erase an explicit receiver.
-            if (sameNode(identity.nameNode, node)) receiver = identity.receiver || null;
+            if (!kindsOnly && sameNode(identity.nameNode, node)) receiver = identity.receiver || null;
         }
         // A bare name lexically inside a class method participates in C++
         // member lookup on that class. This is ownership evidence for test
         // discovery and usage presentation; receiver-qualified forms above
         // retain their explicit receiver instead.
-        if (!receiver) receiver = enclosingClassName(node);
+        if (!kindsOnly && !receiver) receiver = enclosingClassName(node);
         // Where a bare C reference resolves (fix #396): block declarations,
         // parameters and `for` initializers bind it, else file scope.
         const scope = scopeMemo && usageType === 'reference' && !receiver

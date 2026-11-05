@@ -94,13 +94,15 @@ function createLanguageAdapter(config) {
         },
         findUsages(code, name, parser, tree, options) {
             // Account callers have already classified indexed call records.
-            // Only parsers of call-shaped macros recover calls here; other
-            // languages keep their ordinary usage path and need no options.
+            // Only parsers of call-shaped macros recover calls here. Kind-only
+            // scans are a separate opt-in; other parsers keep their usual path.
             const skipCallRecovery = options?.skipCallRecovery && config.traits?.macroInvocationSyntax === 'call';
-            return options?.lexicalScopes || skipCallRecovery
+            const usageKindsOnly = options?.usageKindsOnly && !options.lexicalScopes && config.traits?.usageKindsOnly;
+            return options?.lexicalScopes || skipCallRecovery || usageKindsOnly
                 ? languageModule.findUsagesInCode(code, name, parser, tree, {
                     ...(options.lexicalScopes && { lexicalScopes: true }),
                     ...(skipCallRecovery && { skipCallRecovery: true }),
+                    ...(usageKindsOnly && { usageKindsOnly: true }),
                 })
                 : languageModule.findUsagesInCode(code, name, parser, tree);
         },

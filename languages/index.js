@@ -971,6 +971,7 @@ const LANGUAGES = {
             // spelled NAME( where #define NAME( is in effect is the macro
             // (fix #377).
             macroInvocationSyntax: 'call',
+            usageKindsOnly: true,
             typeQualifiedCallStyle: 'static',
             bareCallReachesMethods: false,
             methodCallReachesFunctions: true,
@@ -1019,6 +1020,7 @@ const LANGUAGES = {
             // spelled NAME( where #define NAME( is in effect is the macro
             // (fix #377).
             macroInvocationSyntax: 'call',
+            usageKindsOnly: true,
             typeQualifiedCallStyle: 'path',
             standardPathRoots: ['std'],
             hasArityOverloads: true,

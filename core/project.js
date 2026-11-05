@@ -469,6 +469,8 @@ class ProjectIndex {
      * @param {object} [options]
      * @param {boolean} [options.skipCallRecovery] - omit usage-only call
      * recovery when the caller has already classified lines from the call index
+     * @param {boolean} [options.usageKindsOnly] - omit optional receiver facts
+     * when the consumer needs only occurrence positions and kinds
      * @returns {Array|null} Array of usage objects or null if parsing failed
      */
     _getCachedUsages(filePath, name, options = {}) {
@@ -477,10 +479,14 @@ class ProjectIndex {
         // C/C++ can therefore skip its expensive macro replacement-list call
         // recovery in that mode. Partition both cache layers so a partial
         // account classification can never poison the full `usages` result.
+        // An adapter may also omit receiver facts for kind-only consumers;
+        // lexical-scope requests always retain the complete usage records.
         const mode = [
             options.skipCallRecovery ? (langTraits(this.files.get(filePath)?.language)?.macroInvocationSyntax === 'call'
                 ? 'skip-call-recovery-v2' : 'skip-call-recovery') : '',
             options.lexicalScopes ? 'lexical-scopes' : '',
+            options.usageKindsOnly && !options.lexicalScopes &&
+                langTraits(this.files.get(filePath)?.language)?.usageKindsOnly ? 'usage-kinds-v1' : '',
         ].filter(Boolean).join('+');
         const modeSuffix = mode ? `\0${mode}` : '';
         const cacheKey = `${filePath}\0${name}${modeSuffix}`;

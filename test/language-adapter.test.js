@@ -40,6 +40,21 @@ const SAMPLES = {
 };
 
 describe('v5 language adapter boundary', () => {
+    it('only opted-in occurrence scans omit receiver facts, never lexical-scope requests', () => {
+        const { createLanguageAdapter } = require('../languages/adapter');
+        for (const usageKindsOnly of [undefined, false, true]) {
+            const reads = [];
+            const adapter = createLanguageAdapter({ name: 'sample', traits: { usageKindsOnly },
+                module: () => ({ findUsagesInCode(...args) { reads.push(args); return []; } }) });
+            adapter.findUsages('source', 'name', null, null, { usageKindsOnly: true });
+            adapter.findUsages('source', 'name', null, null, { usageKindsOnly: true, lexicalScopes: true });
+            adapter.findUsages('source', 'name', null, null);
+            assert.deepEqual(reads[0].slice(4), usageKindsOnly ? [{ usageKindsOnly: true }] : []);
+            assert.deepEqual(reads[1].slice(4), [{ lexicalScopes: true }]);
+            assert.equal(reads[2].length, 4);
+        }
+    });
+
     it('forwards call-recovery options only to parsers of call-shaped macros', () => {
         const { createLanguageAdapter } = require('../languages/adapter');
         for (const macroInvocationSyntax of [undefined, 'marked', 'call']) {

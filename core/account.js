@@ -412,8 +412,11 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         // Call lines were classified from the complete calls cache above.
         // Language adapters may skip usage-only call recovery here; notably,
         // C/C++ avoids reparsing every matching macro replacement list.
+        // Only occurrence kinds are consumed below, so receiver ownership
+        // is optional on this path too.
         const usages = index._getCachedUsages(filePath, name, {
             skipCallRecovery: true,
+            usageKindsOnly: true,
         });
         const byLine = new Map();
         if (Array.isArray(usages)) {

@@ -16,6 +16,68 @@ const {
 
 describe('C-family recovery resource and ordering contracts', () => {
     for (const extension of ['c', 'cpp']) {
+        it(`${extension}: occurrence kinds preserve full classification and isolate receiver caches`, () => {
+            const file = `kinds.${extension}`;
+            const source = [
+                'int target(int value) { return value; }',
+                '#define RUN target(1)',
+                '#if OPTION',
+                'struct Other { int (*target)(int); };',
+                '#else',
+                'struct Other { int (*target)(int); int value; };',
+                '#endif',
+                'void use(struct Other* other) { other->target(2); (target)(3); int (*callback)(int) = target; }',
+                'const char* text = "target target"; // target',
+                ...(extension === 'cpp' ? [
+                    'struct Holder { int target; void use() { target; this->target; } };',
+                    'namespace ns { template<typename T> int target(T value) { return value; } }',
+                    'template<typename T> void use(T& other) { other.template target<int>(); ns::target<int>(1); ::target(2); }',
+                ] : []),
+            ].join('\n');
+            const dir = tmp({ [file]: source }), absolute = path.join(dir, file);
+            const positions = rows => rows.map(({ line, column, usageType }) => ({ line, column, usageType }));
+            const compare = index => {
+                index._beginOp();
+                try {
+                    for (const name of ['target', 'Other', 'Holder', 'value', 'callback', 'T', 'missing']) {
+                        const options = { skipCallRecovery: true };
+                        const kinds = index._getCachedUsages(absolute, name, { ...options, usageKindsOnly: true });
+                        const full = index._getCachedUsages(absolute, name, options);
+                        assert.deepEqual(positions(kinds), positions(full), name);
+                        assert.ok(kinds.every(row => !row.receiver), name);
+                        if (name === 'target') assert.ok(full.some(row => row.receiver), 'ordinary usages retain receivers');
+                        assert.deepEqual(index._getCachedUsages(absolute, name,
+                            { ...options, lexicalScopes: true, usageKindsOnly: true }),
+                        index._getCachedUsages(absolute, name, { ...options, lexicalScopes: true }));
+                    }
+                } finally { index._endOp(); }
+                const original = index._getCachedUsages;
+                const handle = `${file}:1:target`;
+                const expected = execute(index, 'show', { name: handle });
+                assert.ok(expected.ok, expected.error);
+                try {
+                    index._getCachedUsages = function (file, name, options) {
+                        return original.call(this, file, name, { ...options, usageKindsOnly: false });
+                    };
+                    assert.deepEqual(execute(index, 'show', { name: handle }), expected);
+                } finally { index._getCachedUsages = original; }
+            };
+            try {
+                const index = idx(dir);
+                compare(index);
+                index.saveCache();
+                index.saveUsageCache();
+                const loaded = new (require('../core/project').ProjectIndex)(dir);
+                assert.equal(loaded.loadCache(), true);
+                compare(loaded);
+                fs.appendFileSync(absolute, '\nvoid later(struct Other* other) { other->target(4); }\n');
+                loaded.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+                compare(loaded);
+            } finally { rm(dir); }
+        });
+    }
+
+    for (const extension of ['c', 'cpp']) {
         it(`${extension}: account recovery uses indexed macro calls across cache and source changes`, () => {
             const file = `calls.${extension}`;
             const dir = tmp({ [file]: [
