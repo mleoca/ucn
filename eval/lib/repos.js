@@ -555,6 +555,14 @@ const REPOS = [
         language: 'rust',
         targetCandidates: ['.'],
     },
+    {
+        // A fresh finding in Python base order and lexical receiver bindings.
+        name: 'cachetools',
+        url: 'https://github.com/tkem/cachetools',
+        commit: 'f314dfaa49fe646427581e16bea33112a2140eb2',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
 ];
 
 // Publish-blocking board. Keep this as a named subset of REPOS so every
@@ -610,11 +618,13 @@ const RELEASE_REPOS = Object.freeze(RELEASE_REPO_NAMES.map(name => {
 // indicatif were selected from source/build metadata, without engine-score
 // screening. A failed fresh draw remains a failure until investigated; do
 // not rotate it away or weaken the gate. Tuning it triggers graduation.
+// Packaging replaces the repaired cachetools draw using source/build
+// eligibility only; it has not been screened for passing answers.
 const FRESH_POOL = [
     { name: 'jinja', url: 'https://github.com/pallets/jinja', language: 'python', targetCandidates: ['.'] },
     { name: 'papaparse', url: 'https://github.com/mholt/PapaParse', language: 'javascript', targetCandidates: ['.'] },
     { name: 'superstruct', url: 'https://github.com/ianstormtaylor/superstruct', language: 'typescript', targetCandidates: ['.'] },
-    { name: 'cachetools', url: 'https://github.com/tkem/cachetools', language: 'python', targetCandidates: ['.'] },
+    { name: 'packaging', url: 'https://github.com/pypa/packaging', language: 'python', targetCandidates: ['.'] },
     { name: 'python-dateutil', url: 'https://github.com/dateutil/dateutil', language: 'python', targetCandidates: ['.'] },
     { name: 'toml', url: 'https://github.com/BurntSushi/toml', language: 'go', targetCandidates: ['.'] },
     { name: 'resty', url: 'https://github.com/go-resty/resty', language: 'go', targetCandidates: ['.'] },
