@@ -456,6 +456,38 @@ describe('perf: cross-operation account caches', () => {
         }
     });
 
+    it('ground scans preserve line boundaries, Unicode identifiers and overlapping candidates', () => {
+        const dir = tmp({});
+        try {
+            const { literalNameRegex } = require('../core/shared');
+            const sources = new Map([
+                [path.join(dir, 'one.js'), 'xa a a\nx:::\ntarget target target\nx_target targetΔ Δtarget\n' +
+                    '𐐀target target𐐀 target\r\n$target target$\n\ntarget'],
+                [path.join(dir, 'two.js'), 'unrelated\n'.repeat(1000) +
+                    'Δ ΔΔ Δ_ _Δ 1Δ Δ1\na.b aXb\n🧰 🧰🧰 a🧰 🧰a\n' +
+                    '𐐀 𐐀𐐀\n\ud800x x\udc00 \ud800 \udc00\r\n'],
+            ]);
+            const index = { root: dir, files: new Map([...sources.keys()].map(file => [file, {}])),
+                failedFiles: new Map(), unsupportedFiles: new Map(), _readFile: file => sources.get(file),
+                _getFileLines: file => sources.get(file).split('\n') };
+            for (const name of ['target', 'a a', '::', 'Δ', '_', '$', 'a.b', '🧰', '𐐀', '\ud800', '\udc00',
+                'x', '\r', 'target\n', '\n', '', 'absent']) {
+                const expected = [];
+                for (const [file, source] of sources) {
+                    const pattern = literalNameRegex(name);
+                    const lines = source.split('\n').flatMap((line, i) =>
+                        line.includes(name) && pattern.test(line) ? [i + 1] : []);
+                    if (lines.length) expected.push([file, lines]);
+                }
+                const ground = computeGroundSet(index, name);
+                assert.deepStrictEqual([...ground.perFile], expected, JSON.stringify(name));
+                assert.strictEqual(ground.total, expected.reduce((n, [, lines]) => n + lines.length, 0));
+            }
+            assert.deepStrictEqual([...computeGroundSet(index, 'a a').perFile.values()], [[1]]);
+            assert.deepStrictEqual([...computeGroundSet(index, '::').perFile.values()], [[2]]);
+        } finally { rm(dir); }
+    });
+
     it('reuses an exact ground set until the index is rebuilt', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',

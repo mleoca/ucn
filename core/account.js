@@ -36,7 +36,7 @@
  * Ground-set semantics are grep `-n -w`: unit is the (file, line) pair, each
  * line with >= 1 word-boundary match counts once, case-sensitive.
  *
- * Performance: the first ground scan is one `includes()`-gated read per project
+ * Performance: the first ground scan is one literal-name-gated read per project
  * file — the same I/O profile as the existing `search`/`usages` commands.
  * Exact results are retained in a small LRU for the lifetime of one built index
  * so context/about/impact projections of the same symbol do not rescan the
@@ -85,7 +85,7 @@ function computeGroundSet(index, name) {
         index._groundSetCache.set(name, cached);
         return cached.result;
     }
-    const wordRe = literalNameRegex(name);
+    const wordRe = literalNameRegex(name, name ? 'y' : '');
     const perFile = new Map();
     let total = 0;
     let fileCount = 0;
@@ -97,16 +97,7 @@ function computeGroundSet(index, name) {
         } catch (e) {
             continue; // deleted since indexing; not part of the universe anymore
         }
-        if (!content.includes(name)) continue;
-        // Shared read-only lines array — split once per file per operation,
-        // reused across the symbols of a multi-symbol command (diff-impact).
-        const lines = index._getFileLines(filePath);
-        const matched = [];
-        for (let i = 0; i < lines.length; i++) {
-            // Only a line holding the text can match (fix #436: the
-            // Unicode-boundary test ran on every line of the file).
-            if (lines[i].includes(name) && wordRe.test(lines[i])) matched.push(i + 1);
-        }
+        const matched = matchingGroundLines(content, name, wordRe);
         if (matched.length > 0) {
             perFile.set(filePath, matched);
             total += matched.length;
@@ -181,6 +172,34 @@ function computeGroundSet(index, name) {
         }
     }
     return result;
+}
+
+// Find literal candidates natively, checking the same Unicode boundaries
+// at their exact offsets. Count line breaks only up to matching positions;
+// once a line matches, its remaining occurrences cannot change the account.
+function matchingGroundLines(content, name, wordRe) {
+    if (name.includes('\n')) return [];
+    if (!name) return content.split('\n').flatMap((line, i) => wordRe.test(line) ? [i + 1] : []);
+    const matched = [];
+    let at = content.indexOf(name);
+    if (at === -1) return matched;
+    let line = 1, end = content.indexOf('\n');
+    while (at !== -1) {
+        wordRe.lastIndex = at;
+        if (wordRe.test(content)) {
+            while (end !== -1 && end < at) {
+                line++;
+                end = content.indexOf('\n', end + 1);
+            }
+            matched.push(line);
+            if (end === -1) break;
+            at = content.indexOf(name, end + 1);
+        } else {
+            // A rejected candidate can overlap a later valid occurrence.
+            at = content.indexOf(name, at + 1);
+        }
+    }
+    return matched;
 }
 
 /** Scan only files the parser/index could not ingest. */
