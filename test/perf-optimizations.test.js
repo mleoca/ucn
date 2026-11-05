@@ -3815,6 +3815,50 @@ describe('fix #422: macro expansion and call derivation in fresh workers', () =>
 });
 
 describe('fix #435: query-board costs without answer changes', () => {
+    it('constructor alias closures keep order, depth, isolated results and fresh operation inputs', () => {
+        const source = 'struct Root {};\n' + Array.from({ length: 15 }, (_, n) =>
+            `using A${n} = ${n ? `A${n - 1}` : 'Root'};`).join('\n');
+        const dir = tmp({ 'aliases.cpp': source });
+        const { constructionTypeNames, constructionAliasNames } = require('../core/constructor-calls');
+        const { factIndex, projectFact } = require('../core/provenance-overload');
+        try {
+            const index = idx(dir), file = path.join(dir, 'aliases.cpp');
+            const root = index.symbols.get('Root')[0];
+            const surfaces = Array.from({ length: 15 }, (_, n) => `A${n}`);
+            const closure = Array.from({ length: 13 }, (_, n) => `A${14 - n}`);
+            index._beginOp();
+            try {
+                assert.deepStrictEqual(constructionTypeNames(index, 'A14'), closure);
+                assert.deepStrictEqual([...constructionAliasNames(index, [root])], surfaces);
+                constructionTypeNames(index, 'A14').push('mutated');
+                constructionAliasNames(index, [root]).clear();
+                assert.deepStrictEqual(constructionTypeNames(index, 'A14'), closure);
+                assert.deepStrictEqual([...constructionAliasNames(index, [root, root])], surfaces);
+                assert.deepStrictEqual([...constructionAliasNames(index, [{ ...root, type: 'function' }])], []);
+                const reads = {}, fields = ['language', 'symbols', 'moduleValueAliases', 'importBindings'];
+                const recorded = factIndex(reads, index, fields);
+                assert.deepStrictEqual(constructionTypeNames(recorded, 'A14'), closure);
+                assert.deepStrictEqual([...constructionAliasNames(recorded, [root])], surfaces);
+                const projectReads = {};
+                assert.deepStrictEqual(projectFact(factIndex(projectReads, index), 'alias:A14',
+                    live => constructionTypeNames(live, 'A14')), closure);
+                const replay = factIndex(JSON.parse(JSON.stringify(reads)), null, fields);
+                assert.deepStrictEqual(constructionTypeNames(replay, 'A14'), closure);
+                assert.deepStrictEqual([...constructionAliasNames(replay, [root])], surfaces);
+                assert.deepStrictEqual(projectFact(factIndex(JSON.parse(JSON.stringify(projectReads)), null),
+                    'alias:A14', () => { throw new Error('replay must use captured names'); }), closure);
+            } finally { index._endOp(); }
+            fs.writeFileSync(file, 'struct Root {};\nusing Fresh = Root;\n');
+            index.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+            index._beginOp();
+            try {
+                assert.deepStrictEqual(constructionTypeNames(index, 'A14'), ['A14']);
+                assert.deepStrictEqual(constructionTypeNames(index, 'Fresh'), ['Fresh', 'Root']);
+                assert.deepStrictEqual([...constructionAliasNames(index, [index.symbols.get('Root')[0]])], ['Fresh']);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
     const countParses = (language, run) => {
         const parser = require('../languages').getParser(language);
         const original = parser.parse;

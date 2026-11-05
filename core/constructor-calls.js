@@ -160,6 +160,9 @@ function constructionAliases(index) {
 // witness records this closure as one fact rather than every file the
 // dictionary scans (fix #418: a scan per witness was quadratic).
 function constructionTypeNames(index, name) {
+    const memo = index.isProvenanceFactIndex ? null : index._opMemo?.('constructionTypeNames');
+    const saved = memo?.get(name);
+    if (saved) return saved.slice();
     const aliases = constructionAliases(index);
     const names = new Set([name]);
     for (let round = 0; round < 12; round++) {
@@ -167,7 +170,9 @@ function constructionTypeNames(index, name) {
         for (const current of [...names]) for (const target of aliases.get(current) || []) names.add(target);
         if (size === names.size) break;
     }
-    return [...names];
+    const result = [...names];
+    memo?.set(name, result);
+    return result.slice();
 }
 
 // Every spelling whose alias closure (`constructionTypeNames`) holds one of
@@ -204,6 +209,13 @@ function constructionTypeCandidates(index, name) {
 function constructionAliasNames(index, targets) {
     const names = new Set(targets.filter(def => ['class', 'struct', 'record', 'enum'].includes(def.type) &&
         langTraits(index.files.get(def.file)?.language)?.hasConstructors).map(def => def.name));
+    if (!names.size) return new Set();
+    // Targets with the same constructor-capable names have the same alias
+    // surfaces. Binding to a particular definition is still proved later.
+    const memo = index.isProvenanceFactIndex ? null : index._opMemo?.('constructionAliasNames');
+    const key = JSON.stringify([...names].sort(codeUnitCompare));
+    const saved = memo?.get(key);
+    if (saved) return new Set(saved);
     const aliases = constructionAliases(index), surfaces = new Set();
     for (let round = 0; round < 12; round++) {
         let changed = false;
@@ -214,7 +226,8 @@ function constructionAliasNames(index, targets) {
         }
         if (!changed) break;
     }
-    return surfaces;
+    memo?.set(key, surfaces);
+    return new Set(surfaces);
 }
 
 function constructionAliasPossibilities(index, file, call) {
