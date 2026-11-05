@@ -107,6 +107,11 @@ const STRUCTURAL_TRAITS = {
     // A write on the instance can replace an inherited method with a
     // callable value, including a wrapper of the previous method.
     instanceAttributesShadowMethods: true,
+    // An external type can supply an inherent method before a project
+    // trait implementation at the same receiver probe step.
+    inherentMethodsPrecedeTraitImpls: false,
+    // Field access follows proven dereference wrappers on a return value.
+    derefFieldAccess: false,
     // Whether importing a module runs its top-level code when the importer
     // loads (JS/TS/HTML scripts, Python): only then is an import cycle an
     // import-time cycle (fix #433).
@@ -366,6 +371,8 @@ const STRUCTURAL_TRAITS = {
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
     instanceAttributesShadowMethods: false,
+    inherentMethodsPrecedeTraitImpls: false,
+    derefFieldAccess: false,
     importsRunModules: false,
     superReceiver: null,
     ownClassMethod: null,
@@ -784,6 +791,8 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             selfParam: ['self', '&self', '&mut self', 'mut self'],
+            inherentMethodsPrecedeTraitImpls: true,
+            derefFieldAccess: true,
             nameReferenceFamily: 'rust',
             // Members live in impl blocks, separate from the declaration
             // of the type. Resolve the written self type in the impl scope.

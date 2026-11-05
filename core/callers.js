@@ -7595,7 +7595,8 @@ function findCallers(index, name, options = {}) {
                     rustImplSelected = selection?.decision === 'confirm';
                 }
 
-                if (fileEntry.language === 'rust' && options.targetDefinitions?.length === 1 &&
+                if (langTraits(fileEntry.language)?.inherentMethodsPrecedeTraitImpls &&
+                    options.targetDefinitions?.length === 1 &&
                     _rustExternalInherentPossible(index, filePath, call, options.targetDefinitions[0])) {
                     if (collectAccount) routeUnverified(filePath, fileEntry, call, 'autoref-dispatch', calledAs, {
                         uncertaintyClass: 'compile-time-dispatch',
@@ -11801,7 +11802,7 @@ function findCallees(index, definition, options = {}) {
                     }
                 }
 
-                if (language === 'rust' && callee.traitImpl) {
+                if (langTraits(language)?.inherentMethodsPrecedeTraitImpls && callee.traitImpl) {
                     const undecided = siteIds.filter(siteId => _rustExternalInherentPossible(
                         index, def.file, siteEvidence.get(siteId).call, callee));
                     for (const siteId of undecided) noteUnverified(siteId,
@@ -31973,7 +31974,7 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         const origin = _returnTypeOrigin(index, chosen.file || filePath, parsed);
         if (!origin) return null;
         return { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), ...(origin.fromFile && { fromFile: origin.fromFile }),
-            ...(language === 'rust' && chosen.file === filePath && { rustReturnDeclaration: _rustReturnDeclaration(chosen) }) };
+            ...(langTraits(language)?.derefFieldAccess && chosen.file === filePath && { rustReturnDeclaration: _rustReturnDeclaration(chosen) }) };
     }
     if (language === 'python' && !consumerAwaited && chosen.isAsync) return null;
     let head = _structuralTypeHead(chosen.returnType, {
@@ -32045,7 +32046,7 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
         : call.receiverField ? [call.receiverField] : [];
     let results = prods.map(r =>
         _typeOfCallResultFold(index, fileEntry, filePath, r, ctx, call.receiverCallAwaited));
-    if (fields.length && fileEntry.language === 'rust') {
+    if (fields.length && langTraits(fileEntry.language)?.derefFieldAccess) {
         results = results.map(result => _rustFieldReceiverType(index, result));
     }
     if (results.some(r => r?.suppressFallback)) return { suppressFallback: true };
