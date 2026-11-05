@@ -155,6 +155,14 @@ describe('public-surface agent benchmark contract', () => {
         assert.doesNotMatch(markdown, /\| task-to-command selection \|/);
     });
 
+    it('keeps trace truncation counts while normalizing native cap guidance', () => {
+        const cli = '2 children truncated by the per-node cap. Use --all to expand them; --depth controls hops only.';
+        const mcp = '2 children truncated by the per-node cap. Use all=true to expand them; depth controls hops only.';
+        assert.equal(normalizeSurfaceGuidance(cli), normalizeSurfaceGuidance(mcp));
+        assert.notEqual(normalizeSurfaceGuidance(cli.replace('2 children', '3 children')),
+            normalizeSurfaceGuidance(mcp));
+    });
+
     it('normalizes only CLI/MCP-native guidance for semantic parity', () => {
         const cli = 'ACCOUNT: 3 = 2 confirmed + 1 unverified\n' +
             'Next: ucn show run · ucn repo --sections=health --deep\n' +

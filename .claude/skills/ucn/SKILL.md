@@ -22,6 +22,8 @@ UCN answers semantic questions about a codebase from a tree-sitter index: where 
 5. After a signature change: `ucn check <handle>`; before committing: target-less `ucn check`. Both compare a changed declaration with its parameters at `--base` (default `HEAD`), so the call sites bound to the old declaration are checked against the new one; a site that fits no remaining overload is a mismatch, never an excluded other-target line.
 6. `ucn source <handle>` or `ucn source path/to/file:10-30` for exact code, only when inspection is needed.
 
+The direct tests in `show <handle> --sections=tests` match `tests <handle>`. Equivalent file and line parameters preserve the same exact declaration, including overloads.
+
 An explicit constructor has its own handle, including Java overloads, compact record constructors and C++ constructors defined outside their class. Proven construction calls appear under that handle and supply arguments to `check`. Review unverified construction sites before changing the signature. A function that constructs a class lists the class as a callee and, when proven, the constructor body it runs `(constructs C)`.
 
 C# `this(...)` and `base(...)` initializers keep the generic type's arity. Nested constructions under a generic containing type stay visible for review when that owner's identity is unproven. `tests` also includes nested-type annotation and qualifier references, with their evidence tier.

@@ -24,6 +24,8 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `check [handle]` | Call-site validation for one symbol against its declaration at `--base` (default `HEAD`); without a handle, the composed pre-commit check of the diff (`--base`, `--staged`). |
 | `plan <handle>` | Preview `--rename-to=X`, `--add-param=p` (`--default-value=v`), or `--remove-param=p`. Never edits files. A Python param added beside `*args` or keyword-only params is keyword-only (after them, before `**kwargs`); calls passing arguments where a param is inserted before a rest param are listed. |
 
+`show <handle> --sections=tests` and `tests <handle>` select direct tests for the same declaration. Equivalent `--file` and `--line` parameters preserve that pin, including overloaded methods.
+
 ## Repository and architecture
 
 | Command | Purpose |

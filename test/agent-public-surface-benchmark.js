@@ -37,8 +37,9 @@ const {
 const { COMMAND_TRUST_MATRIX } = require('../core/trust-matrix');
 
 const DEFAULT_FIXTURE = path.join(__dirname, 'fixtures', 'agent-benchmark');
-const DEFAULT_JSON = path.join(__dirname, 'agent-public-surface-benchmark-report.json');
-const DEFAULT_MD = path.join(__dirname, 'agent-public-surface-benchmark-report.md');
+const REPORTS_DIR = process.env.UCN_EVAL_REPORTS_DIR || __dirname;
+const DEFAULT_JSON = path.join(REPORTS_DIR, 'agent-public-surface-benchmark-report.json');
+const DEFAULT_MD = path.join(REPORTS_DIR, 'agent-public-surface-benchmark-report.md');
 
 const RELEASE_GATES = Object.freeze({
     minSelectionAccuracy: 0.95,
@@ -589,6 +590,8 @@ function normalizeSurfaceGuidance(text) {
             '<top-guidance>')
         .replace(/(?:Use --depth=N|Use depth=<n>) for a deeper graph\./g,
             '<depth-guidance>')
+        .replace(/Use (?:--all|all=true) to expand them; (?:--depth|depth) controls hops only\./g,
+            'Use <all> to expand them; <depth> controls hops only.')
         .replace(/(?:--include-decorated|include_decorated=true)/g,
             '<include-decorated>')
         .replace(/(?:--include-exported|include_exported=true)/g,

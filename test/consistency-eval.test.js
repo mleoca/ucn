@@ -54,6 +54,28 @@ describe('cross-command consistency gate policy', () => {
 });
 
 describe('deterministic disagreement evaluation', () => {
+    for (const [file, source, testFile, testSource, line] of [
+        ['api.py', 'class A:\n    def run(self): return 1\nclass B:\n    def run(self): return 2\n',
+            'test_api.py', 'from api import A, B\ndef test_run():\n    A().run()\n    B().run()\n', 2],
+        ['Api.java', 'class Api {\n int run(int v) { return v; }\n int run(String v) { return 1; }\n}\n',
+            'ApiTest.java', 'class ApiTest {\n void testCalls() {\n  Api api = new Api();\n  api.run(1);\n  api.run("x");\n }\n}\n', 2],
+    ]) it(`${file}: composed tests and explicit file/line parameters retain the exact declaration`, () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({ [file]: source, [testFile]: testSource });
+        try {
+            const index = idx(dir), handle = `${file}:${line}:run`;
+            const direct = execute(index, 'tests', { name: handle });
+            const fields = execute(index, 'tests', { name: 'run', file, line });
+            const show = execute(index, 'show', { name: handle, sections: 'tests' });
+            assert.ok(direct.ok && fields.ok && show.ok);
+            assert.ok(direct.result.some(row => row.matches.length > 0));
+            assert.deepStrictEqual(fields.result, direct.result);
+            assert.deepStrictEqual(show.result.tests, direct.result);
+            assert.equal(execute(index, 'tests', { name: 'run', file, line: 99 }).ok, false,
+                'a nonexistent line cannot fall back to another declaration');
+        } finally { rm(dir); }
+    });
+
     it('selects the same stratified stable-handle board on every run', () => {
         const dir = tmp({
             'package.json': '{"name":"consistency-board"}',
