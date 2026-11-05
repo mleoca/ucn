@@ -137,6 +137,30 @@ const fieldSetTag = fields => {
     return FIELD_SET_TAGS.get(fields);
 };
 
+// File views have the same lazy fields, but read from different witnesses.
+// Share the accessors instead of allocating two closures per field per file;
+// only the reader belongs to the individual view. The fields remain own,
+// enumerable properties and a local write replaces just that view's field.
+const FILE_READERS = new WeakMap();
+const FILE_DESCRIPTORS = new WeakMap();
+function fileDescriptors(fields) {
+    let descriptors = FILE_DESCRIPTORS.get(fields);
+    if (!descriptors) {
+        descriptors = Object.create(null);
+        for (const field of fields) descriptors[field] = {
+            enumerable: true, configurable: true,
+            get() { return FILE_READERS.get(this)(field); },
+            set(value) {
+                Object.defineProperty(this, field, {
+                    value, writable: true, enumerable: true, configurable: true,
+                });
+            },
+        };
+        FILE_DESCRIPTORS.set(fields, descriptors);
+    }
+    return descriptors;
+}
+
 function factIndex(reads, live, fileFields) {
     if (live) WORK.captures++;
     else WORK.replays++;
@@ -180,22 +204,13 @@ function factIndex(reads, live, fileFields) {
         // A language or package read must not copy every declaration in the
         // file. Each observed field is an independent raw input; replaying
         // an unobserved field still refuses for missing facts.
-        const value = {};
-        for (const field of fileFields) Object.defineProperty(value, field, {
-            enumerable: true, configurable: true,
-            get: () => readMapValue(`${base}.${JSON.stringify(field)}`,
-                () => {
-                    const entry = live.files.get(key);
-                    if (fileFields === OVERLOAD_FILE_FIELDS && field === 'symbols' &&
-                        !langTraits(entry.language)?.overloadFileSymbols) return undefined;
-                    return entry[field];
-                }, true),
-            set: next => {
-                Object.defineProperty(value, field, {
-                    value: next, writable: true, enumerable: true, configurable: true,
-                });
-            },
-        });
+        const value = Object.defineProperties({}, fileDescriptors(fileFields));
+        FILE_READERS.set(value, field => readMapValue(`${base}.${JSON.stringify(field)}`, () => {
+            const entry = live.files.get(key);
+            if (fileFields === OVERLOAD_FILE_FIELDS && field === 'symbols' &&
+                !langTraits(entry.language)?.overloadFileSymbols) return undefined;
+            return entry[field];
+        }, true));
         mapReads.set(base, value);
         return value;
     };
