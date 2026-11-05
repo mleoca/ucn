@@ -533,63 +533,59 @@ function fileExports(index, filePath, _visited) {
         const matchedNames = new Set(results.map(r => r.name));
         const unmatched = fileEntry.exports.filter(name => !matchedNames.has(name));
         if (unmatched.length > 0) {
-            // Re-extract raw imports to get name→module mapping (not stored in fileEntry)
-            try {
-                const content = index._readFile(absPath);
-                const { imports: rawImports } = extractImports(content, 'python');
-                // Build name→module map from raw imports
-                const nameToModule = new Map();
-                for (const imp of rawImports) {
-                    if (imp.names) {
-                        for (const name of imp.names) {
-                            if (name !== '*') nameToModule.set(name, imp.module);
-                        }
+            // Read imports for exported names that have no local declaration.
+            const content = index._readFile(absPath);
+            const { imports: rawImports } = extractImports(content, 'python');
+            // Build name→module map from raw imports
+            const nameToModule = new Map();
+            for (const imp of rawImports) {
+                if (imp.names) {
+                    for (const name of imp.names) {
+                        if (name !== '*') nameToModule.set(name, imp.module);
                     }
                 }
-                for (const name of unmatched) {
-                    const sourceModule = nameToModule.get(name);
-                    if (!sourceModule) continue;
-                    const resolvedSrc = resolveImport(sourceModule, absPath, {
-                        language: 'python',
-                        root: index.root,
-                        extensions: index.extensions
+            }
+            for (const name of unmatched) {
+                const sourceModule = nameToModule.get(name);
+                if (!sourceModule) continue;
+                const resolvedSrc = resolveImport(sourceModule, absPath, {
+                    language: 'python',
+                    root: index.root,
+                    extensions: index.extensions
+                });
+                if (!resolvedSrc) continue;
+                const sourceEntry = index.files.get(resolvedSrc);
+                const srcSymbol = sourceEntry && sourceEntry.symbols.find(s => s.name === name);
+                if (srcSymbol) {
+                    matchedNames.add(name);
+                    results.push({
+                        name,
+                        type: srcSymbol.type,
+                        file: fileEntry.relativePath,
+                        startLine: srcSymbol.startLine,
+                        endLine: srcSymbol.endLine,
+                        params: srcSymbol.params,
+                        returnType: srcSymbol.returnType,
+                        signature: index.formatSignature(srcSymbol),
+                        reExportedFrom: sourceEntry.relativePath
                     });
-                    if (!resolvedSrc) continue;
-                    const sourceEntry = index.files.get(resolvedSrc);
-                    const srcSymbol = sourceEntry && sourceEntry.symbols.find(s => s.name === name);
-                    if (srcSymbol) {
-                        matchedNames.add(name);
-                        results.push({
-                            name,
-                            type: srcSymbol.type,
-                            file: fileEntry.relativePath,
-                            startLine: srcSymbol.startLine,
-                            endLine: srcSymbol.endLine,
-                            params: srcSymbol.params,
-                            returnType: srcSymbol.returnType,
-                            signature: index.formatSignature(srcSymbol),
-                            reExportedFrom: sourceEntry.relativePath
-                        });
-                    } else {
-                        // Source not indexed or symbol not found — still list it
-                        matchedNames.add(name);
-                        results.push({
-                            name,
-                            type: 're-export',
-                            file: fileEntry.relativePath,
-                            startLine: undefined,
-                            endLine: undefined,
-                            params: undefined,
-                            returnType: null,
-                            signature: `re-export ${name} from '${sourceModule}'`,
-                            reExportedFrom: resolvedSrc
-                                ? (sourceEntry ? sourceEntry.relativePath : resolvedSrc)
-                                : sourceModule
-                        });
-                    }
+                } else {
+                    // Source not indexed or symbol not found — still list it
+                    matchedNames.add(name);
+                    results.push({
+                        name,
+                        type: 're-export',
+                        file: fileEntry.relativePath,
+                        startLine: undefined,
+                        endLine: undefined,
+                        params: undefined,
+                        returnType: null,
+                        signature: `re-export ${name} from '${sourceModule}'`,
+                        reExportedFrom: resolvedSrc
+                            ? (sourceEntry ? sourceEntry.relativePath : resolvedSrc)
+                            : sourceModule
+                    });
                 }
-            } catch (_) {
-                // File read failure — skip Python re-export resolution
             }
         }
     }

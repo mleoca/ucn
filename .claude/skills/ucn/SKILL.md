@@ -105,6 +105,8 @@ Records go to stdout; `ACCOUNT`/`CONTRACT`, notes and same-name disambiguation g
 
 Exit codes: 0 success; 1 for an empty `--lines` listing, a blocking `check` (target-less `check` with `TRUST: BLOCKED`, or `check <handle>` reporting a mismatch or an unverified call site), or a JSON command error (`meta.ok: false` plus `error`); 2 for a text-mode command error or a `check` that could not run. An exception inside UCN prints `Internal error: ...` on every surface (CLI JSON adds `meta.internalError: true`); it says nothing about the code, so rerun with a narrower target or report it.
 
+File export queries report source-read and import-parser failures as errors. A failed query does not establish an empty public API.
+
 ## Surfaces, JSON and output budgets
 
 CLI, MCP and interactive mode run the same 18 commands through one registry, the same handlers and the same formatters. CLI spells multiword commands with hyphens (`audit-async`), MCP uses snake case (`audit_async`) through one `ucn` tool. `--json` returns `{ meta, data }`: `meta.command` keeps the surface spelling and may add `canonicalCommand`, `meta.contract` carries the truth boundary, and public `file` paths are relative to `meta.pathBase`. Definition handles start at a decorator when present; `nameLine` is the declaration token's line.

@@ -3193,6 +3193,41 @@ describe('fix #180: Python **kwargs not double-prefixed in plan signature', () =
 // Fix G6-PY-002: Python __init__.py fileExports misses __all__ re-exports
 // ============================================================================
 
+describe('fix #480: import and export failures never become empty answers', () => {
+    for (const language of ['python', 'javascript']) {
+        for (const operation of ['Imports', 'Exports']) {
+            it(`${language} ${operation.toLowerCase()} preserves extraction errors`, () => {
+                const module = require(`../languages/${language}`);
+                const key = `find${operation}InCode`, original = module[key];
+                const failure = new Error('extraction failed');
+                module[key] = () => { throw failure; };
+                try {
+                    const extract = require('../core/imports')[`extract${operation}`];
+                    assert.throws(() => extract('', language), error => error === failure);
+                } finally { module[key] = original; }
+            });
+        }
+    }
+
+    for (const fault of ['read', 'parse']) it(`Python re-export ${fault} failures reach the public error envelope`, () => {
+        const dir = tmp({
+            'utils.py': 'def helper(): return 42',
+            '__init__.py': 'from .utils import helper\n__all__ = ["helper"]',
+        });
+        const python = require('../languages/python'), original = python.findImportsInCode;
+        try {
+            const index = idx(dir), failure = new Error(`re-export ${fault} failed`);
+            if (fault === 'read') index._readFile = () => { throw failure; };
+            else python.findImportsInCode = () => { throw failure; };
+            assert.throws(() => index.fileExports('__init__.py'), error => error === failure);
+            const response = execute(index, 'fileExports', { file: '__init__.py' });
+            assert.equal(response.ok, false);
+            assert.equal(response.internalError, true);
+            assert.match(response.error, /re-export (read|parse) failed/);
+        } finally { python.findImportsInCode = original; rm(dir); }
+    });
+});
+
 describe('fix G6-PY-002: Python __init__.py fileExports resolves __all__ re-exports via imports', () => {
     it('fileExports on __init__.py returns names from __all__ that come from sub-module imports', () => {
         const dir = tmp({
@@ -3210,6 +3245,11 @@ describe('fix G6-PY-002: Python __init__.py fileExports resolves __all__ re-expo
         });
         try {
             const index = idx(dir);
+            const entry = index.files.get(path.join(dir, '__init__.py'));
+            assert.ok(entry, 'the package initializer must be indexed');
+            assert.deepStrictEqual(entry.exports, ['helper'], 'indexing must retain the declared export');
+            assert.ok(entry.importDetails.some(imp => imp.module === '.utils' && imp.names.includes('helper')),
+                'indexing must retain the imported binding');
             const exports = index.fileExports('__init__.py');
             assert.ok(Array.isArray(exports), 'fileExports should return an array');
             assert.ok(exports.length > 0, 'should have at least one export');

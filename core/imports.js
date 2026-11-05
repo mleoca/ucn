@@ -22,16 +22,12 @@ function extractImports(content, language) {
 
     const langModule = getLanguageAdapter(moduleLang);
     if (langModule && typeof langModule.findImportsInCode === 'function') {
-        try {
-            const parser = getParser(language);
-            if (parser) {
-                const imports = langModule.findImportsInCode(content, parser);
-                const dynamicCount = imports.filter(i => i.dynamic).length;
-                const importAliases = imports.aliases || null;
-                return { imports, dynamicCount, importAliases };
-            }
-        } catch (e) {
-            // AST parsing failed
+        const parser = getParser(language);
+        if (parser) {
+            const imports = langModule.findImportsInCode(content, parser);
+            const dynamicCount = imports.filter(i => i.dynamic).length;
+            const importAliases = imports.aliases || null;
+            return { imports, dynamicCount, importAliases };
         }
     }
 
@@ -47,14 +43,10 @@ function extractExports(content, language) {
 
     const langModule = getLanguageAdapter(moduleLang);
     if (langModule && typeof langModule.findExportsInCode === 'function') {
-        try {
-            const parser = getParser(language);
-            if (parser) {
-                const foundExports = langModule.findExportsInCode(content, parser);
-                return { exports: foundExports };
-            }
-        } catch (e) {
-            // AST parsing failed
+        const parser = getParser(language);
+        if (parser) {
+            const foundExports = langModule.findExportsInCode(content, parser);
+            return { exports: foundExports };
         }
     }
 
