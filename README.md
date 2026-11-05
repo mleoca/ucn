@@ -143,9 +143,11 @@ confirmed sites, all correct, with 4 unscored and zero missing in-scope sites.
 All 8,000 cross-command comparisons agreed.
 The default dead-code audit found zero false-dead results among 7 scored
 claims; 4 additional claims could not be pinned by the oracle and were unscored.
-All ten repositories passed the performance budgets, including 61 query-class
-comparisons and 31 capability cohorts. The original release comparisons remain
-visible: 45 of 61 passed before applying the capability policy described below.
+The latest local performance run passed 60 of 61 query-class comparisons and
+all 31 capability cohorts. JavaPoet's overload-show p95 was 27.561 ms against
+an effective limit of 25.976 ms, so the performance gate failed. The original
+release comparisons remain visible: 44 of 61 passed before applying the
+capability policy described below.
 Query timings exclude process startup and indexing; cold builds and cache
 loading are measured separately.
 

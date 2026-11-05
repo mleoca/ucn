@@ -746,6 +746,8 @@ function constructionType(node) {
     const typeArgs = name?.type === 'generic_name'
         ? name.namedChildren.find(child => child.type === 'type_argument_list')?.namedChildCount || 0 : 0;
     if (name?.type === 'generic_name') name = name.namedChild(0);
+    // Predefined keywords (`new object()`) cannot name project types.
+    // Escaped names (`new @object()`) are identifiers and keep their records.
     if (name?.type !== 'identifier') return null;
     return { name: name.text, node: name, qualifier: qualifier?.text, typeArgs };
 }
