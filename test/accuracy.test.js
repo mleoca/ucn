@@ -77,6 +77,11 @@ describe('Oracle contract', () => {
                 'template <typename T> void dependent_use(T value) { dependent_target(value); }',
                 'typedef struct { int value; } AnonymousAlias;',
                 'typedef struct NamedRecord { int value; } NamedRecord;',
+                'void take_callback(void (*)(), const char*, int) {}',
+                '#define RUN_CALLBACK(fn) take_callback((fn), #fn, __LINE__)',
+                'void macro_reference() { RUN_CALLBACK(grow); }',
+                '#define INVOKE(fn) fn()',
+                'void macro_call() { INVOKE(grow); }',
             ].join('\n'),
             'third_party/bundled.cpp': 'void bundled_target() {}',
         });
@@ -147,6 +152,16 @@ describe('Oracle contract', () => {
                 references.find(reference => reference.line === 129)?.kind,
                 'call',
                 'compiler-backed macro argument fallback preserves direct calls',
+            );
+            assert.equal(
+                references.find(reference => reference.line === 147)?.kind,
+                'reference',
+                'a macro argument passed as a function pointer is not a call',
+            );
+            assert.equal(
+                references.find(reference => reference.line === 149)?.kind,
+                'call',
+                'a macro that invokes its function argument remains a call',
             );
             const parentReferences = await clangdOracle.findReferences(
                 handle, { ...parent, comprehensive: true });

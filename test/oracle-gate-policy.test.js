@@ -1146,3 +1146,48 @@ describe('fix #429: the value-member arm summary', () => {
         assert.strictEqual(summary.tier1Precision, null);
     });
 });
+
+describe('fix #473: macro call roles come from the expanded compiler AST', () => {
+    for (const invokes of [false, true]) {
+        it(`keeps a macro ${invokes ? 'invocation' : 'function-pointer argument'} distinct when token AST lookup is empty`, async () => {
+            const { tmp, rm } = require('./helpers');
+            const { clangdOracle } = require('../eval/oracles/clangd-oracle');
+            const { pathToUri } = require('../eval/oracles/lsp-client');
+            const dir = tmp({ 'main.c': 'void worker(void) {}\nvoid run(void) {\n  RUN_TEST(worker);\n}\n' });
+            const file = path.join(dir, 'main.c'), uri = pathToUri(file);
+            const range = { start: { line: 2, character: 11 }, end: { line: 2, character: 17 } };
+            const ast = {
+                kind: 'Call',
+                range: { start: { line: 2, character: 2 }, end: { line: 2, character: 18 } },
+                children: [
+                    { kind: 'ImplicitCast', children: [{ kind: 'DeclRef', detail: invokes ? 'worker' : 'consume' }] },
+                    ...(!invokes ? [{ kind: 'Paren', children: [{ kind: 'DeclRef', detail: 'worker', range }] }] : []),
+                ],
+            };
+            const queries = [];
+            const handle = {
+                root: dir, language: 'c', opened: new Set([file]), source: new Map(), astLines: new Map(),
+                symbols: new Map([['main.c:1:worker', { name: 'worker', file: 'main.c', line: 1, column: 5, kind: 'function', body: true }]]),
+                valueSymbols: new Map(),
+                lsp: { async request(method, params) {
+                    if (method === 'textDocument/references') return [{ uri, range }];
+                    if (method === 'textDocument/prepareCallHierarchy') return [{}];
+                    if (method === 'callHierarchy/incomingCalls') return [{
+                        from: { uri, range: { start: { line: 1, character: 0 }, end: { line: 3, character: 1 } } },
+                        fromRanges: [range],
+                    }];
+                    if (method === 'textDocument/ast') {
+                        queries.push(params.range.start.character);
+                        return params.range.start.character === 0 ? ast : null;
+                    }
+                    throw new Error(`Unexpected compiler request: ${method}`);
+                } },
+            };
+            try {
+                const refs = await clangdOracle.findReferences(handle, { name: 'worker', file: 'main.c', line: 1 });
+                assert.deepEqual(refs.map(ref => ref.kind), [invokes ? 'call' : 'reference']);
+                assert.deepEqual(queries, [11, 0], 'retry the enclosing line once, then share its bounded AST');
+            } finally { rm(dir); }
+        });
+    }
+});

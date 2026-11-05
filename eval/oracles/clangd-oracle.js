@@ -686,7 +686,11 @@ async function callReferenceInfo(handle, absFile, range, name, {
 } = {}) {
     const line = range.start.line;
     const column = range.start.character;
-    const ast = await lineAst(handle, absFile, line, column);
+    // A macro argument can have no independently selectable AST node.
+    // Its expanded call is still available from the enclosing source line;
+    // inspect that callee before trusting hierarchy's broader reference set.
+    const ast = await lineAst(handle, absFile, line, column) ||
+        (column > 0 ? await lineAst(handle, absFile, line, 0) : null);
     if (!ast) return null;
     const containsReference = node => containsPosition(node, line, column);
     const visitCallee = node => {
