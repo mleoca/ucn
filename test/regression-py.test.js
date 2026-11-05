@@ -16,6 +16,86 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
+describe('fix #467: instance wrappers preserve possible method calls', () => {
+    it('keeps wrapped inherited calls visible on both sides without borrowing unrelated owners', () => {
+        const dir = tmp({ 'a.py': [
+            'def wrap(f): return f',
+            'def replacement(): return 0',
+            'class A:',
+            '    def m(self): return 1',
+            'class B(A):',
+            '    def __init__(self): self.m = wrap(self.m)',
+            '    def run(self): return self.m()',
+            '    def parent(self): return super().m()',
+            'class C(B):',
+            '    def child(self): return self.m()',
+            'class Replaced(A):',
+            '    def __init__(self): self.m = replacement',
+            '    def replaced(self): return self.m()',
+            'class Other:',
+            '    def m(self): return 2',
+            '    def other(self): return self.m()',
+            'def typed(b: B): return b.m()',
+            'def constructed(): return B().m()',
+            'def qualified(b: B): return A.m(b)',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const target = index.find('m', { exact: true }).find(d => d.className === 'A');
+            const callers = index.findCallers('m', { targetDefinitions: [target], collectAccount: true });
+            for (const line of [7, 10, 17, 18]) {
+                assert.ok(!callers.some(site => site.line === line));
+                assert.ok(callers.unverifiedEntries.some(site => site.line === line), `line ${line}`);
+            }
+            for (const line of [7, 10]) assert.ok(callers.unverifiedEntries.some(site =>
+                site.line === line && site.reason === 'instance-attribute-wraps-method'));
+            for (const line of [13, 16]) {
+                assert.ok(!callers.some(site => site.line === line));
+                assert.ok(!callers.unverifiedEntries.some(site => site.line === line));
+            }
+            for (const name of ['run', 'child', 'typed', 'constructed']) {
+                const source = index.find(name, { exact: true })[0];
+                const callees = index.findCallees(source, { collectAccount: true, includeMethods: true });
+                assert.ok(!callees.some(callee => callee.name === 'm'), name);
+                assert.ok(callees.unverifiedCallees.some(callee => callee.name === 'm' &&
+                    callee.reason === 'instance-attribute-wraps-method'), name);
+                assert.strictEqual(callees.calleeAccount.conserved, true);
+            }
+            for (const name of ['parent']) {
+                const callees = index.findCallees(index.find(name, { exact: true })[0],
+                    { collectAccount: true, includeMethods: true });
+                assert.ok(callees.some(callee => callee.name === 'm' && callee.className === 'A'), name);
+            }
+            const qualified = index.findCallees(index.find('qualified', { exact: true })[0],
+                { collectAccount: true, includeMethods: true });
+            assert.ok(qualified.unverifiedCallees.some(callee => callee.name === 'm' &&
+                callee.reason === 'uncertain-receiver'));
+            const show = execute(index, 'show', { name: 'a.py:4:m', sections: 'callers' });
+            assert.ok(show.ok, show.error);
+            assert.strictEqual(show.result.context.meta.account.conserved, true);
+            assert.strictEqual(show.result.context.meta.account.contract.observedTextZero, false);
+            const replaced = index.findCallees(index.find('replaced', { exact: true })[0],
+                { collectAccount: true, includeMethods: true });
+            assert.ok(!replaced.some(callee => callee.name === 'm'));
+            assert.ok(replaced.unverifiedCallees.some(callee => callee.reason === 'callable-value'));
+        } finally { rm(dir); }
+    });
+
+    it('does not read initializer evidence from a file removed since indexing', () => {
+        const dir = tmp({
+            'base.py': 'class A:\n    def m(self): return 1\n',
+            'child.py': 'from base import A\nclass B(A):\n    def __init__(self): self.m = wrap(self.m)\n',
+        });
+        try {
+            const index = idx(dir);
+            const field = index.find('m', { exact: true }).find(definition => definition.instanceAttribute);
+            fs.unlinkSync(path.join(dir, 'child.py'));
+            const { instanceAttributeInitializerReads } = require('../core/value-references');
+            assert.deepStrictEqual(instanceAttributeInitializerReads(index, field), []);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #464: Python member lookup respects bases and lexical bindings', () => {
     it('does not skip an earlier unknown base for a later imported member', () => {
         const dir = tmp({

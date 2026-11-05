@@ -18,6 +18,45 @@ const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = req
 
 const os = require('os');
 
+describe('fix #467: instance method wrappers remain reviewable', () => {
+    for (const extension of ['js', 'ts', 'tsx', 'html']) {
+        it(`preserves the post-write call and its callee uncertainty in ${extension}`, () => {
+            const source = [
+                'class A { m() { return 1; } }',
+                'class B extends A {',
+                '  constructor() { super(); this.m = this.m.bind(this); }',
+                '  run() { return this.m(); }',
+                '  parent() { return super.m(); }',
+                '}',
+                'function use() { return new B().m(); }',
+            ].join('\n');
+            const file = `a.${extension}`;
+            const dir = tmp({ [file]: extension === 'html' ? `<script>${source}</script>` : source });
+            try {
+                const index = idx(dir);
+                const target = index.find('m', { exact: true }).find(d => d.className === 'A');
+                const callers = index.findCallers('m', { targetDefinitions: [target], collectAccount: true });
+                assert.ok(!callers.some(site => site.line === 4));
+                assert.ok(callers.unverifiedEntries.some(site => site.line === 4 &&
+                    site.reason === 'instance-attribute-wraps-method'));
+                const field = index.find('m', { exact: true }).find(d => d.instanceAttribute);
+                assert.ok(field, 'the write remains a field declaration');
+                for (const name of ['run', 'use']) {
+                    const callees = index.findCallees(index.find(name, { exact: true })[0],
+                        { collectAccount: true, includeMethods: true });
+                    assert.ok(!callees.some(callee => callee.name === 'm'), name);
+                    assert.ok(callees.unverifiedCallees.some(callee => callee.name === 'm' &&
+                        callee.reason === 'instance-attribute-wraps-method'), name);
+                    assert.strictEqual(callees.calleeAccount.conserved, true);
+                }
+                const direct = index.findCallees(index.find('parent', { exact: true })[0],
+                    { collectAccount: true, includeMethods: true });
+                assert.ok(direct.some(callee => callee.name === 'm' && callee.className === 'A'));
+            } finally { rm(dir); }
+        });
+    }
+});
+
 describe('fix #441: separate declarator extents', () => {
     for (const extension of ['js', 'ts', 'tsx', 'html']) {
         it(`keeps sibling functions and module values separate in ${extension}`, () => {

@@ -77,6 +77,30 @@ function _notForeignSameNameOwner(index, member, ref) {
         descendsFromTargets(index, ref, [member]) === 'yes';
 }
 
+/** Instance storage wins member lookup, but reading the previous member
+ * while computing its value can retain a call to that method. The field
+ * remains a separate binding; this supplies review evidence only. */
+function _instanceAttributeCall(index, receiver, definitions, targets = definitions) {
+    if (!receiver?.key || !definitions.some(definition => definition.instanceAttribute) ||
+        !langTraits(index.files.get(receiver.def?.file)?.language)?.instanceAttributesShadowMethods) return null;
+    const declaring = findDeclaringClass(index, receiver, definitions);
+    const attributes = declaring?.members.filter(member => member.instanceAttribute) || [];
+    if (declaring?.uncertain || !attributes.length) return null;
+    const { instanceAttributeInitializerReads } = require('./value-references');
+    const readsPrevious = attributes.some(member => instanceAttributeInitializerReads(index, member).length > 0);
+    let wrapsTarget = false;
+    if (readsPrevious) {
+        const remaining = definitions.filter(member => !attributes.includes(member));
+        const previous = findDeclaringClass(index, declaring.ref, remaining);
+        wrapsTarget = !!previous && (previous.uncertain
+            ? descendsFromTargets(index, declaring.ref, targets) !== 'no'
+            : previous.members.some(member => isCallableMember(member) && targets.some(target =>
+                sameDeclaration(declarationIdentity(member), declarationIdentity(target)))));
+        if (!wrapsTarget) wrapsTarget = !!_instanceAttributeCall(index, declaring.ref, remaining, targets)?.wrapsTarget;
+    }
+    return { wrapsTarget, reason: readsPrevious ? 'instance-attribute-wraps-method' : 'callable-value' };
+}
+
 const CONSTRUCTABLE_BINDING_KINDS = new Set([
     'class', 'struct', 'record', 'enum', 'function',
 ]);
@@ -4050,6 +4074,11 @@ function findCallers(index, name, options = {}) {
                             }
                             const declaring = callerClassRef?.external ? null
                                 : findDeclaringClass(index, callerClassRef, definitions, { parentsOnly });
+                            if (!parentsOnly && _instanceAttributeCall(index, callerClassRef, definitions,
+                                options.targetDefinitions || definitions)?.wrapsTarget) {
+                                routeUnverified(filePath, fileEntry, call, 'instance-attribute-wraps-method', calledAs);
+                                continue;
+                            }
                             const matchedClass = declaring ? declaring.ref.name : null;
                             if (matchedClass) {
                                 const tDefs = options.targetDefinitions || definitions;
@@ -9820,7 +9849,7 @@ function findCallees(index, definition, options = {}) {
                         index, call, symbols || [], typeName, language, def.file,
                         isCallable);
                     if (sel.ambiguous) {
-                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        noteUnverified(siteId, call, sel.reason || 'overload-ambiguous');
                         continue;
                     }
                     const match = sel.match;
@@ -9999,7 +10028,7 @@ function findCallees(index, definition, options = {}) {
                             fromFile: receiverOriginFile, definition: receiverTypeDefinition,
                         });
                     if (sel.ambiguous) {
-                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        noteUnverified(siteId, call, sel.reason || 'overload-ambiguous');
                         continue;
                     }
                     const match = sel.match;
@@ -10139,7 +10168,7 @@ function findCallees(index, definition, options = {}) {
                             continue;
                         }
                         if (sel.ambiguous) {
-                            noteUnverified(siteId, call, 'overload-ambiguous');
+                            noteUnverified(siteId, call, sel.reason || 'overload-ambiguous');
                             continue;
                         }
                     }
@@ -10470,7 +10499,7 @@ function findCallees(index, definition, options = {}) {
                 if (members.length > 0) {
                     const selected = _calleeOverloadSelect(index, call, members, language);
                     if (selected.ambiguous) {
-                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        noteUnverified(siteId, call, selected.reason || 'overload-ambiguous');
                         continue;
                     }
                     if (selected.match) {
@@ -10524,7 +10553,7 @@ function findCallees(index, definition, options = {}) {
                     const selected = _calleeOverloadSelect(
                         index, call, candidates, language);
                     if (selected.ambiguous) {
-                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        noteUnverified(siteId, call, selected.reason || 'overload-ambiguous');
                         continue;
                     }
                     if (selected.match) {
@@ -11370,7 +11399,7 @@ function findCallees(index, definition, options = {}) {
                     }
                 }
                 if (selected.ambiguous) {
-                    noteUnverified(siteId, call, 'overload-ambiguous');
+                    noteUnverified(siteId, call, selected.reason || 'overload-ambiguous');
                     continue;
                 }
                 let match = selected.match;
@@ -11390,7 +11419,7 @@ function findCallees(index, definition, options = {}) {
                         selected = selectOwner(declaring.ref);
                         match = selected.match;
                         if (selected.ambiguous) {
-                            noteUnverified(siteId, call, 'overload-ambiguous');
+                            noteUnverified(siteId, call, selected.reason || 'overload-ambiguous');
                             ambiguityClaimed = true;
                         }
                     }
@@ -11416,7 +11445,7 @@ function findCallees(index, definition, options = {}) {
                         }
                         selected = selectOwner(current);
                         if (selected.ambiguous) {
-                            noteUnverified(siteId, call, 'overload-ambiguous');
+                            noteUnverified(siteId, call, selected.reason || 'overload-ambiguous');
                             ambiguityClaimed = true;
                             match = null;
                             break;
@@ -19181,6 +19210,16 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
 
 function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
     contextFile, accepts = () => true, typeOrigin = null) {
+    if (langTraits(language)?.instanceAttributesShadowMethods && !typeOrigin?.typeQualified &&
+        !_isSuperReceiver(language, call.receiver) && symbols?.some(symbol => symbol.instanceAttribute)) {
+        const definition = typeOrigin?.definition;
+        const receiver = typeOrigin?.classRef || (definition
+            ? { name: typeName, key: classKeyOf(index, definition), def: definition }
+            : _typeRefAt(index, typeOrigin?.fromFile || contextFile, typeName,
+                typeOrigin?.fromFile && typeOrigin.fromFile !== contextFile ? null : call.line));
+        const attribute = _instanceAttributeCall(index, receiver, symbols);
+        if (attribute) return { ambiguous: true, reason: attribute.reason };
+    }
     if (typeOrigin?.primitiveType || typeOrigin?.stdResult) {
         const view = _flowReceiverType(index, contextFile, call,
             { ...typeOrigin, type: typeName }, symbols || []);
@@ -22496,7 +22535,7 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
             (s.ownerTypeArity || 0) === siteArity);
     if (language !== 'java' && language !== 'csharp' && classDefsNamed(index, receiver).hasScoped) {
         const selected = _calleeSelectReceiverMethod(
-            index, call, symbols, receiver, language, def.file, isCallable);
+            index, call, symbols, receiver, language, def.file, isCallable, { typeQualified: true });
         return selected.match ? { match: selected.match, typeName: receiver }
             : { unverified: selected.ambiguous ? 'overload-ambiguous' : 'uncertain-receiver' };
     }

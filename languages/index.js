@@ -104,6 +104,9 @@ const JAVA_LANG_NOT_SERIALIZABLE = ['Object', 'Runnable', 'AutoCloseable', 'Comp
 
 const STRUCTURAL_TRAITS = {
     typeSystem: 'structural',
+    // A write on the instance can replace an inherited method with a
+    // callable value, including a wrapper of the previous method.
+    instanceAttributesShadowMethods: true,
     // Whether importing a module runs its top-level code when the importer
     // loads (JS/TS/HTML scripts, Python): only then is an import cycle an
     // import-time cycle (fix #433).
@@ -362,6 +365,7 @@ const STRUCTURAL_TRAITS = {
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
+    instanceAttributesShadowMethods: false,
     importsRunModules: false,
     superReceiver: null,
     ownClassMethod: null,

@@ -55,7 +55,14 @@ function instanceAttributeInitializerReads(index, definition) {
     if (memo?.has(definition)) return memo.get(definition);
     const file = definition.file;
     let language = index.files.get(file)?.language;
-    let source = index._readFile(file);
+    let source;
+    try {
+        source = index._readFile(file);
+    } catch {
+        // A file removed since indexing is no longer in the observed
+        // source universe, as in computeGroundSet.
+        return [];
+    }
     const embedded = langTraits(language)?.embeddedSyntax;
     if (embedded) {
         source = embedded.source(source, getParser(language));
