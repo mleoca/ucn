@@ -110,6 +110,33 @@ function plainStructure(tree, source) {
         .every(node => node.namedChildren.every(child => LITERAL_PARTS.has(child.type)));
 }
 
+// Equal code between corresponding literal/comment regions has the same
+// token stream, including extra comment nodes. Java's grammar does not read
+// their contents as code. Check both trees and literal children so an escape
+// that ends a region or introduces a template cannot use this proof.
+function literalOnlyTranslation(rawTree, translatedTree, source, translated) {
+    if (!rawTree || !translatedTree || rawTree.rootNode.hasError || translatedTree.rootNode.hasError) return false;
+    const kinds = ['string_literal', 'character_literal', 'line_comment', 'block_comment'];
+    const before = rawTree.rootNode.descendantsOfType(kinds);
+    const after = translatedTree.rootNode.descendantsOfType(kinds);
+    if (before.length !== after.length) return false;
+    let rawEnd = 0, translatedEnd = 0;
+    for (let i = 0; i < before.length; i++) {
+        const left = before[i], right = after[i];
+        if (left.type !== right.type || left.startIndex < rawEnd || right.startIndex < translatedEnd) return false;
+        const outside = source.slice(rawEnd, left.startIndex);
+        if (outside !== translated.slice(translatedEnd, right.startIndex) || noncanonicalIdentifier(outside)) return false;
+        if (left.type === 'string_literal' || left.type === 'character_literal') {
+            if (left.namedChildren.some(child => !LITERAL_PARTS.has(child.type)) ||
+                right.namedChildren.some(child => !LITERAL_PARTS.has(child.type))) return false;
+        }
+        rawEnd = left.endIndex;
+        translatedEnd = right.endIndex;
+    }
+    const outside = source.slice(rawEnd);
+    return outside === translated.slice(translatedEnd) && !noncanonicalIdentifier(outside);
+}
+
 // The index retains raw-source positions. Its type/name facts are usable
 // when lexical translation preserves the AST's names and structure. Literal
 // contents and comment text do not change Java's static argument types.
@@ -144,9 +171,13 @@ function wholeSourceCanonical(source, parseError) {
             const parser = getParser('java');
             const rawTree = safeParse(parser, source);
             if (translated === source) canonical = plainStructure(rawTree, source);
-            else {
-                const before = typeNameStructure(rawTree);
-                if (before !== null) canonical = before === typeNameStructure(parseNameSource(parser, translated, safeParse));
+            else if (rawTree && !rawTree.rootNode.hasError) {
+                const translatedTree = parseNameSource(parser, translated, safeParse);
+                canonical = literalOnlyTranslation(rawTree, translatedTree, source, translated);
+                if (!canonical) {
+                    const before = typeNameStructure(rawTree);
+                    if (before !== null) canonical = before === typeNameStructure(translatedTree);
+                }
             }
         }
     }

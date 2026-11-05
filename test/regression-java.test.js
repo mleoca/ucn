@@ -491,6 +491,22 @@ describe('fix #417: Java type-name evidence follows lexical translation', () => 
             String.raw`class A {String emoji="😀"; char zero='\u0000';}`,
         ]) assert.equal(typeNameSourceCanonical(source), true, source);
     });
+    it('literal-region proof retains fallback for changed trivia and refuses introduced code', () => {
+        for (const source of [
+            String.raw`@Anno("\u0061") class A { char c='\u0062'; String s="\u0000"; }`,
+            String.raw`class A { /* \u000a */ String s="\u0061"; int value; }`,
+            String.raw`// harmless\u000a` + '\nclass A {}',
+            'class A { String s="""\n' + String.raw`\u0061` + '\n"""; }',
+            String.raw`class A { String s="\u200d"; /* \u0000 */ int value; }`,
+        ]) assert.equal(typeNameSourceCanonical(source), true, source);
+        for (const source of [
+            String.raw`class A { String s="\u0022; int injected; String t=\u0022"; }`,
+            String.raw`class A { /* \u002a\u002f int injected; /* */ }`,
+            String.raw`class A { String s="\u0061"; int v\u0061lue; }`,
+            String.raw`class A { String s="\u0061"; int v` + '\u200d' + 'alue; }',
+            String.raw`class A { String s=STR."\u0061 \{value}"; }`,
+        ]) assert.equal(typeNameSourceCanonical(source), false, source);
+    });
     it('withdraws certainty when translation changes imports or identifiers', () => {
         for (const source of [
             String.raw`//\u000a import q.java;` + '\nclass A {}',
