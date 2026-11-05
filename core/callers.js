@@ -19080,7 +19080,13 @@ function _calleeOverloadSelect(index, call, matches, language) {
         const byConst = _cppSelectByObjectConstness(applicable, call.receiverConst);
         if (byConst) applicable = _cppWithoutDefinedDeclarations(byConst);
     }
-    if (applicable.length === 1) return { match: applicable[0] };
+    if (applicable.length === 1) {
+        if (fits.length > 1 && _needsUserDefinedConversionProof(index, call, applicable[0], language) &&
+            !_overloadProvablyApplicable(index, call, applicable[0], fits, language)) {
+            return { ambiguous: true, applicable };
+        }
+        return { match: applicable[0] };
+    }
     // Rust impls of one type that differ in their self reference layer
     // (fix #401): the receiver's known layer selects by probe step.
     if (language === 'rust') {
@@ -20135,6 +20141,8 @@ function _preferFixedArityOverloads(index, call, applicable, language) {
  * ambiguous, never assigned to the more specific or fixed-arity candidate.
  */
 function _overloadProvablyApplicable(index, call, definition, candidates, language) {
+    const constructors = langTraits(language)?.userDefinedConversions === 'constructors-and-operators';
+    if (constructors && (definition.templateParams || definition.isSpecialization)) return false;
     const argCount = call.argCount;
     if (!Number.isInteger(argCount)) return false;
     const kinds = Array.isArray(call.argKinds) ? call.argKinds : [];
@@ -20161,7 +20169,8 @@ function _overloadProvablyApplicable(index, call, definition, candidates, langua
                 continue;
             }
         }
-        if (!_argProvablyConverts(index, kinds[i], param, language, definition, _javaCallArgumentOrigin(call))) return false;
+        if (!(constructors ? _cppArgProvablyConverts(index, kinds[i], param)
+            : _argProvablyConverts(index, kinds[i], param, language, definition, _javaCallArgumentOrigin(call)))) return false;
     }
     return true;
 }
@@ -25337,6 +25346,54 @@ function _javaKnownReferenceConversion(index, paramType, owner, supertypes, clos
     return null;
 }
 
+// A declared implicit operator is a possible conversion, never an
+// applicability proof. Generic owners and inherited operators participate
+// too; constraints and operator overload resolution remain undecided.
+function _implicitConversionMayApply(index, kind, paramType, language) {
+    if (_isLambdaKind(kind)) return false;
+    const head = text => {
+        let value = String(text || '');
+        while (/<[^<>]*>/.test(value)) value = value.replace(/<[^<>]*>/g, '');
+        return value.replace(/\?$/, '').split('.').pop();
+    };
+    const actual = /^(?:type|new|cast):/.test(kind) ? head(kind.slice(kind.indexOf(':') + 1)) : null;
+    const intrinsic = /^(?:sbyte|byte|short|ushort|int|uint|long|ulong|char|float|double|decimal|bool|string|object|nint|nuint|dynamic)$/;
+    const names = [[actual, 'source'], [head(paramType), 'target']]
+        .filter(([name]) => name && !intrinsic.test(name) && index.symbols.has(name));
+    if (!names.length) return false;
+    const owners = live => {
+        const memo = live._opMemo?.('implicitConversionOwners', () => new Map());
+        if (memo?.has(language)) return memo.get(language);
+        const result = { source: new Set(), target: new Set() };
+        for (const [name, definitions] of live.symbols) {
+            if (!name.startsWith('operator ')) continue;
+            for (const definition of definitions) {
+                if (!definition.className || !definition.modifiers?.includes('implicit') ||
+                    live.files.get(definition.file)?.language !== language) continue;
+                const owner = head(definition.className);
+                const from = head(definition.paramsStructured?.[0]?.type), to = head(definition.returnType);
+                const unknown = !from || !to || from !== owner && to !== owner;
+                if (from === owner || unknown) result.source.add(owner);
+                if (to === owner || unknown) result.target.add(owner);
+            }
+        }
+        for (const name of result.source) {
+            for (const child of live.extendedByGraph.get(name) || []) result.source.add(head(child.name));
+        }
+        memo?.set(language, result);
+        return result;
+    };
+    return names.some(([name, direction]) => lazyProvenanceOverloadModule().projectHas(index,
+        `implicit-conversion-owners:${language}:${direction}`, name, live => owners(live)[direction]));
+}
+
+function _needsUserDefinedConversionProof(index, call, definition, language) {
+    const conversions = langTraits(language)?.userDefinedConversions;
+    if (conversions === 'constructors-and-operators') return true;
+    return conversions === 'operators' && (call.argKinds || []).some((kind, position) =>
+        _implicitConversionMayApply(index, kind, _javaParamAt(definition, position, call)?.type, language));
+}
+
 function _javaArgKindMatches(index, kind, paramType, language, typeParams = null, paramOwner = null, argumentOrigin = null) {
     if (!kind || kind === 'expr') return true;
     if (!paramType) return true;
@@ -25347,6 +25404,8 @@ function _javaArgKindMatches(index, kind, paramType, language, typeParams = null
     // A declared type parameter (`T? argument` in `AgainstNull<T>`) is
     // inferred from the argument: no argument type disproves it (fix #391).
     if (typeParams?.has(bare.replace(/\?$/, ''))) return true;
+    if (langTraits(language)?.userDefinedConversions === 'operators' &&
+        _implicitConversionMayApply(index, kind, paramType, language)) return true;
     if (_isLambdaKind(kind)) {
         // A lambda converts only to a delegate / functional-interface type
         // (fix #391): never to a string, a primitive or closed value type,
@@ -25589,46 +25648,6 @@ function _computeCppTypeCategory(type) {
     if (!head) return { kind: 'unknown', head: null };
     if (/^[A-Z][0-9]?$/.test(head)) return { kind: 'generic', head };
 
-    const encodingIn = (value) => {
-        if (value.includes('wchar_t') || /\bw(?:format_)?string(?:_view)?\b/.test(value)) {
-            return 'wchar_t';
-        }
-        if (value.includes('char8_t') || value.includes('u8string')) return 'char8_t';
-        if (value.includes('char16_t') || value.includes('u16string')) return 'char16_t';
-        if (value.includes('char32_t') || value.includes('u32string')) return 'char32_t';
-        if (value.includes('char')) return 'char';
-        return null;
-    };
-    if (head === 'wformat_string') {
-        return { kind: 'format-string', encoding: 'wchar_t', head };
-    }
-    if (head === 'format_string') {
-        return { kind: 'format-string', encoding: 'char', head };
-    }
-    if (head === 'basic_format_string') {
-        return {
-            kind: 'format-string',
-            encoding: encodingIn(compact) || null,
-            head,
-        };
-    }
-    if (head === 'wstring' || head === 'wstring_view') {
-        return { kind: 'string', encoding: 'wchar_t', head };
-    }
-    if (head === 'string' || head === 'string_view') {
-        return { kind: 'string', encoding: 'char', head };
-    }
-    if (head === 'basic_string' || head === 'basic_string_view') {
-        return {
-            kind: 'string',
-            encoding: encodingIn(compact) || null,
-            head,
-        };
-    }
-    if (head === 'locale_ref' || head === 'locale') {
-        return { kind: 'locale', head };
-    }
-    if (head === 'text_style') return { kind: 'style', head };
     if (['char', 'wchar_t', 'char8_t', 'char16_t', 'char32_t'].includes(head)) {
         return {
             kind: compact.includes('*') || compact.includes('[')
@@ -25639,9 +25658,7 @@ function _computeCppTypeCategory(type) {
     }
     if (['bool'].includes(head)) return { kind: 'bool', head };
     if ([
-        'short', 'int', 'long', 'float', 'double', 'size_t', 'ptrdiff_t',
-        'int8_t', 'int16_t', 'int32_t', 'int64_t',
-        'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+        'short', 'int', 'long', 'long long', 'long double', 'float', 'double',
     ].includes(head) || /\b(?:unsigned|signed)\b/.test(original)) {
         return { kind: 'number', head };
     }
@@ -25651,7 +25668,7 @@ function _computeCppTypeCategory(type) {
 
 /**
  * Conservative C++ static-shape test. A negative verdict is returned only
- * for language-level incompatible literal/platform categories. User-defined
+ * for language-level incompatible builtin categories. User-defined
  * converting constructors and unknown template constraints keep the
  * candidate alive.
  */
@@ -25662,7 +25679,7 @@ function _cppArgKindMatches(index, kind, paramType) {
 
     if (kind.startsWith('string:')) {
         const encoding = kind.slice('string:'.length);
-        if (expected.kind === 'format-string' || expected.kind === 'string') {
+        if (expected.kind === 'string') {
             return !expected.encoding || expected.encoding === encoding;
         }
         // A string literal decays to a pointer to its characters: a pointer
@@ -25671,8 +25688,7 @@ function _cppArgKindMatches(index, kind, paramType) {
         // template's member type (`const Ch*`) may be the character type
         // (fix #396).
         if (expected.kind === 'pointer') return !_cppPointeeRejectsCharacters(index, expected.head);
-        if (['locale', 'style', 'number', 'bool', 'character']
-            .includes(expected.kind)) {
+        if (['number', 'character'].includes(expected.kind)) {
             return false;
         }
         return true;
@@ -25682,7 +25698,7 @@ function _cppArgKindMatches(index, kind, paramType) {
         if (expected.kind === 'character') {
             return !expected.encoding || expected.encoding === encoding;
         }
-        if (['format-string', 'string', 'locale', 'style', 'pointer']
+        if (['string', 'pointer']
             .includes(expected.kind)) {
             return false;
         }
@@ -25690,7 +25706,7 @@ function _cppArgKindMatches(index, kind, paramType) {
     }
     if (kind === 'number:integer' || kind === 'number:floating') {
         if (expected.kind === 'number') return true;
-        if (['format-string', 'string', 'locale', 'style', 'pointer']
+        if (['string', 'pointer']
             .includes(expected.kind)) {
             return false;
         }
@@ -25698,7 +25714,7 @@ function _cppArgKindMatches(index, kind, paramType) {
     }
     if (kind === 'bool') {
         if (expected.kind === 'bool' || expected.kind === 'number') return true;
-        if (['format-string', 'string', 'locale', 'style', 'pointer']
+        if (['string', 'pointer']
             .includes(expected.kind)) {
             return false;
         }
@@ -25712,7 +25728,7 @@ function _cppArgKindMatches(index, kind, paramType) {
         const actualType = kind.slice(kind.indexOf(':') + 1);
         const actual = _cppTypeCategory(index, actualType);
         const closed = new Set([
-            'format-string', 'string', 'locale', 'style',
+            'string',
             'number', 'bool', 'character',
         ]);
         // One spelled head is one type unless the declarators part them: a
@@ -25724,11 +25740,12 @@ function _cppArgKindMatches(index, kind, paramType) {
         }
         if (closed.has(actual.kind) && closed.has(expected.kind)) {
             if (actual.kind !== expected.kind) {
-                // std::locale converts to fmt::locale_ref by contract.
-                if (actual.kind === 'locale' && expected.kind === 'locale') return true;
+                if (expected.kind === 'bool' && actual.kind === 'string') return true;
+                if (['number', 'bool', 'character'].includes(actual.kind) &&
+                    ['number', 'bool', 'character'].includes(expected.kind)) return true;
                 return false;
             }
-            if ((actual.kind === 'format-string' || actual.kind === 'string' ||
+            if ((actual.kind === 'string' ||
                 actual.kind === 'character') &&
                 actual.encoding && expected.encoding) {
                 return actual.encoding === expected.encoding;
@@ -25736,6 +25753,22 @@ function _cppArgKindMatches(index, kind, paramType) {
         }
     }
     return true;
+}
+
+function _cppArgProvablyConverts(index, kind, param) {
+    if (!param?.type || param.rest || !kind || kind === 'expr') return false;
+    const expected = _cppTypeCategory(index, param.type);
+    if (kind === 'bool' || kind.startsWith('char:') || kind.startsWith('number:')) {
+        return ['number', 'bool', 'character'].includes(expected.kind);
+    }
+    if (kind.startsWith('string:')) {
+        return expected.kind === 'bool' || expected.kind === 'string' &&
+            expected.encoding === kind.slice('string:'.length) &&
+            /\bconst\b/.test(String(param.type).split(/\*|\[/)[0]);
+    }
+    if (kind === 'null') return ['pointer', 'string'].includes(expected.kind);
+    if (kind.startsWith('type:')) return _cppExactParamMatch(param.type, kind.slice('type:'.length));
+    return false;
 }
 
 /**
@@ -27461,8 +27494,12 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         // static import), or the model misread its arguments. Either way it
         // is not evidence for the pin, and not proof against it: visible.
         // An argument COUNT no overload accepts keeps the arity verdict.
-        if (!(targetLanguage === 'java' || targetLanguage === 'csharp') ||
-            !family.some(d => _overloadArityFits(call, d))) return null;
+        if (!family.some(d => _overloadArityFits(call, d))) return null;
+        if (langTraits(targetLanguage)?.userDefinedConversions === 'constructors-and-operators') {
+            return { ambiguous: true, candidates: 0, compileTimeDispatch: true,
+                dispatchFamily: `${call.name} C++ overload set` };
+        }
+        if (!(targetLanguage === 'java' || targetLanguage === 'csharp')) return null;
         // Another project definition of the name every argument provably
         // converts to shows the arguments were read right (fix #428:
         // `lbf.getBean(TestBean.class)` binds a subclass's getBean(Class<T>),
@@ -27486,6 +27523,14 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     if (!pinnedApplicable) return 'other-overload';
     if (applicable.every(d =>
         pinnedKeys.has(pinKey(d)))) {
+        const arityFits = family.filter(d => _overloadArityFits(call, d));
+        if (arityFits.length > 1 && applicable.some(definition =>
+            _needsUserDefinedConversionProof(index, call, definition, targetLanguage)) &&
+            !applicable.some(definition => _overloadProvablyApplicable(index, call, definition, arityFits, targetLanguage))) {
+            return { ambiguous: true, candidates: applicable.length,
+                ...(targetLanguage === 'cpp' && { compileTimeDispatch: true,
+                    dispatchFamily: `${call.name} C++ overload set` }) };
+        }
         return null;
     }
     if (applicable.length === 1) return null; // uniquely the pinned overload

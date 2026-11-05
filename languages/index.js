@@ -184,6 +184,7 @@ const STRUCTURAL_TRAITS = {
     memberHidingModifier: null,
     virtualMemberModifiers: null,
     hasArityOverloads: false,
+    userDefinedConversions: null,
     overloadPhases: null,
     overloadFileSymbols: false,
     inheritedOverloadSignatures: false,
@@ -443,6 +444,9 @@ const NOMINAL_TRAITS = {
     // the caller contract: a pinned overload is only confirmed when the call
     // site provably binds it.
     hasArityOverloads: false,
+    // User-defined conversions keep otherwise incompatible argument types
+    // possible; selecting an overload still needs a positive conversion proof.
+    userDefinedConversions: null,
     overloadPhases: null,
     overloadFileSymbols: false,
     inheritedOverloadSignatures: false,
@@ -1038,6 +1042,7 @@ const LANGUAGES = {
             typeQualifiedCallStyle: 'path',
             standardPathRoots: ['std'],
             hasArityOverloads: true,
+            userDefinedConversions: 'constructors-and-operators',
             // Range-for lowers onto member begin()/end() with no name token.
             // The standard library's traits read member types by name
             // (fix #427): std::iterator_traits (value_type, difference_type,
@@ -1112,6 +1117,7 @@ const LANGUAGES = {
             packageScope: 'namespace',
             hasDynamicImports: false,
             hasArityOverloads: true,
+            userDefinedConversions: 'operators',
             bareCallReachesMethods: true,
             // The type the compiler synthesizes for top-level statements: a
             // local function there has no other class in lexical scope.

@@ -18,6 +18,161 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #479: user-defined conversions do not prove overload applicability', () => {
+    const cases = [
+        ['constrained converting constructor', 'n.cpp', [
+            'namespace lib {',
+            'struct string_view {};',
+            'struct format_string { format_string(string_view); };',
+            'struct locale_ref { template<class T, class = typename T::collate> locale_ref(const T&); };',
+            'void pick(locale_ref value, int extra) {}',
+            'void pick(format_string value, int extra) {}',
+            'void run(string_view value) { pick(value, 1); }',
+            '}',
+        ]],
+        ['requires converting constructor', 'n.cpp', [
+            'namespace lib {',
+            'struct string_view {};',
+            'struct format_string { format_string(string_view); };',
+            'struct locale_ref { template<class T> requires requires { typename T::collate; } locale_ref(const T&); };',
+            'void pick(locale_ref value, int extra) {}',
+            'void pick(format_string value, int extra) {}',
+            'void run(string_view value) { pick(value, 1); }',
+            '}',
+        ]],
+        ['conversion operator on a library-shaped name', 'n.cpp', [
+            'struct locale { operator int() const; };',
+            'void pick(int value) {}',
+            'void pick(bool value) {}',
+            'void run(locale value) { pick(value); }',
+        ]],
+        ['constrained conversion operator', 'n.cpp', [
+            'struct Value { template<class T> requires (sizeof(T) == sizeof(int)) operator T() const; };',
+            'void pick(int value) {}',
+            'void pick(const char* value) {}',
+            'void run(Value value) { pick(value); }',
+        ]],
+        ['C# implicit conversion', 'N.cs', [
+            'struct Token { public static implicit operator string(Token value) => "value"; }',
+            'class Use {',
+            ' static void pick(string value) {}',
+            ' static void pick(object value) {}',
+            ' static void run(Token value) { pick(value); }',
+            '}',
+        ]],
+        ['C# generic owner implicit conversion', 'N.cs', [
+            'struct Token<T> { public static implicit operator string(Token<T> value) => "value"; }',
+            'class Use {',
+            ' static void pick(string value) {}',
+            ' static void pick(object value) {}',
+            ' static void run(Token<int> value) { pick(value); }',
+            '}',
+        ]],
+        ['C# inherited implicit conversion', 'N.cs', [
+            'class Token { public static implicit operator string(Token value) => "value"; }',
+            'class Derived : Token {}',
+            'class Use {',
+            ' static void pick(string value) {}',
+            ' static void pick(object value) {}',
+            ' static void run(Derived value) { pick(value); }',
+            '}',
+        ]],
+    ];
+    for (const [label, file, lines] of cases) it(label, () => {
+        const dir = tmp({ [file]: lines.join('\n') });
+        try {
+            const index = idx(dir), callLine = lines.findIndex(line => line.includes('void run(')) + 1;
+            for (const definition of index.symbols.get('pick')) {
+                const result = index.context('pick', { file, line: definition.startLine });
+                assert.ok(!result.callers.some(call => call.line === callLine), label);
+                assert.ok(result.unverifiedCallers.some(call => call.line === callLine &&
+                    call.reason === 'overload-ambiguous'), `${label}: ${definition.startLine}`);
+                assert.equal(result.meta.account.conserved, true);
+            }
+            const run = index.context('run', { file, line: callLine });
+            assert.ok(!run.callees.some(call => call.name === 'pick'), label);
+            assert.ok(run.unverifiedCallees.some(call => call.name === 'pick' &&
+                call.reason === 'overload-ambiguous'), label);
+        } finally { rm(dir); }
+    });
+
+    it('a sole possible converting constructor still needs an applicability proof', () => {
+        const dir = tmp({ 'n.cpp': [
+            'struct Gate { template<class T> requires (sizeof(T) == sizeof(bool)) Gate(T); };',
+            'void pick(Gate value) {}',
+            'void pick(const char* value) {}',
+            'void run() { pick(true); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir), result = index.context('pick', { file: 'n.cpp', line: 2 });
+            assert.equal(result.callers.length, 0);
+            assert.ok(result.unverifiedCallers.some(call => call.line === 4 && call.reason === 'overload-ambiguous'));
+            const run = index.context('run', { file: 'n.cpp', line: 4 });
+            assert.ok(!run.callees.some(call => call.name === 'pick'));
+            assert.ok(run.unverifiedCallees.some(call => call.name === 'pick' && call.reason === 'overload-ambiguous'));
+        } finally { rm(dir); }
+    });
+
+    it('an implicit conversion into a C# type does not imply conversion out of it', () => {
+        const dir = tmp({ 'N.cs': [
+            'struct Token { public static implicit operator Token(string value) => new Token(); }',
+            'class Use {',
+            ' static void pick(string value) {}',
+            ' static void pick(object value) {}',
+            ' static void run(Token value) { pick(value); }',
+            '}',
+        ].join('\n') });
+        try {
+            const index = idx(dir), result = index.context('pick', { file: 'N.cs', line: 4 });
+            assert.deepEqual(result.callers.map(call => call.line), [5]);
+            assert.equal(index.context('pick', { file: 'N.cs', line: 3 }).unverifiedCallers.length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('keeps builtin C++ conversions and explicit-only C# operators distinct', () => {
+        for (const [file, lines, targetLine, callerLine] of [
+            ['n.cpp', ['void pick(const char* value) {}', 'void pick(int value) {}',
+                'void run() { pick("value"); }'], 1, 3],
+            ['N.cs', ['struct Token { public static explicit operator string(Token value) => "value"; }',
+                'class Use {', 'static void pick(string value) {}', 'static void pick(object value) {}',
+                'static void run(Token value) { pick(value); }', '}'], 4, 5],
+        ]) {
+            const dir = tmp({ [file]: lines.join('\n') });
+            try {
+                const result = idx(dir).context('pick', { file, line: targetLine });
+                assert.deepEqual(result.callers.map(call => call.line), [callerLine], file);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('replays implicit-conversion evidence independently and refreshes it after an edit', () => {
+        const { captureOverload, validateOverload } = require('../core/provenance-overload');
+        const { declarationIdentity } = require('../core/provenance');
+        const { selectProvenanceOverload } = require('../core/callers');
+        const lines = cases.find(([label]) => label === 'C# implicit conversion')[2];
+        const dir = tmp({ 'N.cs': lines.join('\n') });
+        try {
+            const index = idx(dir), members = index.symbols.get('pick');
+            const call = index.getCachedCalls(path.join(dir, 'N.cs')).find(call => call.name === 'pick');
+            index._beginOp();
+            try {
+                const witness = captureOverload(index, call, members, 'csharp', selectProvenanceOverload);
+                assert.equal(witness.outcome, 'ambiguous');
+                const copy = JSON.parse(JSON.stringify(witness));
+                assert.equal(validateOverload(copy, members.map(declarationIdentity), null, false, true), true);
+                const key = Object.keys(copy.reads).find(key => key.includes('implicit-conversion-owners:csharp') && key.endsWith('Token'));
+                assert.ok(key);
+                delete copy.reads[key];
+                assert.equal(validateOverload(copy, members.map(declarationIdentity), null, false, true), false);
+            } finally { index._endOp(); }
+            fs.writeFileSync(path.join(dir, 'N.cs'), lines.join('\n').replace('implicit operator', 'explicit operator'));
+            index.build(null, { quiet: true, workers: 0 });
+            const result = index.context('pick', { file: 'N.cs', line: 4 });
+            assert.deepEqual(result.callers.map(call => call.line), [5]);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #417: nominal interface field calls do not select static class methods', () => {
     const cases = [
         ['N.java', 'interface Contract {void pick();} class Target {static void pick(){}static void pick(Object value){}}class Use {Contract value;void build(){value.pick();}}'],

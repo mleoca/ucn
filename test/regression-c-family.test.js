@@ -1342,20 +1342,20 @@ describe('C++ language support', () => {
         }
     });
 
-    it('uses C++ literal kinds to select namespace-qualified free overloads', () => {
+    it('does not infer C++ user-defined conversions from library-like type names', () => {
         const dir = tmp({
             'include/fmt/format.hpp': [
                 'namespace fmt {',
-                'template <typename... T> struct format_string {};',
-                'template <typename... T> struct wformat_string {};',
+                'template <typename... T> struct format_string { format_string(const char*); };',
+                'template <typename... T> struct wformat_string { wformat_string(const wchar_t*); };',
                 'struct locale_ref {};',
                 'struct text_style {};',
                 'template <typename... T>',
-                'void format(format_string<T...> value, T&&... args);',
+                'void format(format_string<> value, T&&... args);',
                 'void format(locale_ref value);',
                 'void format(text_style value);',
                 'template <typename... T>',
-                'void format(wformat_string<T...> value, T&&... args);',
+                'void format(wformat_string<> value, T&&... args);',
                 '}',
             ].join('\n'),
             'use.cpp': [
@@ -1389,12 +1389,13 @@ describe('C++ language support', () => {
                     call.line,
                     call.tier,
                 ]),
-                [['use.cpp', 3, 'confirmed']],
+                [],
             );
-            assert.equal(result.unverifiedCallers.length, 0);
+            assert.deepEqual(result.unverifiedCallers.map(call => [call.line, call.reason]),
+                [[3, 'overload-ambiguous'], [5, 'overload-ambiguous']]);
             assert.equal(
                 result.meta.account.excluded.byReason['overload-mismatch'].count,
-                2,
+                1,
             );
             assert.equal(result.meta.account.conserved, true);
         } finally {
@@ -1452,11 +1453,11 @@ describe('C++ language support', () => {
         }
     });
 
-    it('preserves C++ array shape for wide-string overload selection', () => {
+    it('preserves C++ array shape without inferring a class conversion from its name', () => {
         const dir = tmp({
             'wide.cpp': [
-                'struct string_view {};',
-                'struct wstring_view {};',
+                'struct string_view { string_view(const char*); };',
+                'struct wstring_view { wstring_view(const wchar_t*); };',
                 'void runtime(string_view value);',
                 'void runtime(wstring_view value);',
                 'void use() {',
@@ -1479,16 +1480,14 @@ describe('C++ language support', () => {
                 file: 'wide.cpp', line: 3,
             });
             assert.equal(narrow.callers.length, 0);
-            assert.equal(narrow.unverifiedCallers.length, 0,
-                JSON.stringify(narrow.unverifiedCallers));
-            assert.equal(
-                narrow.meta.account.excluded.byReason['overload-mismatch'].count,
-                1,
-            );
+            assert.deepEqual(narrow.unverifiedCallers.map(call => [call.line, call.reason]),
+                [[7, 'overload-ambiguous']]);
             const wide = index.context('runtime', {
                 file: 'wide.cpp', line: 4,
             });
-            assert.deepEqual(wide.callers.map(call => call.line), [7]);
+            assert.equal(wide.callers.length, 0);
+            assert.deepEqual(wide.unverifiedCallers.map(call => [call.line, call.reason]),
+                [[7, 'overload-ambiguous']]);
             assert.equal(wide.meta.account.conserved, true);
         } finally {
             rm(dir);
@@ -6115,7 +6114,7 @@ describe('fix #393: C/C++ rename and caller identity leftovers', () => {
                     unverified: (r.result.unverifiedCallers || []).map(c => c.line),
                 };
             };
-            assert.deepEqual(callersOf(3), { confirmed: [3], unverified: [] });
+            assert.deepEqual(callersOf(3), { confirmed: [], unverified: [3] });
             assert.deepEqual(callersOf(4), { confirmed: [], unverified: [] });
             assert.deepEqual(callersOf(5), { confirmed: [4], unverified: [] });
             assert.deepEqual(callersOf(6), { confirmed: [5], unverified: [] });

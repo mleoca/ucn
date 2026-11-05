@@ -32,6 +32,8 @@ An explicit constructor has its own handle, including Java overloads, compact re
 
 C# `this(...)` and `base(...)` initializers keep the generic type's arity. Nested constructions under a generic containing type stay visible for review when that owner's identity is unproven. `tests` also includes nested-type annotation and qualifier references, with their evidence tier. Arguments such as `Outer<T>.Inner<U>` can keep C# overload choices unverified when the enclosing type identity is unresolved.
 
+User-defined conversions can keep overload choices unverified. C++ class names do not establish converting constructors or template constraints; C# implicit operators keep potentially reachable overloads visible. A possible conversion alone cannot confirm the selected overload.
+
 ## Choose a command
 
 | Decision | Command |
