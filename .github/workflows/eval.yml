@@ -1,7 +1,7 @@
 name: Eval
 
 # Reliability/accuracy evaluation on pinned real repos:
-#  - conservation: account invariant + engine-gap metrics (42 pinned repos,
+#  - conservation: account invariant + engine-gap metrics (43 pinned repos,
 #    covering JavaScript/TypeScript, Python, Go, Rust, Java, C/C++, and C#)
 #  - oracle: tiered caller answers vs compiler/LSP ground truth (ts-morph for
 #    TS repos; pyright-langserver over LSP for Python, jedi available as a
@@ -26,9 +26,33 @@ on:
     - cron: '0 6 * * 1'   # Mondays 06:00 UTC
 
 jobs:
-  eval:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 210
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - id: matrix
+        env:
+          UCN_EVAL_FULL: ${{ inputs.full || false }}
+        run: node eval/run-ci-plan.js
+
+  eval:
+    name: Eval (${{ matrix.id }})
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # Distinct directories preserve every rollup when artifacts merge.
+      UCN_EVAL_REPORTS_DIR: ${{ github.workspace }}/eval/reports/${{ matrix.id }}
     steps:
       - uses: actions/checkout@v5
 
@@ -87,29 +111,31 @@ jobs:
 
       # Measure before compiler servers and verbose reports perturb timing.
       - name: "Performance gate (cold build, warm cache, semantic query p95)"
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && (github.event_name == 'schedule' || inputs.full) }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' && (github.event_name == 'schedule' || inputs.full) }}
         run: npm run trust:gate:performance
 
       # An earlier failed arm must not hide the other independent reports.
       # Failed steps still fail the job; cancellation and setup failure stop work.
       - name: Conservation eval (pinned repos)
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && (github.event_name == 'schedule' || inputs.full) }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' && (github.event_name == 'schedule' || inputs.full) }}
         run: node eval/conservation-real.js
 
       - name: "Oracle eval (gate: missing-unexplained = 0)"
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && (github.event_name == 'schedule' || inputs.full) }}
-        run: node eval/run-oracle-eval.js
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'oracle' }}
+        env:
+          EVAL_REPOS: ${{ matrix.repos }}
+        run: node eval/run-oracle-eval.js --repo "$EVAL_REPOS"
 
       - name: "Fresh-repo oracle eval (2 unpinned repos, weekly rotation — generalization gate)"
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && (github.event_name == 'schedule' || inputs.full) }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' && (github.event_name == 'schedule' || inputs.full) }}
         run: node eval/run-oracle-eval.js --fresh 2 --max-unscored-ratio 0.10
 
       - name: "Deadcode eval (gate: default-arm false-dead = 0)"
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && (github.event_name == 'schedule' || inputs.full) }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' && (github.event_name == 'schedule' || inputs.full) }}
         run: node eval/run-deadcode-eval.js --sample 300
 
       - name: "Cross-command consistency (gate: disagreements = 0)"
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && (github.event_name == 'schedule' || inputs.full) }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' && (github.event_name == 'schedule' || inputs.full) }}
         run: npm run trust:gate:consistency
 
       # Task-outcome gate on the PINNED tuned set (websocket/flask/serde_json —
@@ -120,17 +146,32 @@ jobs:
       # has a green run on this runner (the #292b rule: a new gate must run on
       # the enforcing environment before any tag push relies on it).
       - name: "Outcome gate (pinned tuned set, toolchain-judged)"
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' }}
         run: node eval/run-outcome-eval.js --gate
 
       - name: "Pre-tag release dry run (publish-blocking board)"
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && github.event_name == 'workflow_dispatch' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'release' }}
         run: npm run trust:gate
 
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: eval-reports
+          name: eval-reports-${{ matrix.id }}
           path: eval/reports/
+          retention-days: 90
+
+  reports:
+    name: Collect evaluation reports
+    needs: [plan, eval]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Each job has its own subdirectory, so same-dated rollups never
+      # overwrite one another. Failed jobs still upload their evidence.
+      - uses: actions/upload-artifact/merge@v6
+        with:
+          name: eval-reports
+          pattern: eval-reports-*
           retention-days: 90

@@ -132,33 +132,67 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         'weekly timing precedes the independent correctness arms');
     });
 
-    it('weekly arms survive an earlier failure but stop for cancellation or missing dependencies', () => {
+    it('parallel evaluation covers the pinned board once and rejects unassigned repositories', () => {
+        const { evaluationMatrix } = require('../eval/run-ci-plan');
+        for (const event of ['schedule', 'workflow_dispatch']) {
+            const rows = evaluationMatrix(event, true).include;
+            const names = rows.filter(row => row.kind === 'oracle').flatMap(row => row.repos.split(','));
+            assert.deepStrictEqual(names.sort(), REPOS.map(repo => repo.name).sort());
+            assert.strictEqual(new Set(rows.map(row => row.id)).size, rows.length);
+            assert.strictEqual(rows.filter(row => row.kind === 'checks').length, 1);
+            assert.strictEqual(rows.filter(row => row.kind === 'release').length, event === 'workflow_dispatch' ? 1 : 0);
+        }
+        assert.deepStrictEqual(evaluationMatrix('workflow_dispatch', false).include.map(row => row.kind),
+            ['checks', 'release']);
+        assert.deepStrictEqual(evaluationMatrix('schedule', false), evaluationMatrix('schedule', true));
+        assert.throws(() => evaluationMatrix('push', true), /Unsupported/);
+        assert.throws(() => evaluationMatrix('schedule', 'false'), /boolean/);
+        assert.throws(() => evaluationMatrix('schedule', true, []), /empty/);
+        assert.throws(() => evaluationMatrix('schedule', true, [{ name: 'new', language: 'unknown' }]), /No oracle group/);
+        assert.throws(() => evaluationMatrix('schedule', true, [REPOS[0], REPOS[0]]), /duplicate/);
+        assert.throws(() => evaluationMatrix('schedule', true, [{ name: '--bad,name', language: 'java' }]), /Invalid/);
+    });
+
+    it('every planned arm survives earlier failures without running in another job', () => {
         const vm = require('node:vm');
+        const { evaluationMatrix } = require('../eval/run-ci-plan');
         const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
-        const arms = workflow.split(/\n      - name: /).filter(step =>
+        const arms = workflow.split(/\n      - name: /).slice(1).filter(step =>
             /\n        run: (?:node eval\/|npm run trust:gate)/.test(step));
         assert.strictEqual(arms.length, 8);
-        for (const step of arms) {
-            const expression = step.match(/\n        if: \$\{\{ (.+) \}\}/)?.[1];
-            assert.ok(expression?.includes('!cancelled()'), step.split('\n')[0]);
-            assert.doesNotMatch(step, /continue-on-error:/);
-            const evaluate = (event, full, cancelled, outcome) => vm.runInNewContext(expression, {
-                github: { event_name: event }, inputs: { full },
-                cancelled: () => cancelled, steps: { dependencies: { outcome } },
-                // Explicit status functions prevent the implicit success()
-                // condition from skipping all subsequent arms after failure.
-                success: () => false,
-            });
-            const pretag = step.startsWith('"Pre-tag');
-            const outcome = step.startsWith('"Outcome');
-            assert.strictEqual(evaluate('schedule', false, false, 'success'), !pretag);
-            assert.strictEqual(evaluate('workflow_dispatch', true, false, 'success'), true);
-            assert.strictEqual(evaluate('workflow_dispatch', false, false, 'success'), pretag || outcome);
-            assert.strictEqual(evaluate('schedule', true, true, 'success'), false);
-            assert.strictEqual(evaluate('workflow_dispatch', true, false, 'failure'), false);
+        for (const [event, full] of [['schedule', false], ['workflow_dispatch', true], ['workflow_dispatch', false]]) {
+            for (const matrix of evaluationMatrix(event, full).include) {
+                for (const step of arms) {
+                    const expression = step.match(/\n        if: \$\{\{ (.+) \}\}/)?.[1];
+                    const title = step.split('\n')[0];
+                    assert.ok(expression?.includes('!cancelled()'), title);
+                    assert.doesNotMatch(step, /continue-on-error:/);
+                    const evaluate = (cancelled, outcome) => vm.runInNewContext(expression, {
+                        github: { event_name: event }, inputs: { full }, matrix,
+                        cancelled: () => cancelled, steps: { dependencies: { outcome } },
+                        // Explicit status functions override implicit success()
+                        // so one failed arm does not suppress later reports.
+                        success: () => false,
+                    });
+                    const kind = step.startsWith('"Pre-tag') ? 'release' :
+                        step.startsWith('"Oracle eval') ? 'oracle' : 'checks';
+                    const scheduled = !step.startsWith('"Outcome') && kind === 'checks';
+                    const expected = matrix.kind === kind && (!scheduled || event === 'schedule' || full);
+                    assert.strictEqual(evaluate(false, 'success'), expected, `${event}/${matrix.id}/${title}`);
+                    assert.strictEqual(evaluate(true, 'success'), false);
+                    assert.strictEqual(evaluate(false, 'failure'), false);
+                }
+            }
         }
         assert.match(workflow, /- run: npm ci\n        id: dependencies/);
+        assert.match(workflow, /fail-fast: false/);
+        assert.match(workflow, /max-parallel: 6/);
+        assert.match(workflow, /UCN_EVAL_REPORTS_DIR: .*\$\{\{ matrix.id \}\}/);
         assert.match(workflow, /name: Upload reports\n        if: always\(\)/);
+        assert.match(workflow, /name: eval-reports-\$\{\{ matrix.id \}\}/);
+        assert.match(workflow, /needs: \[plan, eval\]\n    if: always\(\)/);
+        assert.match(workflow, /uses: actions\/upload-artifact\/merge@v6/);
+        assert.match(workflow, /pattern: eval-reports-\*/);
     });
 
     it('keeps one machine-readable release board across gates and documentation', () => {
