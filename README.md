@@ -143,25 +143,12 @@ confirmed sites, all correct, with 4 unscored and zero missing in-scope sites.
 All 8,000 cross-command comparisons agreed.
 The default dead-code audit found zero false-dead results among 7 scored
 claims; 4 additional claims could not be pinned by the oracle and were unscored.
-The latest local performance run passed 58 of 61 query-class comparisons and
-all 31 capability cohorts. The performance gate failed on these comparisons:
-
-| Repository and query class | Measurement | Time | Effective limit |
-|---|---|---:|---:|
-| JavaPoet overload-show | p50 | 15.812 ms | 13.150 ms |
-| Newtonsoft.Json overload-show | p95 | 68.076 ms | 67.504 ms |
-| fmt class-find | p95 | 59.723 ms | 59.348 ms |
-
-The original release comparisons remain visible: 42 of 61 passed before
-applying the capability policy described below.
-Query timings exclude process startup and indexing; cold builds and cache
-loading are measured separately.
 
 The samples are deterministic and stratified by reference activity. Confirmed
 precision applies to scored claims; recall counts in-scope oracle edges found
 in either the confirmed or unverified band. Unverified candidates, oracle
 abstentions, and unscored findings remain separate. These measurements do not
-establish complete runtime knowledge or identical performance on every machine.
+establish complete runtime knowledge.
 
 The scheduled board covers 43 pinned repositories: the ten above plus zod,
 express, hono, zustand, fastify, dayjs, rich, click, attrs, grpc-go, chi, cursive,
@@ -183,12 +170,6 @@ dependencies installed:
 npm run verify
 npm run trust:gate
 ```
-
-Performance reports retain the last release's query timings. Queries that gained
-a reference band or newly indexed declarations also use [capability cohorts](eval/performance-capabilities.md)
-measured on the first working revision, with the same 1.15x and +5 ms limits.
-Existing capabilities keep their release reference; missing bands or inconsistent
-declaration inventories fail the comparison. Raw release results remain visible.
 
 ## Commands
 
