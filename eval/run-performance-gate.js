@@ -51,7 +51,7 @@ const {
     selectQueryHandles,
     summarizeQueryClasses,
 } = require('./lib/performance-query-board');
-const { impactCapabilities } = require('./lib/performance-capabilities');
+const { CAPABILITY_PINS, impactCapabilities, declarationCapabilities } = require('./lib/performance-capabilities');
 
 const CALIBRATION_SCRIPT = path.join(__dirname, 'lib', 'host-calibration.js');
 
@@ -299,7 +299,8 @@ function callableBoard(index, limit) {
  * `boardQueries` order. Returns { [classId]: { handles, samplesMs, errors,
  * errorDetails } } -- raw timings; `summarizeQueryClasses` merges processes.
  */
-function runQueryClassBoard(index, pins) {
+function runQueryClassBoard(index, pins, repo) {
+    const inventories = CAPABILITY_PINS.repos?.[repo]?.classes?.['class-find']?.inventory;
     const classes = {};
     for (const query of boardQueries(pins)) {
         let row = classes[query.classId];
@@ -315,7 +316,14 @@ function runQueryClassBoard(index, pins) {
         }
         row.samplesMs.push(elapsed(started));
         row.handles.push(query.handle ?? query.command);
-        row.capabilities.push(query.command === 'impact' && response?.ok ? impactCapabilities(response.result) : null);
+        let capabilities = null;
+        if (response?.ok) {
+            if (query.command === 'impact') capabilities = impactCapabilities(response.result);
+            else if (query.classId === 'class-find' && inventories) {
+                capabilities = declarationCapabilities(response.result, inventories[query.handle]);
+            }
+        }
+        row.capabilities.push(capabilities);
         if (!response?.ok) {
             row.errors++;
             if (row.errorDetails.length < 5) {
@@ -428,7 +436,7 @@ async function evaluateRepo(repo) {
 
         // After the context board, so both engines enter it with the same
         // lazy state materialized; one pass per process, best across them.
-        if (queryPins) queryClasses = runQueryClassBoard(warm, queryPins);
+        if (queryPins) queryClasses = runQueryClassBoard(warm, queryPins, repo.name);
     } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -990,10 +998,10 @@ async function main() {
         'Per handle the best of the isolated process samples, host-normalized; p50/p95 over the ' +
             'class\'s pinned handles, compared with the same handles measured on the release ' +
             `engine on this host class (limit ${budgets.maxQueryClassRatio}x and ` +
-            `+${budgets.minQueryClassDeltaMs}ms). Impact classes with a new reference band retain their raw ` +
+            `+${budgets.minQueryClassDeltaMs}ms). Queries with a new reference band or declaration inventory retain their raw ` +
             'release comparison and gate the following capability cohorts against the first working ' +
-            'revision that supplied that band. Existing capabilities retain the release reference; ' +
-            'missing or inconsistent bands fail the comparison.',
+            'revision that supplied that capability. Existing capabilities retain the release reference; ' +
+            'missing or inconsistent bands or declaration inventories fail the comparison.',
         '',
         '| repo | class / cohort | n | p50 | p95 | reference p50/p95 | ratio p50/p95 | slowest | result |',
         '|---|---|---:|---:|---:|---:|---:|---|---|',

@@ -17,35 +17,48 @@
       "kind": "first-capability",
       "commit": "291387b431fc3e686c96c2558d7cd1ce9947ca35",
       "capability": "typeReferences",
-      "measuredAt": "2026-11-04",
+      "measuredAt": "2026-11-05",
       "processSamples": 3,
       "hostFactors": [
-        0.9727
+        0.9986
       ],
-      "runnerSha256": "7b160b2e65103e7c8beb5be4739a85acb376b1c84568e91b9e10e2993b17cb0f"
+      "runnerSha256": "72b2fb912d86d44999e777246d25dc70f2de745bc44ba6dd2bd2eb990d279ff4"
     },
     "value-accesses": {
       "kind": "first-capability",
       "commit": "5b7259c752c7f51b7980968761a3913f9ddece71",
       "capability": "valueAccesses",
-      "measuredAt": "2026-11-04",
+      "measuredAt": "2026-11-05",
       "processSamples": 3,
       "hostFactors": [
-        0.9591
+        0.9847
       ],
-      "runnerSha256": "7b160b2e65103e7c8beb5be4739a85acb376b1c84568e91b9e10e2993b17cb0f"
+      "runnerSha256": "72b2fb912d86d44999e777246d25dc70f2de745bc44ba6dd2bd2eb990d279ff4"
     },
     "value-accesses-first-success": {
       "kind": "first-success",
       "commit": "cf4eeb1f31e9ce1e94e3db5dda48eebd42854d6e",
       "capability": "valueAccesses",
-      "measuredAt": "2026-11-04",
+      "measuredAt": "2026-11-05",
       "processSamples": 3,
       "reason": "The introducing revision errors for this handle; this revision first returns its value-access band.",
       "hostFactors": [
-        0.9842
+        1.0172
       ],
-      "runnerSha256": "7b160b2e65103e7c8beb5be4739a85acb376b1c84568e91b9e10e2993b17cb0f"
+      "runnerSha256": "72b2fb912d86d44999e777246d25dc70f2de745bc44ba6dd2bd2eb990d279ff4"
+    },
+    "constructor-declarations": {
+      "kind": "first-capability",
+      "commit": "fe4183e243836ebb5ee1c7de70c6d3296338c953",
+      "parent": "9f39cfdf2b62774d5db9ff13b8aa0a08a009ac1d",
+      "capability": "constructorDeclarations",
+      "processSamples": 3,
+      "reason": "The introducing revision indexes explicit Java constructor declarations omitted by its parent and by the release.",
+      "hostFactors": [
+        0.9939
+      ],
+      "measuredAt": "2026-11-05",
+      "runnerSha256": "72b2fb912d86d44999e777246d25dc70f2de745bc44ba6dd2bd2eb990d279ff4"
     }
   },
   "repos": {
@@ -65,9 +78,9 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  7.146088,
-                  1.24396,
-                  2.095199
+                  7.012818,
+                  1.940717,
+                  1.982776
                 ]
               }
             },
@@ -105,12 +118,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  8.886456,
-                  5.491607,
-                  3.466792,
-                  6.049421,
-                  2.318841,
-                  6.506099
+                  8.69605,
+                  5.318371,
+                  3.426424,
+                  5.865746,
+                  2.27582,
+                  6.34508
                 ]
               }
             }
@@ -137,12 +150,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  38.838285,
-                  22.883726,
-                  2.756246,
-                  1.166855,
-                  2.580446,
-                  0.797779
+                  38.059283,
+                  22.609654,
+                  2.790907,
+                  1.136591,
+                  2.513519,
+                  0.788103
                 ]
               }
             }
@@ -164,12 +177,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  22.692107,
-                  5.022417,
-                  12.716088,
-                  5.894067,
-                  2.720259,
-                  2.538838
+                  22.264649,
+                  4.998477,
+                  12.372296,
+                  5.725602,
+                  2.656647,
+                  2.468772
                 ]
               }
             }
@@ -195,11 +208,11 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  68.714917,
-                  1.891642,
-                  3.395703,
-                  0.719646,
-                  0.730955
+                  66.646305,
+                  1.858602,
+                  3.296615,
+                  0.689966,
+                  0.710995
                 ]
               }
             },
@@ -233,12 +246,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  18.299447,
-                  33.20196,
-                  6.918987,
-                  6.514441,
-                  6.130748,
-                  2.344907
+                  17.666294,
+                  34.245963,
+                  6.743171,
+                  6.418198,
+                  5.763177,
+                  2.163095
                 ]
               }
             }
@@ -277,10 +290,10 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  2.485864,
-                  2.54138,
-                  1.454714,
-                  0.727871
+                  2.454436,
+                  2.432405,
+                  1.451031,
+                  0.69297
                 ]
               }
             }
@@ -302,12 +315,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  11.375248,
-                  5.752268,
-                  8.644563,
-                  38.362006,
-                  8.149307,
-                  12.028986
+                  11.262313,
+                  5.653499,
+                  8.500051,
+                  37.514979,
+                  8.081649,
+                  11.838123
                 ]
               }
             }
@@ -332,10 +345,10 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  13.378226,
-                  7.934615,
-                  1.762105,
-                  6.250643
+                  13.199479,
+                  7.884038,
+                  1.704386,
+                  6.233727
                 ]
               }
             },
@@ -371,12 +384,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  10.797623,
-                  30.203316,
-                  36.769888,
-                  117.666562,
-                  36.780315,
-                  6.200605
+                  10.478318,
+                  30.168579,
+                  36.106428,
+                  116.118615,
+                  35.612877,
+                  6.036356
                 ]
               }
             }
@@ -402,11 +415,11 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  644.448442,
-                  252.010898,
-                  22.024262,
-                  2.103423,
-                  3.73188
+                  655.083116,
+                  240.263369,
+                  21.463048,
+                  2.04987,
+                  3.745243
                 ]
               }
             },
@@ -440,12 +453,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  12.44083,
-                  31.237619,
-                  35.307059,
-                  93.295798,
-                  16.663539,
-                  15.374831
+                  12.354016,
+                  30.159439,
+                  34.401341,
+                  91.549711,
+                  16.332893,
+                  14.82482
                 ]
               }
             }
@@ -471,11 +484,11 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  45.257531,
-                  23.47692,
-                  12.719235,
-                  4.885371,
-                  10.52123
+                  43.496896,
+                  22.614661,
+                  12.911076,
+                  5.128179,
+                  11.061486
                 ]
               }
             },
@@ -509,12 +522,182 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  6.714628,
-                  11.487853,
-                  8.737358,
-                  5.931603,
-                  7.748931,
-                  10.223126
+                  6.657865,
+                  11.320199,
+                  8.533564,
+                  5.688027,
+                  7.470296,
+                  9.695339
+                ]
+              }
+            }
+          ]
+        },
+        "class-find": {
+          "boardKey": "f1771ef8e7ca",
+          "inventory": {
+            "src/main/java/com/squareup/javapoet/ClassName.java:33:ClassName": [
+              {
+                "file": "src/main/java/com/squareup/javapoet/ClassName.java",
+                "line": 33,
+                "name": "ClassName",
+                "kind": "class",
+                "constructor": false
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/ClassName.java",
+                "line": 53,
+                "name": "ClassName",
+                "kind": "constructor",
+                "constructor": true
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/ClassName.java",
+                "line": 57,
+                "name": "ClassName",
+                "kind": "constructor",
+                "constructor": true
+              }
+            ],
+            "src/main/java/com/squareup/javapoet/TypeName.java:68:TypeName": [
+              {
+                "file": "src/main/java/com/squareup/javapoet/TypeName.java",
+                "line": 68,
+                "name": "TypeName",
+                "kind": "class",
+                "constructor": false
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/TypeName.java",
+                "line": 97,
+                "name": "TypeName",
+                "kind": "constructor",
+                "constructor": true
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/TypeName.java",
+                "line": 107,
+                "name": "TypeName",
+                "kind": "constructor",
+                "constructor": true
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/TypeName.java",
+                "line": 101,
+                "name": "TypeName",
+                "kind": "constructor",
+                "constructor": true
+              }
+            ],
+            "src/main/java/com/squareup/javapoet/AnnotationSpec.java:44:AnnotationSpec": [
+              {
+                "file": "src/main/java/com/squareup/javapoet/AnnotationSpec.java",
+                "line": 44,
+                "name": "AnnotationSpec",
+                "kind": "class",
+                "constructor": false
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/AnnotationSpec.java",
+                "line": 50,
+                "name": "AnnotationSpec",
+                "kind": "constructor",
+                "constructor": true
+              }
+            ],
+            "src/main/java/com/squareup/javapoet/CodeWriter.java:44:CodeWriter": [
+              {
+                "file": "src/main/java/com/squareup/javapoet/CodeWriter.java",
+                "line": 44,
+                "name": "CodeWriter",
+                "kind": "class",
+                "constructor": false
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/CodeWriter.java",
+                "line": 73,
+                "name": "CodeWriter",
+                "kind": "constructor",
+                "constructor": true
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/CodeWriter.java",
+                "line": 77,
+                "name": "CodeWriter",
+                "kind": "constructor",
+                "constructor": true
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/CodeWriter.java",
+                "line": 81,
+                "name": "CodeWriter",
+                "kind": "constructor",
+                "constructor": true
+              }
+            ],
+            "src/main/java/com/squareup/javapoet/LineWrapper.java:139:FlushType": [
+              {
+                "file": "src/main/java/com/squareup/javapoet/LineWrapper.java",
+                "line": 139,
+                "name": "FlushType",
+                "kind": "enum",
+                "constructor": false
+              }
+            ],
+            "src/main/java/com/squareup/javapoet/ParameterizedTypeName.java:31:ParameterizedTypeName": [
+              {
+                "file": "src/main/java/com/squareup/javapoet/ParameterizedTypeName.java",
+                "line": 31,
+                "name": "ParameterizedTypeName",
+                "kind": "class",
+                "constructor": false
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/ParameterizedTypeName.java",
+                "line": 41,
+                "name": "ParameterizedTypeName",
+                "kind": "constructor",
+                "constructor": true
+              },
+              {
+                "file": "src/main/java/com/squareup/javapoet/ParameterizedTypeName.java",
+                "line": 36,
+                "name": "ParameterizedTypeName",
+                "kind": "constructor",
+                "constructor": true
+              }
+            ]
+          },
+          "cohorts": [
+            {
+              "origin": "constructor-declarations",
+              "capability": "constructorDeclarations",
+              "handles": [
+                "src/main/java/com/squareup/javapoet/ClassName.java:33:ClassName",
+                "src/main/java/com/squareup/javapoet/TypeName.java:68:TypeName",
+                "src/main/java/com/squareup/javapoet/AnnotationSpec.java:44:AnnotationSpec",
+                "src/main/java/com/squareup/javapoet/CodeWriter.java:44:CodeWriter",
+                "src/main/java/com/squareup/javapoet/ParameterizedTypeName.java:31:ParameterizedTypeName"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  55.054834,
+                  75.393903,
+                  7.755307,
+                  73.806218,
+                  26.948385
+                ]
+              }
+            },
+            {
+              "origin": "release",
+              "capability": "declarationInventory",
+              "handles": [
+                "src/main/java/com/squareup/javapoet/LineWrapper.java:139:FlushType"
+              ],
+              "baselineByHost": {
+                "darwin-arm64": [
+                  0.191481
                 ]
               }
             }
@@ -539,10 +722,10 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  202.538295,
-                  242.775779,
-                  1.624345,
-                  3.187005
+                  195.467655,
+                  229.961947,
+                  1.602243,
+                  3.041258
                 ]
               }
             },
@@ -576,10 +759,10 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  27.920968,
-                  30.324262,
-                  18.528829,
-                  77.046189
+                  26.996039,
+                  29.985782,
+                  17.727227,
+                  75.014725
                 ]
               }
             },
@@ -620,12 +803,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  6.631027,
-                  11.288167,
-                  3.047188,
-                  2.569137,
-                  17.17693,
-                  3.7216
+                  6.233727,
+                  10.80713,
+                  2.853996,
+                  2.491488,
+                  17.161025,
+                  3.683156
                 ]
               }
             }
@@ -647,12 +830,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  12.135335,
-                  24.725263,
-                  8.490251,
-                  8.035658,
-                  15.198624,
-                  3.854655
+                  11.606581,
+                  23.517823,
+                  7.886666,
+                  7.691683,
+                  14.283538,
+                  3.60719
                 ]
               }
             }
@@ -679,12 +862,12 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  111.384805,
-                  33.861417,
-                  7.524417,
-                  7.941811,
-                  35.057058,
-                  7.643672
+                  107.347286,
+                  32.219107,
+                  7.111957,
+                  7.487482,
+                  33.604046,
+                  7.224114
                 ]
               }
             }
@@ -705,11 +888,11 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  35.636534,
-                  381.803774,
-                  9.61735,
-                  6.385153,
-                  6.618705
+                  34.72225,
+                  370.775871,
+                  9.512542,
+                  6.372499,
+                  6.395857
                 ]
               }
             },
@@ -721,7 +904,7 @@
               ],
               "baselineByHost": {
                 "darwin-arm64": [
-                  13.129445
+                  12.979748
                 ]
               }
             }

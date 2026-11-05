@@ -1,12 +1,12 @@
 'use strict';
 
-// An impact command that gained a reference band has a different workload.
-// Keep the release comparison, and judge each capability cohort against its
-// earliest working implementation. These references never follow the tree
-// under test. Ordinary find/show/constructor/overload costs keep the release
-// baseline; a larger answer alone does not create an exception.
+// A new reference band or newly indexed declaration changes the workload.
+// Keep the release comparison beside the earliest working implementation
+// of that capability. These references never follow the tree under test.
+// More proof work or confidence changes alone do not create an exception.
 const CAPABILITY_PINS = Object.freeze(require('./performance-capabilities.json'));
 const BANDS = Object.freeze(['typeReferences', 'valueAccesses', 'propertyAccesses']);
+const CAPABILITIES = Object.freeze([...BANDS, 'declarationInventory', 'constructorDeclarations']);
 const count = value => Number.isInteger(value) && value >= 0;
 const round = value => Number(value.toFixed(3));
 const percentile = (values, p) => [...values].sort((a, b) => a - b)[Math.ceil(values.length * p) - 1];
@@ -29,6 +29,45 @@ function impactCapabilities(result) {
     }));
 }
 
+// Source locations and declaration kinds form the capability inventory.
+// Call confidence can change without removing a declaration from the answer.
+function inventoryKey(row) {
+    if (!row || typeof row.file !== 'string' || !row.file || !Number.isInteger(row.line) || row.line < 1 ||
+        typeof row.name !== 'string' || !row.name || typeof row.kind !== 'string' || !row.kind ||
+        typeof row.constructor !== 'boolean') return null;
+    return JSON.stringify([row.file, row.line, row.name, row.kind, row.constructor]);
+}
+
+function inventoryKeys(inventory) {
+    if (!Array.isArray(inventory) || !inventory.length) return null;
+    const keys = inventory.map(inventoryKey);
+    return keys.some(key => key === null) || new Set(keys).size !== keys.length ? null : new Set(keys);
+}
+
+/** Check after the timer, against the independently established source inventory. */
+function declarationCapabilities(result, inventory) {
+    const expected = inventoryKeys(inventory);
+    let valid = !!expected && Array.isArray(result) && result.length === expected.size;
+    const seen = new Set();
+    if (valid) for (const row of result) {
+        const key = inventoryKey({ file: row?.relativePath, line: row?.startLine,
+            name: row?.name, kind: row?.type, constructor: row?.isConstructor === undefined ? false : row.isConstructor });
+        const counts = row?.usageCounts;
+        if (!key || !expected.has(key) || seen.has(key) ||
+            counts?.countKind !== 'target-call-candidates-with-tier-breakdown-excludes-references' ||
+            !['total', 'calls', 'definitions', 'imports', 'references', 'confirmedCalls',
+                'unverifiedCalls', 'otherTargetCalls'].every(field => count(counts[field])) ||
+            counts.confirmedCalls + counts.unverifiedCalls !== counts.calls ||
+            counts.total !== counts.calls + counts.definitions + counts.imports + counts.references) {
+            valid = false;
+            break;
+        }
+        seen.add(key);
+    }
+    return { declarationInventory: valid,
+        constructorDeclarations: valid && inventory.some(row => row.kind === 'constructor' && row.constructor) };
+}
+
 /** A null result means this class has no capability comparison. */
 function evaluateCapabilityCohorts(classId, measured, release, budgets, {
     repo, hostClass, pinnedCommit, capabilityPins = CAPABILITY_PINS,
@@ -38,7 +77,7 @@ function evaluateCapabilityCohorts(classId, measured, release, budgets, {
     if (!comparison || !release) return null;
     const failures = [], rows = [];
     const fail = message => failures.push(`${classId}: ${message}`);
-    if (!['class-impact', 'value-impact'].includes(classId) || capabilityPins.schemaVersion !== 1 ||
+    if (!['class-impact', 'value-impact', 'class-find'].includes(classId) || capabilityPins.schemaVersion !== 1 ||
         release.engine !== capabilityPins.releaseEngine || pin.commit !== pinnedCommit ||
         comparison.boardKey !== measured.boardKey) {
         fail('capability reference does not match the release, repository or measured handles');
@@ -57,14 +96,27 @@ function evaluateCapabilityCohorts(classId, measured, release, budgets, {
         fail('capability cohorts must cover every measured handle exactly once');
         return { failures, rows };
     }
+    if (classId === 'class-find' && (!comparison.inventory ||
+        Object.keys(comparison.inventory).length !== measured.handles.length ||
+        measured.handles.some(handle => !inventoryKeys(comparison.inventory[handle])))) {
+        fail('declaration comparison must pin a complete, unique inventory for every handle');
+        return { failures, rows };
+    }
+    const allowed = classId === 'class-impact' ? ['typeReferences'] : classId === 'value-impact'
+        ? ['valueAccesses', 'propertyAccesses'] : ['declarationInventory', 'constructorDeclarations'];
     for (const cohort of cohorts) {
         const origin = capabilityPins.origins?.[cohort.origin];
         const reference = cohort.baselineByHost?.[hostClass];
         const indices = cohort.handles.map(handle => measured.handles.indexOf(handle));
         if (!origin || !/^[a-f0-9]{40}$/.test(origin.commit) ||
             !['release', 'first-capability', 'first-success'].includes(origin.kind) ||
-            !(classId === 'class-impact' ? ['typeReferences'] : ['valueAccesses', 'propertyAccesses']).includes(cohort.capability) ||
+            !allowed.includes(cohort.capability) ||
             (origin.kind !== 'release' && origin.capability !== cohort.capability) ||
+            (classId === 'class-find' && (cohort.capability === 'declarationInventory'
+                ? origin.kind !== 'release' || cohort.handles.some(handle =>
+                    comparison.inventory[handle].some(row => row.constructor))
+                : origin.kind !== 'first-capability' || cohort.handles.some(handle =>
+                    !comparison.inventory[handle].some(row => row.kind === 'constructor' && row.constructor)))) ||
             !cohort.handles.length || !Array.isArray(reference) || reference.length !== indices.length ||
             reference.some(value => !Number.isFinite(value) || value < 0)) {
             fail(`missing or invalid ${cohort.origin} reference for ${hostClass}`);
@@ -94,4 +146,4 @@ function evaluateCapabilityCohorts(classId, measured, release, budgets, {
     return { failures, rows };
 }
 
-module.exports = { CAPABILITY_PINS, BANDS, impactCapabilities, evaluateCapabilityCohorts };
+module.exports = { CAPABILITY_PINS, BANDS, CAPABILITIES, impactCapabilities, declarationCapabilities, evaluateCapabilityCohorts };

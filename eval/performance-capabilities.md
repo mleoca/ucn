@@ -1,9 +1,9 @@
-# Impact performance comparisons
+# Performance capability comparisons
 
 The query board keeps its original 5.5.1 handles, timings and limits. Every
-report still shows that raw release comparison. A new reference band changes
-the work an impact command performs, so its enforcing comparison uses the
-earliest working implementation of that capability.
+report still shows that raw release comparison. A new reference band or newly indexed declarations change
+the work a command performs, so its enforcing comparison uses the earliest
+working implementation of that capability.
 
 The 120 pinned impact handles partition into these cohorts:
 
@@ -21,6 +21,15 @@ returns the band; the other five fmt value handles retain their introducing
 revision. Full commits, host factors, process counts, runner hashes and
 per-handle measurements are in [the reference data](lib/performance-capabilities.json).
 
+Five javapoet class-find queries gained eleven explicit constructor declarations
+at `fe4183e` (parent `9f39cfd`). That first revision returns the same seventeen
+declarations as the current inventory, while its parent matches the release.
+Those five complete commands use the introducing revision; the sixth query,
+the unchanged `FlushType` enum, retains its original release sample. Comparing
+all sixty class-find queries across the ten repositories found no other added
+declaration locations. Kind reclassifications and constructor markers on
+existing C++ or C# declarations do not qualify.
+
 Each cohort times the entire command, including its existing caller work.
 It uses the same pinned order, 40-query context prefix, three startup samples
 and three isolated process samples. The best sample per handle is normalized
@@ -32,6 +41,10 @@ No existing release pin is replaced.
 Every process must return the expected band with consistent site counts and
 conserved accounting when supplied. Missing bands, mismatched handles or
 revisions, incomplete cohorts and missing host references fail the comparison.
+Each declaration comparison also checks the exact file, line, name, kind and
+constructor marker, rejects missing, duplicate or extra rows, and requires
+consistent nonnegative usage counts and their conservation equations. These
+checks run after each command timer, including slower process samples.
 Confirmed-site counts are not frozen: a correctness fix may move a site to
 review. Query errors always fail. Hosts without release query baselines remain
 explicitly unmeasured, as on the original board.
@@ -49,7 +62,8 @@ prefix; do not time a selected handle in isolation. Historical runs supply
 measurements, never release qualification. A timing-protocol change requires
 new historical measurements with that protocol, preserving the earlier data.
 
-Find, show, constructor and overload queries keep their release comparisons.
-More proof work or a larger answer alone does not grant a capability exception.
+Other find queries, plus show, constructor and overload queries, keep their
+release comparisons. More callers, changed confidence, additional proof work,
+or reclassification of an existing declaration does not qualify.
 At a release boundary, remeasure from the released tree and retire or revise
 these explicit exceptions; they cannot silently apply to a later baseline.

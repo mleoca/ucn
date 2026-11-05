@@ -795,7 +795,7 @@ describe('fix #432: query-class performance board', () => {
 
     it('never fails a millisecond-scale class on timer jitter alone', () => {
         const verdict = board.evaluateQueryClasses({ 'class-find': measuredRow(2.4, 4.5) },
-            release(1.6, 3.1), GATING, { repo: 'javapoet' });
+            release(1.6, 3.1), GATING, { repo: 'javapoet', capabilities: false });
         assert.deepEqual(verdict.failures, []);
     });
 
@@ -1018,13 +1018,14 @@ describe('impact performance capability cohorts', () => {
         assert.equal(impactCapabilities({ typeReferences: demoted }).typeReferences, true);
     });
 
-    it('covers all impact handles at their pinned commits without changing other query classes', () => {
+    it('covers all compared handles at their pinned commits with complete cohorts', () => {
         const counts = {};
         let classes = 0;
         for (const repo of RELEASE_REPOS) {
             const pin = CAPABILITY_PINS.repos[repo.name];
             assert.equal(pin.commit, repo.commit);
-            assert.deepEqual(Object.keys(pin.classes), ['class-impact', 'value-impact']);
+            assert.deepEqual(Object.keys(pin.classes), repo.name === 'javapoet'
+                ? ['class-impact', 'value-impact', 'class-find'] : ['class-impact', 'value-impact']);
             for (const [classId, group] of Object.entries(pin.classes)) {
                 classes++;
                 const queries = board.boardQueries(board.QUERY_BOARD_PINS[repo.name]).filter(q => q.classId === classId);
@@ -1040,13 +1041,142 @@ describe('impact performance capability cohorts', () => {
                 }
             }
         }
-        assert.equal(classes, 20);
-        assert.deepEqual(counts, { 'type-references': 48, release: 14, 'value-accesses': 57,
-            'value-accesses-first-success': 1 });
+        assert.equal(classes, 21);
+        assert.deepEqual(counts, { 'type-references': 48, release: 15, 'value-accesses': 57,
+            'value-accesses-first-success': 1, 'constructor-declarations': 5 });
         for (const origin of Object.values(CAPABILITY_PINS.origins)) {
             assert.match(origin.commit, /^[a-f0-9]{40}$/);
             assert.ok(origin.processSamples >= 3);
             assert.ok(origin.hostFactors.every(factor => factor > 0 && Number.isFinite(factor)));
+        }
+    });
+});
+
+describe('declaration inventory performance cohorts', () => {
+    const board = require('../eval/lib/performance-query-board');
+    const { CAPABILITY_PINS, declarationCapabilities } = require('../eval/lib/performance-capabilities');
+    const budgets = { ...DEFAULT_BUDGETS, requireQueryClassBaselines: true };
+    const handles = ['A.java:1:Kind', 'A.java:2:A'];
+    const key = board.boardKey(handles);
+    const inventories = {
+        [handles[0]]: [{ file: 'A.java', line: 1, name: 'Kind', kind: 'enum', constructor: false }],
+        [handles[1]]: [{ file: 'A.java', line: 2, name: 'A', kind: 'class', constructor: false },
+            { file: 'A.java', line: 3, name: 'A', kind: 'constructor', constructor: true }],
+    };
+    const answer = handle => inventories[handle].map(row => ({
+        relativePath: row.file, startLine: row.line, name: row.name, type: row.kind, isConstructor: row.constructor,
+        usageCounts: { countKind: 'target-call-candidates-with-tier-breakdown-excludes-references',
+            total: 3, calls: 1, definitions: 2, imports: 0, references: 0,
+            confirmedCalls: 1, unverifiedCalls: 0, otherTargetCalls: 0 },
+    }));
+    const release = { engine: '5.5.1 (a274a48)', classes: {
+        'class-find': { boardKey: key, p50Ms: 0.2, p95Ms: 5 },
+    } };
+    const fixture = () => ({ schemaVersion: 1, releaseEngine: release.engine,
+        origins: { release: { kind: 'release', commit: '1'.repeat(40) },
+            constructors: { kind: 'first-capability', capability: 'constructorDeclarations', commit: '2'.repeat(40) } },
+        repos: { javapoet: { commit: board.QUERY_BOARD_PINS.javapoet.commit, classes: {
+            'class-find': { boardKey: key, inventory: structuredClone(inventories), cohorts: [
+                { origin: 'release', capability: 'declarationInventory', handles: handles.slice(0, 1),
+                    baselineByHost: { 'darwin-arm64': [0.2] } },
+                { origin: 'constructors', capability: 'constructorDeclarations', handles: handles.slice(1),
+                    baselineByHost: { 'darwin-arm64': [20] } },
+            ] },
+        } } },
+    });
+    const run = (times = [0.2, 20]) => ({ 'class-find': { handles, samplesMs: times, errors: 0,
+        capabilities: handles.map(h => declarationCapabilities(answer(h), inventories[h])) } });
+    const judge = (runs = [run()], pins = fixture(), baseline = release, extra = {}) =>
+        board.evaluateQueryClasses(board.summarizeQueryClasses(runs), baseline, budgets,
+            { repo: 'javapoet', hostClass: 'darwin-arm64', capabilityPins: pins, ...extra });
+
+    it('requires exact unique declarations and conserved counts, without freezing confidence', () => {
+        const rows = answer(handles[1]), expected = inventories[handles[1]];
+        assert.deepEqual(declarationCapabilities(rows, expected),
+            { declarationInventory: true, constructorDeclarations: true });
+        assert.deepEqual(declarationCapabilities(answer(handles[0]), inventories[handles[0]]),
+            { declarationInventory: true, constructorDeclarations: false });
+        for (const row of rows) {
+            row.usageCounts.confirmedCalls = 0;
+            row.usageCounts.unverifiedCalls = 1;
+        }
+        assert.equal(declarationCapabilities(rows.reverse(), expected).constructorDeclarations, true);
+        const mutations = [
+            r => r.pop(), r => r.push(r[0]), r => { r[1] = r[0]; },
+            r => { r[0].startLine++; }, r => { r[0].relativePath = 'B.java'; },
+            r => { r[0].name = 'Other'; }, r => { r[0].type = 'method'; },
+            r => { r[1].isConstructor = false; }, r => { r[0].isConstructor = null; },
+            r => { delete r[0].usageCounts; }, r => { r[0].usageCounts.total++; },
+            r => { r[0].usageCounts.confirmedCalls++; }, r => { r[0].usageCounts.otherTargetCalls = -1; },
+            r => { r[0].usageCounts.calls = '1'; }, r => { r[0].usageCounts.countKind = 'other'; },
+        ];
+        for (const mutate of mutations) {
+            const broken = answer(handles[1]); mutate(broken);
+            assert.equal(declarationCapabilities(broken, expected).declarationInventory, false);
+        }
+        assert.equal(declarationCapabilities(rows, undefined).declarationInventory, false);
+        assert.equal(declarationCapabilities(rows, [expected[0], expected[0]]).declarationInventory, false);
+    });
+
+    it('keeps raw release failures and independently enforces existing and new workloads', () => {
+        const result = judge();
+        assert.deepEqual(result.failures, []);
+        assert.equal(result.rows['class-find'].releaseComparison.failed, true);
+        assert.equal(result.rows['class-find'].capabilityCohorts.length, 2);
+        assert.ok(judge([run([0.2, 30])]).failures.some(f => /constructors p95/.test(f)));
+        assert.ok(judge([run([6, 10])]).failures.some(f => /release p95/.test(f)));
+        assert.ok(judge([run()], fixture(), release, { capabilities: false }).failures.length > 0);
+    });
+
+    it('rejects an incomplete slower process even when the fastest process is valid', () => {
+        const slower = run([1, 24]);
+        slower['class-find'].capabilities[1] = declarationCapabilities(answer(handles[1]).slice(0, 1), inventories[handles[1]]);
+        assert.ok(judge([run(), slower]).failures.some(f => /constructorDeclarations missing or inconsistent/.test(f)));
+    });
+
+    it('refuses missing inventories and mismatched origins, handles, commits or references', () => {
+        const mutations = [
+            p => { delete p.repos.javapoet.classes['class-find'].inventory; },
+            p => { delete p.repos.javapoet.classes['class-find'].inventory[handles[0]]; },
+            p => { p.repos.javapoet.classes['class-find'].inventory.extra = []; },
+            p => { p.repos.javapoet.classes['class-find'].inventory[handles[1]].push(inventories[handles[1]][0]); },
+            p => { p.repos.javapoet.classes['class-find'].cohorts[1].origin = 'release'; },
+            p => { p.repos.javapoet.classes['class-find'].cohorts[0].capability = 'constructorDeclarations'; },
+            p => { p.repos.javapoet.classes['class-find'].cohorts[1].baselineByHost = {}; },
+            p => { p.repos.javapoet.classes['class-find'].cohorts[1].handles = [handles[0]]; },
+            p => { p.repos.javapoet.classes['class-find'].boardKey = 'wrong'; },
+            p => { p.repos.javapoet.commit = '3'.repeat(40); },
+            p => { p.origins.constructors.kind = 'first-success'; },
+            p => { p.origins.constructors.capability = 'typeReferences'; },
+            p => { p.origins.constructors.commit = 'working-tree'; },
+            p => { delete p.origins.constructors; },
+        ];
+        for (const mutate of mutations) {
+            const pins = fixture(); mutate(pins);
+            assert.ok(judge([run()], pins).failures.length > 0);
+        }
+        assert.ok(judge([run()], fixture(), { ...release, engine: 'later' }).failures.length > 0);
+        assert.ok(judge([run()], fixture(), release, { hostClass: 'missing' }).failures.length > 0);
+    });
+
+    it('limits the inventory comparison to five introduced Java constructor queries and one release enum', () => {
+        const group = CAPABILITY_PINS.repos.javapoet.classes['class-find'];
+        const expanded = group.cohorts.find(c => c.capability === 'constructorDeclarations');
+        const unchanged = group.cohorts.find(c => c.capability === 'declarationInventory');
+        assert.equal(expanded.handles.length, 5);
+        assert.equal(unchanged.handles.length, 1);
+        assert.match(unchanged.handles[0], /:FlushType$/);
+        assert.equal(unchanged.origin, 'release');
+        assert.equal(unchanged.baselineByHost['darwin-arm64'][0], 0.191481);
+        const rows = Object.values(group.inventory).flat();
+        assert.equal(rows.length, 17);
+        assert.equal(rows.filter(row => row.constructor).length, 11);
+        assert.equal(CAPABILITY_PINS.origins[expanded.origin].commit, 'fe4183e243836ebb5ee1c7de70c6d3296338c953');
+        for (const repo of RELEASE_REPOS) {
+            if (repo.name !== 'javapoet') assert.equal(CAPABILITY_PINS.repos[repo.name].classes['class-find'], undefined);
+            for (const classId of ['class-show', 'constructor-show', 'overload-show']) {
+                assert.equal(CAPABILITY_PINS.repos[repo.name].classes[classId], undefined);
+            }
         }
     });
 });
