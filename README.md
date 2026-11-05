@@ -121,7 +121,8 @@ needs the compiler and tests.
 
 Release gates compare UCN's answers with independent compilers and language
 servers on a ten-repository board of pinned production codebases. The local
-November 5, 2026 evaluation recorded these sampled caller results:
+November 5, 2026 evaluation, using clangd 18.1.8 for C/C++ and .NET 10.0.403
+for Roslyn, recorded these sampled caller results:
 
 | Repository | Pinned commit | Oracle | Symbols sampled | Confirmed precision | In-scope recall |
 |---|---|---|---:|---:|---:|
@@ -134,12 +135,13 @@ November 5, 2026 evaluation recorded these sampled caller results:
 | javapoet | `b9017a95` | JDT LS | 50 | 100% | 100% |
 | newtonsoft-json | `4f73e743` | Roslyn | 50 | 100% | 100% |
 | cjson | `c859b25d` | clangd | 50 | 100% | 100% |
-| fmt | `e424e3f2` | clangd | 50 | 100% | 100% |
+| fmt | `e424e3f2` | clangd | 50 | 99.44% | 100% |
 
-That evaluation scored 11,051 confirmed caller edges, all correct; 57 further
-edges were unscored. It reported zero missing in-scope oracle edges in both
-caller and callee answers. The separate value-reference sample scored 1,241
-confirmed sites, all correct, with 4 unscored and zero missing in-scope sites.
+That evaluation scored 9,690 confirmed caller edges, of which 9,688 were
+correct; 56 further edges were unscored. It reported zero missing in-scope
+oracle edges in both caller and callee answers. The separate value-reference
+sample scored 1,241 confirmed sites, all correct, with 4 unscored and zero
+missing in-scope sites.
 All 8,000 cross-command comparisons agreed.
 The default dead-code audit found zero false-dead results among 7 scored
 claims; 4 additional claims could not be pinned by the oracle and were unscored.
