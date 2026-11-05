@@ -2380,3 +2380,60 @@ def process(items):
         } finally { rm(d); }
     });
 });
+
+describe('fix #474: constructor name tokens are declarations of their class', () => {
+    it('clangd keeps constructor declarations apart from adjacent type references', async t => {
+        if (spawnSync(process.env.UCN_EVAL_CLANGD || 'clangd', ['--version'], { stdio: 'ignore' }).status !== 0) {
+            t.skip('clangd is not installed');
+            return;
+        }
+        const dir = tmp({ 'parcel.cpp': [
+            'struct Parcel {',
+            '  explicit Parcel(int n = 0) {}',
+            '  Parcel(const Parcel& other) {}',
+            '};',
+            'struct Crate {',
+            '  Crate();',
+            '};',
+            'Crate::Crate() {}',
+            'Parcel use(Parcel value) { return value; }',
+        ].join('\n') });
+        let handle;
+        try {
+            handle = await clangdOracle.prepare(dir, { repo: { language: 'cpp' } });
+            const symbols = await clangdOracle.listSymbols(handle);
+            const parcel = symbols.find(symbol => symbol.name === 'Parcel');
+            const refs = await clangdOracle.findReferences(handle, parcel);
+            assert.ok(refs.some(ref => ref.line === 2 && ref.kind === 'definition'));
+            assert.ok(refs.some(ref => ref.line === 3 && ref.kind === 'definition'));
+            assert.ok(refs.some(ref => ref.line === 3 && ref.kind === 'reference'),
+                'the copy constructor parameter remains a type reference on the declaring line');
+            assert.ok(refs.some(ref => ref.line === 9 && ref.kind === 'reference'));
+            const crate = symbols.find(symbol => symbol.name === 'Crate');
+            const crateRefs = await clangdOracle.findReferences(handle, crate);
+            assert.ok(crateRefs.some(ref => ref.line === 6 && ref.kind === 'definition'));
+            assert.ok(crateRefs.some(ref => ref.line === 8 && ref.kind === 'definition'));
+            assert.ok(crateRefs.some(ref => ref.line === 8 && ref.kind === 'reference'),
+                'the out-of-class qualifier remains a type reference beside its constructor token');
+        } finally {
+            if (handle) await clangdOracle.dispose(handle);
+            rm(dir);
+        }
+    });
+
+    for (const [file, source] of [
+        ['ParcelTest.java', 'class Parcel {\n Parcel() {}\n Parcel(Parcel other) {}\n}\n'],
+        ['ParcelTests.cs', 'class Parcel {\n public Parcel() {}\n public Parcel(Parcel other) {}\n}\n'],
+        ['parcel_test.cpp', 'struct Parcel {\n Parcel() {}\n Parcel(const Parcel& other) {}\n};\n'],
+    ]) {
+        it(`${file}: tests skips a constructor declaring name and retains its parameter type`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir);
+                const matches = index.tests('Parcel', { file }).flatMap(row => row.matches);
+                assert.ok(!matches.some(match => match.line === 2), 'declaring the constructor is not a type use');
+                assert.ok(matches.some(match => match.line === 3), 'using the type as a parameter is a type use');
+            } finally { rm(dir); }
+        });
+    }
+});

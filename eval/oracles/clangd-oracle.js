@@ -129,6 +129,7 @@ const clangdOracle = {
             versions: new Map(),
             symbols: new Map(),
             valueSymbols: new Map(),
+            constructorDeclarations: new Set(),
             astLines: new Map(),
             occurrenceCache: new Map(),
             lexicalCodeCache: new Map(),
@@ -169,6 +170,17 @@ const clangdOracle = {
                 const compilerArtifact = isAnonymousRecordSymbol(entry) ||
                     isRedundantRecordTypedef(entry, namedRecords) ||
                     isUnexpandedMacroFunction(handle, absFile, entry, containers);
+                // A constructor's declaring token names its class without
+                // using that type. Keep its exact compiler selection position
+                // even though constructors are not separate sampled classes.
+                // Other type tokens on the same line remain references.
+                if (entry.kind === SYMBOL_KIND.CONSTRUCTOR && range && !compilerArtifact) {
+                    const line = range.start.line + 1;
+                    const name = sourceIdentifier(handle, absFile, line, range.start.character, entry.name);
+                    if (name && name === semanticName) {
+                        handle.constructorDeclarations.add(`${relFile}:${line}:${range.start.character}:${name}`);
+                    }
+                }
                 const memberKind = valueKind(entry.kind);
                 if (memberKind && range && !isAnonymousRecordSymbol(entry)) {
                     const line = range.start.line + 1;
@@ -283,6 +295,7 @@ const clangdOracle = {
             const isDefinition =
                 (rel === file && refLine === line) ||
                 handle.symbols.has(`${rel}:${refLine}:${name}`) ||
+                (targetIsClass && handle.constructorDeclarations?.has(`${rel}:${refLine}:${refColumn}:${name}`)) ||
                 (!!valueTarget && handle.valueSymbols.has(`${rel}:${refLine}:${name}`));
             const copy = !isDefinition && copies
                 ? await referenceCopy(handle, copies, refAbs, refLine, refColumn) : null;
