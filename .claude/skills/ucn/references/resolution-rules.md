@@ -134,7 +134,7 @@ A Go package-level variable has one static type across its package: `var Command
 
 A chain starting with `Self::make()` uses the producer's return type for later methods. Recorded field suffixes, including one field, use the field's declared type; an unresolved hop remains unverified. Field access through a returned standard deref wrapper such as `MutexGuard<State>` uses `State` only after proving the wrapper's binding and payload identity. A project namesake or generic payload supplies no such proof.
 
-Calls to a trait impl on an external type stay `autoref-dispatch` when the type's unseen inherent methods could precede it, including `self.method()` or `Self::method(self)` inside the impl. Explicit trait paths retain their own lookup. Struct literals never bind an impl block.
+Calls to a trait impl on an external type stay `autoref-dispatch` when the type's unseen inherent methods could precede it, including `self.method()` or `Self::method(self)` inside the impl. This review applies per target, including pins containing several definitions; a proven project-owned receiver keeps its own method. Explicit trait paths retain their own lookup. Struct literals never bind an impl block.
 
 A field access through `self` in an `impl` uses the type written on that implementation, including scoped imports and aliases. An external type never borrows a project namesake's fields; an unresolved owner stays `member-owner-unresolved`.
 

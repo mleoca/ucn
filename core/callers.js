@@ -7595,14 +7595,34 @@ function findCallers(index, name, options = {}) {
                     rustImplSelected = selection?.decision === 'confirm';
                 }
 
-                if (langTraits(fileEntry.language)?.inherentMethodsPrecedeTraitImpls &&
-                    options.targetDefinitions?.length === 1 &&
-                    _rustExternalInherentPossible(index, filePath, call, options.targetDefinitions[0])) {
-                    if (collectAccount) routeUnverified(filePath, fileEntry, call, 'autoref-dispatch', calledAs, {
-                        uncertaintyClass: 'compile-time-dispatch',
-                        dispatchFamily: `${name} inherent methods of an external type`,
-                    });
-                    continue;
+                if (langTraits(fileEntry.language)?.inherentMethodsPrecedeTraitImpls) {
+                    const externalTargets = targetDefs2.filter(target =>
+                        _rustExternalInherentPossible(index, filePath, call, target));
+                    if (externalTargets.length) {
+                        // A mixed pin can also contain a project-owned member.
+                        // Only the same source-backed receiver lookup used by
+                        // confirmation may select it over the external candidates.
+                        // Duplicates and unresolved owners cannot remove review.
+                        const ownedTargets = targetDefs2.filter(target => !externalTargets.includes(target));
+                        const facts = ownedTargets.length ? _confirmationFacts(index, filePath, call, targetDefs2, {
+                            bindingId, ...resolvedReceiverFacts,
+                            sameClass: !!resolvedBySameClass && !resolvedByTypedAttribute && !qualifiedOwnerMatch,
+                            ...(fieldHopType && !call.receiverType && {
+                                receiverType: fieldHopType, receiverTypeSource: 'field',
+                                receiverOrigin: { source: 'field', root: call.receiverRoot,
+                                    rootType: call.receiverRootType, field: call.receiverField },
+                            }),
+                        }) : null;
+                        const selected = facts?.lookup?.selected;
+                        if (!selected || !ownedTargets.some(target =>
+                            sameDeclaration(selected, declarationIdentity(target)))) {
+                            if (collectAccount) routeUnverified(filePath, fileEntry, call, 'autoref-dispatch', calledAs, {
+                                uncertaintyClass: 'compile-time-dispatch',
+                                dispatchFamily: `${name} inherent methods of an external type`,
+                            });
+                            continue;
+                        }
+                    }
                 }
 
                 // Method probing by reference layer (fix #392, bytes-measured:

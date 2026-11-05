@@ -9964,3 +9964,72 @@ describe('fix #444: producer values, macro calls and impl ownership', () => {
         } finally { rm(dir); }
     });
 });
+
+
+describe('fix #469: external inherent dispatch is independent of target pin shape', () => {
+    it('keeps external impl calls unverified beside duplicate and unrelated owned targets', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nupstream="1"\n',
+            'src/lib.rs': [
+                'use upstream::Terminal;',
+                'trait Local { fn clear(&self); }',
+                'impl Local for Terminal { fn clear(&self) { self.clear(); } }',
+                'struct Owned;',
+                'impl Owned { fn clear(&self) {} fn use_it(&self) { self.clear(); } }',
+                'fn external(t: Terminal) { t.clear(); }',
+                'fn explicit(t: Terminal) { <Terminal as Local>::clear(&t); }',
+                'impl TerminalBridge for Terminal { fn via_type(&self) { Self::clear(self); } }',
+                'trait TerminalBridge { fn via_type(&self); }',
+                'fn owned(t: Owned) { t.clear(); }',
+                'fn owned_path(t: Owned) { Owned::clear(&t); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const definitions = index.find('clear', { exact: true });
+            const external = definitions.find(d => d.className === 'Terminal');
+            const owned = definitions.find(d => d.className === 'Owned');
+            for (const targets of [[external], [external, external], [external, owned], [owned, external]]) {
+                const up = index.findCallers('clear', { targetDefinitions: targets, collectAccount: true });
+                for (const line of [3, 6, 8]) {
+                    assert.ok(!up.some(c => c.line === line), `confirmed external call at ${line}`);
+                    assert.ok(up.unverifiedEntries.some(c => c.line === line && c.reason === 'autoref-dispatch'),
+                        `missing external review at ${line}`);
+                }
+                if (targets.includes(owned)) for (const line of [5, 10, 11]) {
+                    assert.ok(up.some(c => c.line === line), `owned call lost at ${line}`);
+                    assert.ok(!up.unverifiedEntries.some(c => c.line === line));
+                }
+                assert.ok(!up.unverifiedEntries.some(c => c.line === 7 && c.reason === 'autoref-dispatch'));
+            }
+            for (const name of ['clear', 'external', 'via_type']) {
+                const caller = index.find(name, { exact: true }).find(d => name === 'clear' ? d.className === 'Terminal'
+                    : name === 'via_type' ? d.traitImpl : true);
+                const down = index.findCallees(caller, { collectAccount: true, includeMethods: true });
+                assert.ok(!down.some(c => c.name === 'clear'));
+                assert.ok(down.unverifiedCallees.some(c => c.name === 'clear' && c.reason === 'autoref-dispatch'));
+                assert.strictEqual(down.calleeAccount.conserved, true);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('resolves super paths to the parent module on both relationship views', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
+            'src/lib.rs': 'fn helper() {}\nmod child {\n    fn helper() {}\n    fn run() { super::helper(); }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const helpers = index.find('helper', { exact: true });
+            const parent = helpers.find(d => d.startLine === 1);
+            const child = helpers.find(d => d.startLine === 3);
+            const up = index.findCallers('helper', { targetDefinitions: [parent], collectAccount: true });
+            assert.deepStrictEqual(up.map(c => c.line), [4]);
+            assert.strictEqual(index.findCallers('helper', { targetDefinitions: [child], collectAccount: true }).length, 0);
+            const down = index.findCallees(index.find('run', { exact: true })[0],
+                { collectAccount: true, includeMethods: true });
+            assert.deepStrictEqual(down.map(c => [c.name, c.startLine]), [['helper', 1]]);
+            assert.strictEqual(down.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
