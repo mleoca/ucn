@@ -42,7 +42,7 @@ const { getParser, safeParse, langTraits, LANGUAGES } = require('../languages');
 const { sameNode } = require('../languages/utils');
 const { jsPatternTarget } = require('../languages/lexical-scope');
 const { classKeyOf } = require('./class-identity');
-const { projectHas, sharedRead } = require('./provenance-overload');
+const { projectHas, sharedRead, containingDeclarations } = require('./provenance-overload');
 const { indexedContent } = require('./source-memo');
 
 // Modules read lazily (load cycles), each resolved once: a require() per
@@ -1233,9 +1233,8 @@ class TypeReferenceResolver {
     }
 
     _containerOf(d) {
-        const entry = this.index.files.get(d.file);
         let best = null;
-        for (const s of entry?.symbols || []) {
+        for (const s of containingDeclarations(this.index, d) || []) {
             if (s === d || s.startLine == null || s.endLine == null) continue;
             if (s.sourceSpan && d.sourceSpan &&
                 (s.sourceSpan.start > d.sourceSpan.start ||

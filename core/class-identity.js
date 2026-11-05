@@ -117,8 +117,7 @@ function ownerNameOf(member) {
  * file (another def whose range strictly contains it), 0 at module level.
  */
 function _enclosingScopeStart(index, def) {
-    const fileEntry = index.files.get(def.file);
-    const symbols = fileEntry?.symbols;
+    const symbols = require('./provenance-overload').containingDeclarations(index, def);
     if (!Array.isArray(symbols)) return 0;
     let best = null;
     // Only declarations holding the definition's first line can enclose it.

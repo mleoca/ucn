@@ -143,11 +143,17 @@ confirmed sites, all correct, with 4 unscored and zero missing in-scope sites.
 All 8,000 cross-command comparisons agreed.
 The default dead-code audit found zero false-dead results among 7 scored
 claims; 4 additional claims could not be pinned by the oracle and were unscored.
-The latest local performance run passed 60 of 61 query-class comparisons and
-all 31 capability cohorts. JavaPoet's overload-show p95 was 27.561 ms against
-an effective limit of 25.976 ms, so the performance gate failed. The original
-release comparisons remain visible: 44 of 61 passed before applying the
-capability policy described below.
+The latest local performance run passed 58 of 61 query-class comparisons and
+all 31 capability cohorts. The performance gate failed on these comparisons:
+
+| Repository and query class | Measurement | Time | Effective limit |
+|---|---|---:|---:|
+| JavaPoet overload-show | p50 | 15.812 ms | 13.150 ms |
+| Newtonsoft.Json overload-show | p95 | 68.076 ms | 67.504 ms |
+| fmt class-find | p95 | 59.723 ms | 59.348 ms |
+
+The original release comparisons remain visible: 42 of 61 passed before
+applying the capability policy described below.
 Query timings exclude process startup and indexing; cold builds and cache
 loading are measured separately.
 

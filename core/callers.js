@@ -24160,7 +24160,7 @@ function _javaPlatformSupertypeContract(index, parent, owner) {
     // ancestry is still visited by the caller and keeps its result open.
     if ((index.symbols.get(root) || []).some(def =>
         ['class', 'interface', 'enum', 'record'].includes(def.type)) ||
-        entry.symbols?.some(def => _declaredTypeParameterNames(def).has(root))) return null;
+        _javaTypeScopeSymbols(index, entry)?.some(def => _declaredTypeParameterNames(def).has(root))) return null;
     const imports = _javaTypeImports(index, entry, root);
     let qualified;
     if (imports.length) {
@@ -24348,7 +24348,7 @@ function _javaQualifiedReturnType(index, type, definition) {
     if (traits.standardPathRoots.includes(root)) return null;
     const rootDefinitions = (index.symbols.get(root) || []).filter(def => IDENTITY_TYPE_KINDS.has(def.type));
     if (!rootDefinitions.length) return null;
-    if (entry.symbols.some(def => _declaredTypeParameterNames(def).has(root) ||
+    if (_javaTypeScopeSymbols(index, entry).some(def => _declaredTypeParameterNames(def).has(root) ||
         def.name === root && def.lexicalScopeStartLine != null)) return null;
     const span = definition.sourceSpan;
     const scopes = _javaArgumentScopes(index, { file: definition.file,
@@ -24439,7 +24439,7 @@ function _javaCollectionReturnInfo(index, owner, method, origin, argCount) {
     const suffix = erased.match(/(?:\[\])+$/)?.[0] || '';
     const type = suffix ? erased.slice(0, -suffix.length) : erased;
     const root = type.split('.')[0], entry = index.files.get(origin.file);
-    if (entry.symbols.some(def => _declaredTypeParameterNames(def).has(root))) return null;
+    if (_javaTypeScopeSymbols(index, entry).some(def => _declaredTypeParameterNames(def).has(root))) return null;
     const imports = _javaTypeImports(index, entry, root);
     if (imports.some(binding => binding.unknownType)) return null;
     const candidates = imports.length ? imports.map(binding =>
@@ -24978,7 +24978,18 @@ function _javaFormalMemberType(index, name, owner) {
     const visited = new Set();
     while (scope && !visited.has(scope)) {
         visited.add(scope);
-        const result = visit({ name: scope.name, key: classKeyOf(index, scope), def: scope }, new Set(), true);
+        const own = scope.name === name ? [scope] : named.filter(member => member.file === scope.file &&
+            (member.namespace || '') === (scope.namespace || '') &&
+            member.enclosingType === [scope.enclosingType, scope.name].filter(Boolean).join('.'));
+        // A declared member wins before inheritance is considered. When no
+        // declaration of this class name has any parents, there is no graph
+        // to resolve and no lexical identity key to derive for the walk.
+        const parentless = !own.length && !scope.extends && !scope.implements?.length &&
+            !(index.extendsGraph.get(scope.name) || []).length &&
+            (index.symbols.get(scope.name) || []).every(def => !def.extends && !def.implements?.length);
+        const result = own.length ? { definitions: own }
+            : parentless ? { definitions: [], uncertain: false }
+                : visit({ name: scope.name, key: classKeyOf(index, scope), def: scope }, new Set(), true);
         if (result.uncertain || result.definitions?.length) return result;
         if (!scope.enclosingType) break;
         const parentName = scope.enclosingType.split('.').pop();
@@ -24996,6 +25007,14 @@ function _javaFormalMemberType(index, name, owner) {
 // those lines only (fix #421); without it, about the whole file.
 function _typeNamesCanonicalAt(index, writtenFile, at = null) {
     if (!writtenFile) return true;
+    const start = Number.isInteger(at?.startLine) ? at.startLine : null;
+    const end = start === null ? null : Number.isInteger(at.endLine) ? at.endLine : start;
+    const key = JSON.stringify(['canonical-type-names', writtenFile, start, end]);
+    return lazyProvenanceOverloadModule().sharedRead(index, key,
+        view => _typeNamesCanonicalAtUncached(view, writtenFile, start === null ? null : { startLine: start, endLine: end }));
+}
+
+function _typeNamesCanonicalAtUncached(index, writtenFile, at) {
     const file = path.isAbsolute(writtenFile) ? writtenFile : path.resolve(index.root, writtenFile);
     const language = index.files.get(file)?.language;
     const canonical = langTraits(language)?.typeNameSourceCanonical;
@@ -25036,8 +25055,22 @@ function _javaCallArgumentOrigin(call) {
         invocation: { file: call.argumentFile, site: call.callSite } }) };
 }
 
+function _javaTypeScopeSymbols(index, entry) {
+    if (!entry?.relativePath) return entry?.symbols;
+    const file = path.resolve(index.root, entry.relativePath);
+    return lazyProvenanceOverloadModule().fileSymbolFact(index, file, `java-type-scope\0${file}`, (symbols, live) => {
+        if (!symbols) return symbols;
+        const memo = live._opMemo?.('javaTypeScopeSymbols', () => new Map());
+        if (memo?.has(file)) return memo.get(file);
+        const scope = symbols?.filter(def => ['class', 'interface', 'enum', 'record'].includes(def.type) ||
+            def.generics || def.ownerGenerics || def.lexicalScopeStartLine != null);
+        memo?.set(file, scope);
+        return scope;
+    });
+}
+
 function _javaArgumentScopes(index, origin, entry) {
-    const types = entry.symbols.filter(def => ['class', 'interface', 'enum', 'record'].includes(def.type));
+    const types = _javaTypeScopeSymbols(index, entry).filter(def => ['class', 'interface', 'enum', 'record'].includes(def.type));
     if (!origin?.site) return types;
     const ownersAt = langTraits(entry.language)?.typeNameOwnersAt;
     if (!ownersAt) return null;
@@ -25057,13 +25090,14 @@ function _javaPlatformOriginUnshadowed(index, origin, name, root = 'java') {
     const writtenFile = typeof origin === 'string' ? origin : origin?.file;
     if (!writtenFile) return false;
     const file = path.resolve(index.root, writtenFile), entry = index.files.get(file);
-    if (langTraits(entry?.language)?.typeNameScoping !== 'package-on-demand' || !Array.isArray(entry.symbols)) return false;
+    const symbols = _javaTypeScopeSymbols(index, entry);
+    if (langTraits(entry?.language)?.typeNameScoping !== 'package-on-demand' || !Array.isArray(symbols)) return false;
     if (!_typeNamesCanonicalAt(index, file)) return false;
-    const types = entry.symbols.filter(def => ['class', 'interface', 'enum', 'record'].includes(def.type));
+    const types = symbols.filter(def => ['class', 'interface', 'enum', 'record'].includes(def.type));
     const packages = new Set(types.map(def => def.namespace || ''));
     if (packages.size !== 1 || _javaTypeImports(index, entry, root).length ||
         (entry.importDetails || []).some(detail => detail.names?.includes('*')) ||
-        entry.symbols.some(def => _declaredTypeParameterNames(def).has(root))) return false;
+        symbols.some(def => _declaredTypeParameterNames(def).has(root))) return false;
     const namespace = [...packages][0];
     if ((index.symbols.get(root) || []).some(def => ['class', 'interface', 'enum', 'record'].includes(def.type) &&
         (def.file === file || !def.enclosingType && !def.lexicalScopeStartLine &&
@@ -25087,8 +25121,9 @@ function _javaPlatformProducerIdentity(index, owner, origin, name, packageRoot) 
     const written = origin?.written?.replace(/<.*$/s, '').trim();
     if (!written || written === owner) return _javaPlatformOriginUnshadowed(index, origin, name, packageRoot);
     const entry = index.files.get(origin.file), root = written.split('.')[0];
-    if (!entry?.symbols || !_typeNamesCanonicalAt(index, origin.file) ||
-        entry.symbols.some(def => _declaredTypeParameterNames(def).has(root)) ||
+    const symbols = _javaTypeScopeSymbols(index, entry);
+    if (!symbols || !_typeNamesCanonicalAt(index, origin.file) ||
+        symbols.some(def => _declaredTypeParameterNames(def).has(root)) ||
         (index.symbols.get(root) || []).some(def => def.file === origin.file &&
             ['class', 'interface', 'enum', 'record'].includes(def.type))) return false;
     const imports = _javaTypeImports(index, entry, root);
@@ -25108,8 +25143,9 @@ function _javaSimplePlatformArgument(index, origin, name) {
     const writtenFile = typeof origin === 'string' ? origin : origin?.file;
     if (!writtenFile) return false;
     const file = path.resolve(index.root, writtenFile), entry = index.files.get(file);
-    if (!entry?.symbols || !_typeNamesCanonicalAt(index, file)) return false;
-    if (entry.symbols.some(def => _declaredTypeParameterNames(def).has(name))) return false;
+    const symbols = _javaTypeScopeSymbols(index, entry);
+    if (!symbols || !_typeNamesCanonicalAt(index, file)) return false;
+    if (symbols.some(def => _declaredTypeParameterNames(def).has(name))) return false;
     // A local type may bind the annotation at a different position from the
     // argument's use. Its spelling is insufficient to establish a JDK type.
     if ((index.symbols.get(name) || []).some(def => def.file === file &&
@@ -25176,7 +25212,8 @@ function _javaKnownArgumentConversion(index, kind, paramType, owner, argumentOri
             const file = typeof argumentOrigin === 'string' ? argumentOrigin : argumentOrigin?.file;
             const entry = file && index.files.get(path.resolve(index.root, file));
             const root = erased.split('.')[0];
-            return !entry?.symbols || entry.symbols.some(def => _declaredTypeParameterNames(def).has(root))
+            const symbols = _javaTypeScopeSymbols(index, entry);
+            return !symbols || symbols.some(def => _declaredTypeParameterNames(def).has(root))
                 ? null : false;
         }
         if (JAVA_PRIMITIVES.has(erased)) literal = erased;

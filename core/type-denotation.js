@@ -45,7 +45,7 @@ const fs = require('fs');
 const path = require('path');
 const { langTraits } = require('../languages');
 const { findCargoRoot, findGoModule } = require('./imports');
-const { projectFact, projectHas } = require('./provenance-overload');
+const { projectFact, projectHas, fileSymbolFact } = require('./provenance-overload');
 
 const TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum', 'record', 'union']);
 
@@ -505,8 +505,10 @@ function scopedTypeDenotation(index, fileEntry, filePath, name, line, scoping) {
 function scopingSiteKey(index, filePath, line) {
     const fileEntry = index.files.get(filePath);
     if (!fileEntry || !langTraits(fileEntry.language)?.typeNameScoping) return '';
-    const namespaces = memoized(index, `\x01site-ns\x00${filePath}`, () => new Set((fileEntry.symbols || [])
-        .filter(symbol => TYPE_KINDS.has(symbol.type)).map(symbol => symbol.namespace || '')));
+    const namespaces = memoized(index, `\x01site-ns\x00${filePath}`, () => new Set(
+        fileSymbolFact(index, filePath, `file-type-namespaces\0${filePath}`, (symbols, live) => symbols
+            ? memoized(live, `\x01site-ns-facts\x00${filePath}`, () => symbols
+                .filter(symbol => TYPE_KINDS.has(symbol.type)).map(symbol => symbol.namespace || '')) : [])));
     if (namespaces.size <= 1) return '\x01';
     const namespace = siteNamespaceOf(fileEntry, line);
     return namespace === undefined ? '\x02' : `\x03${namespace}`;

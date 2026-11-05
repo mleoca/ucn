@@ -227,7 +227,28 @@ function errorMemberScopes(source) {
     return scopes;
 }
 
+const typeOwnerSources = new (require('../core/source-memo').SourceMemo)({
+    maxEntries: 128, maxWeight: 16 * 1024 * 1024,
+    weigh: facts => facts.weight,
+});
+
 function typeNameOwnersAt(source, site) {
+    if (typeof source !== 'string' || !Number.isInteger(site?.start) || !Number.isInteger(site?.line)) return null;
+    const key = `${site.start}:${site.line}`;
+    const facts = typeOwnerSources.get('java', source) || { sites: new Map(), weight: 0 };
+    const { sites } = facts;
+    if (sites.has(key)) return sites.get(key);
+    const owners = typeNameOwnersAtUncached(source, site);
+    const result = owners && Object.freeze(owners.map(owner => Object.freeze(owner)));
+    if (sites.size < 4096) {
+        sites.set(key, result);
+        facts.weight += key.length * 2 + 32 + (result?.length || 0) * 32;
+        typeOwnerSources.set('java', source, facts);
+    }
+    return result;
+}
+
+function typeNameOwnersAtUncached(source, site) {
     if (!typeNameSourceCanonical(source) || !Number.isInteger(site?.start)) return null;
     const tree = lazySourceMemoModule().parsedSource('java', source);
     if (!tree) return null;

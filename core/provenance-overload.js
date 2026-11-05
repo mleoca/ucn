@@ -235,6 +235,18 @@ function factIndex(reads, live, fileFields) {
             if (property === 'projectFact') {
                 return (key, compute) => readMapValue(`fact:${key}`, () => projectFact(live, key, compute), true);
             }
+            if (property === 'projectFileSymbols') {
+                return (file, key, compute) => readMapValue(`fact:${key}`, () => {
+                    const entry = live.files.get(file);
+                    // Keep exactly the file fields this view exposes. In
+                    // particular, overload views omit declarations for
+                    // languages whose selector does not consume them.
+                    const exposed = fileFields ? fileFields.includes('symbols') &&
+                        (fileFields !== OVERLOAD_FILE_FIELDS || langTraits(entry?.language)?.overloadFileSymbols)
+                        : langTraits(entry?.language)?.overloadFileSymbols;
+                    return compute(exposed ? entry?.symbols : undefined, live);
+                }, true);
+            }
             if (property === 'provenanceFs') return Object.fromEntries(
                 ['existsSync', 'readdirSync', 'readFileSync'].map(method => [method, (...args) => {
                     const result = read(`fs.${method}:${JSON.stringify(args)}`, () => {
@@ -311,6 +323,32 @@ function keyList(live, map) {
  */
 function projectFact(index, key, compute) {
     return index?.isProvenanceFactIndex ? index.projectFact(key, compute) : compute(index);
+}
+
+function fileSymbolFact(index, file, key, compute) {
+    return index.isProvenanceFactIndex ? index.projectFileSymbols(file, key, compute)
+        : compute(index.files.get(file)?.symbols, index);
+}
+
+/** Raw declarations whose line ranges contain the queried declaration.
+ * Scope proofs need these candidates, not every unrelated member in the
+ * file. The innermost choice is still derived from the recorded ranges.
+ */
+function containingDeclarations(index, definition) {
+    const { file, startLine, endLine } = definition;
+    if (!index.isProvenanceFactIndex || !Number.isInteger(startLine) || !Number.isInteger(endLine)) {
+        return index.files.get(file)?.symbols;
+    }
+    const key = JSON.stringify(['containing-declarations', file, startLine, endLine]);
+    return fileSymbolFact(index, file, key, (symbols, live) => {
+        if (!Array.isArray(symbols)) return symbols;
+        const memo = live._opMemo?.('containingDeclarations', () => new Map());
+        if (memo?.has(key)) return memo.get(key);
+        const candidates = require('./shared').symbolsSpanning(symbols, startLine)
+            .filter(symbol => !(symbol.endLine < endLine));
+        memo?.set(key, candidates);
+        return candidates;
+    });
 }
 
 /**
@@ -507,5 +545,5 @@ function overloadMemberGroup(steps) {
     return group;
 }
 
-module.exports = { captureOverload, validateOverload, overloadMemberGroup, factIndex, projectFact, projectHas, sharedRead,
+module.exports = { captureOverload, validateOverload, overloadMemberGroup, factIndex, projectFact, projectHas, sharedRead, containingDeclarations, fileSymbolFact,
     sealFacts, replayed, seedReplay, provenanceWork, ProvenanceRefusal, refusedProof };
