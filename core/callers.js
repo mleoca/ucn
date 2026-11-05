@@ -20142,7 +20142,9 @@ function _overloadProvablyApplicable(index, call, definition, candidates, langua
         let param = _javaParamAt(definition, i, call);
         const identity = _javaParamTypeIdentity(index, definition, i, call);
         const distinguishing = candidates.some(other => other !== definition &&
-            _javaParamTypeIdentity(index, other, i, call) !== identity);
+            (_javaParamTypeIdentity(index, other, i, call) !== identity ||
+             (langTraits(language)?.genericArityIsIdentity &&
+              genericArityOf(_javaParamAt(other, i, call)?.type) !== genericArityOf(param?.type))));
         if (!distinguishing) continue;
         if (param?.rest && langTraits(language)?.overloadPhases === 'strict-loose-variable') {
             if (_javaVariadicNormalFormPossible(index, call, definition)) {
@@ -22937,6 +22939,10 @@ function _csharpTypeIdentity(raw) {
  */
 /** A written C# type's identity and generic arity (`IRequest<Pong>` -> IRequest/1). */
 function _csharpTypeWithArity(text) {
+    // This lookup models a type's own arity, not constructed enclosing
+    // types. Erasing Outer<A, B>.Inner<T> to Outer/2 would disprove a real
+    // Inner/1 candidate before overload ranking can consider it.
+    if (hasParameterizedQualifier(text)) return null;
     const name = _csharpTypeIdentity(text);
     if (!name) return null;
     const written = String(text).trim().replace(/^global::/, '').replace(/\?$/, '');

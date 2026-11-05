@@ -18724,3 +18724,47 @@ describe('fix #434: constructor identity never crosses languages; C# closures, c
         } finally { rm(dir); }
     });
 });
+
+describe('fix #472: constructed enclosing types cannot disprove a generic overload', () => {
+    const fixture = nested => [
+        'namespace N {',
+        ...(nested ? ['class Sender<A, B> {'] : []),
+        'public class Token {}',
+        'public class Token<T> : Token {}',
+        ...(!nested ? ['class Sender {'] : []),
+        ' public void Send(Token token, params object[] values) {}',
+        ' public void Send<T>(Token<T> token, T value) {}',
+        '}',
+        'class Client {',
+        ` void Run(${nested ? 'Sender<int, int>' : 'Sender'} sender, ${nested ? 'Sender<int, int>.' : ''}Token<string> token, string value) {`,
+        '  sender.Send(token, value);',
+        ' }',
+        '}',
+        '}',
+    ].join('\n');
+
+    for (const nested of [true, false]) {
+        it(`C#: ${nested ? 'constructed owner remains reviewable' : 'proven generic argument retains normal overload selection'}`, () => {
+            const source = fixture(nested), dir = tmp({ 'M.cs': source });
+            try {
+                const index = idx(dir), definitions = index.symbols.get('Send');
+                const generic = definitions.find(def => def.generics);
+                const variadic = definitions.find(def => def.paramsStructured.some(param => param.rest));
+                const line = source.split('\n').findIndex(text => text.includes('sender.Send(')) + 1;
+                const callers = definition => index.context('Send', { file: 'M.cs', line: definition.startLine });
+                const normal = callers(generic), expanded = callers(variadic);
+                const sites = rows => rows.map(row => row.line);
+                assert.deepStrictEqual(sites(expanded.callers), []);
+                assert.deepStrictEqual(sites(normal.callers), nested ? [] : [line]);
+                assert.deepStrictEqual(sites(normal.unverifiedCallers), nested ? [line] : []);
+                assert.deepStrictEqual(sites(expanded.unverifiedCallers), nested ? [line] : []);
+                if (nested) {
+                    assert.ok(normal.unverifiedCallers.every(row => row.reason === 'overload-ambiguous'));
+                    const body = index.context('Run', { file: 'M.cs' });
+                    assert.ok(!body.callees.some(row => row.name === 'Send'));
+                    assert.ok(body.unverifiedCallees.some(row => row.name === 'Send'));
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
