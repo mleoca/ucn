@@ -16,7 +16,7 @@ Use this reference when an agent, CI job, or script will make decisions from UCN
 
 ## Trust lines
 
-Every caller-bearing answer ends with trust lines that truncation preserves:
+Caller, callee and trace views carry the applicable trust lines below, preserved through truncation. Source, definition and test-reference lists do not supply a caller account; request `show` or `impact` when one is needed.
 
 - `ACCOUNT` partitions every line where the name occurs: confirmed, unverified, non-call (import, definition, reference, other text), other-target, unaccounted. In mixed-language repositories it also counts occurrences in unsupported-language source files.
 - `CONTRACT` states the scope of that partition. When unsupported-language files contain the name, it says so and limits the partition-complete claim to supported languages. Semantic completeness is never claimed.
@@ -52,7 +52,9 @@ A lone project owner of a method name does not identify an untyped receiver. Suc
 
 ## Release evaluation
 
-Releases are gated on pinned real repositories against independent oracles (ts-morph, Pyright, gopls, rust-analyzer, JDT LS, Roslyn, clangd): 100% in-scope caller, callee and value-reference recall with zero unaccounted oracle edges, at least 98% confirmed-tier precision, full conservation, zero false-dead claims in the default `deadcode` audit, exactly agreeing cross-command claims for the same handle (`find`, `show`, `source`, `impact`, `tests`, `check`, caller `trace`), bounded unverified review burden (at most 10% of exact true edges left unverified, at least 80% of targets with no actionable ambiguity, at most five actionable candidates at p95), throughput and memory budgets, and per-class query latency (orientation, class, constructor, overload and value queries) against the previous release on the reference host. Passing these sampled gates is release evidence for the measured static evidence classes; it does not turn dynamic dispatch, generated code, reflection, or external dependencies into complete runtime knowledge.
+Releases are gated on pinned real repositories against independent oracles (ts-morph, Pyright, gopls, rust-analyzer, JDT LS, Roslyn, clangd): 100% in-scope caller, callee and value-reference recall with zero unaccounted oracle edges, at least 98% confirmed-tier precision, full conservation, zero false-dead claims in the default `deadcode` audit, exactly agreeing cross-command claims for the same handle (`find`, `show`, `source`, `impact`, `tests`, `check`, caller `trace`), and bounded unverified review burden (at most 10% of exact true edges left unverified, at least 80% of targets with no actionable ambiguity, at most five actionable candidates at p95).
+
+Performance gates cover throughput, memory and per-class query latency on the reference host. Existing capabilities compare against the previous release. A newly introduced reference band or declaration inventory compares the complete command against its first working revision, with the same 1.15x and +5 ms allowance. The original release comparison stays visible; extra proof work or changed confidence alone does not qualify for a new baseline. Passing these sampled gates is evidence for the measured static evidence classes, not complete runtime knowledge of dynamic dispatch, generated code, reflection or external dependencies.
 
 ## Truncation
 

@@ -73,9 +73,9 @@ when the task needs every occurrence, including those that are not calls.
 
 ## Code navigation and change analysis
 
-`show` gathers a symbol's signature, source, callers, callees, and related
-context. Select the sections you need or set an output budget to keep the
-answer focused. `trace` follows the call graph across files, down into callees
+`show` gives a symbol's summary, callers, and callees by default. Select
+`--sections` to request source, tests, or related context, or set an output
+budget to keep the answer focused. `trace` follows the call graph across files, down into callees
 or up through callers toward entry points. Unverified relationships remain
 visible, and the tree's accounting reports where exploration stopped.
 
@@ -121,7 +121,7 @@ needs the compiler and tests.
 
 Release gates compare UCN's answers with independent compilers and language
 servers on a ten-repository board of pinned production codebases. The local
-October 4, 2026 evaluation recorded these sampled caller results:
+November 5, 2026 evaluation recorded these sampled caller results:
 
 | Repository | Pinned commit | Oracle | Symbols sampled | Confirmed precision | In-scope recall |
 |---|---|---|---:|---:|---:|
@@ -136,13 +136,18 @@ October 4, 2026 evaluation recorded these sampled caller results:
 | cjson | `c859b25d` | clangd | 50 | 100% | 100% |
 | fmt | `e424e3f2` | clangd | 50 | 100% | 100% |
 
-That evaluation reported zero missing in-scope oracle edges in both caller
-and callee answers, and 8,000 cross-command comparisons with zero disagreements.
-The default dead-code audit found zero false-dead results among 9 scored
+That evaluation scored 11,051 confirmed caller edges, all correct; 57 further
+edges were unscored. It reported zero missing in-scope oracle edges in both
+caller and callee answers. The separate value-reference sample scored 1,241
+confirmed sites, all correct, with 4 unscored and zero missing in-scope sites.
+All 8,000 cross-command comparisons agreed.
+The default dead-code audit found zero false-dead results among 7 scored
 claims; 4 additional claims could not be pinned by the oracle and were unscored.
-All ten repositories passed the performance budgets, with steady-state query
-p95 from 4.7 to 101.1 ms. Those timings exclude process startup and indexing;
-cold builds and cache loading are measured separately.
+All ten repositories passed the performance budgets, including 61 query-class
+comparisons and 31 capability cohorts. The original release comparisons remain
+visible: 45 of 61 passed before applying the capability policy described below.
+Query timings exclude process startup and indexing; cold builds and cache
+loading are measured separately.
 
 The samples are deterministic and stratified by reference activity. Confirmed
 precision applies to scored claims; recall counts in-scope oracle edges found
@@ -200,6 +205,8 @@ declaration inventories fail the comparison. Raw release results remain visible.
 | Likely missing awaits | `audit-async` |
 | Stack-trace frame resolution | `stacktrace <text>` |
 
+`--staged` selects the Git-diff form of `impact` or `check`, without a symbol.
+
 `deps --cycles` groups circular dependencies and, in JS/TS and Python,
 distinguishes eager imports from deferred or type-only edges. Enumeration limits are disclosed. `repo`
 reports source coverage as well as project structure; its HOT ranking counts
@@ -225,7 +232,7 @@ Use `--json` when the script needs structured fields or a tree result.
 
 Listings are deterministic for a given source tree: a fresh build, a cache
 load, and an incremental rebuild return the same records in the same order.
-Listings have no default row cap. Explicit limits disclose what they omit,
+`--lines` listings have no default row cap. Explicit limits disclose what they omit,
 and a shell-mode character budget fails before writing partial output.
 `source --raw` extracts complete functions and classes unless an explicit
 line limit is requested; any resulting truncation is reported on stderr.
@@ -235,7 +242,8 @@ empty results and exit 1 for command errors (`meta.ok: false` plus `error`).
 An exception inside UCN is reported as `Internal error: ...` (JSON adds
 `meta.internalError: true`), never as an answer about the code.
 Target-less `check` exits 1 when `TRUST` is `BLOCKED`, 0 for other completed
-checks, and 2 if it could not run.
+checks, and 2 if it could not run. `check <symbol>` exits 1 for a signature
+mismatch or an unverified call site.
 
 Outside `--lines`, `find`, text `search`, `deadcode`, `api`, and
 `repo --sections=files` default to a maximum of 500 results. `find` text shows

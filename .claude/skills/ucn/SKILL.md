@@ -5,7 +5,7 @@ description: AST code intelligence for JavaScript/TypeScript, Python, Go, Rust, 
 
 # UCN
 
-UCN answers semantic questions about a codebase from a tree-sitter index: where a symbol is defined, who calls it, what it calls, what a change touches, which tests reach it. Every answer labels its evidence and accounts for every line it looked at; nothing is silently dropped.
+UCN answers semantic questions about a codebase from a tree-sitter index: where a symbol is defined, who calls it, what it calls, what a change touches, which tests reach it. Caller and impact answers label uncertain relationships and account for observed name occurrences. Other commands expose their own scope and evidence limits.
 
 ## When to use it
 
@@ -17,7 +17,7 @@ UCN answers semantic questions about a codebase from a tree-sitter index: where 
 
 1. `ucn repo` in an unfamiliar repository; `--deep` adds index health and readiness. Skipped unsupported source is listed with a handoff: use text search and a language-native tool for those files. An `UNSUPPORTED` or `PARTIAL` scope is never a semantic zero.
 2. `ucn find <name>` pins a definition. Pass its `path:line:name` handle to every later command. A plain name that matches several definitions carries an ambiguity warning in `show`, `source`, `trace`, `impact`, `tests`, `check` and `plan`; never treat the auto-selected definition as the repository-wide target.
-3. `ucn show <handle>` gives the summary, callers and callees. Add `--sections=source,tests,types,dependencies,example,related` for more.
+3. `ucn show <handle>` gives the summary, callers and callees. `--sections` replaces that selection; for example, `--sections=summary,source,tests` requests those three sections.
 4. Before a change: `ucn impact <handle>` and `ucn tests <handle> --depth=3`.
 5. After a signature change: `ucn check <handle>`; before committing: target-less `ucn check`. Both compare a changed declaration with its parameters at `--base` (default `HEAD`), so the call sites bound to the old declaration are checked against the new one; a site that fits no remaining overload is a mismatch, never an excluded other-target line.
 6. `ucn source <handle>` or `ucn source path/to/file:10-30` for exact code, only when inspection is needed.
@@ -55,13 +55,13 @@ C# `this(...)` and `base(...)` initializers keep the generic type's arity. Neste
 
 ## Read the evidence
 
-Caller-bearing views (`show`, `impact`, `trace`, `tests`, `check`) tier every candidate:
+Caller candidates in `show`, `impact`, `trace` and `check` carry evidence tiers:
 
 - `CONFIRMED`: binding, receiver, import, or ownership evidence for the pinned target.
 - `UNVERIFIED`: call syntax that may reach the target, with the reason identity could not be established. Review it before a breaking change. When same-name definitions compete, `show` lists their stable handles once above the sites.
 - Excluded sites (another definition's caller, an incompatible receiver, an external package, an arity mismatch) are counted as other-target lines in `ACCOUNT`, each with its reason in JSON.
 
-Trust lines close every answer and survive truncation:
+Caller, callee and trace views carry the applicable trust lines below, preserved through truncation. A source extraction, definition list or test-reference list does not provide a caller account; use `show` or `impact` when that account is needed.
 
 - `ACCOUNT` partitions every line where the name occurs: confirmed, unverified, non-call (definition, import, reference, other text), other-target, unaccounted. In mixed-language repositories it also counts occurrences in unsupported-language source files.
 - `CONTRACT` states what that partition covers. Semantic completeness is never claimed: aliases, generated code, reflection and runtime dispatch may exist.
@@ -76,7 +76,9 @@ Return-type flow follows imported aliases and declared field owners. An unresolv
 
 Rust chains follow the produced value through recorded field hops and proven standard lock guards. A trait impl on an external type cannot prove that `self.method()` or `Self::method(self)` calls itself: an unseen inherent method may win, so the call requires review. Struct constructions name the type declaration, never its impl block.
 
-A property/getter/setter target adds `PROPERTY ACCESS SITES` to `impact` (reads and writes with access kind; receiver identity confirms, an unresolved receiver stays unverified). A type target (class, struct, interface, enum, trait, record, union, alias) adds `TYPE REFERENCE SITES`: every token naming the type outside its call sites (annotations, bases, casts, qualifiers, imports), decided by the language's own name lookup; constructions and static calls through the type stay in `CALL SITES`, and a `TYPE ACCOUNT` line partitions every name token (confirmed, unverified with a reason, excluded with a reason, at call sites, declaration). `DEPENDENCY SITES` counts each token once. Target-less `impact` and `check` diff the working tree against `HEAD` (`--staged` for the index), include untracked non-ignored source as whole-file additions, and put classes, interfaces, types and fields in declaration bands; a modified or deleted declaration makes `check` `BLOCKED` until reviewed with the language toolchain.
+A property/getter/setter target adds `PROPERTY ACCESS SITES` to `impact` (reads and writes with access kind; receiver identity confirms, an unresolved receiver stays unverified). A type target (class, struct, interface, enum, trait, record, union, alias) adds `TYPE REFERENCE SITES`: every token naming the type outside its call sites (annotations, bases, casts, qualifiers, imports), decided by the language's own name lookup; constructions and static calls through the type stay in `CALL SITES`, and a `TYPE ACCOUNT` line partitions every name token (confirmed, unverified with a reason, excluded with a reason, at call sites, declaration). `DEPENDENCY SITES` counts each token once. Target-less `impact` and `check` diff the working tree against `HEAD` (`--staged` for the index), include untracked non-ignored source as whole-file additions, and put classes, interfaces, types and fields in declaration bands; a modified or deleted type or a deleted value makes `check` `BLOCKED`. A modified value requires review (`REVIEW_REQUIRED`) unless another finding blocks the check. Validate these changes with the language toolchain.
+
+`tests` distinguishes calls and unverified calls from imports, references, strings and test-case matches. Those other match kinds are discovery hints, not confirmed call edges.
 
 Numeric evidence values are ordinal ranking weights, not probabilities. An observed-text zero is not a semantic zero or safe-delete proof.
 
@@ -95,7 +97,7 @@ ucn source handleRequest --raw            # the code and nothing else, ready for
 ucn source src/server.js:40-80 --raw
 ```
 
-Records go to stdout; `ACCOUNT`/`CONTRACT`, notes and same-name disambiguation go to stderr as `# ` lines (MCP keeps them in the one text block; `--raw` appends its note as one trailing `# ` line there). `--lines` has no default row cap; explicit `--top`/`--limit` disclose what they omit; an explicit `--max-chars` fails before any output instead of truncating records. `grep -v '# unverified'` keeps the confirmed tier. `usages --lines` emits one record per source line and tags combined kinds; JSON keeps individual occurrences. `show --lines` accepts only the callers/callees sections (default callers); target-less `impact --lines` lists Git-diff callers with per-target accounting. `source --raw` extracts whole functions and large classes; `--max-lines` truncation is disclosed on stderr. Unusual path characters (backslash, tab, CR, LF) are escaped; use `--json` for exact filenames, and for `trace`/`tests` scripting. Closing the pipe with `head` is supported.
+Records go to stdout; `ACCOUNT`/`CONTRACT`, notes and same-name disambiguation go to stderr as `# ` lines (MCP keeps them in the one text block; `--raw` appends its note as one trailing `# ` line there). `--lines` has no default row cap; explicit `--top`/`--limit` disclose what they omit; an explicit `--max-chars` fails before any output instead of truncating records. On `show --lines` caller or callee records, `grep -v '# unverified'` keeps the confirmed tier. `usages --lines` emits one record per source line and tags combined kinds; JSON keeps individual occurrences. `show --lines` accepts only the callers/callees sections (default callers); target-less `impact --lines` lists Git-diff callers with per-target accounting. `source --raw` extracts whole functions and large classes; `--max-lines` truncation is disclosed on stderr. Unusual path characters (backslash, tab, CR, LF) are escaped; use `--json` for exact filenames, and for `trace`/`tests` scripting. Closing the pipe with `head` is supported.
 
 Exit codes: 0 success; 1 for an empty `--lines` listing, a blocking `check` (target-less `check` with `TRUST: BLOCKED`, or `check <handle>` reporting a mismatch or an unverified call site), or a JSON command error (`meta.ok: false` plus `error`); 2 for a text-mode command error or a `check` that could not run. An exception inside UCN prints `Internal error: ...` on every surface (CLI JSON adds `meta.internalError: true`); it says nothing about the code, so rerun with a narrower target or report it.
 
@@ -117,8 +119,8 @@ C/C++ uses `compile_commands.json` when present for header classification and in
 
 1. Pin the exact definition with `find`.
 2. Run `impact`; review every unverified, excluded, filtered, and warning entry.
-3. Run `trace --direction=callers` for transitive behavioral impact.
-4. Run `tests --depth=3`; treat paths without static test links as test-planning signals, not runtime coverage proof.
+3. Run `ucn trace <handle> --direction=callers` for transitive behavioral impact.
+4. Run `ucn tests <handle> --depth=3`; treat paths without static test links as test-planning signals, not runtime coverage proof.
 5. Make the change.
 6. Run `check <handle>`, the relevant compiler/type checker, and selected tests.
 7. Run target-less `check` to reconcile the repository diff.
