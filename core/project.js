@@ -478,7 +478,8 @@ class ProjectIndex {
         // recovery in that mode. Partition both cache layers so a partial
         // account classification can never poison the full `usages` result.
         const mode = [
-            options.skipCallRecovery ? 'skip-call-recovery' : '',
+            options.skipCallRecovery ? (langTraits(this.files.get(filePath)?.language)?.macroInvocationSyntax === 'call'
+                ? 'skip-call-recovery-v2' : 'skip-call-recovery') : '',
             options.lexicalScopes ? 'lexical-scopes' : '',
         ].filter(Boolean).join('+');
         const modeSuffix = mode ? `\0${mode}` : '';

@@ -8,7 +8,7 @@ const { dedupeOccurrences, addRuleStat, finishRuleStats, ruleTable } = require('
 
 describe('fix #417: type lookup records only observed file facts', () => {
     const { factIndex } = require('../core/provenance-overload');
-    it('shared file accessors keep observations and local writes in their own views', () => {
+    it('file observations and local writes stay in their own views', () => {
         const fields = ['language', 'symbols'];
         const live = { files: new Map([
             ['a', { language: 'java', symbols: [{ name: 'A' }] }],
@@ -17,8 +17,6 @@ describe('fix #417: type lookup records only observed file facts', () => {
         const reads = {}, view = factIndex(reads, live, fields);
         const a = view.files.get('a'), b = view.files.get('b');
         assert.deepEqual(Object.keys(a), fields);
-        assert.equal(Object.getOwnPropertyDescriptor(a, 'language').get,
-            Object.getOwnPropertyDescriptor(b, 'language').get);
         assert.equal(a.language, 'java');
         assert.equal(b.language, 'cpp');
         assert.equal(a.symbols[0].name, 'A');

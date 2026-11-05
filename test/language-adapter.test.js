@@ -40,6 +40,22 @@ const SAMPLES = {
 };
 
 describe('v5 language adapter boundary', () => {
+    it('forwards call-recovery options only to parsers of call-shaped macros', () => {
+        const { createLanguageAdapter } = require('../languages/adapter');
+        for (const macroInvocationSyntax of [undefined, 'marked', 'call']) {
+            const reads = [];
+            const adapter = createLanguageAdapter({ name: 'sample', traits: { macroInvocationSyntax },
+                module: () => ({ findUsagesInCode(...args) { reads.push(args); return []; } }) });
+            adapter.findUsages('source', 'name', null, null, { skipCallRecovery: true });
+            adapter.findUsages('source', 'name', null, null, { skipCallRecovery: true, lexicalScopes: true });
+            adapter.findUsages('source', 'name', null, null);
+            assert.deepEqual(reads[0].slice(4), macroInvocationSyntax === 'call' ? [{ skipCallRecovery: true }] : []);
+            assert.deepEqual(reads[1].slice(4), [{ lexicalScopes: true,
+                ...(macroInvocationSyntax === 'call' && { skipCallRecovery: true }) }]);
+            assert.equal(reads[2].length, 4);
+        }
+    });
+
     it('fix #415: optional query declarations match every existing parser hook', () => {
         for (const language of Object.keys(LANGUAGES)) {
             const adapter = getLanguageAdapter(language);

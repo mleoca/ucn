@@ -93,10 +93,15 @@ function createLanguageAdapter(config) {
             return languageModule.findExportsInCode(code, parser);
         },
         findUsages(code, name, parser, tree, options) {
-            // Only the lexical-scope request (fix #392) reaches the parser;
-            // other query options keep the adapter's historical behavior.
-            return options?.lexicalScopes
-                ? languageModule.findUsagesInCode(code, name, parser, tree, { lexicalScopes: true })
+            // Account callers have already classified indexed call records.
+            // Only parsers of call-shaped macros recover calls here; other
+            // languages keep their ordinary usage path and need no options.
+            const skipCallRecovery = options?.skipCallRecovery && config.traits?.macroInvocationSyntax === 'call';
+            return options?.lexicalScopes || skipCallRecovery
+                ? languageModule.findUsagesInCode(code, name, parser, tree, {
+                    ...(options.lexicalScopes && { lexicalScopes: true }),
+                    ...(skipCallRecovery && { skipCallRecovery: true }),
+                })
                 : languageModule.findUsagesInCode(code, name, parser, tree);
         },
         getEntryPointKind(symbol) {

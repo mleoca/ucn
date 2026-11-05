@@ -15,6 +15,66 @@ const {
 } = require('../languages/c-family');
 
 describe('C-family recovery resource and ordering contracts', () => {
+    for (const extension of ['c', 'cpp']) {
+        it(`${extension}: account recovery uses indexed macro calls across cache and source changes`, () => {
+            const file = `calls.${extension}`;
+            const dir = tmp({ [file]: [
+                'int target(int value) { return value; }',
+                '#define RUN(value) target(value)',
+                '#define CALLBACK (&target)',
+                '#if OPTION',
+                '#define CHOSEN target(2)',
+                '#else',
+                '#define CHOSEN target(3)',
+                '#endif',
+                '#define APPLY(fn, value) fn(value)',
+                'void use(void) { RUN(1); APPLY(target, 4); }',
+            ].join('\n') });
+            const handle = `${file}:1:target`, absolute = path.join(dir, file);
+            const compare = index => {
+                const original = index._getCachedUsages;
+                const full = {};
+                try {
+                    index._getCachedUsages = function (file, name, options) {
+                        return original.call(this, file, name, { ...options, skipCallRecovery: false });
+                    };
+                    for (const command of ['show', 'impact']) {
+                        full[command] = execute(index, command, { name: handle });
+                        assert.ok(full[command].ok, full[command].error);
+                    }
+                } finally { index._getCachedUsages = original; }
+                for (const command of ['show', 'impact']) {
+                    assert.deepEqual(execute(index, command, { name: handle }), full[command], command);
+                }
+                const account = index._getCachedUsages(absolute, 'target', { skipCallRecovery: true });
+                const usages = index._getCachedUsages(absolute, 'target');
+                for (const line of [2, 5, 7]) {
+                    assert.ok(usages.some(usage => usage.line === line && usage.usageType === 'call'));
+                    assert.ok(!account.some(usage => usage.line === line && usage.usageType === 'call'));
+                }
+                assert.ok(!account.some(usage => usage.line === 999), 'obsolete usage modes are not reused');
+            };
+            try {
+                const index = idx(dir);
+                const cache = require('../core/cache');
+                cache.storeUsageResult(index, absolute, 'target', 'skip-call-recovery',
+                    [{ line: 999, usageType: 'call' }]);
+                index.saveCache();
+                index.saveUsageCache();
+                compare(index);
+                index.saveUsageCache();
+                const loaded = new (require('../core/project').ProjectIndex)(dir);
+                assert.equal(loaded.loadCache(), true);
+                compare(loaded);
+                fs.appendFileSync(absolute, '\n#define LATER target(5)\nvoid later(void) { LATER; }\n');
+                loaded.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+                compare(loaded);
+                assert.ok(loaded._getCachedUsages(absolute, 'target').some(usage =>
+                    usage.line === 11 && usage.usageType === 'call'));
+            } finally { rm(dir); }
+        });
+    }
+
     it('skips whole-file conditional sweeps above the native-tree memory cap', () => {
         const ordinary = '#if FEATURE\nint enabled;\n#else\nint disabled;\n#endif\n';
         assert.ok(conditionalRecoverySources(ordinary).length >= 2);
@@ -233,8 +293,10 @@ describe('C language support', () => {
             const accountUsages = index._getCachedUsages(
                 sourcePath, 'target', { skipCallRecovery: true });
             assert.ok(Array.isArray(accountUsages));
+            assert.ok(!accountUsages.some(usage => usage.line === 4 && usage.usageType === 'call'),
+                'account mode does not recover calls already held in the call index');
             assert.ok([...index._usageResultCache.keys()].some(key =>
-                key.endsWith('\0skip-call-recovery')),
+                key.endsWith('\0skip-call-recovery-v2')),
             'account-mode classifications use an isolated cache partition');
 
             const macro = index.symbols.get('RUN_TARGET')[0];
@@ -258,7 +320,7 @@ describe('C language support', () => {
                 usage.relativePath === 'tests/check.c' &&
                 usage.line === 4 && usage.usageType === 'call'));
             assert.ok([...index._usageResultCache.keys()].some(key =>
-                !key.endsWith('\0skip-call-recovery') && key.includes('\0target')),
+                !key.endsWith('\0skip-call-recovery-v2') && key.includes('\0target')),
             'full usages retains its own macro-complete cache entry');
 
             const tests = execute(index, 'tests', {
