@@ -6061,8 +6061,11 @@ function templateScopes(tree) {
             if (!parameter.type.endsWith('parameter_declaration') ||
                 parameter.type === 'parameter_declaration' ||
                 parameter.type === 'optional_parameter_declaration') continue;
-            const nameNode = parameter.childForFieldName('name') ||
-                (parameter.namedChildren || []).find(child =>
+            const namedParameter = parameter.type === 'template_template_parameter_declaration'
+                ? parameter.namedChildren.find(child => child.type.endsWith('type_parameter_declaration'))
+                : parameter;
+            const nameNode = namedParameter?.childForFieldName('name') ||
+                (namedParameter?.namedChildren || []).find(child =>
                     child.type === 'type_identifier');
             if (nameNode?.text) names.push(nameNode.text);
         }
@@ -6339,18 +6342,23 @@ function enclosingMacroArguments(node) {
  * #401): the shape of `T v(X());` that is an object initialized by a call
  * whenever X is not a type. null for any other parameter.
  */
-function vexingParseCallName(node) {
+function vexingParseCallIdentity(node) {
     const list = node.parent;
     const declarator = list?.type === 'parameter_list' ? list.parent : null;
     const declaration = declarator?.type === 'function_declarator' ? declarator.parent : null;
     if (declaration?.type !== 'declaration' || declaration.parent?.type !== 'compound_statement') return null;
     const typeNode = node.childForFieldName('type');
     const abstract = node.childForFieldName('declarator');
-    if (typeNode?.type !== 'type_identifier' || abstract?.type !== 'abstract_function_declarator') return null;
+    if (!['type_identifier', 'template_type'].includes(typeNode?.type) ||
+        abstract?.type !== 'abstract_function_declarator') return null;
     const params = abstract.childForFieldName('parameters');
     if (!params || params.namedChildCount !== 0) return null;
     if (node.namedChildren.some(child => child.type === 'type_qualifier')) return null;
-    return typeNode.text;
+    const identity = callIdentity(typeNode);
+    // A template-template parameter is a type even when a project function
+    // has the same name. Its empty function-type parameter is no call.
+    if (typeNode.type === 'template_type' && enclosedByTemplateParameter(node, identity.name)) return null;
+    return identity;
 }
 
 function constructorFieldNames(owner) {
@@ -6444,10 +6452,12 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
         // grammar reads a function declaration whose parameter is an
         // unnamed function type; when `CurrentOptions` is no type (decided at
         // query time) it is a call initializing the object.
-        if (node.type === 'parameter_declaration' && vexingParseCallName(node)) {
-            const nameNode = node.childForFieldName('type');
+        const declarationCall = node.type === 'parameter_declaration' ? vexingParseCallIdentity(node) : null;
+        if (declarationCall) {
+            const nameNode = declarationCall.nameNode;
             calls.push({
-                name: nameNode.text,
+                name: declarationCall.name,
+                ...(declarationCall.explicitTemplateCall && { explicitTemplateCall: true }),
                 line: nameNode.startPosition.row + 1,
                 column: nameNode.startPosition.column,
                 callStart: node.startIndex,

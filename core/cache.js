@@ -997,7 +997,8 @@ function clearAllCaches() {
 // v322: C# constructions retain terminal names and arity; nested generic receivers retain their qualifier.
 // v326: C++ files retain raw base-clause positions and their syntactic scopes.
 // v327: Python explicit-argument super calls retain a producer, not a lexical parent receiver.
-const CACHE_FORMAT_VERSION = 327;
+// v328: ambiguous C++ direct initializers retain empty template-call records.
+const CACHE_FORMAT_VERSION = 328;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

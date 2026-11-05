@@ -8284,3 +8284,37 @@ describe('fix #436: a header\'s grammar is its indexed language, whatever the pr
         } finally { rm(dir); rm(elsewhere); }
     });
 });
+
+describe('fix #476: template calls inside ambiguous direct initializers', () => {
+    for (const argument of ['int', 'Pair<int, int>']) {
+        it(`retains factory<${argument}>() on both sides of a call graph`, () => {
+            const dir = tmp({
+                'factory.h': 'template<class A, class B> struct Pair {};\ntemplate<class T> int factory() { return 1; }\n',
+                'use.cpp': '#include "factory.h"\nstruct Box { explicit Box(int); };\nvoid use() {\n Box value(factory<' + argument + '>());\n}\n',
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.context('factory', { file: 'factory.h' });
+                assert.ok([...callers.callers, ...callers.unverifiedCallers].some(call => call.line === 4 && path.basename(call.file) === 'use.cpp'));
+                const body = index.context('use', { file: 'use.cpp' });
+                assert.ok([...body.callees, ...body.unverifiedCallees].some(call => call.name === 'factory'));
+            } finally { rm(dir); }
+        });
+    }
+
+    it('a class-template parameter declares a function instead of invoking the type', () => {
+        const dir = tmp({ 'use.cpp': 'template<class T> struct Tag {};\nstruct Box {};\nvoid use() {\n Box declaration(Tag<int>());\n}\n' });
+        try {
+            const index = idx(dir), body = index.context('use', { file: 'use.cpp' });
+            assert.ok(![...body.callees, ...body.unverifiedCallees].some(call => call.name === 'Tag'));
+        } finally { rm(dir); }
+    });
+
+    it('an enclosing template-template parameter does not invoke a same-named project function', () => {
+        const dir = tmp({ 'use.cpp': 'template<class T> int factory() { return 1; }\nstruct Box {};\ntemplate<template<class> class factory> void use() {\n Box declaration(factory<int>());\n}\n' });
+        try {
+            const index = idx(dir), callers = index.context('factory', { file: 'use.cpp', line: 1 });
+            assert.ok(![...callers.callers, ...callers.unverifiedCallers].some(call => call.line === 4));
+        } finally { rm(dir); }
+    });
+});

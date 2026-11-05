@@ -4399,3 +4399,33 @@ describe('fix #436: first-touch query costs read from the index, answers unchang
         } finally { rm(dir); }
     });
 });
+
+describe('fix #476: ambiguous template initializer records survive workers and cache', () => {
+    it('retains call identity and ambiguity facts across build modes', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { indexSnapshot } = require('./helpers');
+        const dir = tmp({
+            'factory.hpp': 'template<class T> int factory() { return 1; }\n',
+            'use.cpp': '#include "factory.hpp"\nstruct Box { explicit Box(int); };\nvoid use() { Box value(factory<int>()); }\n',
+            'a.cpp': 'void a() {}\n',
+            'b.cpp': 'void b() {}\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const file = path.join(dir, 'use.cpp');
+            const calls = parallel.getCachedCalls(file);
+            assert.ok(calls.some(call => call.name === 'factory' && call.explicitTemplateCall && call.declarationReading));
+            parallel.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(loaded.getCachedCalls(file), JSON.parse(JSON.stringify(calls)));
+            const result = loaded.context('factory', { file: 'factory.hpp' });
+            assert.ok([...result.callers, ...result.unverifiedCallers].some(call => call.line === 3));
+        } finally { rm(dir); }
+    });
+});

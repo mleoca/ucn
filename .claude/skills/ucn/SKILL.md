@@ -28,7 +28,7 @@ Rust calls to trait implementations on external types require review when unseen
 
 Python inherited members respect base order. Unknown earlier bases and explicit `super(Class, value)` receivers can keep calls unverified. A lambda's own `self` or `cls` parameter does not prove a field owner; captured method receivers retain their binding.
 
-An explicit constructor has its own handle, including Java overloads, compact record constructors and C++ constructors defined outside their class. Proven construction calls appear under that handle and supply arguments to `check`. Review unverified construction sites before changing the signature. A function that constructs a class lists the class as a callee and, when proven, the constructor body it runs `(constructs C)`.
+An explicit constructor has its own handle, including Java overloads, compact record constructors and C++ constructors defined outside their class. Proven construction calls appear under that handle and supply arguments to `check`. Review unverified construction sites before changing the signature. A function that constructs a class lists the class as a callee and, when proven, the constructor body it runs `(constructs C)`. C++ template calls inside parenthesized object initializers remain visible.
 
 C# `this(...)` and `base(...)` initializers keep the generic type's arity. Nested constructions under a generic containing type stay visible for review when that owner's identity is unproven. `tests` also includes nested-type annotation and qualifier references, with their evidence tier. Arguments such as `Outer<T>.Inner<U>` can keep C# overload choices unverified when the enclosing type identity is unresolved.
 
