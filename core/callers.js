@@ -25778,8 +25778,7 @@ function _cppArgProvablyConverts(index, kind, param) {
  */
 function _cppPointeeRejectsCharacters(index, head) {
     if (!head || head === 'void') return false;
-    if (['short', 'int', 'long', 'float', 'double', 'size_t', 'ptrdiff_t', 'bool',
-        'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t']
+    if (['short', 'int', 'long', 'float', 'double', 'bool']
         .includes(head)) return true;
     const defs = index.symbols.get(head) || [];
     return defs.length > 0 && defs.every(d => IDENTITY_TYPE_KINDS.has(d.type) && d.type !== 'type');

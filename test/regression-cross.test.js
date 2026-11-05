@@ -18,6 +18,29 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #481: C++ aliases do not inherit builtin conversion rules', () => {
+    it('retains a character-pointer alias beside the pointer-to-bool conversion', () => {
+        const dir = tmp({ 'n.cpp': [
+            'using size_t = char;',
+            'void pick(const size_t* value) {}',
+            'void pick(bool value) {}',
+            'void run() { pick("value"); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            for (const line of [2, 3]) {
+                const result = index.context('pick', { file: 'n.cpp', line });
+                assert.equal(result.callers.length, 0);
+                assert.ok(result.unverifiedCallers.some(call => call.line === 4));
+                assert.equal(result.meta.account.conserved, true);
+            }
+            const result = index.context('run', { file: 'n.cpp', line: 4 });
+            assert.ok(!result.callees.some(call => call.name === 'pick'));
+            assert.ok(result.unverifiedCallees.some(call => call.name === 'pick'));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #479: user-defined conversions do not prove overload applicability', () => {
     const cases = [
         ['constrained converting constructor', 'n.cpp', [
