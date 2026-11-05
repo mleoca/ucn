@@ -3942,7 +3942,8 @@ function findCallsInTree(code, tree, parser, sink = null) {
                     // Detect super().method() pattern
                     if (objNode?.type === 'call') {
                         const superFunc = objNode.childForFieldName('function');
-                        if (superFunc?.type === 'identifier' && superFunc.text === 'super') {
+                        if (superFunc?.type === 'identifier' && superFunc.text === 'super' &&
+                            objNode.childForFieldName('arguments')?.namedChildCount === 0) {
                             receiver = 'super';
                         }
                     }

@@ -11380,7 +11380,21 @@ function findCallees(index, definition, options = {}) {
                 // Parents resolve to definitions from the child's own scope
                 // (fix #358); unresolved same-name parents keep every
                 // candidate and therefore surface as ambiguity.
-                if (!match && callerClassRef) {
+                if (!match && callerClassRef && langTraits(language)?.memberLookupOrder === 'c3') {
+                    const declaring = findDeclaringClass(index, callerClassRef,
+                        symbols.filter(symbol => isCallableMember(symbol)), { parentsOnly: parentOnlyReceiver });
+                    if (declaring?.uncertain) {
+                        noteUnverified(siteId, call, 'inherited-unresolved');
+                        ambiguityClaimed = true;
+                    } else if (declaring) {
+                        selected = selectOwner(declaring.ref);
+                        match = selected.match;
+                        if (selected.ambiguous) {
+                            noteUnverified(siteId, call, 'overload-ambiguous');
+                            ambiguityClaimed = true;
+                        }
+                    }
+                } else if (!match && callerClassRef) {
                     const visitKey = ref => ref.key || `?${ref.name}`;
                     const visited = new Set([visitKey(callerClassRef)]);
                     const queue = [...parentRefsOfClass(index, callerClassRef)];

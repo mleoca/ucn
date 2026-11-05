@@ -16,6 +16,127 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
+describe('fix #464: Python member lookup respects bases and lexical bindings', () => {
+    it('does not skip an earlier unknown base for a later imported member', () => {
+        const dir = tmp({
+            'base.py': 'class Base:\n    def run(self): pass\n',
+            'test_case.py': [
+                'from outside import Foreign', 'from base import Base',
+                'class Mixed(Foreign, Base):', '    def test_run(self): self.run()',
+                'class Reverse(Base, Foreign):', '    def test_run(self): self.run()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('run', { collectAccount: true });
+            assert.deepStrictEqual(callers.map(c => c.line), [6]);
+            assert.ok(callers.unverifiedEntries.some(c => c.line === 4));
+            const { findCallees } = require('../core/callers');
+            const def = index.symbols.get('test_run').find(d => d.className === 'Mixed');
+            const callees = findCallees(index, def, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.unverifiedCallees.some(c => c.name === 'run'));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('uses C3 rather than breadth-first lookup in a complete hierarchy', () => {
+        const dir = tmp({ 'test_case.py': [
+            'class Root: pass',
+            'class Deep(Root):', '    def run(self): pass',
+            'class Left(Deep): pass',
+            'class Right(Root):', '    def run(self): pass',
+            'class Child(Left, Right):', '    def test_run(self): self.run()',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('run');
+            const deep = defs.find(d => d.className === 'Deep'), right = defs.find(d => d.className === 'Right');
+            const { findDeclaringClass, ownerRefOf } = require('../core/class-identity');
+            assert.strictEqual(findDeclaringClass(index, ownerRefOf(index, index.symbols.get('test_run')[0]), defs).ref.name, 'Deep');
+            const callers = index.findCallers('run', { collectAccount: true, targetDefinitions: [deep] });
+            assert.ok([...callers, ...callers.unverifiedEntries].some(c => c.line === 8));
+            assert.ok(!index.findCallers('run', { collectAccount: true, targetDefinitions: [right] }).some(c => c.line === 8));
+            const { findCallees } = require('../core/callers');
+            const callees = findCallees(index, index.symbols.get('test_run')[0], { collectAccount: true });
+            assert.ok(callees.some(c => c.bindingId === deep.bindingId) || callees.unverifiedCallees.some(c => c.name === 'run'));
+        } finally { rm(dir); }
+    });
+
+    it('distinguishes a captured method receiver from lambda, nested and static parameters', () => {
+        const dir = tmp({ 'test_case.py': [
+            'class Cached:', '    lock = 1',
+            '    def method(self):', '        self.lock',
+            '        good = lambda: self.lock', '        bad = lambda self: self.lock',
+            '        def nested(self): return self.lock',
+            '    @staticmethod', '    def static(self): return self.lock',
+            '    @classmethod', '    def class_method(cls):', '        return cls.lock',
+            '    alias = decorate(lambda cls: cls.lock)',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const band = index.impact('lock', { file: 'test_case.py', line: 2 }).valueAccesses;
+            assert.deepStrictEqual(band.byFile.flatMap(f => f.sites.map(s => s.line)), [4, 5, 12]);
+            assert.deepStrictEqual(band.unverifiedSites.map(s => s.line), [6, 7, 9, 13]);
+            assert.strictEqual(band.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('keeps explicit super arguments visible without borrowing the lexical parent', () => {
+        const dir = tmp({ 'test_case.py': [
+            'class Base:', '    def run(self): pass',
+            'class Child(Base):', '    def run(self): return super().run()',
+            'def test_use(obj, anchor):', '    super(Child, obj).run()', '    super(anchor, obj).run()',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('run').find(d => d.className === 'Base');
+            const callers = index.findCallers('run', { collectAccount: true, targetDefinitions: [def] });
+            assert.deepStrictEqual(callers.map(c => c.line), [4]);
+            assert.deepStrictEqual(callers.unverifiedEntries.map(c => c.line), [6, 7]);
+        } finally { rm(dir); }
+    });
+
+    it('preserves explicit super producers through workers and saved indexes', () => {
+        const dir = tmp({
+            'base.py': 'class Base:\n    def run(self): pass\n',
+            'child.py': 'from base import Base\nclass Child(Base):\n    def use(self):\n        super().run()\n        super(Child, self).run()\n',
+        });
+        try {
+            const { getCachedCalls } = require('../core/callers');
+            const calls = index => getCachedCalls(index, path.join(dir, 'child.py')).filter(c => c.name === 'run')
+                .map(c => [c.line, c.receiver || null, c.receiverCall || null]);
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2);
+            assert.deepStrictEqual(calls(sequential), [[4, 'super', null], [5, null, 'super']]);
+            assert.deepStrictEqual(calls(parallel), calls(sequential));
+            sequential.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.strictEqual(loaded.loadCache(), true);
+            assert.deepStrictEqual(calls(loaded), calls(sequential));
+        } finally { rm(dir); }
+    });
+
+    it('links bare class-body method references to the exact test target', () => {
+        const dir = tmp({ 'test_case.py': [
+            'class Cached:', '    def __get(self): pass', '    get = decorate(__get)',
+            '    def shadow(self): return __get',
+            'class Other:', '    def __get(self): pass', '    get = decorate(__get)',
+            'class Rebound:', '    def __get(self): pass', '    __get = replacement', '    get = decorate(__get)',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'test_case.py:2:__get' });
+            assert.ok(result.ok, result.error);
+            assert.deepStrictEqual(result.result.flatMap(f => f.matches.map(m => m.line)), [3]);
+            const rebound = execute(index, 'tests', { name: 'test_case.py:9:__get' });
+            assert.ok(!rebound.result.flatMap(f => f.matches).some(m => m.line === 11 && m.evidenceTier !== 'unverified'));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #441: local synthesized initializer owners', () => {
     it('binds local class keywords by lexical identity and reviews rebinding or parameter receivers', () => {
         const dir = tmp({ 'local.py': [

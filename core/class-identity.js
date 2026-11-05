@@ -82,6 +82,7 @@ function _state(index) {
             // fix #365: target-independent derivations repeated for every
             // same-name definition a caller query pins (stats --hot / repo).
             declaring: new WeakMap(), // definitions array -> Map<refKey|mode, result>
+            linearizations: new Map(),
             descendants: new Map(),   // class key -> descendant key Set (default cap)
             // fix #389: certain owner definitions, same-file namesake counts,
             // names with function-local class definitions.
@@ -680,6 +681,24 @@ function parentRefsOf(index, ref) {
         // language's own disambiguation. Re-read it from the declared clause.
         const rawParents = decl.extends ? splitParentList(decl.extends) : [];
         const declRef = { name: ref.name, key: ref.key, def: decl };
+        if (langTraits(index.files.get(contextFile)?.language)?.memberLookupOrder === 'c3') {
+            // Python's base order is semantic. Resolving imported bases as
+            // a separate group would move them ahead of earlier bases.
+            for (const written of rawParents) {
+                const imported = _importBoundParents(index, contextFile, [written], ref);
+                if (imported.refs.length) { imported.refs.forEach(push); continue; }
+                if (written.includes('.')) {
+                    push(_resolveQualifiedParent(index, written, contextFile, declRef));
+                } else {
+                    push(externalParentDenotation(index, contextFile, written, decl.startLine) ||
+                        resolveClassRef(index, written, contextFile, {
+                            excludeKey: written === ref.name ? ref.key : null,
+                            line: decl.startLine,
+                        }));
+                }
+            }
+            continue;
+        }
         // A base the module binds by import where names bind per runtime
         // configuration (Python, fix #424): the import's own chase decides
         // which class it is (`from .auto import tqdm as base`, where auto
@@ -1092,6 +1111,54 @@ function _findDeclaringClass(index, startRef, definitions, opts) {
         }
         return members.length > 0 ? { ref, uncertain, members } : null;
     };
+    if (langTraits(index.files.get(startRef.def?.file)?.language)?.memberLookupOrder === 'c3') {
+        if (!opts.parentsOnly) { const own = check(startRef); if (own) return own; }
+        const order = c3Order(index, startRef);
+        if (order) {
+            for (const ref of order.slice(opts.parentsOnly ? 1 : 0)) {
+                const hit = check(ref);
+                if (hit) return hit;
+            }
+            return null;
+        }
+        // Even an incomplete order starts with the class and its first
+        // direct base. A single-base chain preserves that prefix. Once
+        // branches merge, unknown ancestry can change which member wins.
+        const seen = new Set();
+        let ref = startRef, skip = opts.parentsOnly;
+        while (ref?.key && ref.def && !ref.external && !seen.has(ref.key)) {
+            seen.add(ref.key);
+            if (!skip) { const hit = check(ref); if (hit) return hit; }
+            skip = false;
+            const parents = parentRefsOf(index, ref);
+            if (parents.length === 1) { ref = parents[0]; continue; }
+            if (parents.length > 1 && parents[0].key && parents[0].def && !parents[0].external) {
+                const hit = check(parents[0]);
+                if (hit) return hit;
+            }
+            break;
+        }
+        // A fully resolved project closure ending only in known external
+        // bases cannot reach an unrelated project namesake. Keep that
+        // negative identity proof; uncertainty in ORDER matters only when
+        // a project member or an unresolved base can participate.
+        const pending = opts.parentsOnly ? [...parentRefsOf(index, startRef)] : [startRef];
+        const visited = new Set();
+        let possible = false;
+        while (pending.length) {
+            const candidate = pending.shift();
+            if (candidate.external || visited.has(_refVisitKey(candidate))) continue;
+            visited.add(_refVisitKey(candidate));
+            if (!candidate.key || !candidate.def || candidate.importUnresolved || check(candidate)) {
+                possible = true;
+                break;
+            }
+            pending.push(...parentRefsOf(index, candidate));
+        }
+        if (!possible) return null;
+        return alternativesDeclare(index, ref, definitions, opts) ||
+            { ref: ref || startRef, uncertain: true, members: [] };
+    }
     const visited = new Set([_refVisitKey(startRef)]);
     if (!opts.parentsOnly) {
         const own = check(startRef);
@@ -1130,6 +1197,30 @@ function _findDeclaringClass(index, startRef, definitions, opts) {
         }
     }
     return null;
+}
+
+/** Complete C3 order, or null when a base's ancestry is unknown. */
+function c3Order(index, ref, visiting = new Set()) {
+    if (!ref?.key || !ref.def || ref.external || visiting.has(ref.key)) return null;
+    const memo = _state(index).linearizations;
+    if (memo.has(ref.key)) return memo.get(ref.key);
+    visiting.add(ref.key);
+    const parents = parentRefsOf(index, ref);
+    const lists = parents.map(parent => c3Order(index, parent, visiting)?.slice());
+    visiting.delete(ref.key);
+    if (lists.some(list => !list)) { memo.set(ref.key, null); return null; }
+    lists.push(parents.slice());
+    const order = [ref];
+    while (lists.some(list => list.length)) {
+        const active = lists.filter(list => list.length);
+        const head = active.map(list => list[0]).find(candidate =>
+            !active.some(list => list.slice(1).some(item => item.key === candidate.key)));
+        if (!head) { memo.set(ref.key, null); return null; }
+        order.push(head);
+        for (const list of active) if (list[0].key === head.key) list.shift();
+    }
+    memo.set(ref.key, order);
+    return order;
 }
 
 /**

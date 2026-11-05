@@ -1568,10 +1568,14 @@ function tests(index, nameOrFile, options = {}) {
                 // className scoping for references: require class-associated receiver
                 if (className && (matchType === 'reference' || matchType === 'string-ref' ||
                     matchType === 'unverified-reference')) {
-                    // Bare references (no receiver) like `fn = save` have no class
-                    // association — skip them. Only keep member-access references
-                    // where the receiver matches the target class.
-                    if (!usage.receiver && matchType !== 'unverified-reference') continue;
+                    // A bare name can bind an earlier class-body method.
+                    // Other references need a receiver matching the target.
+                    if (!usage.receiver && matchType !== 'unverified-reference') {
+                        if (!classBodyReferenceTargets(index, testPath, entry.language, usage, targetDefs)) continue;
+                        seenLines.add(lineKey);
+                        matches.push({ line: usage.line, content: lineContent.trim(), matchType: 'reference' });
+                        continue;
+                    }
                     if (!usage.receiver && matchType === 'unverified-reference') {
                         seenLines.add(lineKey);
                         matches.push({
@@ -2122,6 +2126,23 @@ function _buildInstanceTypeMap(index, filePath, content, targetClassName) {
     }
 
     return typeMap;
+}
+
+/** A bare name bound by one preceding declaration in a Python class body. */
+function classBodyReferenceTargets(index, file, language, usage, targets) {
+    if (!langTraits(language)?.assignmentDeclaresLocal || !targets.length) return false;
+    const tree = index._getParsedTree(file, index._readFile(file), language);
+    if (!tree) return false;
+    const node = tree.rootNode.namedDescendantForPosition({ row: usage.line - 1, column: usage.column });
+    const owner = require('./value-references').pythonClassBodyOf(node);
+    if (!owner) return false;
+    const { pythonBindingSites, pythonClassBodyOrder } = require('../languages/lexical-scope');
+    const bindings = pythonBindingSites(owner, node.text);
+    if (bindings.length !== 1 || pythonClassBodyOrder(owner, node, node.text) !== 'class') return false;
+    const binding = bindings[0];
+    return targets.some(def => def.file === file && def.name === node.text &&
+        def.startLine >= owner.startPosition.row + 1 && def.endLine <= owner.endPosition.row + 1 &&
+        binding.startPosition.row + 1 === (def.nameLine || def.startLine));
 }
 
 /**

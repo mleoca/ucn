@@ -647,6 +647,7 @@ const LANGUAGES = {
             // An inherited member shadows other bases' members in the MRO,
             // no interface contract: not modeled as slot evidence (fix #426).
             inheritedMemberFillsSlots: false,
+            memberLookupOrder: 'c3',
             fixedConstructorName: null,
             nameReferenceFamily: 'python',
             scriptsShareGlobalScope: false,

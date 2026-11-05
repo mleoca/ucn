@@ -17754,7 +17754,7 @@ describe('fix #428: a confirmed caller\'s witness establishes its target (valida
         return result.result.callers || [];
     };
     const superCases = [
-        ['a.py', 'class Base:\n    def close(self):\n        pass\n\nclass Child(Base):\n    def close(self):\n        super().close()\n        super(Child, self).close()\n', 'a.py:2:close', [7, 8]],
+        ['a.py', 'class Base:\n    def close(self):\n        pass\n\nclass Child(Base):\n    def close(self):\n        super().close()\n        super(Child, self).close()\n', 'a.py:2:close', [7]],
         ['a.js', 'class Base { formatItem(x) { return x } }\nclass Child extends Base { formatItem(x) { return super.formatItem(x) } }\nmodule.exports = { Base, Child }\n', 'a.js:1:formatItem', [2]],
         ['a.ts', 'export class Base { formatItem(x: number) { return x } }\nexport class Child extends Base { formatItem(x: number) { return super.formatItem(x) } }\n', 'a.ts:1:formatItem', [2]],
         ['A.java', 'class Base { void passivate(Object o) {} }\nclass Child extends Base { void passivate(Object o) { super.passivate(o); } }\n', 'A.java:1:passivate', [2]],
@@ -17764,9 +17764,15 @@ describe('fix #428: a confirmed caller\'s witness establishes its target (valida
         it(`${file}: a super call's lookup starts at the enclosing class's bases`, () => {
             const dir = tmp({ [file]: source });
             try {
-                const callers = contextCallers(idx(dir), handle);
+                const index = idx(dir);
+                const callers = contextCallers(index, handle);
                 assert.deepStrictEqual(callers.map(c => c.line), lines);
                 for (const caller of callers) assert.strictEqual(caller.provenance.validation, 'establishes-target');
+                if (file === 'a.py') {
+                    const result = execute(index, 'context', { name: handle });
+                    assert.ok(result.result.unverifiedCallers.some(call => call.line === 8),
+                        'explicit super arguments need value identity, not a lexical-parent assumption');
+                }
             } finally { rm(dir); }
         });
     }

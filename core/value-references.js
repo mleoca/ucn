@@ -1779,6 +1779,15 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             return bases?.length === 1 ? bases[0] : null;
         }
         if (receiver.type === 'this' || traits.selfParam?.includes(receiver.text)) {
+            if (traits.assignmentDeclaresLocal && traits.ownClassMethod) {
+                const local = this.localBinding(file, receiver, receiver.text, true);
+                const scope = local?.binding?.scope;
+                const method = scope && (this.index.files.get(file)?.symbols || []).find(def =>
+                    def.className && def.name === scope.childForFieldName('name')?.text &&
+                    def.startLine <= scope.startPosition.row + 1 && def.endLine === scope.endPosition.row + 1);
+                if (!method || method.memberType === 'static' || !traits.ownClassMethod(method,
+                    method.type === 'classmethod' ? 'class' : 'instance', receiver.text)) return null;
+            }
             if (traits.typeSystem === 'structural' && receiver.type === 'this') {
                 for (let scope = receiver.parent; scope && scope.type !== 'class_body'; scope = scope.parent) {
                     if (FUNCTION_NODES.has(scope.type) ||

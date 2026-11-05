@@ -94,6 +94,10 @@ A structural producer's imported alias and field path retain their own identity.
 
 ## Python
 
+Member lookup preserves written base order and uses C3 for a complete project hierarchy. An unknown base cannot be skipped to confirm a later member. A known prefix can still establish ownership; unresolved lookup or proof evidence stays unverified. Explicit `super(Class, value)` calls retain their producer expression and remain unverified when its result cannot be proved. Only zero-argument `super()` uses the lexical parent lookup.
+
+A field receiver named `self` or `cls` must bind to the method's first parameter. A closure capturing that parameter retains its owner; lambda parameters, nested-function parameters, static-method parameters and rebound names do not inherit it by spelling. `tests` includes a bare class-body method reference when one preceding declaration binds it, keeping same-named methods in other classes separate.
+
 Class and instance field annotations feed receiver typing. An instance write such as `self.compute = wrap(self.compute)` remains a field declaration even when its right side reads an inherited method; data-descriptor assignments still belong to their property. A qualified member value such as `selected = pkg.Type.method` enters the method-reference inventory and `tests`, with unresolved ownership shown as unverified.
 
 A value imported through a conditional reexport remains an `import-chain` dependency for review. Renaming one alternative preserves the chooser's binding name; unresolved source imports are reviewed instead of automatically edited.
