@@ -1153,7 +1153,9 @@ describe('fix #473: macro call roles come from the expanded compiler AST', () =>
             const { tmp, rm } = require('./helpers');
             const { clangdOracle } = require('../eval/oracles/clangd-oracle');
             const { pathToUri } = require('../eval/oracles/lsp-client');
-            const dir = tmp({ 'main.c': 'void worker(void) {}\nvoid run(void) {\n  RUN_TEST(worker);\n}\n' });
+            const dir = require('fs').realpathSync.native(tmp({
+                'main.c': 'void worker(void) {}\nvoid run(void) {\n  RUN_TEST(worker);\n}\n',
+            }));
             const file = path.join(dir, 'main.c'), uri = pathToUri(file);
             const range = { start: { line: 2, character: 11 }, end: { line: 2, character: 17 } };
             const ast = {
