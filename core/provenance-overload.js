@@ -249,7 +249,9 @@ function factIndex(reads, live, fileFields) {
                 const cache = new Map(); local.set(property, cache); return cache;
             }
             if (['symbols', 'files', 'importGraph', 'extendsGraph', 'extendedByGraph'].includes(property)) {
-                return {
+                // One map facade per view, as on the live index. Reusing
+                // the facade does not skip its methods' recorded reads.
+                const map = {
                     get(key) {
                         if (property === 'files' && fileFields) return readFile(key);
                         return readMapValue(`${property}.get:${JSON.stringify(key)}`, () => {
@@ -270,6 +272,8 @@ function factIndex(reads, live, fileFields) {
                     *entries() { for (const key of this.keys()) yield [key, this.get(key)]; },
                     [Symbol.iterator]() { return this.entries(); },
                 };
+                local.set(property, map);
+                return map;
             }
             const method = live ? typeof live[property] === 'function'
                 : reads[`method:${String(property)}`] === true;

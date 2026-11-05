@@ -75,6 +75,31 @@ describe('fix #417: type lookup records only observed file facts', () => {
         assert.equal(replay.files.get('missing.cpp'), undefined);
         assert.equal(replay.hasMissingProvenanceFacts, false);
     });
+    it('map facades keep recording reads and local overrides are isolated from replay', () => {
+        const live = { symbols: new Map([['A', [{ name: 'A' }]], ['B', [{ name: 'B' }]]]),
+            files: new Map([['unit.java', { language: 'java' }]]) };
+        const reads = {}, view = factIndex(reads, live, ['language']);
+        const symbols = view.symbols;
+        assert.equal(view.symbols, symbols);
+        assert.equal(view.files, view.files);
+        assert.deepEqual(reads, {});
+        assert.equal(symbols.get('A')[0].name, 'A');
+        assert.equal(view.symbols.has('missing'), false);
+        assert.deepEqual([...view.symbols.keys()], ['A', 'B']);
+        assert.equal(Object.hasOwn(reads, 'symbols.get:"B"'), false);
+        assert.deepEqual([...view.symbols].map(([name]) => name), ['A', 'B']);
+        assert.equal(Object.hasOwn(reads, 'symbols.get:"B"'), true);
+        view.symbols = new Map([['local', []]]);
+        assert.deepEqual([...view.symbols.keys()], ['local']);
+        assert.equal(symbols.get('A')[0].name, 'A');
+        const replay = factIndex(JSON.parse(JSON.stringify(reads)), undefined, ['language']);
+        live.symbols.clear();
+        assert.notEqual(replay.symbols, symbols);
+        assert.deepEqual([...replay.symbols.values()].flat().map(row => row.name), ['A', 'B']);
+        assert.equal(replay.symbols.has('missing'), false);
+        assert.throws(() => replay.symbols.get('uncaptured'), /Missing provenance fact/);
+        assert.equal(replay.hasMissingProvenanceFacts, true);
+    });
 });
 
 describe('fix #417: overload witnesses record only observed file fields', () => {
