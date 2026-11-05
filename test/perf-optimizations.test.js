@@ -1512,6 +1512,50 @@ describe('fix #443: source facts and hierarchy reads', () => {
     });
 });
 
+describe('brief member counts', () => {
+    it('brief counts the same file members after building, loading and source edits', () => {
+        const dir = tmp({
+            'a.js': 'class Box { work() {} callback = () => 1; }\nclass Other { work() {} }',
+            'b.py': 'class Box:\n def work(self): pass\ndef nested():\n class Box:\n  def work(self): pass\n',
+            'c.java': 'class Box { void work() {} static void helper() {} }',
+            'd.cs': 'partial class Box { void Work() {} }',
+            'more.cs': 'partial class Box { void More() {} }',
+            'e.hpp': 'struct Box { void work(); void another() {} };',
+            'e.cpp': '#include "e.hpp"\nvoid Box::work() {}',
+            'f.rs': 'struct Box {}\nimpl Box { fn work(&self) {} fn make() -> Box { Box {} } }',
+            'g.go': 'package p\ntype Box struct {}\nfunc (b Box) Work() {}',
+        });
+        const { brief } = require('../core/brief');
+        const check = index => {
+            const symbols = [...index.symbols.values()].flat();
+            const types = symbols.filter(def => ['class', 'struct', 'interface', 'enum', 'trait', 'record'].includes(def.type));
+            assert.ok(types.length >= 8);
+            const original = index.symbols.values;
+            index.symbols.values = () => { throw new Error('a file member count must not scan the project'); };
+            try {
+                for (const def of types) {
+                    const expected = symbols.filter(symbol => symbol.file === def.file &&
+                        symbol.className === def.name && symbol.isMethod).length;
+                    assert.strictEqual(brief(index, def.name, { file: def.relativePath, line: def.startLine }).memberCount,
+                        expected, `${def.relativePath}:${def.startLine}:${def.name}`);
+                }
+            } finally { index.symbols.values = original; }
+        };
+        try {
+            const index = idx(dir);
+            check(index);
+            index.saveCache();
+            const loaded = new (require('../core/project').ProjectIndex)(dir);
+            assert.strictEqual(loaded.loadCache(), true);
+            check(loaded);
+            fs.appendFileSync(path.join(dir, 'b.py'), '\nclass More:\n def added(self): pass\n');
+            loaded.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+            check(loaded);
+        } finally { rm(dir); }
+    });
+
+});
+
 describe('visitNameNodes usage scan', () => {
     it('classifies usages identically with unicode content before the occurrence', () => {
         const dir = tmp({

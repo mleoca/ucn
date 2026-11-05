@@ -229,7 +229,10 @@ function firstSentence(text) {
 function countMembers(index, def) {
     if (!def || !def.file) return 0;
     let count = 0;
-    for (const arr of index.symbols.values()) {
+    // Build and cache loading keep each file's declaration list alongside
+    // the name index. This count only reads declarations of the pinned file.
+    const fileSymbols = index.files?.get(def.file)?.symbols;
+    for (const arr of fileSymbols ? [fileSymbols] : index.symbols.values()) {
         for (const s of arr) {
             if (s.file === def.file && s.className === def.name && s.isMethod) count++;
         }
