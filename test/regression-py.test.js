@@ -3217,6 +3217,12 @@ describe('fix #480: import and export failures never become empty answers', () =
         const python = require('../languages/python'), original = python.findImportsInCode;
         try {
             const index = idx(dir), failure = new Error(`re-export ${fault} failed`);
+            const entry = index.files.get(path.join(dir, '__init__.py'));
+            assert.deepStrictEqual(entry?.exports, ['helper'], JSON.stringify({
+                files: [...index.files.keys()], exports: entry?.exports,
+                imports: entry?.importDetails, symbols: entry?.symbols,
+                failedFiles: [...index.failedFiles], issues: index.discoveryIssues,
+            }));
             if (fault === 'read') index._readFile = () => { throw failure; };
             else python.findImportsInCode = () => { throw failure; };
             assert.throws(() => index.fileExports('__init__.py'), error => error === failure);
