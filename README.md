@@ -121,7 +121,7 @@ needs the compiler and tests.
 
 Release gates compare UCN's answers with independent compilers and language
 servers on a ten-repository board of pinned production codebases. The local
-November 5, 2026 evaluation, using clangd 18.1.8 for C/C++ and .NET 10.0.403
+November 6, 2026 evaluation, using clangd 18.1.8 for C/C++ and .NET 10.0.403
 for Roslyn, recorded these sampled caller results:
 
 | Repository | Pinned commit | Oracle | Symbols sampled | Confirmed precision | In-scope recall |
@@ -137,7 +137,7 @@ for Roslyn, recorded these sampled caller results:
 | cjson | `c859b25d` | clangd | 50 | 100% | 100% |
 | fmt | `e424e3f2` | clangd | 50 | 100% | 100% |
 
-That evaluation scored 9,676 confirmed caller edges, all correct;
+That evaluation scored 9,677 confirmed caller edges, all correct;
 41 further edges were unscored. It reported zero missing in-scope
 oracle edges in both caller and callee answers. The separate value-reference
 sample scored 1,241 confirmed sites, all correct, with 4 unscored and zero
