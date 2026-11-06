@@ -5972,10 +5972,14 @@ function staticArgumentKind(node, variableTypes) {
     }
     if (node.type === 'number_literal') {
         const text = node.text || '';
+        // Integer literal zero is a null pointer constant, including its
+        // base, digit separators and standard integer suffixes.
+        if (/^(?:0[xX]0+|0[bB]0+|0+)(?:[uU](?:ll|LL|[lLzZ])?|(?:ll|LL|[lLzZ])[uU]?)?$/
+            .test(text.replace(/'/g, ''))) return 'number:zero';
+        const hexadecimal = /^0[xX]/.test(text);
         const floating = text.includes('.') ||
             /[pP][+-]?[0-9]/.test(text) ||
-            /[eE][+-]?[0-9]/.test(text) ||
-            /[fF]$/.test(text);
+            !hexadecimal && (/[eE][+-]?[0-9]/.test(text) || /[fF]$/.test(text));
         return floating ? 'number:floating' : 'number:integer';
     }
     if (node.type === 'true' || node.type === 'false') return 'bool';

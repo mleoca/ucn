@@ -14,6 +14,56 @@ const {
     mergeExtracted,
 } = require('../languages/c-family');
 
+describe('fix #485: integer zero remains a null pointer constant', () => {
+    const zeros = ['0', '0L', '0u', '0x0', '00', '0b0', "0'0", '0ULL'];
+    const source = [
+        'struct Gate { Gate(int); };',
+        'void pick(const char* value) {}',
+        'void pick(Gate value) {}',
+        'void run() {',
+        ...zeros.map(value => ` pick(${value});`),
+        '}',
+    ].join('\n');
+    it('keeps pointer overloads visible beside user-defined conversions', () => {
+        const dir = tmp({ 'n.cpp': source });
+        try {
+            const index = idx(dir);
+            for (const line of [2, 3]) {
+                const answer = index.context('pick', { file: 'n.cpp', line });
+                const sites = [...answer.callers, ...answer.unverifiedCallers];
+                assert.deepEqual(sites.map(site => site.line).sort((a, b) => a - b),
+                    zeros.map((_, offset) => offset + 5));
+                assert.equal(answer.meta.account.conserved, true);
+            }
+        } finally { rm(dir); }
+    });
+    it('distinguishes zero literals from booleans, characters, identifiers and nonzero integers', () => {
+        const code = "void run() { f(0); f(false); f('\\0'); f(NULL); f(ZERO); f(0.0); f(0xdead); f(0x0F); f(1e2); }";
+        const calls = getLanguageAdapter('cpp').findCallsInCode(code, getParser('cpp'));
+        assert.deepEqual(calls.map(call => call.argKinds[0]), [
+            'number:zero', 'bool', 'char:char', 'null', 'expr', 'number:floating',
+            'number:integer', 'number:integer', 'number:floating',
+        ]);
+    });
+    it('preserves zero kinds in sequential, worker and disk-cache builds', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { saveCache, loadCache } = require('../core/cache');
+        const dir = tmp({ 'n.cpp': source });
+        try {
+            const records = index => [...index.files.keys()].sort().map(file => index.getCachedCalls(file));
+            const sequential = new ProjectIndex(dir); sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir); parallel.build(null, { quiet: true, workers: 2 });
+            assert.deepEqual(records(parallel), records(sequential));
+            assert.equal(records(sequential).flat().filter(call => call.argKinds?.[0] === 'number:zero').length, zeros.length);
+            const cache = path.join(dir, '.cache-485', 'index.json');
+            saveCache(sequential, cache);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loadCache(loaded, cache));
+            assert.deepEqual(records(loaded), records(sequential));
+        } finally { rm(dir); }
+    });
+});
+
 describe('C-family recovery resource and ordering contracts', () => {
     for (const extension of ['c', 'cpp']) {
         it(`${extension}: occurrence kinds preserve full classification and isolate receiver caches`, () => {

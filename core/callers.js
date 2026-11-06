@@ -25704,6 +25704,7 @@ function _cppArgKindMatches(index, kind, paramType) {
         }
         return true;
     }
+    if (kind === 'number:zero') return true;
     if (kind === 'number:integer' || kind === 'number:floating') {
         if (expected.kind === 'number') return true;
         if (['string', 'pointer']
@@ -25758,6 +25759,7 @@ function _cppArgKindMatches(index, kind, paramType) {
 function _cppArgProvablyConverts(index, kind, param) {
     if (!param?.type || param.rest || !kind || kind === 'expr') return false;
     const expected = _cppTypeCategory(index, param.type);
+    if (kind === 'number:zero' && ['pointer', 'string'].includes(expected.kind)) return true;
     if (kind === 'bool' || kind.startsWith('char:') || kind.startsWith('number:')) {
         return ['number', 'bool', 'character'].includes(expected.kind);
     }

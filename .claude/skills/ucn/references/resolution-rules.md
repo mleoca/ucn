@@ -236,6 +236,8 @@ C/C++ uses `compile_commands.json` when available to classify headers and resolv
 
 C++ argument checks use builtin types and proven exact matches. A class or alias name, including a familiar library name, does not establish its conversions. Converting constructors, conversion operators and template constraints remain unproven unless the engine has sufficient evidence. A sole possible overload that needs such a conversion remains `overload-ambiguous`; rejecting every modeled type match cannot fall back to namespace ownership as confirmation. Array and pointer shape remain available without implying a conversion to a named class.
 
+Integer literals with value zero, including hexadecimal, octal and suffixed forms, are null pointer constants. Pointer overloads remain reachable beside arithmetic and user-defined conversions; boolean and character literals keep their own conversion rules.
+
 ### Declarations, linkage and configurations
 
 C/C++ declarations in the same scope and file share their class body, including a conditional body; alternative bodies remain indexed separately. A forward declaration (`class State;`) is the class the project defines once under its qualified name (`find` marks it `(forward declaration)`); several definitions (separate programs, a vendored copy) keep it apart. A C++17 deduction guide declares no function. A plain forward-declared field type completes across files only to one same-scope class or struct visible through the consuming file's include closure. The field's written type resolves in its declaring scope, including a type alias. Separate programs keep their own complete classes; conditional, generic, anonymous-namespace or ambiguous cross-file completions stay unverified.

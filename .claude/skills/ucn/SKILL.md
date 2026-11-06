@@ -34,6 +34,8 @@ C# `this(...)` and `base(...)` initializers keep the generic type's arity. Neste
 
 User-defined conversions can keep overload choices unverified. C++ class names do not establish converting constructors or template constraints; C# implicit operators keep potentially reachable overloads visible. A possible conversion alone cannot confirm the selected overload.
 
+C++ integer literals with value zero keep pointer overloads reachable as null pointer constants.
+
 ## Choose a command
 
 | Decision | Command |
