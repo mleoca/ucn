@@ -35,7 +35,7 @@ function refusedProof(error, refusal = null) {
 }
 
 const OVERLOAD_FILE_FIELDS = ['language', 'relativePath', 'importBindings',
-    'importDetails', 'symbols', 'moduleResolved'];
+    'importDetails', 'symbols', 'moduleResolved', 'cppUsings', 'macroScopeMarkers'];
 
 // Work counters of witness construction (fix #418): a scaling test asserts
 // that encoded and decoded facts grow with the sites a query visits, never

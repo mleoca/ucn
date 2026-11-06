@@ -1629,6 +1629,12 @@ function preprocessorDirective(line) {
  */
 const CONDITIONAL_RECOVERY_MAX_BYTES = 256 * 1024;
 
+// Keep every branch's tokens while removing only conditional directives.
+// Consumers must still parse the combined tokens to establish their meaning.
+function conditionalHeaderText(code) {
+    return code.split(/(?<=\n)/).map(line => preprocessorDirective(line) ? blankLine(line) : line).join('');
+}
+
 function conditionalRecoverySources(code) {
     if (Buffer.byteLength(code) > CONDITIONAL_RECOVERY_MAX_BYTES) return [];
     const lines = code.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) || [];
@@ -5596,7 +5602,10 @@ function buildVariableTypes(tree) {
             if (current.type === 'array_declarator') arrays++;
             for (const child of current.namedChildren || []) stack.push(child);
         }
-        if (arrays > 0) return `${type}${'[]'.repeat(arrays)}`;
+        const qualifiers = (holder?.children || []).filter(child => child.type === 'type_qualifier')
+            .map(child => child.text).join(' ');
+        const qualified = qualifiers ? `${qualifiers} ${type}` : type;
+        if (arrays > 0) return `${qualified}${'[]'.repeat(arrays)}`;
         // Pointer levels are part of the argument's type (fix #393):
         // `const char* format` passes a C string, never a `char`. The chain
         // of declarators is followed (an initializer's own declarators are
@@ -5605,7 +5614,7 @@ function buildVariableTypes(tree) {
         // decides overloads (`f(char*)` versus `f(const char*)`).
         let pointers = 0;
         for (let current = declarator; current;) {
-            if (current.type === 'function_declarator') return type;
+            if (current.type === 'function_declarator') return qualified;
             if (current.type === 'pointer_declarator') pointers++;
             current = current.type === 'init_declarator' || current.type === 'pointer_declarator' ||
                 current.type === 'reference_declarator' || current.type === 'parenthesized_declarator'
@@ -5614,13 +5623,13 @@ function buildVariableTypes(tree) {
                         child.type.endsWith('declarator') || child.type === 'identifier'))
                 : null;
         }
-        if (pointers === 0) return type;
-        const pointeeConst = (holder?.children || []).some(child =>
-            child.type === 'type_qualifier' && child.text === 'const');
-        return `${pointeeConst ? 'const ' : ''}${type} ${'*'.repeat(pointers)}`;
+        if (pointers === 0) return qualified;
+        return `${qualified} ${'*'.repeat(pointers)}`;
     };
     const addBindings = (node, type, pointeeType, scope, declarators, containerElementType, typeNamespace,
         constKnown = true) => {
+        const writtenType = node.childForFieldName('type');
+        const staticBase = writtenType && typeName(writtenType) === type ? writtenType.text : type;
         // The decl-specifier `const` qualifies the object a value or
         // reference names, or what a pointer points at (fix #427).
         const declConst = constKnown
@@ -5652,7 +5661,8 @@ function buildVariableTypes(tree) {
                 ...(elementType && { elementType }),
                 name: identity.name,
                 type,
-                staticType: declaratorStaticType(type, declarator, node),
+                staticType: declaratorStaticType(staticBase, declarator, node),
+                staticOrigin: writtenType && typeName(writtenType) === type ? argumentTypeContext(writtenType) : null,
                 origin: typeOrigin(node.type === 'declaration' &&
                     (declarator.type === 'identifier' ||
                      declarator.childForFieldName('value')?.type === 'new_expression')
@@ -5886,6 +5896,7 @@ function buildVariableTypes(tree) {
     return {
         get: (name, atNode) => resolveBinding(name, atNode)?.type,
         getStatic: (name, atNode) => resolveBinding(name, atNode)?.staticType,
+        getStaticOrigin: (name, atNode) => resolveBinding(name, atNode)?.staticOrigin,
         evidence: (name, atNode) => {
             const binding = resolveBinding(name, atNode);
             return { receiverTypeSource: binding?.origin?.source || 'unknown',
@@ -5983,7 +5994,9 @@ function staticArgumentKind(node, variableTypes) {
         return floating ? 'number:floating' : 'number:integer';
     }
     if (node.type === 'true' || node.type === 'false') return 'bool';
-    if (node.type === 'null' || node.type === 'nullptr') return 'null';
+    // The grammar also calls NULL a null node, but that macro can expand
+    // to integer zero. Only the keyword has nullptr's conversion rules.
+    if (node.type === 'null' || node.type === 'nullptr') return node.text === 'nullptr' ? 'null' : 'expr';
     if (node.type === 'identifier') {
         const type = variableTypes?.getStatic(node.text, node) ||
             variableTypes?.get(node.text, node);
@@ -5994,21 +6007,21 @@ function staticArgumentKind(node, variableTypes) {
             (node.namedChildren || []).find(child =>
                 TYPE_NODES.has(child.type) || child.type === 'type_descriptor');
         const type = typeName(typeNode);
-        return type ? `type:${type}` : 'expr';
+        return type ? `type:${typeNode.text}` : 'expr';
     }
     if (node.type === 'new_expression') {
         const typeNode = node.childForFieldName('type') ||
             (node.namedChildren || []).find(child =>
                 TYPE_NODES.has(child.type) || child.type === 'type_descriptor');
         const type = typeName(typeNode);
-        return type ? `type:${type}` : 'expr';
+        return type ? `type:${typeNode.text}*` : 'expr';
     }
     if (node.type === 'cast_expression') {
         const typeNode = node.childForFieldName('type') ||
             (node.namedChildren || []).find(child =>
                 TYPE_NODES.has(child.type) || child.type === 'type_descriptor');
         const type = typeName(typeNode);
-        return type ? `type:${type}` : 'expr';
+        return type ? `type:${typeNode.text}` : 'expr';
     }
     if (node.type === 'call_expression') {
         const fnNode = node.childForFieldName('function');
@@ -6019,7 +6032,7 @@ function staticArgumentKind(node, variableTypes) {
                 (fnNode?.namedChildren || []).find(child =>
                     child.type === 'type_descriptor' || TYPE_NODES.has(child.type));
             const type = typeName(typeNode);
-            if (type) return `type:${type}`;
+            if (type) return `type:${typeNode.text}`;
         }
         // Bare-identifier producers are name-resolvable (fix #299B): mark
         // them `bcall:` so the overload discipline can type the argument
@@ -6038,13 +6051,34 @@ function staticArgumentKind(node, variableTypes) {
     return 'expr';
 }
 
+function argumentTypeContext(node) {
+    const typeParameters = [];
+    for (const [name, ranges] of templateScopes(node.tree)) {
+        if (ranges.some(range => range.start <= node.startIndex && node.endIndex <= range.end)) typeParameters.push(name);
+    }
+    return { line: node.startPosition.row + 1, ...(typeParameters.length && { typeParameters }) };
+}
+
+function argumentTypeOrigin(node, variableTypes) {
+    if (node.type === 'parenthesized_expression') return argumentTypeOrigin(node.namedChild(0), variableTypes);
+    if (node.type === 'identifier') return variableTypes?.getStaticOrigin(node.text, node) || null;
+    return argumentTypeContext(node);
+}
+
+function argumentFacts(values, variableTypes) {
+    const argKinds = values.map(value => staticArgumentKind(value, variableTypes));
+    const argTypeOrigins = values.map((value, i) => argKinds[i].startsWith('type:')
+        ? argumentTypeOrigin(value, variableTypes) : null);
+    return { argKinds, ...(argTypeOrigins.some(Boolean) && { argTypeOrigins }) };
+}
+
 function callArguments(node, variableTypes) {
     const args = node.childForFieldName('arguments');
     if (!args) return { argCount: 0, argKinds: [] };
     const values = args.namedChildren.filter(child => !child.type.endsWith('comment'));
     return {
         argCount: values.length,
-        argKinds: values.map(value => staticArgumentKind(value, variableTypes)),
+        ...argumentFacts(values, variableTypes),
         firstArg: values[0],
     };
 }
@@ -6213,8 +6247,7 @@ function recoveredExplicitCallOperator(node, variableTypes) {
             isMethod: false,
             explicitTemplateCall: true,
             argCount: values.length,
-            argKinds: values.map(value =>
-                staticArgumentKind(value, variableTypes)),
+            ...argumentFacts(values, variableTypes),
             enclosingFunction: enclosingFunctionOf(node),
         };
     }
@@ -6249,8 +6282,7 @@ function recoveredExplicitCallOperator(node, variableTypes) {
         isMethod: false,
         explicitTemplateCall: true,
         argCount: values.length,
-        argKinds: values.map(value =>
-            staticArgumentKind(value, variableTypes)),
+        ...argumentFacts(values, variableTypes),
         enclosingFunction: enclosingFunctionOf(node),
     };
 }
@@ -6425,7 +6457,7 @@ function outOfClassMemInitializer(definition, target, args, variableTypes) {
         ctorDelegation: delegates ? 'this' : 'super',
         ...(scope && { constructorQualifier: scope.text }),
         ...(!delegates && { memberInitializer: true }),
-        argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)) };
+        argCount: values.length, ...argumentFacts(values, variableTypes) };
 }
 
 function implicitOwnerScope(node) {
@@ -6649,6 +6681,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 ...(assignedTo && { assignedTo }),
                 argCount: args.argCount,
                 argKinds: args.argKinds,
+                ...(args.argTypeOrigins && { argTypeOrigins: args.argTypeOrigins }),
                 enclosingFunction,
                 ...(first && {
                     firstStringArg: first.value,
@@ -6684,8 +6717,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                         ...(identity.isPathCall && { isPathCall: true }),
                         parenthesizedCallee: true,
                         argCount: values.length,
-                        argKinds: values.map(value =>
-                            staticArgumentKind(value, variableTypes)),
+                        ...argumentFacts(values, variableTypes),
                         enclosingFunction: enclosingFunctionOf(node),
                     });
                     return false;
@@ -6722,7 +6754,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                         isMethod: false, isConstructor: true, constructorSyntax: 'delegation',
                         ctorDelegation: sameNode(written, self) ? 'this' : 'super',
                         ...(scope && { constructorQualifier: scope.text }),
-                        argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)),
+                        argCount: values.length, ...argumentFacts(values, variableTypes),
                         enclosingFunction: enclosingFunctionOf(node) });
                 }
             }
@@ -6749,6 +6781,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                     }),
                     argCount: args.argCount,
                     argKinds: args.argKinds,
+                ...(args.argTypeOrigins && { argTypeOrigins: args.argTypeOrigins }),
                     enclosingFunction: enclosingFunctionOf(node),
                 });
             }
@@ -6767,7 +6800,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                     isMethod: false, isConstructor: true,
                     constructorSyntax: value.type === 'initializer_list' ? 'list' : 'direct',
                     ...(type.childForFieldName('scope') && { constructorQualifier: type.childForFieldName('scope').text }),
-                    argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)),
+                    argCount: values.length, ...argumentFacts(values, variableTypes),
                     enclosingFunction: enclosingFunctionOf(node),
                 });
             }
@@ -6799,7 +6832,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                     callStart: node.startIndex, callEnd: node.endIndex,
                     isMethod: false, isConstructor: true, constructorSyntax: 'list',
                     ...(type.childForFieldName('scope') && { constructorQualifier: type.childForFieldName('scope').text }),
-                    argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)),
+                    argCount: values.length, ...argumentFacts(values, variableTypes),
                     enclosingFunction: enclosingFunctionOf(node) });
             }
         }
@@ -7254,6 +7287,7 @@ function findMacroBodyCalls(tree, code, parser, onlyName = null) {
                 : valueNode.startIndex + call.callEnd - prefix.length;
             calls.push({
                 ...withoutParameterReceiverTypes(call, parameters),
+                ...(call.argTypeOrigins && { argTypeOrigins: call.argTypeOrigins.map(() => null) }),
                 line,
                 column,
                 ...(callStart != null && callStart >= valueNode.startIndex && {
@@ -7783,6 +7817,7 @@ module.exports = {
     hasExternalMacroContext: () => externalMacroContext !== null,
     // Deterministic test seams for the recovery memory/order contracts.
     conditionalRecoverySources,
+    conditionalHeaderText,
     mergeExtracted,
     macroAccessEffect,
 };

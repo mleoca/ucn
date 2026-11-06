@@ -384,6 +384,37 @@ function macroBodyTokens(index, def) {
     return expansionState(index).tokensOf(def);
 }
 
+class DeclarationChoice extends Error {
+    constructor(name, definitions) { super(name); this.definitions = definitions; }
+}
+
+/** Expand every bounded macro configuration of a declaration fragment. */
+function expandDeclaration(index, file, line, source) {
+    const state = expansionState(index);
+    const pending = [new Map()], variants = [];
+    while (pending.length) {
+        const choices = pending.pop();
+        const site = { file, line, lines: index._getFileLines(file), fileState: {},
+            lookupMemo: new Map(), usedDefs: new Set(), budget: MAX_TOKENS, ambiguous: false,
+            declarationChoices: choices };
+        try {
+            const tokens = expandTokens(index, state, site, lexPP(source), new Set(), 0);
+            const text = tokens.map(token => token.v).join(' ');
+            const complete = !site.ambiguous && !tokens.some(token => token.opaque || token.noexpand);
+            if (!variants.some(variant => variant.text === text)) variants.push({ text, complete });
+        } catch (error) {
+            if (error instanceof DeclarationChoice) {
+                if (pending.length + variants.length + error.definitions.length > MAX_VARIANTS) {
+                    variants.push({ text: source, complete: false }); break;
+                }
+                for (const definition of error.definitions) pending.push(new Map(choices).set(error.message, definition));
+            } else if (error instanceof BlindExpansion) variants.push({ text: source, complete: false });
+            else throw error;
+        }
+    }
+    return { ...variants[0], complete: variants.length === 1 && variants[0].complete, variants };
+}
+
 /** Does an invocation with `args` fit the macro's parameter list? */
 function arityFits(def, args) {
     const params = def.ppParams || [];
@@ -508,7 +539,12 @@ function expandTokens(index, state, site, tokens, hide, depth) {
             out.push({ ...t, noexpand: true });
             continue;
         }
-        const scope = definitionsInScope(index, state, site, t.v);
+        let scope = definitionsInScope(index, state, site, t.v);
+        if (site.declarationChoices && scope.defs.length > 1 && !scope.truncated) {
+            const chosen = site.declarationChoices.get(t.v);
+            if (!chosen) throw new DeclarationChoice(t.v, scope.defs);
+            scope = { defs: [chosen], ambiguous: false, truncated: false };
+        }
         let def = scope.defs[0];
         if (!def) {
             out.push(t);
@@ -1413,4 +1449,4 @@ function macroExpansionSummary(index) {
 }
 
 module.exports = { withMacroExpansion, macroExpansionSummary, expansionState, persistableMacroExpansion,
-    macroDefinitionsAt, macroBodyTokens, codeTokens, pastedNameSites };
+    macroDefinitionsAt, macroBodyTokens, expandDeclaration, codeTokens, pastedNameSites };

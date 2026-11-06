@@ -458,8 +458,9 @@ function constructionEvidenceUncached(index, owner, call, classBinding) {
     const language = index.files.get(owner.file).language;
     const protocol = protocolFacts(index, owner);
     const { selectProvenanceOverload } = require('./callers');
-    const overloadCall = langTraits(language)?.inheritedOverloadSignatures
-        ? { ...call, argumentFile: classBinding?.facts?.site?.file } : call;
+    const overloadCall = langTraits(language)?.inheritedOverloadSignatures ||
+        langTraits(language)?.userDefinedConversions === 'constructors-and-operators'
+        ? { ...call, argumentFile: classBinding?.facts?.site?.file || call.argumentFile } : call;
     const overload = captureOverload(index, overloadCall, members, language, selectProvenanceOverload);
     const selected = overload?.selected;
     const fallback = !selected && members.length === 1 ? declarationIdentity(members[0]) : null;

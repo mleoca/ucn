@@ -1030,6 +1030,7 @@ class ProjectIndex {
         // A changed file can alter either even before a full rebuild reaches
         // its graph phase, so no prior call-identity verdict may survive.
         this._implicitConversionOwners = null;
+        this._cppScope = null;
         this._cppVisibleFilesCache?.clear();
         this._textualIncludeClosureCache?.clear();
         this._translationUnitLanguageCache?.clear();
@@ -1130,6 +1131,7 @@ class ProjectIndex {
         if (!existing) return;
 
         this._implicitConversionOwners = null;
+        this._cppScope = null;
         this._evictParsedTree(filePath);
 
         for (const symbol of existing.symbols) {

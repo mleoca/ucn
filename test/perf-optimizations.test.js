@@ -199,7 +199,7 @@ fn main() { Builder::new().step(); }
 });
 
 describe('perf: repeated C++ overload identity caches', () => {
-    it('shares normalized types and project identity pairs within one operation', () => {
+    it('shares conversion facts and project identity pairs within one operation', () => {
         const dir = tmp({
             'format.cpp': [
                 'struct Printer {',
@@ -218,19 +218,28 @@ describe('perf: repeated C++ overload identity caches', () => {
                 const first = index.findCallers('format', {
                     targetDefinitions: [target], collectAccount: true,
                 });
-                const normalizedCount = index._opCppTypeCategoryCache.size;
+                const conversions = index._cppScope.conversionResults;
+                const conversionCount = () => [...conversions.values()].reduce((count, results) => count + results.size, 0);
+                const recordedConversions = conversionCount();
+                const call = index.getCachedCalls(path.join(dir, 'format.cpp')).find(site => site.name === 'format');
+                const boundCall = index._opMemo('argumentSourceCalls').get(call);
+                assert.equal(boundCall.argumentFile, 'format.cpp');
+                assert.equal(call.argumentFile, undefined, 'source attachment must not mutate the indexed record');
                 const receiverTypeCount = index._cppScope.resolved.size;
                 const derefPairs = index._opDerefPairs;
                 const aliasPairs = index._opAliasPairs;
                 const second = index.findCallers('format', {
                     targetDefinitions: [target], collectAccount: true,
                 });
-                assert.ok(normalizedCount > 0,
-                    'C++ parameter categories should be cached');
+                assert.ok(recordedConversions > 0,
+                    'C++ argument conversions should be cached');
                 assert.ok(receiverTypeCount > 0,
                     'qualified C++ receiver identity should be cached');
-                assert.strictEqual(index._opCppTypeCategoryCache.size, normalizedCount,
-                    'identical overload analysis reuses normalized types');
+                assert.strictEqual(index._cppScope.conversionResults, conversions);
+                assert.strictEqual(index._opMemo('argumentSourceCalls').get(call), boundCall,
+                    'repeated queries retain the source-bound record identity');
+                assert.strictEqual(conversionCount(), recordedConversions,
+                    'identical overload analysis reuses argument conversions');
                 assert.strictEqual(index._cppScope.resolved.size, receiverTypeCount,
                     'identical overload analysis reuses qualified receiver identity');
                 assert.strictEqual(index._opDerefPairs, derefPairs,

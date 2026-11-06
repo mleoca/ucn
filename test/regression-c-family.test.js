@@ -14,6 +14,345 @@ const {
     mergeExtracted,
 } = require('../languages/c-family');
 
+describe('fix #486: qualified C++ standard string conversions', () => {
+    const source = [
+        '#include <string>', '#include <string_view>',
+        'namespace app {',
+        'void log(std::string_view message) {}',
+        'void log(int code) {}',
+        'void emit(const std::string& text) {}',
+        'void emit(double value) {}',
+        'void run() {',
+        ' log("hello");', ' log(42);', ' emit("text");', ' emit(1.5);',
+        '}', '}',
+    ].join('\n');
+    it('confirms each standard string and arithmetic overload', () => {
+        const dir = tmp({ 'log.cpp': source });
+        try {
+            const index = idx(dir);
+            for (const [name, line, caller] of [['log', 4, 9], ['log', 5, 10], ['emit', 6, 11], ['emit', 7, 12]]) {
+                const answer = index.context(name, { file: 'log.cpp', line });
+                assert.deepEqual(answer.callers.map(site => site.line), [caller]);
+                assert.equal(answer.unverifiedCallers.length, 0);
+                assert.equal(answer.meta.account.conserved, true);
+                const { declarationIdentity } = require('../core/provenance');
+                const { captureOverload, validateOverload } = require('../core/provenance-overload');
+                const { selectProvenanceOverload } = require('../core/callers');
+                const definition = index.symbols.get(name).find(def => def.startLine === line);
+                const call = index.getCachedCalls(path.join(dir, 'log.cpp')).find(site => site.line === caller);
+                const members = index.symbols.get(name);
+                const witness = captureOverload(index, { ...call, argumentFile: 'log.cpp' }, members,
+                    'cpp', selectProvenanceOverload);
+                assert.ok(validateOverload(JSON.parse(JSON.stringify(witness)), members.map(declarationIdentity),
+                    declarationIdentity(definition)));
+            }
+        } finally { rm(dir); }
+    });
+    for (const [imports, spelling] of [
+        ['using namespace std;', 'string_view'],
+        ['using std::string_view;', 'string_view'],
+        ['namespace platform = std;', 'platform::string_view'],
+        ['using View = std::string_view;', 'View'],
+        ['', 'std::basic_string_view<char>'],
+    ]) it(`resolves ${spelling} through its declaring scope`, () => {
+        const dir = tmp({ 'n.cpp': [
+            '#include <string_view>', imports,
+            `void pick(${spelling} text) {}`, 'void pick(int value) {}',
+            'void run() { pick("text"); pick(42); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            for (const line of [3, 4]) {
+                const answer = index.context('pick', { file: 'n.cpp', line });
+                assert.equal(answer.callers.length, 1);
+                assert.equal(answer.unverifiedCallers.length, 0);
+            }
+        } finally { rm(dir); }
+    });
+    it('does not borrow the platform contract for project names or a shadowed std namespace', () => {
+        const dir = tmp({ 'n.cpp': [
+            'namespace app {', 'namespace std { struct string_view { string_view(int); }; }',
+            'void pick(std::string_view value) {}', 'void pick(const char* value) {}',
+            'void run() { pick(42); }', '}',
+        ].join('\n') });
+        try {
+            const answer = idx(dir).context('pick', { file: 'n.cpp', line: 3 });
+            assert.equal(answer.callers.length + answer.unverifiedCallers.length, 1);
+        } finally { rm(dir); }
+    });
+    it('keeps the character encoding and standard string-to-view conversion', () => {
+        const dir = tmp({ 'n.cpp': [
+            '#include <string>', '#include <string_view>',
+            'void pick(std::string_view text) {}', 'void pick(std::wstring_view text) {}',
+            'void run(std::string text, std::wstring wide) {',
+            ' pick("text");', ' pick(L"text");', ' pick(text);', ' pick(wide);', '}',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(index.context('pick', { file: 'n.cpp', line: 3 }).callers.map(site => site.line), [6, 8]);
+            assert.deepEqual(index.context('pick', { file: 'n.cpp', line: 4 }).callers.map(site => site.line), [7, 9]);
+        } finally { rm(dir); }
+    });
+    it('distinguishes character pointers from extra indirection and volatile characters', () => {
+        const dir = tmp({ 'n.cpp': [
+            '#include <string_view>', 'void pick(std::string_view text) {}',
+            'void run(char** nested, volatile char* vol, char* const fixed) {',
+            ' pick(nested);', ' pick(vol);', ' pick(fixed);', '}',
+        ].join('\n') });
+        try {
+            const index = idx(dir), definition = index.symbols.get('pick')[0];
+            const calls = index.getCachedCalls(path.join(dir, 'n.cpp')).filter(call => call.name === 'pick');
+            const { argumentConversion, platformConversion } = require('../core/cpp-conversions');
+            for (let n = 0; n < calls.length; n++) {
+                const call = { ...calls[n], argumentFile: 'n.cpp' };
+                const args = [index, call.argKinds[0], 'std::string_view', definition, call, 0];
+                assert.equal(argumentConversion(...args), n === 2);
+                assert.equal(platformConversion(...args), n === 2);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('does not prove a temporary string binds to a mutable reference', () => {
+        const dir = tmp({ 'n.cpp': [
+            '#include <string>', 'void pick(std::string& text) {}',
+            'void pick(const char* text, ...) {}', 'void run() { pick("text"); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir), definition = index.symbols.get('pick')[0];
+            const call = index.getCachedCalls(path.join(dir, 'n.cpp')).find(site => site.name === 'pick');
+            const { platformConversion } = require('../core/cpp-conversions');
+            assert.equal(platformConversion(index, call.argKinds[0], definition.paramsStructured[0].type,
+                definition, { ...call, argumentFile: 'n.cpp' }, 0), null);
+            assert.equal(index.context('pick', { file: 'n.cpp', line: 2 }).callers.length, 0);
+            assert.ok(index.context('pick', { file: 'n.cpp', line: 3 }).unverifiedCallers.some(site => site.line === 4));
+        } finally { rm(dir); }
+    });
+
+    it('preserves qualified argument types through workers and disk caches', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { saveCache, loadCache } = require('../core/cache');
+        const dir = tmp({ 'n.cpp': '#include <string>\nvoid run(std::string text) { send(text); }' });
+        try {
+            const records = index => index.getCachedCalls(path.join(dir, 'n.cpp'));
+            const sequential = new ProjectIndex(dir); sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir); parallel.build(null, { quiet: true, workers: 2 });
+            assert.deepEqual(records(sequential)[0].argKinds, ['type:std::string']);
+            assert.deepEqual(records(parallel), records(sequential));
+            const cache = path.join(dir, '.cache-486', 'index.json'); saveCache(sequential, cache);
+            const loaded = new ProjectIndex(dir); assert.ok(loadCache(loaded, cache));
+            assert.deepEqual(records(loaded), records(sequential));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #486: source-backed C++ conversion constraints', () => {
+    it('does not give the NULL macro the conversion rules of nullptr', () => {
+        const dir = tmp({ 'n.cpp': [
+            '#define NULL 0', 'struct Gate { Gate(void*); };',
+            'void pick(Gate value) {}', 'void pick(bool value) {}',
+            'void run() { pick(NULL); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            for (const line of [3, 4]) {
+                const result = index.context('pick', { file: 'n.cpp', line });
+                assert.equal(result.callers.length, 0);
+                assert.deepEqual(result.unverifiedCallers.map(call => call.line), [5]);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('deduces a conversion operator target in the parameter declaration scope', () => {
+        const dir = tmp({ 'n.cpp': [
+            'namespace A { struct Token { using member = int; }; }',
+            'namespace B { namespace A { struct Token {}; }',
+            'struct Value { template<class T, class = typename T::member> operator T() const; }; }',
+            'void pick(A::Token value) {}', 'void pick(int value) {}',
+            'void run(B::Value value) { pick(value); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(index.context('pick', { file: 'n.cpp', line: 4 }).callers.map(call => call.line), [6]);
+            assert.equal(index.context('pick', { file: 'n.cpp', line: 5 }).callers.length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('retains the full pointer type returned by a conversion operator', () => {
+        const dir = tmp({ 'n.cpp': [
+            'struct Value { operator const char*() const; };',
+            'void pick(const char* text) {}', 'void pick(int code) {}',
+            'void run(Value value) { pick(value); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const pointer = index.context('pick', { file: 'n.cpp', line: 2 });
+            assert.deepEqual(pointer.callers.map(call => call.line), [4]);
+            const number = index.context('pick', { file: 'n.cpp', line: 3 });
+            assert.equal(number.callers.length + number.unverifiedCallers.length, 0);
+            const run = index.context('run', { file: 'n.cpp', line: 4 });
+            assert.deepEqual(run.callees.filter(call => call.name === 'pick').map(call => call.startLine), [2]);
+        } finally { rm(dir); }
+    });
+
+    it('replays constructor constraints from recorded declarations without live caches', () => {
+        const dir = tmp({ 'n.cpp': [
+            'struct Gate { template<class T, class = typename T::member> Gate(T); };',
+            'void pick(Gate value) {}', 'void pick(const char* value) {}',
+            'void run() { pick("text"); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir), members = index.symbols.get('pick');
+            const call = index.getCachedCalls(path.join(dir, 'n.cpp')).find(site => site.name === 'pick');
+            const { captureOverload, validateOverload } = require('../core/provenance-overload');
+            const { declarationIdentity } = require('../core/provenance');
+            const { selectProvenanceOverload } = require('../core/callers');
+            const witness = captureOverload(index, { ...call, argumentFile: 'n.cpp' }, members,
+                'cpp', selectProvenanceOverload);
+            const copy = JSON.parse(JSON.stringify(witness));
+            const identities = members.map(declarationIdentity), selected = declarationIdentity(members[1]);
+            assert.ok(validateOverload(copy, identities, selected));
+            const key = Object.keys(copy.reads).find(key => key.startsWith('fact:cpp-conversion-class:'));
+            assert.ok(key);
+            copy.reads[key].constructors[0].syntax.templateComplete = false;
+            assert.equal(validateOverload(copy, identities, selected), false);
+            delete copy.reads[key];
+            assert.equal(validateOverload(copy, identities, selected), false);
+        } finally { rm(dir); }
+    });
+
+    const cases = [
+        ['empty class', 'struct Gate {};', 'const char*', '"text"', 'other'],
+        ['class named T', 'struct T {}; using Gate = T;', 'const char*', '"text"', 'other'],
+        ['converting constructor', 'struct Gate { Gate(bool); };', 'const char*', 'true', 'gate'],
+        ['explicit constructor', 'struct Gate { explicit Gate(const char*); };', 'const char*', '"text"', 'other'],
+        ['non-class dependent member', 'struct Gate { template<class Char, class = typename Char::member> Gate(Char); };', 'const char*', '"text"', 'other'],
+        ['requires dependent member', 'struct Gate { template<class Char> requires requires { typename Char::member; } Gate(Char); };', 'const char*', '"text"', 'other'],
+        ['standard same-type constraint', 'struct Gate { template<class Char, std::enable_if_t<std::is_same<Char, int>::value, int> = 0> Gate(Char); };', 'const char*', '"text"', 'other'],
+        ['standard conversion constraint', 'struct Gate { template<class Char, std::enable_if_t<std::is_convertible<Char, int>::value, int> = 0> Gate(Char); };', 'const char*', '"text"', 'other'],
+        ['project constraint macro', '#define ENABLE(...) std::enable_if_t<(__VA_ARGS__), int> = 0\nstruct Gate { template<class Char, ENABLE(sizeof(typename Char::member))> Gate(Char); };', 'const char*', '"text"', 'other'],
+        ['a deduced integer type is not a null pointer constant', 'struct Gate { template<class T, std::enable_if_t<std::is_convertible<T, const char*>::value, int> = 0> Gate(T); };', 'const char*', '0', 'other'],
+        ['reference binding is not a category-only trait proof', 'struct Gate { template<class T, std::enable_if_t<!std::is_convertible<T, int&>::value, int> = 0> Gate(T); };', 'const char*', 'true', 'gate'],
+        ['unknown constraint preserves candidate', 'struct Gate { template<class Char> requires (sizeof(Char) > 0) Gate(Char); };', 'const char*', '"text"', 'review'],
+        ['integer suffix keeps template type undecided', 'struct Gate { template<class Char, std::enable_if_t<std::is_same<Char, long>::value, int> = 0> Gate(Char); };', 'double', '1L', 'review'],
+        ['inherited converting constructors', 'struct Base { Base(bool); }; struct Gate : Base { using Base::Base; };', 'const char*', 'true', 'gate'],
+        ['derived-to-base conversion', 'struct Gate {}; struct Child : Gate {};', 'int', 'Child{}', 'gate'],
+        ['source conversion operator', 'struct Gate { operator int() const; };', 'int', 'Gate{}', 'gate'],
+    ];
+    for (const [label, prelude, other, value, selected] of cases) it(label, () => {
+        const code = ['#include <type_traits>', prelude, 'void pick(Gate value) {}',
+            `void pick(${other} value) {}`, `void run() { pick(${value}); }`].join('\n');
+        const dir = tmp({ 'n.cpp': code });
+        try {
+            const index = idx(dir), definitions = index.symbols.get('pick');
+            for (let position = 0; position < definitions.length; position++) {
+                const result = index.context('pick', { file: 'n.cpp', line: definitions[position].startLine });
+                const chosen = selected === (position === 0 ? 'gate' : 'other');
+                assert.equal(result.callers.length, chosen ? 1 : 0, label);
+                assert.equal(result.unverifiedCallers.length, selected === 'review' ? 1 : 0, label);
+                assert.equal(result.meta.account.conserved, true);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('reads an argument type where its declaration bound the alias', () => {
+        const dir = tmp({ 'n.cpp': [
+            '#include <string_view>', 'using Text = std::string_view;',
+            'void pick(std::string_view value) {}', 'void pick(int value) {}',
+            'void run(Text text) {', ' { using Text = int;', '   pick(text);', ' }', '}',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(index.context('pick', { file: 'n.cpp', line: 3 }).callers.map(call => call.line), [7]);
+            assert.equal(index.context('pick', { file: 'n.cpp', line: 4 }).callers.length, 0);
+            const call = index.getCachedCalls(path.join(dir, 'n.cpp')).find(call => call.name === 'pick');
+            assert.equal(call.argTypeOrigins[0].line, 5);
+        } finally { rm(dir); }
+    });
+
+    it('deduced project types keep the argument declaration namespace', () => {
+        const dir = tmp({ 'n.cpp': [
+            'namespace A { struct Token { using member = int; }; }',
+            'namespace B { struct Token {};',
+            'struct Gate { template<class T, class = typename T::member> Gate(T); };',
+            'void pick(Gate value) {}', 'void pick(int value) {}', '}',
+            'void run(A::Token value) { B::pick(value); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(index.context('pick', { file: 'n.cpp', line: 4 }).callers.map(call => call.line), [7]);
+            assert.equal(index.context('pick', { file: 'n.cpp', line: 5 }).callers.length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('class template arguments resolve where the specialization is written', () => {
+        const dir = tmp({ 'n.cpp': [
+            'namespace A { struct Token { using member = int; }; }',
+            'namespace B { namespace A { struct Token {}; }',
+            'template<class T> struct Box { using member = typename T::member; };',
+            'struct Gate { template<class T, class = typename T::member> Gate(T); };',
+            'void pick(Gate value) {}', 'void pick(int value) {}', '}',
+            'void run(B::Box<A::Token> value) { B::pick(value); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(index.context('pick', { file: 'n.cpp', line: 5 }).callers.map(call => call.line), [8]);
+            assert.equal(index.context('pick', { file: 'n.cpp', line: 6 }).callers.length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('incomplete source classes keep their possible conversions visible', () => {
+        const dir = tmp({ 'n.cpp': 'struct Unknown;\nstruct Gate {};\nvoid pick(Gate);\nvoid pick(int);\nvoid run(Unknown& value) { pick(value); }' });
+        try {
+            const index = idx(dir);
+            for (const line of [3, 4]) {
+                const result = index.context('pick', { file: 'n.cpp', line });
+                assert.equal(result.callers.length, 0);
+                assert.deepEqual(result.unverifiedCallers.map(call => call.line), [5]);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('reuses conversion facts until an edit, rebuild or cache load changes the index', () => {
+        const source = 'struct Gate { Gate(int); };\nvoid pick(Gate value) {}\nvoid pick(const char* value) {}\nvoid run() { pick("text"); }';
+        const dir = tmp({ 'n.cpp': source });
+        try {
+            const index = idx(dir), file = path.join(dir, 'n.cpp');
+            const query = () => require('../core/cpp-conversions').argumentConversion(index,
+                'string:char', 'Gate', index.symbols.get('pick')[0], { argumentFile: 'n.cpp', line: 4 }, 0);
+            assert.equal(query(), false);
+            const memo = index._cppScope.conversionResults;
+            query(); assert.strictEqual(index._cppScope.conversionResults, memo);
+            const cache = path.join(dir, 'index.json'); index.saveCache(cache);
+            fs.writeFileSync(file, source.replace('Gate(int)', 'Gate(const char*)'));
+            index.indexFile(file);
+            assert.equal(query(), null);
+            assert.notStrictEqual(index._cppScope.conversionResults, memo);
+            fs.writeFileSync(file, source);
+            assert.ok(index.loadCache(cache));
+            assert.equal(query(), false);
+            fs.writeFileSync(file, source.replace('Gate(int)', 'Gate(const char*)'));
+            index.build(null, { quiet: true, workers: 0 });
+            assert.equal(query(), null);
+        } finally { rm(dir); }
+    });
+
+    it('a function template parameter does not borrow a project type of the same name', () => {
+        const dir = tmp({ 'n.cpp': [
+            'struct Char {};', 'struct Gate { Gate(int); };',
+            'void pick(Gate value) {}', 'void pick(const char* value) {}',
+            'template<class Char> void run(Char value) { pick(value); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            for (const line of [3, 4]) {
+                const result = index.context('pick', { file: 'n.cpp', line });
+                assert.equal(result.callers.length, 0);
+                assert.equal(result.unverifiedCallers.length, 1);
+            }
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #485: integer zero remains a null pointer constant', () => {
     const zeros = ['0', '0L', '0u', '0x0', '00', '0b0', "0'0", '0ULL'];
     const source = [
@@ -41,7 +380,7 @@ describe('fix #485: integer zero remains a null pointer constant', () => {
         const code = "void run() { f(0); f(false); f('\\0'); f(NULL); f(ZERO); f(0.0); f(0xdead); f(0x0F); f(1e2); }";
         const calls = getLanguageAdapter('cpp').findCallsInCode(code, getParser('cpp'));
         assert.deepEqual(calls.map(call => call.argKinds[0]), [
-            'number:zero', 'bool', 'char:char', 'null', 'expr', 'number:floating',
+            'number:zero', 'bool', 'char:char', 'expr', 'expr', 'number:floating',
             'number:integer', 'number:integer', 'number:floating',
         ]);
     });
@@ -1424,7 +1763,7 @@ describe('C++ language support', () => {
             ).filter(call => call.name === 'format');
             assert.deepEqual(calls.map(call => call.argKinds[0]), [
                 'string:char',
-                'type:text_style',
+                'type:fmt::text_style',
                 'string:wchar_t',
             ]);
 
@@ -1439,13 +1778,13 @@ describe('C++ language support', () => {
                     call.line,
                     call.tier,
                 ]),
-                [],
+                [['use.cpp', 3, 'confirmed']],
             );
             assert.deepEqual(result.unverifiedCallers.map(call => [call.line, call.reason]),
-                [[3, 'overload-ambiguous'], [5, 'overload-ambiguous']]);
+                []);
             assert.equal(
                 result.meta.account.excluded.byReason['overload-mismatch'].count,
-                1,
+                2,
             );
             assert.equal(result.meta.account.conserved, true);
         } finally {
@@ -1531,13 +1870,13 @@ describe('C++ language support', () => {
             });
             assert.equal(narrow.callers.length, 0);
             assert.deepEqual(narrow.unverifiedCallers.map(call => [call.line, call.reason]),
-                [[7, 'overload-ambiguous']]);
+                []);
             const wide = index.context('runtime', {
                 file: 'wide.cpp', line: 4,
             });
-            assert.equal(wide.callers.length, 0);
+            assert.deepEqual(wide.callers.map(call => call.line), [7]);
             assert.deepEqual(wide.unverifiedCallers.map(call => [call.line, call.reason]),
-                [[7, 'overload-ambiguous']]);
+                []);
             assert.equal(wide.meta.account.conserved, true);
         } finally {
             rm(dir);
@@ -6164,7 +6503,7 @@ describe('fix #393: C/C++ rename and caller identity leftovers', () => {
                     unverified: (r.result.unverifiedCallers || []).map(c => c.line),
                 };
             };
-            assert.deepEqual(callersOf(3), { confirmed: [], unverified: [3] });
+            assert.deepEqual(callersOf(3), { confirmed: [3], unverified: [] });
             assert.deepEqual(callersOf(4), { confirmed: [], unverified: [] });
             assert.deepEqual(callersOf(5), { confirmed: [4], unverified: [] });
             assert.deepEqual(callersOf(6), { confirmed: [5], unverified: [] });

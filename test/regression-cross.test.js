@@ -94,7 +94,7 @@ describe('fix #479: user-defined conversions do not prove overload applicability
             'void pick(format_string value, int extra) {}',
             'void run(string_view value) { pick(value, 1); }',
             '}',
-        ]],
+        ], 6],
         ['requires converting constructor', 'n.cpp', [
             'namespace lib {',
             'struct string_view {};',
@@ -104,7 +104,7 @@ describe('fix #479: user-defined conversions do not prove overload applicability
             'void pick(format_string value, int extra) {}',
             'void run(string_view value) { pick(value, 1); }',
             '}',
-        ]],
+        ], 6],
         ['conversion operator on a library-shaped name', 'n.cpp', [
             'struct locale { operator int() const; };',
             'void pick(int value) {}',
@@ -143,25 +143,30 @@ describe('fix #479: user-defined conversions do not prove overload applicability
             '}',
         ]],
     ];
-    for (const [label, file, lines] of cases) it(label, () => {
+    for (const [label, file, lines, selectedLine] of cases) it(label, () => {
         const dir = tmp({ [file]: lines.join('\n') });
         try {
             const index = idx(dir), callLine = lines.findIndex(line => line.includes('void run(')) + 1;
             for (const definition of index.symbols.get('pick')) {
                 const result = index.context('pick', { file, line: definition.startLine });
-                assert.ok(!result.callers.some(call => call.line === callLine), label);
-                assert.ok(result.unverifiedCallers.some(call => call.line === callLine &&
-                    call.reason === 'overload-ambiguous'), `${label}: ${definition.startLine}`);
+                if (selectedLine) {
+                    assert.deepEqual(result.callers.map(call => call.line), definition.startLine === selectedLine ? [callLine] : [], label);
+                    assert.equal(result.unverifiedCallers.length, 0, label);
+                } else {
+                    assert.ok(!result.callers.some(call => call.line === callLine), label);
+                    assert.ok(result.unverifiedCallers.some(call => call.line === callLine &&
+                        call.reason === 'overload-ambiguous'), `${label}: ${definition.startLine}`);
+                }
                 assert.equal(result.meta.account.conserved, true);
             }
             const run = index.context('run', { file, line: callLine });
-            assert.ok(!run.callees.some(call => call.name === 'pick'), label);
-            assert.ok(run.unverifiedCallees.some(call => call.name === 'pick' &&
-                call.reason === 'overload-ambiguous'), label);
+            assert.equal(run.callees.some(call => call.name === 'pick'), !!selectedLine, label);
+            assert.equal(run.unverifiedCallees.some(call => call.name === 'pick' &&
+                call.reason === 'overload-ambiguous'), !selectedLine, label);
         } finally { rm(dir); }
     });
 
-    it('a sole possible converting constructor still needs an applicability proof', () => {
+    it('a sole surviving overload binds when every sibling is disproven', () => {
         const dir = tmp({ 'n.cpp': [
             'struct Gate { template<class T> requires (sizeof(T) == sizeof(bool)) Gate(T); };',
             'void pick(Gate value) {}',
@@ -170,11 +175,11 @@ describe('fix #479: user-defined conversions do not prove overload applicability
         ].join('\n') });
         try {
             const index = idx(dir), result = index.context('pick', { file: 'n.cpp', line: 2 });
-            assert.equal(result.callers.length, 0);
-            assert.ok(result.unverifiedCallers.some(call => call.line === 4 && call.reason === 'overload-ambiguous'));
+            assert.deepEqual(result.callers.map(call => call.line), [4]);
+            assert.equal(result.unverifiedCallers.length, 0);
             const run = index.context('run', { file: 'n.cpp', line: 4 });
-            assert.ok(!run.callees.some(call => call.name === 'pick'));
-            assert.ok(run.unverifiedCallees.some(call => call.name === 'pick' && call.reason === 'overload-ambiguous'));
+            assert.ok(run.callees.some(call => call.name === 'pick'));
+            assert.ok(!run.unverifiedCallees.some(call => call.name === 'pick'));
         } finally { rm(dir); }
     });
 
@@ -650,23 +655,20 @@ describe('fix #417: functional construction binds its type before constructor ov
     for (const [label, source] of [
         ['separate declarations', code],
         ['same-line declarations', 'namespace A {struct Value{};} namespace B {struct Value{};}\nstruct Box {Box(A::Value value){} Box(B::Value value){}};\nBox build(){return Box(A::Value{});}\n'],
-    ]) it(`C++ ${label}: constructor handles retain a site when argument identity cannot choose a body`, () => {
+    ]) it(`C++ ${label}: qualified argument identity selects the constructor body`, () => {
         const dir = tmp({ 'n.cpp': source });
         try {
             const index = idx(dir);
             for (const ctor of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
                 const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
-                assert.equal(callers.length, 0);
-                assert.equal(callers.unverifiedEntries.length, 1);
-                assert.equal(callers.unverifiedEntries[0].reason, 'constructor-overload-ambiguous');
+                assert.equal(callers.length, ctor.paramsStructured[0].type === 'A::Value' ? 1 : 0);
+                assert.equal(callers.unverifiedEntries.length, 0);
             }
             const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
-            // The braced argument also constructs its proven aggregate type;
-            // the Box construction keeps its class with an undecided body
-            // (fix #421).
+            // Construction retains the class and the selected constructor body.
             assert.deepEqual(callees.map(def => [def.name, def.namespace || null]).sort(),
-                [['Box', null], ['Value', 'A']]);
-            assert.ok(callees.initializerReviews.some(def => def.reason === 'constructor-overload-ambiguous'));
+                [['Box', null], ['Box', null], ['Value', 'A']]);
+            assert.equal(callees.initializerReviews.length, 0);
         } finally { rm(dir); }
     });
     it('a changed constructor retains an old possible binding as a review item', () => {

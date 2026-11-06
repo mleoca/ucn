@@ -43,12 +43,41 @@ function _state(index) {
     return state;
 }
 
+// Source-derived conversion declarations share this build's invalidation.
+function conversionSyntaxMemo(index) {
+    const state = _state(index);
+    return state.conversionSyntax || (state.conversionSyntax = new Map());
+}
+
+// Live queries can reuse pure conversion results until index facts change.
+// Witness views recompute from their recorded raw declarations instead.
+function conversionResultMemo(index) {
+    const state = _state(index);
+    return state.conversionResults || (state.conversionResults = new Map());
+}
+
 function resetCppScope(index) {
     index._cppScope = null;
 }
 
 function _isCppFile(index, file) {
     return index.files.get(file)?.language === 'cpp';
+}
+
+// Lookup consumes declaration inventories by kind. Record that raw subset
+// so a type or macro query does not copy unrelated same-name value members
+// into every overload witness. Scope and visibility still replay below.
+function _declarationsOfKind(index, name, kind) {
+    return projectFact(index, `cpp-${kind}-declarations:${name}`, live => {
+        const state = _state(live);
+        const memo = state.declarationKinds || (state.declarationKinds = new Map());
+        const key = `${kind}\0${name}`;
+        if (!memo.has(key)) memo.set(key, (live.symbols.get(name) || []).filter(definition => kind === 'macro'
+            ? definition.type === 'macro'
+            : _isCppFile(live, definition.file) && (TYPE_KINDS.has(definition.type) ||
+                definition.type === 'type' && definition.aliasOf)));
+        return memo.get(key);
+    });
 }
 
 /** Files a translation unit rooted at `file` sees through its includes. */
@@ -86,8 +115,8 @@ function _macroEffect(index, name, file) {
     const visible = includeClosure(index, file);
     let effect = null;
     let key = null;
-    for (const definition of index.symbols.get(name) || []) {
-        if (definition.type !== 'macro' || !visible.has(definition.file)) continue;
+    for (const definition of _declarationsOfKind(index, name, 'macro')) {
+        if (!visible.has(definition.file)) continue;
         const scope = definition.namespaceScope;
         const scopeKey = scope ? JSON.stringify(scope) : '';
         if (key === null) {
@@ -116,8 +145,8 @@ function _macroEffect(index, name, file) {
 function _expandedNamespaceName(index, name, visible, depth = 0) {
     if (depth > 4) return [name];
     let body = null;
-    for (const definition of index.symbols.get(name) || []) {
-        if (definition.type !== 'macro' || !visible.has(definition.file)) continue;
+    for (const definition of _declarationsOfKind(index, name, 'macro')) {
+        if (!visible.has(definition.file)) continue;
         if (Array.isArray(definition.ppParams) || typeof definition.ppBody !== 'string') return [name];
         const text = definition.ppBody.replace(/\s+/g, '');
         if (!/^[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$/.test(text)) return [name];
@@ -190,12 +219,15 @@ function effectiveNamespace(index, definition) {
 /** Effective namespace enclosing an arbitrary source position. */
 function namespaceAt(index, file, line) {
     const prefix = _macroPrefixAt(index, file, line);
-    const entry = index.files.get(file);
     let own = '';
     let ownSpan = Infinity;
     // The innermost definition containing the line carries the AST
     // namespace of that position.
-    for (const symbol of symbolsSpanning(entry?.symbols, line)) {
+    const enclosing = projectFact(index, `cpp-namespace-spans:${file}:${line}`, live =>
+        symbolsSpanning(live.files.get(file)?.symbols, line).map(symbol => ({
+            startLine: symbol.startLine, endLine: symbol.endLine, namespace: symbol.namespace,
+        })));
+    for (const symbol of enclosing) {
         const span = symbol.endLine - symbol.startLine;
         if (span < ownSpan) {
             ownSpan = span;
@@ -301,10 +333,7 @@ function _scopeOf(index, definition) {
 }
 
 function _typeCandidates(index, name) {
-    return (index.symbols.get(name) || []).filter(definition =>
-        _isCppFile(index, definition.file) &&
-        (TYPE_KINDS.has(definition.type) ||
-         (definition.type === 'type' && definition.aliasOf)));
+    return _declarationsOfKind(index, name, 'type');
 }
 
 /**
@@ -431,7 +460,7 @@ function _withExpandedTarget(index, fact) {
     if (segments.some(part => !/^[A-Za-z_]\w*$/.test(part))) return fact;
     const keepLast = fact.kind === 'declaration' && segments.length > 1;
     const head = keepLast ? segments.slice(0, -1) : segments;
-    if (!head.some(part => (index.symbols.get(part) || []).some(definition => definition.type === 'macro'))) {
+    if (!head.some(part => _declarationsOfKind(index, part, 'macro').length)) {
         return fact;
     }
     const visible = includeClosure(index, fact.file);
@@ -498,14 +527,14 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
     // (`LIB_NAMESPACE::detail::X`) is the name the macro expands to, as in
     // macro-opened namespaces (fix #396).
     if (segments.length > 1 && visibleFiles && segments.slice(0, -1).some(part =>
-        (index.symbols.get(part) || []).some(definition => definition.type === 'macro'))) {
+        _declarationsOfKind(index, part, 'macro').length)) {
         segments = [...segments.slice(0, -1).flatMap(part => _expandedNamespaceName(index, part, visibleFiles)),
             segments[segments.length - 1]];
     }
     if (depth > MAX_ALIAS_HOPS) return { kind: 'unknown', why: 'alias-depth' };
     const origin = context.origin || context.file;
     const cacheKey = `${origin}\0${context.file}\0${context.line}\0${context.className || ''}\0${plain}` +
-        `${declarationsOnly ? '\0d' : ''}${values ? `\0v:${options.valueSite?.index ?? ''}` : ''}${context.namespace != null ? `\0ns:${context.namespace}` : ''}`;
+        `${declarationsOnly ? '\0d' : ''}${options.externalTypes ? '\0external' : ''}${values ? `\0v:${options.valueSite?.index ?? ''}` : ''}${context.namespace != null ? `\0ns:${context.namespace}` : ''}`;
     const state = _state(index);
     if (state.resolved.has(cacheKey)) return state.resolved.get(cacheKey);
     const finish = result => {
@@ -626,6 +655,20 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
     }
     if (matched.length === 0) {
         const full = segments.join('::');
+        // Platform type facts are usable only after ordinary name lookup.
+        // A local namespace/type called std shadows the global root, and
+        // conditional imports cannot establish a platform identity.
+        if (options.externalTypes && !usings.some(fact => fact.ppGroups?.length)) {
+            const shadowed = !global && segments.length > 1 &&
+                _enclosingPrefixes(contextNamespace).filter(Boolean).some(prefix => {
+                    const first = _join(prefix, segments[0]);
+                    return _hasNamespace(index, first) || _typeCandidates(index, segments[0])
+                        .some(definition => visibleFiles?.has(definition.file) && _scopeOf(index, definition) === prefix);
+                });
+            const external = !shadowed && scopes.map(scope => _join(scope, full))
+                .find(name => name.startsWith('std::'));
+            if (external) return finish({ kind: 'external', qualified: external });
+        }
         const scope = scopes.find(candidate => _hasNamespace(index, _join(candidate, full)));
         if (scope !== undefined) {
             // `resolvedNamespace` (fix #393): the namespace the spelling
@@ -675,6 +718,8 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
 }
 
 module.exports = {
+    conversionSyntaxMemo,
+    conversionResultMemo,
     conditionalImportBinding,
     macroPrefixAt: _macroPrefixAt,
     globalQualifiedReaches,
