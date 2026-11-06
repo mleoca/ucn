@@ -1461,6 +1461,7 @@ function loadCache(index, cachePath) {
         index._rustMacroState = null;
         index._cppScope = null;
         index._contractIndex = null;
+        index._implicitConversionOwners = null;
         index._typeDenotation = null;
         index._languageFeatureMemo = null; // fix #380 protocol-type feature memo
 

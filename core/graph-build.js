@@ -604,6 +604,7 @@ function _applyGoImportNames(index, filePath, fileEntry, moduleResolved, dirToGo
  * Build inheritance relationship graphs
  */
 function buildInheritanceGraph(index) {
+    index._implicitConversionOwners = null;
     index.extendsGraph.clear();
     index.extendedByGraph.clear();
 

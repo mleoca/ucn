@@ -18,6 +18,48 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #484: implicit conversion owners belong to an index build', () => {
+    it('shares owner sets across operations and refreshes after edits and cache loads', () => {
+        const source = [
+            'struct Token { public static implicit operator string(Token value) => "value"; }',
+            'class Use {',
+            ' static void pick(string value) {}',
+            ' static void pick(object value) {}',
+            ' static void run(Token value) { pick(value); }',
+            '}',
+        ].join('\n');
+        const dir = tmp({ 'N.cs': source });
+        try {
+            const index = idx(dir), file = path.join(dir, 'N.cs');
+            const query = () => index.context('pick', { file: 'N.cs', line: 4 });
+            const first = query();
+            assert.equal(first.callers.length, 0);
+            assert.ok(first.unverifiedCallers.some(call => call.line === 5));
+            const owners = index._implicitConversionOwners;
+            assert.ok(owners?.has('csharp'));
+            assert.deepEqual(query().unverifiedCallers.map(call => call.line),
+                first.unverifiedCallers.map(call => call.line));
+            assert.strictEqual(index._implicitConversionOwners, owners);
+            const cache = path.join(dir, 'index.json');
+            index.saveCache(cache);
+
+            fs.writeFileSync(file, source.replace('implicit operator', 'explicit operator'));
+            index.indexFile(file);
+            assert.deepEqual(query().callers.map(call => call.line), [5]);
+            assert.notStrictEqual(index._implicitConversionOwners, owners);
+
+            fs.writeFileSync(file, source);
+            assert.equal(index.loadCache(cache), true);
+            assert.equal(query().callers.length, 0);
+            assert.ok(query().unverifiedCallers.some(call => call.line === 5));
+
+            fs.writeFileSync(file, source.replace('implicit operator', 'explicit operator'));
+            index.build(null, { quiet: true, workers: 0 });
+            assert.deepEqual(query().callers.map(call => call.line), [5]);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #481: C++ aliases do not inherit builtin conversion rules', () => {
     it('retains a character-pointer alias beside the pointer-to-bool conversion', () => {
         const dir = tmp({ 'n.cpp': [

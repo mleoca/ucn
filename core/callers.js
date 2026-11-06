@@ -25362,8 +25362,8 @@ function _implicitConversionMayApply(index, kind, paramType, language) {
         .filter(([name]) => name && !intrinsic.test(name) && index.symbols.has(name));
     if (!names.length) return false;
     const owners = live => {
-        const memo = live._opMemo?.('implicitConversionOwners', () => new Map());
-        if (memo?.has(language)) return memo.get(language);
+        const memo = live._implicitConversionOwners ||= new Map();
+        if (memo.has(language)) return memo.get(language);
         const result = { source: new Set(), target: new Set() };
         for (const [name, definitions] of live.symbols) {
             if (!name.startsWith('operator ')) continue;
@@ -25380,7 +25380,7 @@ function _implicitConversionMayApply(index, kind, paramType, language) {
         for (const name of result.source) {
             for (const child of live.extendedByGraph.get(name) || []) result.source.add(head(child.name));
         }
-        memo?.set(language, result);
+        memo.set(language, result);
         return result;
     };
     return names.some(([name, direction]) => lazyProvenanceOverloadModule().projectHas(index,

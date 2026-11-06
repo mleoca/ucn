@@ -170,6 +170,7 @@ class ProjectIndex {
         this._rustMacroState = null;     // Rust macro_rules! expansion state (core/rust-macro-expansion.js)
         this._cppScope = null;           // C++ qualified-name memo (core/cpp-scope.js)
         this._contractIndex = null;      // contract-membership index memo (core/contract-membership.js)
+        this._implicitConversionOwners = null;
         this._typeDenotation = null;     // type-name denotation memo (core/type-denotation.js), reset with _classIdentity
         this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
         this._rustScopeMemo = null; // fix #368: Rust glob/bound resolution memo, index-lifetime
@@ -581,6 +582,7 @@ class ProjectIndex {
         this._rustMacroState = null; // Rust macro_rules! expansion state (core/rust-macro-expansion.js)
         this._cppScope = null; // C++ qualified-name memo (core/cpp-scope.js)
         this._contractIndex = null; // contract-membership memo (core/contract-membership.js)
+        this._implicitConversionOwners = null;
         this._typeDenotation = null; // type-name denotation memo (core/type-denotation.js)
         this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
         this._rustScopeMemo = null; // fix #368: Rust glob/bound resolution memo, index-lifetime
@@ -1027,6 +1029,7 @@ class ProjectIndex {
         // These query caches depend on project symbols and include closure.
         // A changed file can alter either even before a full rebuild reaches
         // its graph phase, so no prior call-identity verdict may survive.
+        this._implicitConversionOwners = null;
         this._cppVisibleFilesCache?.clear();
         this._textualIncludeClosureCache?.clear();
         this._translationUnitLanguageCache?.clear();
@@ -1126,6 +1129,7 @@ class ProjectIndex {
         const existing = this.files.get(filePath);
         if (!existing) return;
 
+        this._implicitConversionOwners = null;
         this._evictParsedTree(filePath);
 
         for (const symbol of existing.symbols) {
@@ -1174,6 +1178,7 @@ class ProjectIndex {
         this._rustMacroState = null;
         this._cppScope = null;
         this._contractIndex = null;
+        this._implicitConversionOwners = null;
         this._typeDenotation = null; // type-name denotation memo (core/type-denotation.js)
         this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
         this._rustScopeMemo = null;
@@ -1236,6 +1241,7 @@ class ProjectIndex {
         this._rustMacroState = null;
         this._cppScope = null;
         this._contractIndex = null;
+        this._implicitConversionOwners = null;
         this._typeDenotation = null; // type-name denotation memo (core/type-denotation.js)
         this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
         this._rustScopeMemo = null; // fix #368: Rust glob/bound resolution memo, index-lifetime
