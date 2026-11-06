@@ -153,7 +153,10 @@ function constructionAliases(index) {
         }
         return aliases;
     };
-    return !index.isProvenanceFactIndex && index._opMemo?.('constructionAliases', build) || build();
+    // Only indexed declarations and import bindings contribute; rebuild and
+    // incremental updates invalidate this inventory. Witnesses read their facts.
+    if (index.isProvenanceFactIndex) return build();
+    return index._constructionAliases || (index._constructionAliases = build());
 }
 
 // The type names a spelling can reach through the alias dictionary. A

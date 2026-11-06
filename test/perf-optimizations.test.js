@@ -3867,6 +3867,45 @@ describe('fix #422: macro expansion and call derivation in fresh workers', () =>
     });
 });
 
+describe('constructor alias inventory lifetime', () => {
+    it('reuses the inventory across operations and refreshes changed files and cache loads', () => {
+        const { constructionTypeNames } = require('../core/constructor-calls');
+        const source = 'struct Root {};\nusing Alias = Root;\n';
+        const dir = tmp({ 'aliases.cpp': source });
+        try {
+            const index = idx(dir), file = path.join(dir, 'aliases.cpp');
+            const query = name => {
+                index._beginOp();
+                try { return constructionTypeNames(index, name); }
+                finally { index._endOp(); }
+            };
+            assert.deepStrictEqual(query('Alias'), ['Alias', 'Root']);
+            const inventory = index._constructionAliases;
+            assert.ok(inventory instanceof Map);
+            assert.deepStrictEqual(query('Alias'), ['Alias', 'Root']);
+            assert.strictEqual(index._constructionAliases, inventory);
+            const cache = path.join(dir, 'index.json');
+            index.saveCache(cache);
+
+            fs.writeFileSync(file, 'struct Root {};\nusing Fresh = Root;\n');
+            index.indexFile(file);
+            assert.deepStrictEqual(query('Alias'), ['Alias']);
+            assert.deepStrictEqual(query('Fresh'), ['Fresh', 'Root']);
+            assert.notStrictEqual(index._constructionAliases, inventory);
+
+            fs.writeFileSync(file, source);
+            assert.strictEqual(index.loadCache(cache), true);
+            assert.deepStrictEqual(query('Alias'), ['Alias', 'Root']);
+            assert.deepStrictEqual(query('Fresh'), ['Fresh']);
+            index.removeFileSymbols(file);
+            index.files.delete(file);
+            assert.deepStrictEqual(query('Alias'), ['Alias']);
+            index.build(null, { quiet: true, workers: 0 });
+            assert.deepStrictEqual(query('Alias'), ['Alias', 'Root']);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #435: query-board costs without answer changes', () => {
     it('constructor alias closures keep order, depth, isolated results and fresh operation inputs', () => {
         const source = 'struct Root {};\n' + Array.from({ length: 15 }, (_, n) =>

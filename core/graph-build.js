@@ -605,6 +605,7 @@ function _applyGoImportNames(index, filePath, fileEntry, moduleResolved, dirToGo
  */
 function buildInheritanceGraph(index) {
     index._implicitConversionOwners = null;
+    index._constructionAliases = null;
     index.extendsGraph.clear();
     index.extendedByGraph.clear();
 
