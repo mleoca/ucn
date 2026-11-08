@@ -14,7 +14,7 @@ const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
 const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, escapeRegExp } = require('./shared');
 const { projectComputedDispatch, projectReflectionSites } = require('./ast-analysis');
-const { reflectionPatternReferences } = require('./reflection');
+const { reflectionPatternReferences, reflectionLiteralNames } = require('./reflection');
 const { protocolMemberOf, protocolTypeOf, typedLiteralContract, rustProjectTraits } = require('./contract-membership');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
@@ -770,6 +770,8 @@ function deadcode(index, options = {}) {
         }
     }
     const literalReflectionNames = new Set();
+    const dynamicReflectionFiles = new Set();
+    const reflectionTables = new Map();
     const reflectionInfo = {
         count: 0,
         literalCount: 0,
@@ -781,6 +783,7 @@ function deadcode(index, options = {}) {
         patterns: [],
         withheld: 0,
         withheldByPattern: [],
+        withheldByTable: [],
     };
     // Reflection is liveness evidence wherever it sits (a test or script
     // outside --in still reaches the member); the disclosure counts cover the
@@ -790,6 +793,7 @@ function deadcode(index, options = {}) {
         const fe = index.files.get(reflectionFile);
         if (!fe || sites.length === 0) continue;
         for (const site of sites) {
+            if (site.dynamic) dynamicReflectionFiles.add(reflectionFile);
             if (site.name) literalReflectionNames.add(site.name);
             if (site.patterns && site.patterns.length > 0 && !site.name) {
                 // Exact alternatives of a multi-spelling site are literals.
@@ -1598,6 +1602,25 @@ function deadcode(index, options = {}) {
                     continue;
                 }
 
+                // A table may feed a dynamic reflection site through a loop
+                // or helper. Withhold exact same-file literal spellings,
+                // conservatively: this is possible dispatch, not proven flow.
+                if (dynamicReflectionFiles.has(symbol.file)) {
+                    if (!reflectionTables.has(symbol.file)) {
+                        const source = index._readFile(symbol.file);
+                        const tree = index._getParsedTree(symbol.file, source,
+                            index.files.get(symbol.file).language);
+                        reflectionTables.set(symbol.file, reflectionLiteralNames(tree));
+                    }
+                    const line = reflectionTables.get(symbol.file).get(symbol.name);
+                    if (line) {
+                        reflectionInfo.withheldByTable.push({ name: symbol.name,
+                            file: symbol.relativePath, line, startLine: symbol.startLine,
+                            reason: 'literal-name-near-dynamic-reflection' });
+                        continue;
+                    }
+                }
+
                 results.push({
                     name: symbol.name,
                     type: symbol.type,
@@ -1635,6 +1658,8 @@ function deadcode(index, options = {}) {
     results.excludedConstructors = excludedConstructors;
     results.excludedDynamicDispatch = excludedDynamicDispatch;
     results.computedDispatch = computedDispatchInfo;
+    reflectionInfo.withheldByTable.sort((a, b) => codeUnitCompare(a.file, b.file) ||
+        a.startLine - b.startLine || codeUnitCompare(a.name, b.name));
     reflectionInfo.withheldByPattern = [...reflectionWithheldByPattern]
         .map(([key, count]) => {
             const [pattern, namespaceOf] = key.split('\u0000');

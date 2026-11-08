@@ -220,6 +220,8 @@ records carry a tab-separated reason. An empty `--lines` listing exits 1, an
 error exits 2, and a successful listing exits 0. `--lines` supports `find`, `show`,
 `usages`, `search`, and `impact`; `show --lines` lists callers by default.
 Use `--json` when the script needs structured fields or a tree result.
+CLI JSON is uncapped by `--max-chars`, even when explicitly supplied;
+`meta.maxChars` reports `"not-applied"`. Use command limits to narrow the result.
 
 Listings are deterministic for a given source tree: a fresh build, a cache
 load, and an incremental rebuild return the same records in the same order.

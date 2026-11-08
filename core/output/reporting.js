@@ -315,6 +315,12 @@ function formatDeadcode(results, options = {}) {
     if (results.reflection?.dynamicCount > 0) {
         lines.push(`\nWARNING: ${results.reflection.dynamicCount} dynamic reflection use(s) have no static member spelling. Dead-code results remain review candidates because runtime-selected members cannot be attributed.`);
     }
+    if (results.reflection?.withheldByTable?.length > 0) {
+        lines.push('\nConservatively withheld: exact string literals in a file with dynamic reflection (flow to the reflection call is unproven):');
+        for (const site of results.reflection.withheldByTable) {
+            lines.push(`  ${site.name}: named in possible reflection table ${site.file}:${site.line}`);
+        }
+    }
     if (results.macroPaste) {
         const m = results.macroPaste;
         if (m.withheld > 0) {

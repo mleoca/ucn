@@ -1,4 +1,4 @@
-// Client requests using fetch and axios
+const axios = require('axios'); // Client requests using fetch and axios
 async function loadUsers() {
     return await fetch('/users');
 }

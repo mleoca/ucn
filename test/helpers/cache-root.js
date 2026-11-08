@@ -37,7 +37,10 @@ if (!process.env.UCN_TEST_CACHE_ROOT || process.env.UCN_CACHE_DIR !== process.en
     process.env.UCN_CACHE_DIR = root;
     process.env.UCN_TEST_CACHE_ROOT = root;
     process.once('exit', () => {
-        fs.rmSync(root, { recursive: true, force: true });
+        // A terminating CLI/MCP child can finish a cache write during the
+        // first removal pass. Retry transient directory races, but still
+        // surface a persistent cleanup failure.
+        fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     });
 }
 

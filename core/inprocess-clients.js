@@ -195,9 +195,23 @@ class PythonClientResolver {
 
     /** The fixture named `name` a test in `file` requests: same module first,
      *  then conftest.py files from the test's directory up to the root. */
-    fixtureDef(file, name) {
-        const key = `${file}\0${name}`;
+    fixtureDef(file, name, requester = null) {
+        let owner = requester?.parent;
+        while (owner && owner.type !== 'class_definition') owner = owner.parent;
+        const key = `${file}\0${name}\0${owner?.startIndex ?? ''}`;
         if (this.fixtureMemo.has(key)) return this.fixtureMemo.get(key);
+        this.fixtureMemo.set(key, null);
+        if (owner) {
+            const matches = namedChildren(field(owner, 'body')).map(stmt =>
+                stmt.type === 'decorated_definition' ? field(stmt, 'definition') : stmt)
+                .filter(fn => fn?.type === 'function_definition' && field(fn, 'name')?.text === name);
+            if (matches.length) {
+                const found = matches.length === 1 && this.isFixture(file, matches[0])
+                    ? { file, fnNode: matches[0] } : null;
+                this.fixtureMemo.set(key, found);
+                return found;
+            }
+        }
         let found = this.moduleFixture(file, name);
         if (!found) {
             for (let dir = path.dirname(file); dir.startsWith(this.index.root); dir = path.dirname(dir)) {
@@ -213,7 +227,8 @@ class PythonClientResolver {
         return found;
     }
 
-    moduleFixture(file, name) {
+    moduleFixture(file, name, depth = 0) {
+        if (depth > MAX_HOPS) return null;
         const root = this.sess.root(file);
         if (!root) return null;
         const hits = [];
@@ -222,7 +237,12 @@ class PythonClientResolver {
             if (fn?.type === 'function_definition' && field(fn, 'name')?.text === name &&
                 this.isFixture(file, fn)) hits.push(fn);
         }
-        return hits.length === 1 ? { file, fnNode: hits[0] } : null;
+        if (hits.length) return hits.length === 1 ? { file, fnNode: hits[0] } : null;
+        const entry = this.sess.entry(file);
+        const bindings = (entry?.importBindings || []).filter(b => (b.alias || b.name) === name && !b.deferred);
+        if (bindings.length !== 1 || bindings[0].kind !== 'from') return null;
+        const relative = entry.moduleResolved?.[bindings[0].module];
+        return relative ? this.moduleFixture(path.join(this.index.root, relative), bindings[0].name, depth + 1) : null;
     }
 
     /** The expression a fixture provides: its single yielded/returned value,
@@ -253,11 +273,14 @@ class PythonClientResolver {
         if (!expr || expr.type !== 'identifier' || hops > MAX_HOPS) return { file, expr };
         if (fnNode) {
             const values = boundValues(field(fnNode, 'body'), expr.text, this.bindingMemo);
-            if (values === null) return null;
+            if (values === null) {
+                const decl = routeGraph.findDecl(this.sess, file, expr.text, expr);
+                return decl?.kind === 'function' ? { file, expr: decl.valueNode } : null;
+            }
             if (values.length === 1) return this.followBinding(file, fnNode, unwrap(values[0].node), hops + 1);
             if (values.length > 1) return null;
             if (isParameterOf(fnNode, expr.text)) {
-                const fixture = this.fixtureDef(file, expr.text);
+                const fixture = this.fixtureDef(file, expr.text, fnNode);
                 return fixture ? this.fixtureValue(fixture.file, fixture.fnNode, hops + 1) : null;
             }
         }
@@ -319,7 +342,7 @@ class PythonClientResolver {
         if (expr.type !== 'identifier') return null;
         const fnNode = enclosingFunctionNode(expr);
         if (fnNode && isParameterOf(fnNode, expr.text)) {
-            const fixture = this.fixtureDef(file, expr.text);
+            const fixture = this.fixtureDef(file, expr.text, fnNode);
             if (!fixture) return null;
             const value = this.fixtureValue(fixture.file, fixture.fnNode, hops + 1);
             if (!value?.expr) return null;
@@ -345,13 +368,8 @@ class PythonClientResolver {
         return null;
     }
 
-    /**
-     * { appKey } for a request `receiver.verb(path)` at `line` of `file` made
-     * through an in-process client, { inProcess: true } when the client is
-     * built from an app that did not resolve, else null (not a client built
-     * from an app).
-     */
-    resolve(file, line, receiver, name) {
+    /** Values bound to a request receiver, without assuming they are clients. */
+    clientValues(file, line, receiver, name) {
         const root = this.sess.root(file);
         if (!root) return null;
         const sites = requestCallNodes(root, line, receiver, name);
@@ -365,7 +383,7 @@ class PythonClientResolver {
             if (values.length > 0) {
                 clients = this.bindingInEffect(values, receiverNode).map(node => ({ file, expr: unwrap(node) }));
             } else if (isParameterOf(fnNode, receiver)) {
-                const fixture = this.fixtureDef(file, receiver);
+                const fixture = this.fixtureDef(file, receiver, fnNode);
                 const value = fixture ? this.fixtureValue(fixture.file, fixture.fnNode, 1) : null;
                 clients = value ? [value] : [];
             }
@@ -376,6 +394,14 @@ class PythonClientResolver {
                 clients = this.bindingInEffect(values, receiverNode).map(node => ({ file, expr: unwrap(node) }));
             }
         }
+        const values = clients?.map(c => this.followBinding(c.file,
+            enclosingFunctionNode(c.expr), c.expr, 0));
+        return values?.every(Boolean) ? values : null;
+    }
+
+    /** The served app key, an unresolved in-process app, or null. */
+    resolve(file, line, receiver, name) {
+        const clients = this.clientValues(file, line, receiver, name);
         if (!clients || clients.length === 0 || clients.some(c => c.expr?.type !== 'call')) return null;
         const keys = clients.map(c => this.clientAppOnce(c.file, c.expr));
         if (keys.every(key => key && key === keys[0])) {

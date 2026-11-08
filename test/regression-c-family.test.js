@@ -2490,6 +2490,7 @@ describe('C# language support', () => {
             ].join('\n'),
             'Program.cs': [
                 'app.MapGet("/health", Handlers.Health);',
+                'var client = new System.Net.Http.HttpClient();',
                 'await client.GetAsync("/health");',
             ].join('\n'),
             'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>',

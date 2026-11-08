@@ -1113,6 +1113,20 @@ function resetReflectionIndex(index) {
     index._reflectionPatternIndex = null;
 }
 
+/** Exact AST string literals, for conservative same-file dynamic dispatch.
+ * This does not prove that a literal flows to a reflection call. */
+function reflectionLiteralNames(tree) {
+    const names = new Map();
+    if (!tree) return names;
+    for (const node of tree.rootNode.descendantsOfType([...STRING_NODES])) {
+        const value = classifyNameExpression(node);
+        if (value.name && !value.dynamic && !names.has(value.name)) {
+            names.set(value.name, node.startPosition.row + 1);
+        }
+    }
+    return names;
+}
+
 module.exports = {
     WILD,
     stringAlternatives,
@@ -1126,5 +1140,6 @@ module.exports = {
     reflectionPatternIndex,
     patternIsAttributable,
     resetReflectionIndex,
+    reflectionLiteralNames,
     resolveKeyParameter,
 };

@@ -2142,7 +2142,9 @@ describe('UCN v5 prerelease audit regressions', () => {
             const endpoints = execute(idx(pyDir), 'endpoints', { clientOnly: true });
             assert.equal(endpoints.ok, true);
             assert.equal(endpoints.result.requests.some(r => r.path === 'user_id'), false);
-            assert.equal(endpoints.result.requests.some(r => r.path === '/api/users'), true);
+            assert.equal(endpoints.result.requests.some(r => r.path === '/api/users'), false);
+            assert.equal(endpoints.result.uncertainRequests.some(r => r.path === '/api/users'), true,
+                'a parameter named session is only a possible HTTP receiver');
 
             const repo = execute(idx(goDir), 'repo', { sections: 'summary,health' });
             const text = publicOutput.formatPublicText('repo', repo.result,

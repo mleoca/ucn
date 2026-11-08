@@ -968,3 +968,31 @@ describe('fix #433: MCP source range by name, release sentence', () => {
         }
     });
 });
+
+describe('fix #490: endpoint receiver origins through MCP', () => {
+    it('exposes name-only calls as possible while arbitrary TestClient names remain confirmed', async () => {
+        const dir = tmp({ 'app.py': [
+            'from fastapi import FastAPI', 'from fastapi.testclient import TestClient',
+            'app = FastAPI()', '@app.get("/x")', 'def read(): return {}',
+            'def run():', '    client = {"/x": 1}', '    client.get("/x")',
+            '    c2 = TestClient(app)', '    c2.get("/x")',
+        ].join('\n') });
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const res = await client.callTool('ucn', { command: 'endpoints', project_dir: dir });
+            assert.ok(!res.result?.isError);
+            const text = res.result?.content?.map(c => c.text).join('') || '';
+            assert.match(text, /Client Requests: 1/);
+            assert.match(text, /Possible client requests \(1\)/);
+            assert.match(text, /client\.get/);
+            const bridged = await client.callTool('ucn', { command: 'endpoints', project_dir: dir, bridge: true });
+            assert.match(bridged.result?.content?.map(c => c.text).join('') || '', /Matched: 1/);
+        } finally {
+            client.stop();
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});

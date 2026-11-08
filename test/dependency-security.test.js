@@ -53,6 +53,18 @@ function lockedPackageName(key) {
 }
 
 describe('published dependency security policy', () => {
+    it('repeated lookbehind matching avoids CVE-2026-116795', () => {
+        const { execFileSync } = require('child_process');
+        const count = execFileSync(process.execPath, ['-e', `
+            const { RE2JS } = require('re2js');
+            const matcher = RE2JS.compile('(?<=a)b', RE2JS.LOOKBEHINDS).matcher('ab'.repeat(8000));
+            let matches = 0;
+            while (matcher.find()) matches++;
+            process.stdout.write(String(matches));
+        `], { cwd: ROOT, encoding: 'utf8', timeout: 10000 });
+        assert.equal(count, '8000');
+    });
+
     it('pins every runtime dependency and has no optional hidden feature tree', () => {
         assert.deepEqual(manifest.optionalDependencies, undefined);
         for (const [name, version] of Object.entries(manifest.dependencies)) {

@@ -577,6 +577,7 @@ describe('Cross-language endpoints: polyglot bridging', () => {
                 '',
             ].join('\n'),
             'client.js': [
+                "const axios = require('axios');",
                 "async function checkHealth() {",
                 "    return await axios.get('/api/health');",
                 "}",

@@ -963,6 +963,7 @@ Common flags:
   --range=N-M (source <file> --range=N-M, or --file=PATH)
   --base=REF --staged --no-cache --clear-cache [--all] --max-files=N --workers=N
   --max-chars=N (text characters, not UTF-8 bytes; default 10K targeted / 3K broad, ceiling 100K)
+           JSON is uncapped; meta.maxChars is "not-applied", even with an explicit budget.
   --lines  find/usages/search/show/impact: grep -n shape, one path:line:text
            record per output line; usages combines occurrences on each source line
            (tags after a tab: # unverified: <reason>, # import,

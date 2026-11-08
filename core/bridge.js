@@ -2279,53 +2279,6 @@ function extractNextjsRoutes(index) {
  * Detect HTTP client requests across the project.
  * Cached on `index._endpointsCache.clientRequests`.
  */
-// Python HTTP client types whose instances are receivers of request calls.
-// A receiver typed to one of these (with-binding, constructor assignment) or
-// bound to a pytest fixture that constructs one is a client by evidence, not
-// by name (fix #349: 145 of 625 real `tc.get("/api/...")` sites on one repo
-// were invisible because the receiver was not literally named `client`).
-const PY_CLIENT_TYPES = new Set([
-    'TestClient', 'Client', 'AsyncClient', 'Session', 'FlaskClient',
-    'ClientSession', 'AsyncSession', 'HTTPConnection', 'HTTPSConnection',
-]);
-const PY_CLIENT_FACTORIES = new Set(['test_client', 'Session', 'Client', 'AsyncClient']);
-const PY_REQUEST_METHODS = /^(get|post|put|delete|patch|options|head|request)$/;
-
-function _pythonClientFixtures(index) {
-    if (index._endpointsCache?.pyClientFixtures) return index._endpointsCache.pyClientFixtures;
-    const fixtures = new Set();
-    for (const [filePath, fileEntry] of index.files) {
-        if (fileEntry.language !== 'python') continue;
-        const fixtureDefs = (fileEntry.symbols || []).filter(s =>
-            (s.decorators || []).some(d => /(^|\.)fixture$/.test(String(d))));
-        if (fixtureDefs.length === 0) continue;
-        const calls = getCachedCalls(index, filePath) || [];
-        for (const def of fixtureDefs) {
-            const constructsClient = calls.some(c =>
-                c.enclosingFunction?.name === def.name &&
-                c.enclosingFunction?.startLine === def.startLine &&
-                (PY_CLIENT_TYPES.has(c.name) || (c.isMethod && PY_CLIENT_FACTORIES.has(c.name))));
-            if (constructsClient) fixtures.add(def.name);
-        }
-    }
-    if (!index._endpointsCache) index._endpointsCache = {};
-    index._endpointsCache.pyClientFixtures = fixtures;
-    return fixtures;
-}
-
-function _pythonClientReceiver(index, fileEntry, call, fixtures) {
-    if (!call.isMethod || !call.receiver || !PY_REQUEST_METHODS.test(call.name)) return null;
-    if (call.receiverType && PY_CLIENT_TYPES.has(String(call.receiverType).split('.').pop())) {
-        return 'python-client';
-    }
-    if (fixtures.size === 0 || !fixtures.has(call.receiver)) return null;
-    const fn = call.enclosingFunction;
-    if (!fn) return null;
-    const sym = (fileEntry.symbols || []).find(s => s.name === fn.name && s.startLine === fn.startLine);
-    const params = String(sym?.params || '').split(',').map(p => p.trim().split(/[:=]/)[0].trim());
-    return params.includes(call.receiver) ? 'pytest-client-fixture' : null;
-}
-
 // `fastify().route({...})` - a route declared on a freshly built server.
 const JS_SERVER_FACTORY_CALL = /^(fastify|Fastify|express|Hono|Koa)$/;
 
@@ -2347,7 +2300,7 @@ function extractClientRequests(index) {
     }
     const requests = [];
     const uncertain = [];
-    const pyFixtures = _pythonClientFixtures(index);
+    const clientProof = new (require('./client-receivers').ClientReceiverProof)(index, endpointsSession(index));
     let helperProof = null;
 
     for (const [filePath, fileEntry] of index.files) {
@@ -2431,7 +2384,9 @@ function extractClientRequests(index) {
                     continue;
                 }
                 if (!helperProof) helperProof = new RequestHelperProof(index, endpointsSession(index));
-                const proof = helperProof.classify(filePath, call);
+                const proof = call.isMethod
+                    ? { proven: !!clientProof.classify(filePath, call), reason: 'receiver-unproven' }
+                    : helperProof.classify(filePath, call);
                 const verb = call.isMethod && /^(get|post|put|delete|patch|options|head)$/i.test(call.name)
                     ? call.name.toUpperCase() : null;
                 const method = cfg.method || verb || 'ALL';
@@ -2462,7 +2417,7 @@ function extractClientRequests(index) {
             // fix #383: Go request constructors read their method and URL
             // from their own argument positions.
             if (call.requestTarget && lang === 'go' && call.receiver && !call.isPathCall &&
-                matchClientRequest({ ...call, firstStringArg: call.requestTarget.url }, lang, calls)) {
+                matchClientRequest({ ...call, firstStringArg: call.requestTarget.url }, lang, clientProof.classify(filePath, call))) {
                 const target = call.requestTarget;
                 if (isPathShaped(target.url)) {
                     // A request with a path but no scheme and host cannot be
@@ -2496,26 +2451,22 @@ function extractClientRequests(index) {
                 continue;
             }
             if (!call.firstStringArg) continue;
-            let r = matchClientRequest(call, lang, calls);
-            if (!r && lang === 'python') {
-                const framework = _pythonClientReceiver(index, fileEntry, call, pyFixtures);
-                if (framework) {
-                    r = { method: call.name.toUpperCase() === 'REQUEST' ? 'ALL' : call.name.toUpperCase(),
-                        framework, methodInferred: call.name === 'request' };
-                }
-            }
+            const conf = CLIENT_PATTERNS[lang];
+            const candidate = conf && (conf.bareCalls.has(call.name) ||
+                conf.receivers.some(p => p.methodPattern.test(call.name)));
+            const r = matchClientRequest(call, lang, candidate ? clientProof.classify(filePath, call) : null);
             if (!r) {
                 // Visible uncertainty: request-shaped call on an unrecognized
                 // receiver with a path-shaped literal. Listed, never counted.
-                const conf = CLIENT_PATTERNS[lang];
                 const pathShaped = call.firstStringArg.startsWith('/') || call.firstStringArg.includes('://');
-                if (conf && call.isMethod && call.receiver && pathShaped &&
+                if (conf && call.receiver && pathShaped &&
                     conf.receivers.some(p => p.methodPattern.test(call.name))) {
                     uncertain.push({
                         receiver: call.receiver, method: call.name, path: call.firstStringArg,
                         file: fileEntry.relativePath || filePath, absoluteFile: filePath, line: call.line,
                         callerName: call.enclosingFunction?.name || '<top-level>',
-                        reason: 'receiver-unrecognized',
+                        reason: conf.receivers.some(p => p.receiverPattern.test(call.receiver))
+                            ? 'receiver-name-only' : 'receiver-unrecognized',
                     });
                 }
                 continue;
@@ -2640,9 +2591,9 @@ function supertestProducerOf(call, calls, producers, locals) {
  * Match a call against client request patterns.
  * Returns { method, framework, methodInferred } or null.
  */
-function matchClientRequest(call, lang, allCallsInFile) {
+function matchClientRequest(call, lang, origin) {
     const conf = CLIENT_PATTERNS[lang];
-    if (!conf) return null;
+    if (!conf || !origin) return null;
 
     // 1) Bare-call patterns: fetch('/path') or fetch('/path', { method: 'POST' })
     if (!call.isMethod && conf.bareCalls.has(call.name)) {
@@ -2662,7 +2613,6 @@ function matchClientRequest(call, lang, allCallsInFile) {
     const isMethodLike = call.isMethod || (lang === 'go' && !!call.receiver && !call.isPathCall);
     if (isMethodLike && call.receiver) {
         for (const p of conf.receivers) {
-            if (!p.receiverPattern.test(call.receiver)) continue;
             if (!p.methodPattern.test(call.name)) continue;
 
             // Determine method
@@ -2697,7 +2647,7 @@ function matchClientRequest(call, lang, allCallsInFile) {
             } else {
                 method = methodName.toUpperCase();
             }
-            return { method, framework: p.framework, methodInferred: inferred };
+            return { method, framework: origin, methodInferred: inferred };
         }
     }
 

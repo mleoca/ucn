@@ -43,6 +43,8 @@ const JS_HTTP_PACKAGES = [
 ];
 const JS_HTTP_GLOBAL_CALLS = new Set(['fetch']);
 const JS_HTTP_GLOBAL_CTORS = new Set(['XMLHttpRequest', 'EventSource']);
+const JS_HTTP_CLIENT_TYPES = new Set(['AxiosInstance', 'AxiosStatic', 'KyInstance',
+    'Got', 'GotInstance', 'HttpClient', 'Dispatcher', 'Agent']);
 const PY_HTTP_MODULES = [
     'requests', 'httpx', 'aiohttp', 'urllib3', 'urllib.request', 'http.client', 'niquests', 'treq',
 ];
@@ -173,7 +175,7 @@ class RequestHelperProof {
     }
 
     /** Proof for the function expression being called. */
-    jsCallee(file, fn, depth, factory = false) {
+    jsCallee(file, fn, depth) {
         if (!fn || depth > MAX_RESOLVE) return unknown('depth');
         if (fn.type === 'identifier') {
             const decl = findDecl(this.sess, file, fn.text, fn);
@@ -201,9 +203,7 @@ class RequestHelperProof {
             // the method reads as one (`client.post`, `instance.request`);
             // a server built on an HTTP stack (`app.route(...)`) is not a
             // client.
-            // A factory call on a client value (`axios.create()`) yields a
-            // client value too.
-            if (!factory && (!prop || !CLIENT_METHOD.test(prop))) return unknown('method-not-request');
+            if (!prop || !CLIENT_METHOD.test(prop)) return unknown('method-not-request');
             return this.jsValue(file, obj, depth + 1);
         }
         if (fn.type === 'call_expression') return this.jsValue(file, fn, depth + 1);
@@ -296,7 +296,7 @@ class RequestHelperProof {
                     const spec = this.requireSpecOf({ valueNode: e });
                     return isHttpPackage(spec, JS_HTTP_PACKAGES) ? PROVEN : unknown('receiver-unproven');
                 }
-                return this.jsCallee(file, callee, depth + 1, true);
+                return this.jsFactory(file, callee, depth + 1);
             }
             default:
                 return unknown('receiver-unproven');
@@ -314,6 +314,59 @@ class RequestHelperProof {
         return last;
     }
 
+    /** A request result or server is not a client just because the function
+     *  that produced it uses an HTTP package. Follow factory return values. */
+    jsFactory(file, callee, depth) {
+        if (!callee || depth > MAX_RESOLVE) return unknown('receiver-unproven');
+        if (callee.type === 'member_expression') {
+            const name = field(callee, 'property')?.text;
+            if (name === 'create' || name === 'extend') {
+                return this.jsValue(file, unwrap(field(callee, 'object')), depth + 1);
+            }
+            return unknown('factory-unproven');
+        }
+        if (callee.type !== 'identifier') return unknown('factory-unproven');
+        const decl = findDecl(this.sess, file, callee.text, callee);
+        let target = decl ? { file, value: decl.count === 1 ? decl.valueNode : null } : null;
+        if (!decl) {
+            const binding = this.jsBinding(file, callee.text);
+            if (binding) {
+                if (binding.binding.module?.startsWith('@hey-api/client-') ||
+                    binding.binding.module === 'openapi-fetch') return PROVEN;
+                const rec = this.jsImportRecord(file, binding.binding, binding.original);
+                if (rec) target = { file: rec.file, value: rec.decl?.valueNode || rec.valueNode };
+            }
+        }
+        const fn = unwrap(target?.value);
+        if (!fn || !JS_FUNCTION_TYPES.has(fn.type)) return unknown('factory-unproven');
+        const body = field(fn, 'body');
+        if (!body) return unknown('factory-unproven');
+        const values = [];
+        const visit = node => {
+            if (node.type === 'return_statement') {
+                values.push(node.namedChild(0));
+                return;
+            }
+            for (const child of namedChildren(node)) {
+                if (!JS_FUNCTION_TYPES.has(child.type) && child.type !== 'class_declaration') visit(child);
+            }
+        };
+        if (body.type === 'statement_block') visit(body);
+        else values.push(body);
+        if (!values.length) return unknown('factory-unproven');
+        const proven = values.every(value => {
+            const v = unwrap(value);
+            if (v?.type !== 'object') return this.jsValue(target.file, v, depth + 1).proven;
+            const methods = namedChildren(v).filter(member =>
+                CLIENT_METHOD.test((field(member, 'key') || field(member, 'name'))?.text || ''));
+            return methods.length > 0 && methods.every(member => {
+                const impl = member.type === 'method_definition' ? member : unwrap(field(member, 'value'));
+                return impl && JS_FUNCTION_TYPES.has(impl.type) && this.jsFunction(target.file, impl, 0).proven;
+            });
+        });
+        return proven ? PROVEN : unknown('factory-unproven');
+    }
+
     /** A parameter proves a client only through its declared type or default. */
     jsParam(file, decl, depth) {
         const holder = decl.nameNode.parent;
@@ -321,7 +374,8 @@ class RequestHelperProof {
         if (typeNode) {
             const m = typeNode.text.replace(/^:\s*/, '').match(/^([A-Za-z_$][\w$]*)/);
             const b = m ? this.jsBinding(file, m[1]) : null;
-            if (b && isHttpPackage(b.binding.module, JS_HTTP_PACKAGES)) return PROVEN;
+            if (b && isHttpPackage(b.binding.module, JS_HTTP_PACKAGES) &&
+                JS_HTTP_CLIENT_TYPES.has(b.original)) return PROVEN;
         }
         const dflt = holder ? (field(holder, 'value') || field(holder, 'right')) : null;
         if (dflt) return this.jsValue(file, dflt, depth + 1);
@@ -374,6 +428,8 @@ class RequestHelperProof {
             return !!b && isHttpPackage(b.binding.module, JS_HTTP_PACKAGES);
         }
         if (callee.type === 'member_expression') {
+            if (CLIENT_METHOD.test(field(callee, 'property')?.text || '') &&
+                this.jsValue(file, unwrap(field(callee, 'object')), 0).proven) return true;
             let root = unwrap(field(callee, 'object'));
             while (root && root.type === 'member_expression') root = unwrap(field(root, 'object'));
             if (!root || root.type !== 'identifier') return false;
@@ -558,4 +614,4 @@ function locateCall(root, start, end, type) {
     return node;
 }
 
-module.exports = { RequestHelperProof, JS_HTTP_PACKAGES, PY_HTTP_MODULES };
+module.exports = { RequestHelperProof, JS_HTTP_PACKAGES, PY_HTTP_MODULES, pyImportedFunction };

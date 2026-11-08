@@ -18085,7 +18085,7 @@ describe('fix #428: a reflective name passed as a literal one call away keeps it
             for (const name of ['idle', 'Idle']) assert.ok(dead.includes(name), `${name}: ${dead.join(',')}`);
         } finally { rm(dir); }
     });
-    it('C#: only calls that can bind the wrapper feed it (owner qualifier, extension receiver, arity)', () => {
+    it('C#: wrapper binding stays precise, with unrelated literals conservatively withheld', () => {
         const dir = tmp({
             'R.cs': [
                 'using System;',
@@ -18107,20 +18107,21 @@ describe('fix #428: a reflective name passed as a literal one call away keeps it
             ].join('\n'),
         });
         try {
-            const dead = deadNames(dir);
-            assert.ok(!dead.includes('Go'), dead.join(','));
-            assert.ok(dead.includes('Idle') && dead.includes('Stop'), dead.join(','));
+            const result = execute(idx(dir), 'deadcode', { includeExported: true }).result;
+            assert.ok(!result.some(r => r.name === 'Go'));
+            assert.deepEqual(result.reflection.withheldByTable.map(r => r.name).sort(), ['Idle', 'Stop']);
         } finally { rm(dir); }
     });
-    it('a rebound or non-literal argument names nothing (the site stays a dynamic disclosure)', () => {
+    it('a rebound argument stays dynamic and a same-file literal conservatively withholds the member', () => {
         const dir = tmp({
             'common.js': 'exports.reg = {\n  a () { return 1 },\n  dispatch (type) { type = type || "a"; return exports.reg[type]() },\n  pick (key) { return exports.reg[key]() }\n}\n',
             'main.js': 'const { reg } = require(\'./common\')\nreg.dispatch("a")\nconst k = process.argv[2]\nreg.pick(k)\n',
         });
         try {
             const result = execute(idx(dir), 'deadcode', { includeExported: true });
-            assert.ok(result.result.map(item => item.name).includes('a'));
+            assert.ok(!result.result.map(item => item.name).includes('a'));
             assert.strictEqual(result.result.reflection.withheld, 0);
+            assert.deepEqual(result.result.reflection.withheldByTable.map(r => r.name), ['a']);
         } finally { rm(dir); }
     });
 });
@@ -18989,4 +18990,155 @@ describe('fix #472: constructed enclosing types cannot disprove a generic overlo
             } finally { rm(dir); }
         });
     }
+});
+
+describe('fix #490: endpoint origins, reflection tables and JSON budget disclosure', () => {
+    it('keeps dictionaries, maps, shadowed imports and unrelated constructors out of confirmed requests', () => {
+        const dir = tmp({
+            'server.py': 'from fastapi import FastAPI\napp=FastAPI()\n@app.get("/x")\ndef read(): return {}\n',
+            'client.py': [
+                'import requests',
+                'class Client:',
+                '    def get(self, path): return path',
+                'def use():',
+                '    s = {"/x": 1}',
+                '    session = {"/x": 2}',
+                '    client = {"/x": 3}',
+                '    cache = {"/x": 4}',
+                '    return s.get("/x"), session.get("/x"), client.get("/x"), cache.get("/x")',
+                'def shadow(requests):',
+                '    requests.get("/x")',
+                'def unrelated():',
+                '    client = Client()',
+                '    client.get("/x")',
+            ].join('\n'),
+            'client.ts': 'export function use() { const client = new Map(); const api = new Map(); const cache = new Map(); return [client.get("/x"), api.get("/x"), cache.get("/x")]; }',
+            'client.go': 'package p\ntype Cache struct{}\nfunc use(client Cache) { client.Get("/x") }',
+            'Client.java': 'class Client { void use(Cache restTemplate) { restTemplate.getForObject("/x"); } }',
+            'client.rs': 'struct Cache; fn use_cache(client: Cache) { client.get("/x"); }',
+            'Client.cs': 'class Example { void Use(Cache client) { client.GetAsync("/x"); } }',
+        });
+        try {
+            const result = execute(idx(dir), 'endpoints', { bridge: true }).result;
+            assert.equal(result.requests.length, 0);
+            assert.equal(result.bridges.length, 0);
+            assert.equal(result.uncertainRequests.length, 13);
+            assert.ok(result.uncertainRequests.some(r => r.receiver === 'cache'));
+        } finally { rm(dir); }
+    });
+
+    it('confirms arbitrary names from HTTP constructors, fixtures and returned clients', () => {
+        const dir = tmp({
+            'app.py': 'from fastapi import FastAPI\napp=FastAPI()\n@app.get("/x")\ndef read(): return {}\n',
+            'clients.py': [
+                'import pytest', 'import requests as transport', 'import httpx',
+                'from fastapi.testclient import TestClient as Tester', 'from app import app',
+                '@pytest.fixture', 'def original():', '    return Tester(app)',
+                '@pytest.fixture', 'def arbitrary(original):', '    return original',
+                'def make():', '    return Tester(app)',
+                'def test_clients(arbitrary):', '    arbitrary.get("/x")',
+                'def run():', '    c2 = Tester(app)', '    c2.get("/x")',
+                '    renamed = transport.Session()', '    renamed.get("/x")',
+                '    other = httpx.Client()', '    other.get("/x")',
+                '    returned = make()', '    returned.get("/x")',
+            ].join('\n'),
+            'clients.ts': [
+                'import axios from "axios";', 'import ky from "ky";', 'import got from "got";',
+                'const a = axios.create();', 'const b = ky.create({});', 'const c = got.extend({});',
+                'a.get("/x");', 'b.get("/x");', 'c.get("/x");',
+            ].join('\n'),
+        });
+        try {
+            const result = execute(idx(dir), 'endpoints', { bridge: true }).result;
+            assert.equal(result.requests.length, 8, JSON.stringify(result.uncertainRequests));
+            assert.deepEqual(result.uncertainRequests, []);
+            assert.ok(result.bridges.some(b => b.request.callerName === 'test_clients'));
+        } finally { rm(dir); }
+    });
+
+    it('does not type an HTTP response, server or unrelated factory return as a client', () => {
+        const dir = tmp({ 'client.ts': [
+            'import axios, { AxiosHeaders } from "axios";', 'import http from "node:http";',
+            'function makeCache() { axios.create(); return new Map(); }',
+            'const client = makeCache();', 'client.get("/map");',
+            'const response = axios.get("/real");', 'response.get("/response");',
+            'const server = http.createServer();', 'server.get("/server");',
+            'function read(client: AxiosHeaders) { client.get("/header"); }',
+        ].join('\n') });
+        try {
+            const result = execute(idx(dir), 'endpoints', { clientOnly: true }).result;
+            assert.deepEqual(result.requests.map(r => r.path), ['/real']);
+            assert.deepEqual(result.uncertainRequests.map(r => r.path).sort(), ['/header', '/map', '/response', '/server']);
+        } finally { rm(dir); }
+    });
+
+    it('withholds literal table names conservatively only in files with dynamic reflection', () => {
+        const source = dynamic => [
+            'class Scheduler:',
+            '    HOOKS = (("_run_table", "table"), ("_run_other", "other"))',
+            '    UNUSED_LABEL = "_unrelated_literal"',
+            '    def _run_table(self): pass',
+            '    def _run_other(self): pass',
+            '    def _literal(self): pass',
+            '    def _unrelated_literal(self): pass',
+            '    def _truly_dead(self): pass',
+            '    def tick(self):',
+            ...(dynamic ? ['        for name, label in self.HOOKS:', '            getattr(self, name)()'] : []),
+            '        getattr(self, "_literal")()',
+            'Scheduler().tick()',
+        ].join('\n');
+        const dir = tmp({ 'dispatch.py': source(true), 'no_dispatch.py': source(false) });
+        try {
+            const result = execute(idx(dir), 'deadcode', {}).result;
+            const names = file => result.filter(r => r.file === file).map(r => r.name).sort();
+            assert.deepEqual(names('dispatch.py'), ['_truly_dead']);
+            assert.deepEqual(names('no_dispatch.py'), ['_run_other', '_run_table', '_truly_dead', '_unrelated_literal']);
+            assert.equal(result.reflection.withheldByTable.length, 3);
+            const text = output.formatDeadcode(result);
+            assert.match(text, /_run_table: named in possible reflection table dispatch.py:2/);
+            assert.match(text, /flow to the reflection call is unproven/);
+            const json = JSON.parse(output.formatPublicJson('deadcode', result));
+            assert.equal(json.meta.reflection.withheldByTable.length, 3);
+        } finally { rm(dir); }
+    });
+
+    it('follows imported and class fixtures and fixture-returned factories without borrowing unrelated bindings', () => {
+        const dir = tmp({
+            'helpers.py': [
+                'import pytest', 'from fastapi.testclient import TestClient',
+                '@pytest.fixture', 'def remote():', '    return TestClient(app)',
+            ].join('\n'),
+            'test_clients.py': [
+                'import pytest', 'from helpers import remote',
+                '@pytest.fixture', 'def maker():',
+                '    from fastapi.testclient import TestClient',
+                '    def build():', '        return TestClient(app)', '    return build',
+                'class TestOne:',
+                '    @pytest.fixture', '    def local(self):',
+                '        from fastapi.testclient import TestClient', '        return TestClient(app)',
+                '    def test_clients(self, local, remote, maker):',
+                '        local.get("/local")', '        remote.get("/remote")',
+                '        renamed = maker()', '        renamed.get("/factory")',
+                'class TestTwo:', '    @pytest.fixture', '    def local(self):', '        return {}',
+                '    def test_fake(self, local):', '        local.get("/not-http")',
+                'def unrelated():', '    unknown = TestClient(app)', '    unknown.get("/wrong-scope")',
+            ].join('\n'),
+        });
+        try {
+            const result = execute(idx(dir), 'endpoints', { clientOnly: true }).result;
+            assert.deepEqual(result.requests.map(r => r.path).sort(), ['/factory', '/local', '/remote']);
+            assert.deepEqual(result.uncertainRequests.map(r => r.path).sort(), ['/not-http', '/wrong-scope']);
+        } finally { rm(dir); }
+    });
+
+    it('declares CLI JSON uncapped for project, file and glob modes', () => {
+        const dir = tmp({ 'a.js': Array.from({ length: 40 }, (_, n) => `function item${n}() { return "λ"; }`).join('\n') });
+        try {
+            for (const target of [dir, path.join(dir, 'a.js'), path.join(dir, '*.js')]) {
+                const raw = runCli(target, 'find', ['item'], ['--json', '--max-chars=1000']);
+                assert.ok(raw.length > 1000);
+                assert.equal(JSON.parse(raw).meta.maxChars, 'not-applied');
+            }
+        } finally { rm(dir); }
+    });
 });

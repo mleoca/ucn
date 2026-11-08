@@ -476,6 +476,7 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
     const envelope = {
         meta: {
             command: surfaceCommand,
+            ...(execution.surface === 'cli' && { maxChars: 'not-applied' }),
             ...(surfaceCommand !== command && { canonicalCommand: command }),
             // A result that self-reports it could not run (check with a bad
             // base ref / outside git) must be machine-distinguishable from a
