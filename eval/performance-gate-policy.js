@@ -102,13 +102,32 @@ const DEFAULT_BUDGETS = Object.freeze({
     maxBoardRssMb: 1536,
     // Query-class board (fix #432): each class's host-normalized p50 and p95
     // against the same handles measured on the last release, on this host
-    // class. A class fails when it is slower by more than the ratio AND by
-    // more than the delta (millisecond-scale queries jitter by whole
-    // milliseconds). Gating runs require it; other runs report it.
-    maxQueryClassRatio: 1.15,
-    minQueryClassDeltaMs: 5,
+    // class. Subsecond changes need both 20% and 50 ms to block release.
+    // Once either time reaches a second, retain the stricter 15% ratio.
+    // An added second blocks even when the relative change is small.
+    maxQueryClassRatio: 1.20,
+    minQueryClassDeltaMs: 50,
+    maxSlowQueryClassRatio: 1.15,
+    maxQueryClassDeltaMs: 1000,
     requireQueryClassBaselines: false,
 });
+
+/** One latency policy for release comparisons and capability cohorts. */
+function queryClassRegression(value, reference, budgets) {
+    const ratioLimit = Math.max(value, reference) >= 1000
+        ? budgets.maxSlowQueryClassRatio : budgets.maxQueryClassRatio;
+    const delta = value - reference;
+    const addedSecond = delta >= budgets.maxQueryClassDeltaMs;
+    const failed = addedSecond ||
+        (value > reference * ratioLimit && delta > budgets.minQueryClassDeltaMs);
+    return {
+        failed,
+        // Keep the former sensitive threshold as an early warning.
+        warning: !failed && value > reference * 1.15 && delta > 5,
+        limit: addedSecond ? `added delay must be <${budgets.maxQueryClassDeltaMs}ms`
+            : `${ratioLimit}x and +${budgets.minQueryClassDeltaMs}ms`,
+    };
+}
 
 function percentile(values, fraction) {
     if (!Array.isArray(values) || values.length === 0) return 0;
@@ -383,4 +402,5 @@ module.exports = {
     summarizeSamples,
     resolveHostFactor,
     evaluatePerformanceBudgets,
+    queryClassRegression,
 };

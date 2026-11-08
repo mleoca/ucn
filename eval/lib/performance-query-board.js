@@ -42,6 +42,7 @@
 
 const crypto = require('crypto');
 const { CAPABILITY_PINS, CAPABILITIES, evaluateCapabilityCohorts } = require('./performance-capabilities');
+const { queryClassRegression } = require('../performance-gate-policy');
 
 // Plural keys: a group named `constructor` would read Object.prototype's.
 const QUERY_GROUPS = Object.freeze(['types', 'constructors', 'overloads', 'values']);
@@ -296,9 +297,9 @@ function summarizeQueryClasses(runs, hostFactor = 1) {
 
 /**
  * Judge each measured class against the release baseline of this host class.
- * A class fails when its host-normalized p50 or p95 exceeds the release value
- * by more than `maxQueryClassRatio` AND by more than `minQueryClassDeltaMs`
- * (a 2 ms query reading 3 ms is timer noise, not a regression). Failures are
+ * Host-normalized p50 and p95 share the latency policy with capability
+ * cohorts: tolerate small millisecond changes, stay strict at seconds.
+ * Smaller regressions remain warnings. Failures are
  * release-blocking when `requireQueryClassBaselines`, warnings otherwise.
  * Query errors always fail; a class measured on handles other than the
  * baseline's (`boardKey`) fails on gating runs, because the ratio would
@@ -340,19 +341,25 @@ function evaluateQueryClasses(summary, baseline, budgets, { repo, hostClass, cap
         row.p50Ratio = base.p50Ms > 0 ? round3(measured.normalizedP50Ms / base.p50Ms) : null;
         row.p95Ratio = base.p95Ms > 0 ? round3(measured.normalizedP95Ms / base.p95Ms) : null;
         const releaseFailures = [];
+        const releaseWarnings = [];
         for (const [label, ratio, value, reference] of [
             ['p50', row.p50Ratio, measured.normalizedP50Ms, base.p50Ms],
             ['p95', row.p95Ratio, measured.normalizedP95Ms, base.p95Ms],
         ]) {
-            if (ratio == null || ratio <= budgets.maxQueryClassRatio) continue;
-            if (value - reference <= budgets.minQueryClassDeltaMs) continue;
-            releaseFailures.push(`${classId} ${label} ${value}ms is ${ratio}x the release ${baseline.engine || 'baseline'} ` +
-                `${reference}ms (limit ${budgets.maxQueryClassRatio}x and +${budgets.minQueryClassDeltaMs}ms)`);
+            const verdict = queryClassRegression(value, reference, budgets);
+            if (verdict.failed) {
+                releaseFailures.push(`${classId} ${label} ${value}ms is ${ratio}x the release ${baseline.engine || 'baseline'} ` +
+                    `${reference}ms (limit ${verdict.limit})`);
+            } else if (verdict.warning) {
+                releaseWarnings.push(`${classId} ${label} ${value}ms vs ${reference}ms: ` +
+                    'small latency regression; below blocking limits');
+            }
         }
         const cohorts = capabilities ? evaluateCapabilityCohorts(classId, measured, baseline, budgets,
             { repo, hostClass, pinnedCommit: QUERY_BOARD_PINS[repo]?.commit, capabilityPins }) : null;
         if (cohorts) {
-            row.releaseComparison = { failed: releaseFailures.length > 0, failures: releaseFailures };
+            row.releaseComparison = { failed: releaseFailures.length > 0,
+                failures: releaseFailures, warnings: releaseWarnings };
             row.capabilityCohorts = cohorts.rows;
             row.comparisonBasis = 'capability-cohorts';
         }
@@ -360,6 +367,7 @@ function evaluateQueryClasses(summary, baseline, budgets, { repo, hostClass, cap
             gate(failure);
             row.failed = true;
         }
+        warnings.push(...(cohorts ? cohorts.warnings || [] : releaseWarnings));
     }
     return { failures, warnings, rows };
 }

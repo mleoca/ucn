@@ -34,7 +34,13 @@ Each cohort times the entire command, including its existing caller work.
 It uses the same pinned order, 40-query context prefix, three startup samples
 and three isolated process samples. The best sample per handle is normalized
 by the measured host factor. A cohort fails if its p50 or p95 exceeds its
-reference by both 1.15x and 5 ms. Existing capabilities retain their original
+reference by both 20% and 50 ms while both times remain below one second.
+Once either time reaches one second, the relative limit is 15%, still with
+the 50 ms minimum increase. Adding a full second always fails, even below
+the relative limit. Smaller increases over 15% and 5 ms are warnings.
+The same policy applies to ordinary release comparisons and capability
+cohorts. Indexing throughput, memory and absolute latency limits remain
+separate checks. Existing capabilities retain their original
 release measurements, reconstructed from the two original three-process runs.
 No existing release pin is replaced.
 

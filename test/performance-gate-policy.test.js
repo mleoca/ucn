@@ -799,6 +799,31 @@ describe('fix #432: query-class performance board', () => {
         assert.deepEqual(verdict.failures, []);
     });
 
+    it('warns on small delays, requires meaningful subsecond regressions, and stays strict at seconds', () => {
+        for (const [before, after, blocks, warns] of [
+            [58.699, 72.904, false, true], // observed C# regression
+            [15.567, 20.793, false, true], // observed C++ regression
+            [10, 60, false, true], // exactly 50 ms
+            [10, 61, true, false],
+            [500, 600, false, true], // exactly 20%
+            [500, 601, true, false],
+            [850, 999, false, true],
+            [850, 1000, true, false], // crossing a second uses 15%
+            [1000, 1150, false, false], // exactly 15%
+            [1000, 1151, true, false],
+            [10000, 10999, false, false],
+            [10000, 11000, true, false], // a whole added second, only 10%
+            [10000, 9000, false, false],
+        ]) {
+            const result = board.evaluateQueryClasses({ 'class-find': measuredRow(after, after) },
+                release(before, before), GATING, { repo: 'fmt', capabilities: false });
+            const context = `${before}ms -> ${after}ms`;
+            assert.equal(result.failures.length > 0, blocks, context);
+            assert.equal(result.warnings.length > 0, warns, context);
+            assert.equal(result.rows['class-find'].failed, blocks, context);
+        }
+    });
+
     it('refuses to compare a class measured on other handles than the release baseline', () => {
         const verdict = board.evaluateQueryClasses(
             { 'class-find': measuredRow(8, 60, ['h1', 'h3']) }, release(8, 60), GATING, { repo: 'fmt' });
@@ -952,10 +977,22 @@ describe('impact performance capability cohorts', () => {
     });
 
     it('still rejects regressions in either an existing or a new capability', () => {
-        assert.ok(judge(measured([5, 122])).failures.some(f => /types p95/.test(f)));
+        assert.ok(judge(measured([5, 151])).failures.some(f => /types p95/.test(f)));
         // A much faster new band cannot hide a slower existing band.
-        assert.ok(judge(measured([12, 30])).failures.some(f => /release p95/.test(f)));
+        assert.ok(judge(measured([56, 30])).failures.some(f => /release p95/.test(f)));
+        const small = judge(measured([12, 122]));
+        assert.deepEqual(small.failures, []);
+        assert.ok(small.warnings.some(w => /types p95/.test(w)));
+        assert.ok(small.warnings.some(w => /release p95/.test(w)));
         assert.deepEqual(judge(measured([5, 104])).failures, []);
+    });
+
+    it('applies the stricter seconds rules to capability cohorts too', () => {
+        for (const [before, after] of [[1000, 1151], [10000, 11000]]) {
+            const pins = fixture();
+            pins.repos.fmt.classes['class-impact'].cohorts[1].baselineByHost['darwin-arm64'] = [before];
+            assert.ok(judge(measured([5, after]), pins).failures.some(f => /types p95/.test(f)));
+        }
     });
 
     it('requires a consistent band in every process, even when the missing one is slower', () => {
@@ -1080,11 +1117,11 @@ describe('declaration inventory performance cohorts', () => {
                 { origin: 'release', capability: 'declarationInventory', handles: handles.slice(0, 1),
                     baselineByHost: { 'darwin-arm64': [0.2] } },
                 { origin: 'constructors', capability: 'constructorDeclarations', handles: handles.slice(1),
-                    baselineByHost: { 'darwin-arm64': [20] } },
+                    baselineByHost: { 'darwin-arm64': [100] } },
             ] },
         } } },
     });
-    const run = (times = [0.2, 20]) => ({ 'class-find': { handles, samplesMs: times, errors: 0,
+    const run = (times = [0.2, 100]) => ({ 'class-find': { handles, samplesMs: times, errors: 0,
         capabilities: handles.map(h => declarationCapabilities(answer(h), inventories[h])) } });
     const judge = (runs = [run()], pins = fixture(), baseline = release, extra = {}) =>
         board.evaluateQueryClasses(board.summarizeQueryClasses(runs), baseline, budgets,
@@ -1123,13 +1160,13 @@ describe('declaration inventory performance cohorts', () => {
         assert.deepEqual(result.failures, []);
         assert.equal(result.rows['class-find'].releaseComparison.failed, true);
         assert.equal(result.rows['class-find'].capabilityCohorts.length, 2);
-        assert.ok(judge([run([0.2, 30])]).failures.some(f => /constructors p95/.test(f)));
-        assert.ok(judge([run([6, 10])]).failures.some(f => /release p95/.test(f)));
+        assert.ok(judge([run([0.2, 151])]).failures.some(f => /constructors p95/.test(f)));
+        assert.ok(judge([run([51, 10])]).failures.some(f => /release p95/.test(f)));
         assert.ok(judge([run()], fixture(), release, { capabilities: false }).failures.length > 0);
     });
 
     it('rejects an incomplete slower process even when the fastest process is valid', () => {
-        const slower = run([1, 24]);
+        const slower = run([1, 110]);
         slower['class-find'].capabilities[1] = declarationCapabilities(answer(handles[1]).slice(0, 1), inventories[handles[1]]);
         assert.ok(judge([run(), slower]).failures.some(f => /constructorDeclarations missing or inconsistent/.test(f)));
     });

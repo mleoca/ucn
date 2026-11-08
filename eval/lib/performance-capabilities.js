@@ -5,6 +5,7 @@
 // of that capability. These references never follow the tree under test.
 // More proof work or confidence changes alone do not create an exception.
 const CAPABILITY_PINS = Object.freeze(require('./performance-capabilities.json'));
+const { queryClassRegression } = require('../performance-gate-policy');
 const BANDS = Object.freeze(['typeReferences', 'valueAccesses', 'propertyAccesses']);
 const CAPABILITIES = Object.freeze([...BANDS, 'declarationInventory', 'constructorDeclarations']);
 const count = value => Number.isInteger(value) && value >= 0;
@@ -75,7 +76,7 @@ function evaluateCapabilityCohorts(classId, measured, release, budgets, {
     const pin = capabilityPins.repos?.[repo];
     const comparison = pin?.classes?.[classId];
     if (!comparison || !release) return null;
-    const failures = [], rows = [];
+    const failures = [], warnings = [], rows = [];
     const fail = message => failures.push(`${classId}: ${message}`);
     if (!['class-impact', 'value-impact', 'class-find'].includes(classId) || capabilityPins.schemaVersion !== 1 ||
         release.engine !== capabilityPins.releaseEngine || pin.commit !== pinnedCommit ||
@@ -136,14 +137,18 @@ function evaluateCapabilityCohorts(classId, measured, release, budgets, {
             const value = row[`${label}Ms`], base = row[`baseline${label[0].toUpperCase()}${label.slice(1)}Ms`];
             const ratio = base > 0 ? round(value / base) : null;
             row[`${label}Ratio`] = ratio;
-            if (value > base * budgets.maxQueryClassRatio && value - base > budgets.minQueryClassDeltaMs) {
+            const verdict = queryClassRegression(value, base, budgets);
+            if (verdict.failed) {
                 row.failed = true;
                 fail(`${cohort.origin} ${label} ${value}ms exceeds ${origin.commit.slice(0, 12)} ` +
-                    `${base}ms (limit ${budgets.maxQueryClassRatio}x and +${budgets.minQueryClassDeltaMs}ms)`);
+                    `${base}ms (limit ${verdict.limit})`);
+            } else if (verdict.warning) {
+                warnings.push(`${classId}: ${cohort.origin} ${label} ${value}ms vs ${base}ms: ` +
+                    'small latency regression; below blocking limits');
             }
         }
     }
-    return { failures, rows };
+    return { failures, warnings, rows };
 }
 
 module.exports = { CAPABILITY_PINS, BANDS, CAPABILITIES, impactCapabilities, declarationCapabilities, evaluateCapabilityCohorts };
