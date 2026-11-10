@@ -198,6 +198,17 @@ function demoteToOpaque(index, entry, error) {
     });
     model.opaque.sort((a, b) => codeUnitCompare(a.relativePath, b.relativePath) ||
         codeUnitCompare(a.reason, b.reason));
+    // The candidate is unreadable NOW. Recording that makes the next
+    // staleness check see a file that became readable again as a change,
+    // even when its size and mtime never moved (a permission that came
+    // back); otherwise the path stays unsearchable until someone edits it.
+    const candidate = (model.candidates || [])
+        .find(item => item.relativePath === entry.relativePath);
+    if (candidate) {
+        candidate.readable = false;
+        candidate.size = null;
+        candidate.mtimeMs = null;
+    }
     // Scans made while it still counted as searchable are not reusable.
     index._groundSetCache = new Map();
     index._groundSetCacheLines = 0;
@@ -243,14 +254,23 @@ function siteText(text, at, nameLength) {
     let lineEnd = text.indexOf('\n', at);
     if (lineEnd === -1) lineEnd = text.length;
     if (lineEnd - lineStart <= SITE_TEXT_MAX) {
-        return text.slice(lineStart, lineEnd).trim().slice(0, SITE_TEXT_MAX);
+        return detached(text.slice(lineStart, lineEnd).trim().slice(0, SITE_TEXT_MAX));
     }
     let from = Math.max(lineStart, at - 60);
     let to = Math.min(lineEnd, from + SITE_TEXT_MAX);
     // A window edge never falls inside a character.
     if (from > lineStart && isLowSurrogate(text.charCodeAt(from))) from++;
     if (to < lineEnd && isHighSurrogate(text.charCodeAt(to - 1))) to--;
-    return text.slice(from, to).trim();
+    return detached(text.slice(from, to).trim());
+}
+
+/**
+ * A copy of a short string that shares no storage with the text it was cut
+ * from. A substring of a large string can keep the whole string alive; fifty
+ * retained site lines must not hold fifty megabyte chunks.
+ */
+function detached(piece) {
+    return Buffer.from(piece, 'utf8').toString('utf8');
 }
 
 /**
@@ -264,9 +284,13 @@ function siteText(text, at, nameLength) {
  * dropped edge.
  *
  * onMatch(line, text) is called once per matching line, in line order.
+ * `texts` bounds how many of those calls carry the line's text (the rest
+ * get null): a caller that lists fifty sites of a million matching lines
+ * must not have a million strings built for it.
  */
-function scanChunksForName(chunks, name, onMatch) {
+function scanChunksForName(chunks, name, onMatch, { texts = Infinity } = {}) {
     if (!name || name.includes('\n')) return;
+    let textsLeft = texts;
     const wordRe = literalNameRegex(name, 'y');
     // Post-context held back: the match, one boundary character (two code
     // units for an astral one) and the rest of a short line for the site.
@@ -310,7 +334,12 @@ function scanChunksForName(chunks, name, onMatch) {
             const matchedLine = lineAt(at);
             if (matchedLine !== lastLine) {
                 lastLine = matchedLine;
-                onMatch(matchedLine, siteText(text, at, name.length));
+                if (textsLeft > 0) {
+                    textsLeft--;
+                    onMatch(matchedLine, siteText(text, at, name.length));
+                } else {
+                    onMatch(matchedLine, null);
+                }
             }
             // The rest of this line cannot change the account.
             const newline = text.indexOf('\n', at);
@@ -399,10 +428,14 @@ function scanChunksForNames(makeChunks, names) {
     }
     for (const name of otherNames) {
         let hit = false;
-        scanChunksForName(makeChunks(), name, () => { hit = true; });
+        scanChunksForName(makeChunks(), name, () => { hit = true; }, { texts: 0 });
         if (hit) found.add(name);
     }
-    return found;
+    // The caller's own strings: a matched run is a substring of a chunk and
+    // would keep that chunk alive for as long as the result is held.
+    const result = new Set();
+    for (const name of names) if (found.has(name)) result.add(name);
+    return result;
 }
 
 /**
@@ -427,22 +460,24 @@ function scanTextOnly(index, name) {
     for (const entry of [...textOnly]) {
         const absolutePath = path.join(index.root, entry.relativePath);
         let matched = 0;
-        const sites = [];
+        // Count every matching line; keep only as many sites as the listing
+        // still has room for. The sample is merged after the file was read
+        // to the end, so a read that fails halfway contributes nothing.
+        const room = SITE_CAP - bucket.sites.length;
+        const sample = [];
         try {
             scanChunksForName(textOnlyChunks(index, absolutePath, entry.size), name, (line, text) => {
                 matched++;
-                sites.push({ file: entry.relativePath, line, text });
-            });
+                if (sample.length < room) sample.push({ file: entry.relativePath, line, text });
+            }, { texts: room });
         } catch (error) {
             // Not searched: the path becomes opaque, the one channel every
             // consumer of this model reports (accounts, lookups, health).
             demoteToOpaque(index, entry, error);
             continue;
         }
-        for (const site of sites) {
-            if (bucket.sites.length < SITE_CAP) bucket.sites.push(site);
-            else bucket.sitesTruncated = true;
-        }
+        bucket.sites.push(...sample);
+        if (matched > sample.length) bucket.sitesTruncated = true;
         if (matched === 0) continue;
         bucket.fileCount++;
         bucket.lines += matched;
@@ -470,7 +505,7 @@ function countNameLines(absolutePath, name) {
     const chunks = size <= WHOLE_FILE_BYTES
         ? [fs.readFileSync(absolutePath, 'utf-8')]
         : streamChunks(absolutePath);
-    scanChunksForName(chunks, name, () => { lines++; });
+    scanChunksForName(chunks, name, () => { lines++; }, { texts: 0 });
     return lines;
 }
 

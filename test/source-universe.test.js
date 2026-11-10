@@ -125,6 +125,74 @@ describe('source universe: one name scanner', () => {
     });
 });
 
+describe('source universe: a listing is bounded however many lines match', () => {
+    it('the scanner builds a site text only while the caller wants one', () => {
+        const content = Array.from({ length: 5000 }, (_, i) => `target(${i})`).join('\n');
+        const lines = [];
+        const texts = [];
+        universe.scanChunksForName(chunked(content, [4096]), 'target', (line, text) => {
+            lines.push(line);
+            if (text !== null) texts.push(text);
+        }, { texts: 50 });
+        assert.strictEqual(lines.length, 5000, 'every matching line is counted');
+        assert.strictEqual(texts.length, 50, 'no more texts than asked for');
+        assert.deepStrictEqual(texts.slice(0, 2), ['target(0)', 'target(1)']);
+    });
+
+    it('fifty sites are kept across files while every line is counted', () => {
+        const many = Array.from({ length: 1000 }, (_, i) => `target(${i})`).join('\n');
+        const dir = tmp({
+            'package.json': '{}',
+            'lib.js': 'export function target() {}',
+            'a.rb': many,
+            'b.rb': 'target(b)',
+        });
+        try {
+            const bucket = universe.scanTextOnly(idx(dir), 'target');
+            assert.strictEqual(bucket.lines, 1001);
+            assert.strictEqual(bucket.fileCount, 2);
+            assert.strictEqual(bucket.sites.length, 50);
+            assert.strictEqual(bucket.sitesTruncated, true);
+            assert.ok(bucket.sites.every(site => site.file === 'a.rb' && typeof site.text === 'string'));
+        } finally { rm(dir); }
+    });
+
+    it('a read that fails halfway contributes neither lines nor sites', () => {
+        // Larger than one stream chunk, with matches in the first chunk.
+        const big = `${'target(first)\n'.repeat(200)}${'#'.repeat(1024 * 1024 + 64)}\ntarget(last)\n`;
+        const dir = tmp({
+            'package.json': '{}',
+            'lib.js': 'export function target() {}',
+            'big.rb': big,
+            'small.rb': 'target(small)',
+        });
+        const readSync = fs.readSync;
+        try {
+            const index = idx(dir);
+            assert.strictEqual(universe.scanTextOnly(index, 'target').lines, 202);
+            // The second read of the streamed file fails.
+            let reads = 0;
+            fs.readSync = (...args) => {
+                if (args[1] && args[1].length === 1024 * 1024 && ++reads === 2) {
+                    throw new Error('injected read failure');
+                }
+                return readSync(...args);
+            };
+            const bucket = universe.scanTextOnly(index, 'target');
+            fs.readSync = readSync;
+            assert.deepStrictEqual(bucket.files, ['small.rb']);
+            assert.strictEqual(bucket.lines, 1);
+            assert.deepStrictEqual(bucket.sites.map(site => site.file), ['small.rb']);
+            // Not dropped: the file is now an unsearchable path.
+            assert.deepStrictEqual(universe.universe(index).opaque.map(entry =>
+                [entry.relativePath, entry.reason]), [['big.rb', 'unreadable-file']]);
+        } finally {
+            fs.readSync = readSync;
+            rm(dir);
+        }
+    });
+});
+
 describe('source universe: a streamed file agrees across commands', () => {
     it('a name split at the stream chunk boundary is found by impact and by deadcode', () => {
         // Larger than one stream chunk (1 MiB), with the chunk boundary
@@ -417,6 +485,43 @@ describe('source universe: a file that cannot be read is never just dropped', ()
             const account = execute(index, 'impact', { name: 'target' }).result.account;
             assert.strictEqual(account.contract.textComplete, false);
             assert.deepStrictEqual(account.opaque.reasons, { 'unreadable-file': 1 });
+        } finally {
+            fs.chmodSync(bundle, 0o644);
+            rm(dir);
+        }
+    });
+
+    it('a file that becomes readable again is searched again, with no content edit', { skip: !unreadable }, () => {
+        const dir = tmp({
+            'package.json': '{}',
+            'lib.js': 'export function target() {}\nexport function other() {}',
+            'vendor.min.js': 'hidden();',
+        });
+        const bundle = path.join(dir, 'vendor.min.js');
+        const stale = index => { index._lastFreshAt = 0; return isCacheStale(index); };
+        const complete = (index, name) =>
+            execute(index, 'impact', { name }).result.account.contract.textComplete;
+        try {
+            // Readable when classified, unreadable when scanned.
+            const live = idx(dir);
+            assert.strictEqual(universe.universe(live).textOnly.length, 1);
+            fs.chmodSync(bundle, 0o000);
+            assert.strictEqual(complete(live, 'other'), false, 'demoted while scanning');
+            // Unreadable when classified.
+            const late = idx(dir);
+            assert.strictEqual(complete(late, 'other'), false);
+            assert.strictEqual(universe.universe(late).textOnly.length, 0);
+
+            // The permission comes back. Size and mtime never moved.
+            fs.chmodSync(bundle, 0o644);
+            for (const index of [live, late]) {
+                assert.strictEqual(stale(index), false, 'no symbol changed: no rebuild');
+                assert.deepStrictEqual(universe.universe(index).opaque, []);
+                assert.strictEqual(complete(index, 'other'), true, 'an unrelated name is clear again');
+                assert.match(execute(index, 'find', { name: 'hidden', exact: true }).note,
+                    /1 literal match\(es\) exist in 1 unanalyzed file\(s\) \(bundled\/minified\)/);
+            }
+            assert.strictEqual(complete(idx(dir), 'other'), true, 'a fresh build agrees');
         } finally {
             fs.chmodSync(bundle, 0o644);
             rm(dir);
