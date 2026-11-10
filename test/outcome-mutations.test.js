@@ -224,6 +224,59 @@ describe('outcome-mutations: required parameter', () => {
     });
 });
 
+describe('outcome-mutations: judge-visibility probe', () => {
+    it('names something undeclared as the first statement of the declaration', () => {
+        const expected = {
+            python: ['get', 3, '        ucnq_probe_undefined'],
+            go: ['Get', 6, '\t_ = ucnqProbeUndefined'],
+            rust: ['get', 5, '        let _ = ucnq_probe_undefined;'],
+            java: ['get', 5, '        ucnqProbeUndefined();'],
+        };
+        for (const [language, [def, row, text]] of Object.entries(expected)) {
+            const probe = mutations.visibilityProbe(input(language, def));
+            assert.strictEqual(line(probe, row), text, language);
+            // The probe is reported on its own line, so the judge's answer
+            // can be placed inside the probe's range.
+            assert.deepStrictEqual(probe.changedRanges,
+                [{ file: SOURCES[language].file, startLine: row, endLine: row }], language);
+            assert.ok(parsesCleanly(language, probe.files[0].content), language);
+        }
+    });
+
+    it('has no site in a body that shares its header line', () => {
+        assert.strictEqual(mutations.visibilityProbe(input('python', 'oneliner')), null);
+    });
+
+    it('additions and dead seeds have a probe variant in the same place', () => {
+        for (const language of ['python', 'go', 'rust', 'java']) {
+            const undefinedValue = mutations.TEMPLATES[language].undefinedValue;
+            const added = mutations.additiveSymbol(input(language), 4);
+            const probe = mutations.additiveSymbol(input(language), 4, { probe: true });
+            assert.strictEqual(probe.files[0].path, added.files[0].path, language);
+            assert.deepStrictEqual(probe.changedRanges, added.changedRanges, language);
+            assert.ok(probe.files[0].content.includes(undefinedValue), language);
+            assert.ok(!added.files[0].content.includes(undefinedValue), language);
+            assert.ok(parsesCleanly(language, probe.files[0].content), language);
+
+            const seed = mutations.seededDeadAddition(input(language), 4);
+            const seedProbe = mutations.seededDeadAddition(input(language), 4, { probe: true });
+            assert.deepStrictEqual(seedProbe.changedRanges, seed.changedRanges, language);
+            assert.ok(seedProbe.files[0].content.includes(undefinedValue), language);
+        }
+    });
+
+    it('states what it can build per language', () => {
+        const python = mutations.checkKindSupport('python');
+        assert.ok(Object.values(python).every(Boolean));
+        const rust = mutations.checkKindSupport('rust');
+        assert.strictEqual(rust['required-param'], true);
+        assert.strictEqual(rust['return-contract-edit'], false);
+        assert.strictEqual(rust['generator-transition'], false);
+        assert.strictEqual(mutations.checkKindSupport('javascript').additive, false);
+        assert.ok(Object.values(mutations.checkKindSupport('csharp')).every(value => value === false));
+    });
+});
+
 describe('outcome-mutations: additions and seeded delete targets', () => {
     it('adds a novel callable as a new file or an appended item', () => {
         const python = mutations.additiveSymbol(input('python'), 3);

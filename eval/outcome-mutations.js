@@ -20,6 +20,9 @@
 const path = require('path');
 const { getParser, safeParse } = require('../languages');
 
+// `probe` is a statement and `undefinedValue` an expression that name
+// something undeclared: the toolchain must report them wherever it actually
+// checks the code they sit in.
 const TEMPLATES = Object.freeze({
     python: {
         inert: 'pass',
@@ -27,13 +30,32 @@ const TEMPLATES = Object.freeze({
         nullReturn: 'None',
         param: 'ucnq_required',
         receiverNames: ['self', 'cls'],
+        probe: 'ucnq_probe_undefined',
+        undefinedValue: 'ucnq_probe_undefined',
     },
-    go: { inert: '_ = 0', param: 'ucnqRequired int' },
-    rust: { inert: 'let _ = 0;', param: 'ucnq_required: i32' },
-    java: { inert: ';', param: 'int ucnqRequired' },
-    javascript: { inert: ';', nullReturn: 'null', param: 'ucnqRequired' },
-    typescript: { inert: ';', nullReturn: 'null', param: 'ucnqRequired: number' },
+    go: {
+        inert: '_ = 0', param: 'ucnqRequired int',
+        probe: '_ = ucnqProbeUndefined', undefinedValue: 'ucnqProbeUndefined',
+    },
+    rust: {
+        inert: 'let _ = 0;', param: 'ucnq_required: i32',
+        probe: 'let _ = ucnq_probe_undefined;', undefinedValue: 'ucnq_probe_undefined',
+    },
+    java: {
+        inert: ';', param: 'int ucnqRequired',
+        probe: 'ucnqProbeUndefined();', undefinedValue: 'ucnqProbeUndefined',
+    },
+    javascript: {
+        inert: ';', nullReturn: 'null', param: 'ucnqRequired',
+        probe: 'ucnqProbeUndefined;', undefinedValue: 'ucnqProbeUndefined',
+    },
+    typescript: {
+        inert: ';', nullReturn: 'null', param: 'ucnqRequired: number',
+        probe: 'ucnqProbeUndefined;', undefinedValue: 'ucnqProbeUndefined',
+    },
 });
+
+const ADDITIVE_LANGUAGES = Object.freeze(['python', 'go', 'java', 'rust']);
 
 /** Columns are addressed only on lines where a column is a character. */
 function isAscii(text) {
@@ -107,6 +129,19 @@ function insertFirstStatement(input, statement) {
 function inertBodyEdit(input) {
     const template = TEMPLATES[input.language];
     return template ? insertFirstStatement(input, template.inert) : null;
+}
+
+/**
+ * Judge-visibility probe for one declaration: a first body statement that
+ * names something undeclared. A toolchain that checks the declaration must
+ * report it on that line. One that does not (a module behind a disabled
+ * feature, a file outside the build or the checker's include set) stays
+ * silent, and then its silence about a real mutation of the same
+ * declaration proves nothing.
+ */
+function visibilityProbe(input) {
+    const template = TEMPLATES[input.language];
+    return template ? insertFirstStatement(input, template.probe) : null;
 }
 
 function hasReturnAnnotation(callable) {
@@ -218,8 +253,12 @@ function firstNodeOfType(tree, type) {
 /** A novel-named callable nothing refers to: a new file where the language
  *  compiles every file of a directory, an appended item where files must be
  *  declared. */
-function additiveSymbol(input, serial) {
+function additiveSymbol(input, serial, { probe = false } = {}) {
     const { language, relativePath, content } = input;
+    // The probe variant returns an undeclared name from the same place.
+    const template = TEMPLATES[language];
+    const value = probe ? template && template.undefinedValue : 'value';
+    if (!value) return null;
     const dir = path.posix.dirname(relativePath);
     const inDir = name => (dir === '.' ? name : `${dir}/${name}`);
     const created = (file, text) => ({
@@ -229,26 +268,26 @@ function additiveSymbol(input, serial) {
     switch (language) {
         case 'python':
             return created(inDir(`ucnq_added_${serial}.py`),
-                `def ucnq_added_fn_${serial}(value):\n    return value\n`);
+                `def ucnq_added_fn_${serial}(value):\n    return ${value}\n`);
         case 'go': {
             const clause = firstNodeOfType(parse(language, content), 'package_clause');
             const name = clause && clause.namedChildren[0];
             if (!name) return null;
             return created(inDir(`ucnq_added_${serial}.go`),
-                `package ${name.text}\n\nfunc ucnqAddedFn${serial}(value int) int {\n\treturn value\n}\n`);
+                `package ${name.text}\n\nfunc ucnqAddedFn${serial}(value int) int {\n\treturn ${value}\n}\n`);
         }
         case 'java': {
             const declaration = firstNodeOfType(parse(language, content), 'package_declaration');
             const header = declaration ? `${declaration.text}\n\n` : '';
             return created(inDir(`UcnqAdded${serial}.java`),
                 `${header}final class UcnqAdded${serial} {\n` +
-                `    static int ucnqAddedFn${serial}(int value) {\n        return value;\n    }\n}\n`);
+                `    static int ucnqAddedFn${serial}(int value) {\n        return ${value};\n    }\n}\n`);
         }
         case 'rust': {
             const result = appended(relativePath, content, [
                 '',
                 `fn ucnq_added_fn_${serial}(value: i32) -> i32 {`,
-                '    value',
+                `    ${value}`,
                 '}',
             ]);
             return {
@@ -285,20 +324,23 @@ function seeded(relativePath, content, snippetLines, target) {
 /** A private callable nothing refers to, appended to an existing file:
  *  deletable by construction. `allowDead` adds the language's own
  *  "unused is intended" marker for crates that deny warnings. */
-function seededDeadAddition(input, serial, { allowDead = false } = {}) {
+function seededDeadAddition(input, serial, { allowDead = false, probe = false } = {}) {
     const { language, relativePath, content } = input;
+    const template = TEMPLATES[language];
+    const value = probe ? template && template.undefinedValue : 'value';
+    if (!value) return null;
     switch (language) {
         case 'python':
             return seeded(relativePath, content, [
                 '', '',
                 `def _ucnq_seeded_dead_${serial}(value):`,
-                '    return value',
+                `    return ${value}`,
             ], { name: `_ucnq_seeded_dead_${serial}`, startLine: 3, endLine: 4, type: 'function' });
         case 'go':
             return seeded(relativePath, content, [
                 '',
                 `func ucnqSeededDead${serial}(value int) int {`,
-                '\treturn value',
+                `\treturn ${value}`,
                 '}',
             ], { name: `ucnqSeededDead${serial}`, startLine: 2, endLine: 4, type: 'function' });
         case 'rust': {
@@ -307,7 +349,7 @@ function seededDeadAddition(input, serial, { allowDead = false } = {}) {
                 '',
                 ...attribute,
                 `fn ucnq_seeded_dead_${serial}(value: i32) -> i32 {`,
-                '    value',
+                `    ${value}`,
                 '}',
             ], { name: `ucnq_seeded_dead_${serial}`,
                 startLine: 2 + attribute.length, endLine: 4 + attribute.length, type: 'function' });
@@ -317,7 +359,7 @@ function seededDeadAddition(input, serial, { allowDead = false } = {}) {
                 '',
                 `final class UcnqSeededDead${serial} {`,
                 `    private static int ucnqSeededDead${serial}(int value) {`,
-                '        return value;',
+                `        return ${value};`,
                 '    }',
                 '}',
             ], { name: `ucnqSeededDead${serial}`, startLine: 3, endLine: 5,
@@ -413,9 +455,30 @@ const DEFINITION_MUTATIONS = Object.freeze({
     'required-param': requiredParam,
 });
 
+/**
+ * Which check-task kinds this module can build for a language. A kind a
+ * language can express but this module cannot build is a coverage gap of the
+ * instrument, reported as unsupported and never as not applicable.
+ */
+function checkKindSupport(language) {
+    const template = TEMPLATES[language] || {};
+    const probed = !!template.probe;
+    return {
+        'additive': probed && ADDITIVE_LANGUAGES.includes(language),
+        'inert-body-edit': probed && !!template.inert,
+        'return-contract-edit': probed && !!template.nullReturn,
+        'generator-transition': probed && !!template.generator,
+        'required-param': probed && !!template.param,
+        'delete-referenced': probed,
+        'delete-unreferenced': probed,
+    };
+}
+
 module.exports = {
     TEMPLATES,
     DEFINITION_MUTATIONS,
+    checkKindSupport,
+    visibilityProbe,
     inertBodyEdit,
     generatorTransition,
     returnContractEdit,

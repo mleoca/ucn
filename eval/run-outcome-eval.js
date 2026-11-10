@@ -902,6 +902,37 @@ function patchedContent(contentByFile, mutation) {
     return next;
 }
 
+/**
+ * Does the judge check the code a mutation lands in? The probe names
+ * something undeclared at the same place; a toolchain that compiles or
+ * type-checks that code reports it on the probe's own lines. Silence means
+ * the judge never looks there (a module behind a disabled feature, a file
+ * outside the build), and then a "clean" verdict on a real mutation of the
+ * same code would prove nothing.
+ */
+function judgeCovers(context, probe) {
+    const { repoPath, judge, baseline } = context;
+    if (!probe) return false;
+    let created = [];
+    try {
+        created = writeMutation(repoPath, probe);
+        const placed = policy.classifyNewDiagnostics(
+            baseline.keys, judge.run(), probe.changedRanges);
+        return placed.inside > 0;
+    } finally {
+        restoreRepo(repoPath, created);
+    }
+}
+
+function definitionProbe(repo, contentByFile, candidate) {
+    return mutations.visibilityProbe({
+        language: repo.language,
+        relativePath: candidate.relativePath,
+        content: contentByFile.get(candidate.relativePath),
+        def: candidate,
+    });
+}
+
 /** Independent sampling stream per phase: adding a phase never moves the
  *  rename/delete samples of an existing board. */
 function phaseRandom(seed, salt) {
@@ -952,6 +983,21 @@ function runSeededDeleteTasks(context, options) {
                 : mutations.seededContractBound(input, serial));
             const plain = build({});
             if (!plain) break; // no seed of this kind in this language
+            // A seed must land in code the judge checks: a dead addition is
+            // probed where it is appended; a contract-bound member proves it
+            // by breaking the build when deleted (below).
+            if (kind === 'dead-addition') {
+                let covered;
+                try {
+                    covered = judgeCovers(context,
+                        mutations.seededDeadAddition(input, serial, { probe: true }));
+                } catch (error) {
+                    judgeErrors++;
+                    log(`  seeded ${kind}: JUDGE ERROR ${error.message}`);
+                    break;
+                }
+                if (!covered) { rejected++; continue; }
+            }
             const marked = kind === 'dead-addition' ? build({ allowDead: true }) : null;
             const variants = marked && marked.files[0].content !== plain.files[0].content
                 ? [plain, marked] : [plain];
@@ -991,6 +1037,14 @@ function runSeededDeleteTasks(context, options) {
                             repairs: judged.repairs,
                             source: 'judge',
                         };
+                        // Deleting the only implementation must break the
+                        // type. A clean judge means it never checked this
+                        // host (or the seed is not a contract here): the
+                        // seed is rejected, never scored as deletable.
+                        if (!ground.broken) {
+                            rejected++;
+                            break;
+                        }
                     }
                     rows.push({
                         id: `${target.relativePath}:${target.startLine}:${target.name}`,
@@ -1032,14 +1086,16 @@ function runSeededDeleteTasks(context, options) {
  */
 function runCheckTasks(context, options, pools) {
     const { repo, repoPath, contentByFile, judge, baseline, log } = context;
-    const applicability = policy.checkKindApplicability(langTraits(repo.language));
+    const applicability = policy.checkKindApplicability(
+        langTraits(repo.language), mutations.checkKindSupport(repo.language));
     const rand = phaseRandom(options.seed, 0x0c4ec4);
     const rows = [];
+    const unscored = [];
     let judgeErrors = 0;
     let proposalErrors = 0;
     let serial = 0;
     for (const kind of policy.CHECK_TASK_KINDS) {
-        if (!applicability[kind]) continue;
+        if (applicability[kind].status !== policy.APPLICABILITY.applicable) continue;
         const pool = pools[kind] || [];
         const order = sampleWithout(pool, pool.length, rand);
         let judged = 0;
@@ -1062,6 +1118,23 @@ function runCheckTasks(context, options, pools) {
                 ? mutation.files[0].path
                 : `${candidate.relativePath}:${candidate.startLine}:${candidate.name}`;
             const label = kind === 'additive' ? mutation.files[0].path : candidate.name;
+            // Score a task only where the judge checks the mutated code. A
+            // task it cannot see is unscored and the next candidate is tried.
+            const probe = kind === 'additive'
+                ? mutations.additiveSymbol(input, serial, { probe: true })
+                : mutations.visibilityProbe(input);
+            let covered;
+            try {
+                covered = judgeCovers(context, probe);
+            } catch (error) {
+                judgeErrors++;
+                log(`  check ${kind} ${label}: JUDGE ERROR ${error.message}`);
+                continue;
+            }
+            if (!covered) {
+                unscored.push({ id, kind, reason: probe ? 'judge-blind' : 'no-probe-site' });
+                continue;
+            }
             let created = [];
             try {
                 if (isDelete) applyStandardDeletion(repoPath, contentByFile, candidate);
@@ -1084,11 +1157,15 @@ function runCheckTasks(context, options, pools) {
                     ? (() => {
                         const repaired = judgeWithGoImportRepair(
                             judge, repoPath, baseline.keys, repo.language);
-                        return policy.classifyNewDiagnostics(
-                            baseline.keys, repaired.diagnostics, []);
+                        // Keys after the import repair, placed by the
+                        // final run's locations.
+                        return policy.classifyNewDiagnostics(baseline.keys, {
+                            keys: [...baseline.keys, ...repaired.newKeys],
+                            diagnostics: repaired.diagnostics,
+                        }, []);
                     })()
                     : policy.classifyNewDiagnostics(
-                        baseline.keys, judge.run().diagnostics, mutation.changedRanges);
+                        baseline.keys, judge.run(), mutation.changedRanges);
                 rows.push({
                     id,
                     kind,
@@ -1116,7 +1193,7 @@ function runCheckTasks(context, options, pools) {
             }
         }
     }
-    return { applicability, rows, judgeErrors, proposalErrors };
+    return { applicability, rows, unscored, judgeErrors, proposalErrors };
 }
 
 // ── Per-repo run ────────────────────────────────────────────────────────────
@@ -1323,7 +1400,15 @@ async function runRepo(repo, options) {
             // engine's own export verdict is never consulted.
             const headerLine = (contentByFile.get(task.relativePath) || '')
                 .split('\n')[task.nameLine - 1];
-            const positive = judged.newKeys.length === 0 &&
+            // A clean deletion is evidence only where the judge checks the
+            // deleted declaration; restore first, then probe the pristine one.
+            let judgeCovered = null;
+            if (judged.newKeys.length === 0) {
+                restoreRepo(repoPath);
+                judgeCovered = judgeCovers(
+                    { repoPath, judge, baseline }, definitionProbe(repo, contentByFile, task));
+            }
+            const positive = judged.newKeys.length === 0 && judgeCovered === true &&
                 occurrencesOutsideDef(contentByFile, task) === 0 &&
                 policy.isLanguagePrivate(repo.language, task.name, headerLine);
             const row = {
@@ -1331,6 +1416,7 @@ async function runRepo(repo, options) {
                 name: task.name,
                 kind: task.type,
                 ...(positive && { positiveSet: 'private-zero' }),
+                ...(judgeCovered != null && { judgeCovered }),
                 groundBroken: judged.newKeys.length > 0,
                 groundNewErrors: judged.newKeys.length,
                 groundErrorSamples: judged.newKeys.slice(0, 3),
@@ -1408,6 +1494,9 @@ async function runRepo(repo, options) {
             contractBound: seeded.rows.filter(row => row.seededKind === 'contract-bound').length,
             rejectedSeeds: seeded.rejected,
         },
+        // Sampled deletions the judge called clean without checking the
+        // deleted declaration (never part of the positive set).
+        groundCleanUnverified: deleteResults.filter(row => row.judgeCovered === false).length,
         ...(sharedAudit && {
             sharedAudit: {
                 outputChars: sharedAudit.outputChars,
@@ -1427,6 +1516,7 @@ async function runRepo(repo, options) {
             check: {
                 applicability: check.applicability,
                 tasksPerKind: options.checkTasks,
+                unscored: check.unscored,
                 tasks: check.rows,
                 aggregate: policy.aggregateCheckTasks(check.rows),
             },
@@ -1436,6 +1526,8 @@ async function runRepo(repo, options) {
             'falseUnsafe counts are upper bounds: a compile-clean deletion can still be runtime-unsafe.',
             'Tasks where every arm broke carry no discriminating signal (allArmsBroke) — typically renames of interface/contract members every arm would need extra knowledge to complete.',
             'Seeded delete tasks have a ground truth by construction: a dead addition is deletable (the positive set, with language-private zero-occurrence symbols the judge confirmed clean); a contract-bound member is the only implementation of a contract member and is judged after deletion. A seed that adds diagnostics of its own is rejected, never scored.',
+            'A task is scored only where the judge checks the mutated code: a probe naming something undeclared is placed in the same declaration first, and a judge that stays silent about it (a module behind a disabled feature, a file outside the build) leaves the task unscored. Unscored check tasks are listed and replaced; a sampled deletion judged clean without that coverage is counted as unverified and never joins the positive set.',
+            'A mutation kind has three standings per language: applicable, not applicable (the language cannot express it), unsupported (the language can express it and this board has no mutation for it). Unsupported is a coverage gap of the instrument and is listed as one.',
             'Check tasks score READY_FOR_TOOLCHAIN against dependents: the ground outcome is new diagnostics outside the mutation\'s own lines. Diagnostics inside those lines are reported separately and never gated. A mutation kind a language cannot express is N/A for that repo.',
             "The contract arm's delete verdict is tri-state: 'review' means zero text evidence but not provably dead by the default deadcode audit (exported symbols, external contracts, entry points). falseSafe is computed over 'safe' verdicts only; review rows are reported with their ground outcomes.",
         ],
@@ -1500,7 +1592,15 @@ function formatCheckTable(check) {
         `${bucket.blocked} | ${bucket.groundBroken} | ${bucket.falseReady} | ` +
         `${bucket.blockedOnClean} / ${bucket.groundClean} | ${bucket.readyOnClean} / ${bucket.groundClean} |`;
     for (const kind of policy.CHECK_TASK_KINDS) {
-        if (!check.applicability[kind]) { lines.push(`| ${kind} | N/A | | | | | | | |`); continue; }
+        const standing = check.applicability[kind];
+        if (standing.status === policy.APPLICABILITY.notApplicable) {
+            lines.push(`| ${kind} | N/A | | | | | | | |`);
+            continue;
+        }
+        if (standing.status === policy.APPLICABILITY.unsupported) {
+            lines.push(`| ${kind} | unsupported: ${standing.reason} | | | | | | | |`);
+            continue;
+        }
         const bucket = check.aggregate.byKind[kind];
         lines.push(bucket ? cell(bucket, kind) : `| ${kind} | 0 | - | - | - | - | - | - | - |`);
     }
@@ -1557,6 +1657,12 @@ function formatMarkdown(reports) {
             lines.push('');
             lines.push(...formatCheckTable(report.check));
             lines.push('');
+            const unscored = report.check.unscored || [];
+            if (unscored.length > 0) {
+                lines.push(`Unscored (replaced): ${unscored.map(task =>
+                    `\`${task.id}\` ${task.kind}, ${task.reason}`).join('; ')}`);
+                lines.push('');
+            }
             const falseReady = report.check.tasks.filter(task =>
                 task.verdict === policy.CHECK_VERDICTS.ready && task.outsideNew > 0);
             for (const task of falseReady) {
@@ -1759,6 +1865,19 @@ async function main() {
         }
     }
 
+    for (const pair of policy.unsupportedCheckPairs(reports)) {
+        process.stdout.write(`unsupported check kind: ${pair.repo} (${pair.language}) ` +
+            `${pair.kind} - ${pair.reason}\n`);
+    }
+    for (const report of reports) {
+        const unscored = (report.check && report.check.unscored) || [];
+        if (unscored.length > 0 || report.groundCleanUnverified > 0) {
+            process.stdout.write(`${report.repo}: ${unscored.length} check task(s) unscored ` +
+                `(judge-blind or no probe site), ${report.groundCleanUnverified || 0} clean ` +
+                'sampled deletion(s) the judge did not check\n');
+        }
+    }
+
     if (gateMode) {
         const gateFailures = policy.evaluateOutcomeGate(reports);
         if (reports.length < repos.length) {
@@ -1776,22 +1895,20 @@ async function main() {
                 `(${reports.length} tuned repos; thresholds: judgeErrors 0, ` +
                 'proposalErrors 0, contract delete falseSafe 0, ' +
                 'contract rename <= grep baseline, check falseReady 0, ' +
-                `check coverage by applicability, positive delete set >= ${thresholds.minPositiveDeleteTasks}; ` +
-                `positive-verdict floors on ${floors} repo(s), READY floors on ${readyFloors} repo(s), ` +
-                `seeded contract-bound ${thresholds.enforceSeededContractBound ? 'enforced' : 'reported, not enforced'})\n`);
+                `check coverage by applicability, positive delete set >= ${thresholds.minPositiveDeleteTasks}, ` +
+                `contract-bound delete tasks >= ${thresholds.minContractBoundTasks}; ` +
+                `positive-verdict floors on ${floors} repo(s), READY floors on ${readyFloors} repo(s))\n`);
             // Pinned defects stay on screen for as long as they are pinned.
-            for (const [repoName, ids] of Object.entries(thresholds.knownCheckFalseReady)) {
-                for (const id of ids) {
-                    process.stdout.write(`  known false-ready (pinned): ${repoName} ${id}\n`);
+            for (const [repoName, pins] of Object.entries(thresholds.knownCheckFalseReady)) {
+                for (const pin of pins) {
+                    process.stdout.write(
+                        `  known false-ready (pinned): ${repoName} ${pin.kind} ${pin.id}\n`);
                 }
             }
-            if (!thresholds.enforceSeededContractBound) {
-                for (const report of reports) {
-                    const bound = report.delete.aggregate.perArm['ucn-contract'];
-                    if (bound && bound.contractBound && bound.contractBound.falseSafe > 0) {
-                        process.stdout.write('  known false-safe (seeded contract-bound, not enforced): ' +
-                            `${report.repo} ${bound.contractBound.falseSafe}/${bound.contractBound.tasks}\n`);
-                    }
+            for (const [repoName, ids] of Object.entries(thresholds.knownContractBoundFalseSafe)) {
+                for (const id of ids) {
+                    process.stdout.write(
+                        `  known false-safe (pinned, seeded contract-bound): ${repoName} ${id}\n`);
                 }
             }
         }

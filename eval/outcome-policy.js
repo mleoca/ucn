@@ -560,17 +560,23 @@ function diffErrorKeys(baselineKeys, afterKeys) {
  * Place the NEW diagnostics of a judged mutation inside or outside the
  * mutation's own edit ranges.
  *
+ * judged: one judge run, { keys, diagnostics }. "New" is decided on the
+ * judge's own normalized key list, the same list the baseline was built
+ * from: cargo and javac keys are deduplicated, so rebuilding keys from the
+ * located diagnostics would read two unchanged occurrences of one message
+ * as one new error. Locations are used only to place the keys that are new.
+ *
  * changedRanges: [{ file, startLine, endLine }] in POST-edit coordinates; a
  * pure deletion is zero-width (endLine < startLine) and contains nothing.
- * Keys stay line-independent for the baseline diff, so a new key is located
- * through every post-edit diagnostic that carries it. It counts as inside
- * only when ALL of those locations are inside an edit range: when a key
- * exists both in the changed lines and elsewhere, the conservative reading
- * for a readiness gate is that a dependent broke.
+ * A new key counts as inside only when ALL of its locations are inside an
+ * edit range: when a message exists both in the changed lines and
+ * elsewhere, the conservative reading for a readiness gate is that a
+ * dependent broke.
  */
-function classifyNewDiagnostics(baselineKeys, afterDiagnostics, changedRanges) {
-    const diagnostics = afterDiagnostics || [];
-    const newKeys = diffErrorKeys(baselineKeys, diagnostics.map(diagnostic => diagnostic.key));
+function classifyNewDiagnostics(baselineKeys, judged, changedRanges) {
+    const diagnostics = (judged && judged.diagnostics) || [];
+    const afterKeys = (judged && judged.keys) || [];
+    const newKeys = diffErrorKeys(baselineKeys, afterKeys);
     const ranges = (changedRanges || []).map(range => ({
         file: normalizeDiagnosticFile(range.file),
         startLine: range.startLine,
@@ -800,25 +806,59 @@ const CHECK_VERDICTS = Object.freeze({
     blocked: 'BLOCKED',
 });
 
+const APPLICABILITY = Object.freeze({
+    applicable: 'applicable',
+    notApplicable: 'not-applicable',
+    unsupported: 'unsupported',
+});
+
 /**
- * Which mutation kinds exist in a language, read from its traits rather than
- * its name. A return-contract edit needs a return contract the checker infers
- * from the body; a generator transition needs a body statement that changes
- * the callable's kind without touching its header. Everything else applies
- * wherever a callable can be declared.
+ * Standing of each mutation kind in a language: three states, never two.
+ *   applicable      the language can express the change and the board can
+ *                   build it: a judged task is required;
+ *   not-applicable  the language cannot express the change at all (a
+ *                   declared return type is the whole contract);
+ *   unsupported     the language CAN express it and the board has no
+ *                   mutation for it. That is a coverage gap of the
+ *                   instrument and is reported as one.
+ * The language side is read from traits rather than a language name: a
+ * return-contract edit needs a return contract taken from the body
+ * (`inferredReturnForms`), a generator transition a body statement that
+ * selects the callable's kind (`callableKindFromBody`). The board builds
+ * the `unannotated` form and the `generator` kind. `support` is the
+ * mutation module's own table of what it can build for the language.
  */
-function checkKindApplicability(traits) {
-    const inferredForms = new Set((traits && traits.inferredReturnForms) || []);
-    const bodyKinds = new Set((traits && traits.callableKindFromBody) || []);
-    return {
-        'additive': true,
-        'inert-body-edit': true,
-        'return-contract-edit': inferredForms.has('unannotated'),
-        'generator-transition': bodyKinds.has('generator'),
-        'required-param': true,
-        'delete-referenced': true,
-        'delete-unreferenced': true,
+function checkKindApplicability(traits, support) {
+    const inferredForms = (traits && traits.inferredReturnForms) || [];
+    const bodyKinds = (traits && traits.callableKindFromBody) || [];
+    const built = kind => !support || support[kind] !== false;
+    const standing = (kind, expressible, reason) => {
+        if (!expressible) return { status: APPLICABILITY.notApplicable };
+        if (reason) return { status: APPLICABILITY.unsupported, reason };
+        if (!built(kind)) {
+            return { status: APPLICABILITY.unsupported, reason: 'no mutation for this language' };
+        }
+        return { status: APPLICABILITY.applicable };
     };
+    const otherForms = inferredForms.filter(form => form !== 'unannotated');
+    const otherKinds = bodyKinds.filter(kind => kind !== 'generator');
+    return {
+        'additive': standing('additive', true),
+        'inert-body-edit': standing('inert-body-edit', true),
+        'return-contract-edit': standing('return-contract-edit', inferredForms.length > 0,
+            inferredForms.includes('unannotated') ? null
+                : `inferred return form without a mutation: ${otherForms.join(', ')}`),
+        'generator-transition': standing('generator-transition', bodyKinds.length > 0,
+            bodyKinds.includes('generator') ? null
+                : `body-selected kind without a mutation: ${otherKinds.join(', ')}`),
+        'required-param': standing('required-param', true),
+        'delete-referenced': standing('delete-referenced', true),
+        'delete-unreferenced': standing('delete-unreferenced', true),
+    };
+}
+
+function applicabilityStatus(entry) {
+    return entry && typeof entry === 'object' ? entry.status : null;
 }
 
 function emptyCheckBucket() {
@@ -885,8 +925,10 @@ function aggregateCheckTasks(tasks) {
 /**
  * Coverage of the check board against the applicability matrix. Every
  * applicable (repo, kind) pair needs at least one judged task; a kind the
- * language cannot express is N/A for that repo; every kind must be judged
- * somewhere on the board, or the board cannot speak for it.
+ * language cannot express is not applicable for that repo; every kind must
+ * be judged somewhere on the board, or the board cannot speak for it.
+ * Unsupported pairs are not failures here; `unsupportedCheckPairs` lists
+ * them so a gap in the instrument is never read as "does not apply".
  */
 function evaluateCheckCoverage(reports) {
     const failures = [];
@@ -903,7 +945,8 @@ function evaluateCheckCoverage(reports) {
         for (const kind of CHECK_TASK_KINDS) {
             const judged = byKind[kind] ? byKind[kind].tasks : 0;
             if (judged > 0) coveredSomewhere.add(kind);
-            if (check.applicability && check.applicability[kind] && judged === 0) {
+            const status = applicabilityStatus(check.applicability && check.applicability[kind]);
+            if (status === APPLICABILITY.applicable && judged === 0) {
                 failures.push(`${report.repo}: no judged ${kind} check task ` +
                     `(applicable to ${report.language})`);
             }
@@ -917,6 +960,20 @@ function evaluateCheckCoverage(reports) {
         }
     }
     return failures;
+}
+
+/** (repo, kind) pairs a language can express and the board cannot build. */
+function unsupportedCheckPairs(reports) {
+    const pairs = [];
+    for (const report of reports) {
+        const applicability = (report.check && report.check.applicability) || {};
+        for (const kind of CHECK_TASK_KINDS) {
+            const entry = applicability[kind];
+            if (applicabilityStatus(entry) !== APPLICABILITY.unsupported) continue;
+            pairs.push({ repo: report.repo, language: report.language, kind, reason: entry.reason });
+        }
+    }
+    return pairs;
 }
 
 // ── Gate policy (pinned tuned set only — unpinned holdouts never gate) ──────
@@ -944,34 +1001,53 @@ const OUTCOME_GATE_THRESHOLDS = Object.freeze({
     //   contractPositiveVerdictFloor per-repo share of the positive set the
     //                                contract arm must answer safe.
     minPositiveDeleteTasks: 2,
-    // Baseline 2026-11-10 (seed 42): websocket 2/2, flask 2/3 (the reviewed
-    // row is cli.py `_path_is_ancestor`, private and unreferenced, not
-    // claimed by the default audit), serde_json 2/2.
+    // Baseline 2026-11-10 (seed 42, every positive row in code the judge
+    // checks): websocket 2/2, flask 2/3 (the reviewed row is cli.py
+    // `_path_is_ancestor`, private and unreferenced, not claimed by the
+    // default audit), serde_json 2/2.
     contractPositiveVerdictFloor: Object.freeze({
         websocket: 1,
         flask: 0.6667,
         serde_json: 1,
     }),
     // Seeded contract-bound members (the only implementer of an interface,
-    // abstract or trait member) are measured from the first run. Their
-    // falseSafe joins the hard zero when the required-slot shield lands.
-    enforceSeededContractBound: false,
+    // abstract or trait member) are the negative control of deletion
+    // guidance: every gate repo must judge at least this many, whatever is
+    // pinned below.
+    minContractBoundTasks: 1,
+    // The one contract-bound false-safe of the baseline, pinned by repo and
+    // exact seeded target. Every other false-safe row, contract-bound or
+    // not, on this repo or any other, fails the gate. The entry is deleted
+    // when the required-slot shield lands.
+    //   websocket  the default audit claims the only implementer of an
+    //              interface (same-name declaration lines are not usages).
+    knownContractBoundFalseSafe: Object.freeze({
+        websocket: Object.freeze(['util.go:306:ucnqSlot4']),
+    }),
     // Precommit check. falseReady is the dangerous direction; the coverage
     // matrix keeps an empty board from passing; the READY floor on clean
     // changes is pinned per repo once check evaluates by change kind.
     maxCheckFalseReady: 0,
-    // False-ready rows of the 2026-11-10 baseline, pinned by task id so a
-    // NEW false-ready row fails the gate while these stay visible in every
-    // report. Each names a defect class the change-kind check closes; the
-    // entry is deleted with the fix, never widened.
+    // False-ready rows of the 2026-11-10 baseline, pinned by repository,
+    // mutation kind and target, so any other false-ready row fails the gate
+    // (the same target under another mutation kind included) while these
+    // stay visible in every report. A pin that no longer matches a
+    // false-ready row is itself a failure: it is deleted with the fix, never
+    // left to cover a later regression. Each names a defect class the
+    // change-kind check closes.
     //   websocket  a required parameter on a function that is only used as
     //              a value (`http.HandleFunc("/r", f)`): no call site drifts.
     //   flask      a body `yield` turns the callable into a generator; the
     //              header is unchanged and 22 dependents break.
     knownCheckFalseReady: Object.freeze({
-        websocket: Object.freeze([
-            'examples/autobahn/server.go:154:echoReadAllWritePreparedMessage']),
-        flask: Object.freeze(['examples/tutorial/flaskr/db.py:9:get_db']),
+        websocket: Object.freeze([Object.freeze({
+            kind: 'required-param',
+            id: 'examples/autobahn/server.go:154:echoReadAllWritePreparedMessage',
+        })]),
+        flask: Object.freeze([Object.freeze({
+            kind: 'generator-transition',
+            id: 'examples/tutorial/flaskr/db.py:9:get_db',
+        })]),
     }),
     requireCheckCoverage: true,
     checkReadyOnCleanFloor: Object.freeze({}),
@@ -993,14 +1069,36 @@ function evaluateOutcomeGate(reports, thresholds = OUTCOME_GATE_THRESHOLDS) {
         }
         const deleteArm = report.delete && report.delete.aggregate.perArm['ucn-contract'];
         if (deleteArm) {
-            const contractBoundFalseSafe = (deleteArm.contractBound &&
-                deleteArm.contractBound.falseSafe) || 0;
-            const gatedFalseSafe = thresholds.enforceSeededContractBound
-                ? deleteArm.falseSafe
-                : deleteArm.falseSafe - contractBoundFalseSafe;
+            // False-safe rows are matched one by one when the report carries
+            // them; a report with only the aggregate is held to the bare count.
+            const pinnedSafe = new Set((thresholds.knownContractBoundFalseSafe &&
+                thresholds.knownContractBoundFalseSafe[repo]) || []);
+            const safeRows = Array.isArray(report.delete.tasks)
+                ? report.delete.tasks.filter(task => task.groundBroken &&
+                    task.arms && task.arms['ucn-contract'] &&
+                    armDeleteVerdict(task.arms['ucn-contract']) === 'safe')
+                : null;
+            const isPinnedSafe = task =>
+                task.seededKind === 'contract-bound' && pinnedSafe.has(task.id);
+            const unexpectedSafe = safeRows ? safeRows.filter(task => !isPinnedSafe(task)) : null;
+            const gatedFalseSafe = unexpectedSafe ? unexpectedSafe.length : deleteArm.falseSafe;
             if (gatedFalseSafe > thresholds.maxContractDeleteFalseSafe) {
                 failures.push(`${repo}: contract delete falseSafe ${gatedFalseSafe} ` +
-                    `(max ${thresholds.maxContractDeleteFalseSafe})`);
+                    `(max ${thresholds.maxContractDeleteFalseSafe})` +
+                    (unexpectedSafe ? `: ${unexpectedSafe.map(task => task.id).join(', ')}` : ''));
+            }
+            for (const id of pinnedSafe) {
+                if (!safeRows || !safeRows.some(task => isPinnedSafe(task) && task.id === id)) {
+                    failures.push(`${repo}: pinned contract-bound false-safe ${id} ` +
+                        'is no longer a false-safe row; remove the pin');
+                }
+            }
+            if (thresholds.minContractBoundTasks != null) {
+                const judged = deleteArm.contractBound ? deleteArm.contractBound.tasks : 0;
+                if (judged < thresholds.minContractBoundTasks) {
+                    failures.push(`${repo}: ${judged} seeded contract-bound delete task(s) ` +
+                        `(min ${thresholds.minContractBoundTasks})`);
+                }
             }
             if (thresholds.minPositiveDeleteTasks != null) {
                 const positiveTasks = deleteArm.positive ? deleteArm.positive.tasks : 0;
@@ -1033,22 +1131,31 @@ function evaluateOutcomeGate(reports, thresholds = OUTCOME_GATE_THRESHOLDS) {
         const check = report.check && report.check.aggregate;
         if (check) {
             if (thresholds.maxCheckFalseReady != null) {
-                // Rows are matched by id when the report carries them; a
-                // report with only the aggregate is held to the bare count.
-                const known = new Set((thresholds.knownCheckFalseReady &&
-                    thresholds.knownCheckFalseReady[repo]) || []);
+                // Rows are matched by kind and id when the report carries
+                // them; a report with only the aggregate is held to the bare
+                // count.
+                const pins = (thresholds.knownCheckFalseReady &&
+                    thresholds.knownCheckFalseReady[repo]) || [];
+                const isPinned = task => pins.some(pin =>
+                    pin.kind === task.kind && pin.id === task.id);
                 const rows = Array.isArray(report.check.tasks)
                     ? report.check.tasks.filter(task =>
                         task.verdict === CHECK_VERDICTS.ready && (task.outsideNew || 0) > 0)
                     : null;
-                const unexpected = rows
-                    ? rows.filter(task => !known.has(task.id))
-                    : null;
+                const unexpected = rows ? rows.filter(task => !isPinned(task)) : null;
                 const count = unexpected ? unexpected.length : check.falseReady;
                 if (count > thresholds.maxCheckFalseReady) {
                     failures.push(`${repo}: check falseReady ${count} ` +
                         `(max ${thresholds.maxCheckFalseReady})` +
-                        (unexpected ? `: ${unexpected.map(task => task.id).join(', ')}` : ''));
+                        (unexpected
+                            ? `: ${unexpected.map(task => `${task.kind} ${task.id}`).join(', ')}`
+                            : ''));
+                }
+                for (const pin of pins) {
+                    if (!rows || !rows.some(task => task.kind === pin.kind && task.id === pin.id)) {
+                        failures.push(`${repo}: pinned false-ready ${pin.kind} ${pin.id} ` +
+                            'is no longer a false-ready row; remove the pin');
+                    }
                 }
             }
             const readyFloor = thresholds.checkReadyOnCleanFloor &&
@@ -1087,9 +1194,11 @@ module.exports = {
     evaluateOutcomeGate,
     CHECK_TASK_KINDS,
     CHECK_VERDICTS,
+    APPLICABILITY,
     checkKindApplicability,
     aggregateCheckTasks,
     evaluateCheckCoverage,
+    unsupportedCheckPairs,
     normalizeDiagnosticFile,
     parseGoDiagnostics,
     parseCargoDiagnostics,
