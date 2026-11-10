@@ -1662,12 +1662,11 @@ function loadCache(index, cachePath) {
  */
 function failedFileStats(index, root) {
     const stats = {};
+    // Only what the build recorded at the failure: a stat taken now could
+    // describe a file that was repaired since.
     for (const failedPath of index.failedFiles || []) {
         const known = index._failedFileStats && index._failedFileStats.get(failedPath);
-        try {
-            const stat = known || fs.statSync(failedPath);
-            stats[path.relative(root, failedPath)] = [stat.size, stat.mtimeMs];
-        } catch (_) { /* gone: the next staleness check rebuilds */ }
+        if (known) stats[path.relative(root, failedPath)] = [known.size, known.mtimeMs];
     }
     return stats;
 }
@@ -1731,17 +1730,16 @@ function isCacheStale(index) {
     // build must try it again (it is in no other sweep, so a repaired file
     // used to stay "failed" until something else forced a rebuild).
     if (index.failedFiles && index.failedFiles.size > 0) {
-        if (!index._failedFileStats) index._failedFileStats = new Map();
         for (const failedPath of index.failedFiles) {
             if (index.files.has(failedPath)) continue;
             let stat;
             try { stat = fs.statSync(failedPath); } catch (_) { return true; }
-            const known = index._failedFileStats.get(failedPath);
-            if (!known) {
-                index._failedFileStats.set(failedPath, { size: stat.size, mtimeMs: stat.mtimeMs });
-            } else if (known.size !== stat.size || known.mtimeMs !== stat.mtimeMs) {
-                return true;
-            }
+            // The build records what the file looked like when it failed
+            // (ProjectIndex._noteFailedFile). Without that record nothing
+            // shows the file is unchanged, so it is tried again: reading the
+            // stat here instead would call a repaired file "unchanged".
+            const known = index._failedFileStats && index._failedFileStats.get(failedPath);
+            if (!known || known.size !== stat.size || known.mtimeMs !== stat.mtimeMs) return true;
         }
     }
 

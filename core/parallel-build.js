@@ -220,7 +220,7 @@ function parallelBuild(index, files, options = {}) {
     {
         for (const result of collected) {
             if (result.error) {
-                index.failedFiles.add(result.filePath);
+                index._noteFailedFile(result.filePath);
                 if (!options.quiet) {
                     console.error(`  Warning: Could not index ${result.filePath}: ${result.error}`);
                 }
@@ -236,7 +236,7 @@ function parallelBuild(index, files, options = {}) {
                         existing.size = result.sizeUpdate;
                     }
                 }
-                index.failedFiles.delete(result.filePath);
+                index._clearFailedFile(result.filePath);
                 continue;
             }
 
@@ -267,7 +267,7 @@ function parallelBuild(index, files, options = {}) {
                 index.callsCacheDirty = true;
             }
 
-            index.failedFiles.delete(result.filePath);
+            index._clearFailedFile(result.filePath);
             changed++;
         }
     }

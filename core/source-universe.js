@@ -117,18 +117,24 @@ function universe(index) {
         });
     }
 
-    // Sizes decide the budget. A candidate that cannot be stat'ed as a file
-    // is opaque, like any other unreadable path.
+    // Sizes decide the budget. A candidate that cannot be read as a file
+    // (missing, not a regular file, no read permission) is opaque, like any
+    // other unreadable path. Every candidate keeps its stat, whatever class
+    // it ends in: an edit to ANY of them can change the budget assignment.
     const sized = [];
+    const candidateStats = [];
     for (const entry of candidates.values()) {
-        try {
-            const stat = fs.statSync(path.join(index.root, entry.relativePath));
-            if (!stat.isFile()) throw new Error('not a regular file');
+        const stat = readableStat(path.join(index.root, entry.relativePath));
+        candidateStats.push({
+            relativePath: entry.relativePath, reason: entry.reason,
+            size: stat.size, mtimeMs: stat.mtimeMs, readable: stat.readable,
+        });
+        if (stat.readable) {
             sized.push({ ...entry, size: stat.size, mtimeMs: stat.mtimeMs });
-        } catch (error) {
+        } else {
             opaque.push({
                 relativePath: entry.relativePath, kind: 'file',
-                reason: 'unreadable-file', detail: error.message,
+                reason: 'unreadable-file', detail: stat.detail,
             });
         }
     }
@@ -153,8 +159,48 @@ function universe(index) {
     textOnly.sort(byPath);
     opaque.sort((a, b) => byPath(a, b) || codeUnitCompare(a.reason, b.reason));
     outside.sort(byPath);
-    index._sourceUniverse = { textOnly, opaque, outside, budget: { limitBytes, usedBytes } };
+    index._sourceUniverse = {
+        textOnly, opaque, outside, budget: { limitBytes, usedBytes },
+        candidates: candidateStats,
+    };
     return index._sourceUniverse;
+}
+
+/** Size, mtime and readability of a text-only candidate, without throwing. */
+function readableStat(absolutePath) {
+    try {
+        const stat = fs.statSync(absolutePath);
+        if (!stat.isFile()) {
+            return { readable: false, size: null, mtimeMs: null, detail: 'not a regular file' };
+        }
+        fs.accessSync(absolutePath, fs.constants.R_OK);
+        return { readable: true, size: stat.size, mtimeMs: stat.mtimeMs };
+    } catch (error) {
+        return { readable: false, size: null, mtimeMs: null, detail: error.message };
+    }
+}
+
+/**
+ * A text-only file that could not be read when it was scanned: it is opaque
+ * from here on, so the same answer and every later one say that part of the
+ * project could not be searched. A read failure never just drops a file
+ * from an answer.
+ */
+function demoteToOpaque(index, entry, error) {
+    const model = universe(index);
+    const at = model.textOnly.findIndex(item => item.relativePath === entry.relativePath);
+    if (at === -1) return;
+    model.textOnly.splice(at, 1);
+    model.budget.usedBytes -= entry.size || 0;
+    model.opaque.push({
+        relativePath: entry.relativePath, kind: 'file', reason: 'unreadable-file',
+        detail: error && error.message ? error.message : 'read failed',
+    });
+    model.opaque.sort((a, b) => codeUnitCompare(a.relativePath, b.relativePath) ||
+        codeUnitCompare(a.reason, b.reason));
+    // Scans made while it still counted as searchable are not reusable.
+    index._groundSetCache = new Map();
+    index._groundSetCacheLines = 0;
 }
 
 /** Drop the memoized universe (a build, a cache load, a refreshed file). */
@@ -199,9 +245,12 @@ function siteText(text, at, nameLength) {
     if (lineEnd - lineStart <= SITE_TEXT_MAX) {
         return text.slice(lineStart, lineEnd).trim().slice(0, SITE_TEXT_MAX);
     }
-    const from = Math.max(lineStart, at - 60);
-    const to = Math.min(lineEnd, from + SITE_TEXT_MAX);
-    return text.slice(from, to).trim().slice(0, SITE_TEXT_MAX);
+    let from = Math.max(lineStart, at - 60);
+    let to = Math.min(lineEnd, from + SITE_TEXT_MAX);
+    // A window edge never falls inside a character.
+    if (from > lineStart && isLowSurrogate(text.charCodeAt(from))) from++;
+    if (to < lineEnd && isHighSurrogate(text.charCodeAt(to - 1))) to--;
+    return text.slice(from, to).trim();
 }
 
 /**
@@ -294,6 +343,31 @@ function scanChunksForName(chunks, name, onMatch) {
 
 const WORD_RUN = /[\p{L}\p{N}_]+/gu;
 const ALL_WORD = /^[\p{L}\p{N}_]+$/u;
+const WORD_CHARACTER = /^[\p{L}\p{N}_]$/u;
+
+function isHighSurrogate(unit) { return unit >= 0xd800 && unit <= 0xdbff; }
+function isLowSurrogate(unit) { return unit >= 0xdc00 && unit <= 0xdfff; }
+
+/**
+ * Where the word that touches the end of `text` starts: everything from
+ * there on may continue in the next piece and must be held back. Walks
+ * CODE POINTS, never UTF-16 units: a letter outside the BMP is two units,
+ * neither of which is a letter on its own, so a unit-wise walk stops inside
+ * it and splits the word (`a𐐀` + `b` read as the words `a𐐀` and `b`).
+ * A lone high surrogate at the very end is half of a character still to
+ * come and is held back with whatever word precedes it.
+ */
+function trailingWordStart(text) {
+    let end = text.length;
+    if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1))) end--;
+    while (end > 0) {
+        const size = end >= 2 && isLowSurrogate(text.charCodeAt(end - 1)) &&
+            isHighSurrogate(text.charCodeAt(end - 2)) ? 2 : 1;
+        if (!WORD_CHARACTER.test(text.slice(end - size, end))) break;
+        end -= size;
+    }
+    return end;
+}
 
 /**
  * Which of `names` occur as whole words in a text, in one pass. A name made
@@ -313,13 +387,7 @@ function scanChunksForNames(makeChunks, names) {
         let carry = '';
         const collect = (text, final) => {
             // A run touching the end of a non-final piece may continue.
-            let end = text.length;
-            if (!final) {
-                while (end > 0 && /[\p{L}\p{N}_]/u.test(text[end - 1])) end--;
-                // Never split a surrogate pair.
-                if (end > 0 && end < text.length &&
-                    text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end--;
-            }
+            const end = final ? text.length : trailingWordStart(text);
             const head = text.slice(0, end);
             for (const run of head.match(WORD_RUN) || []) {
                 if (wordNames.has(run)) found.add(run);
@@ -345,12 +413,9 @@ function scanChunksForNames(makeChunks, names) {
  *
  * @param {object} index - ProjectIndex
  * @param {string} name
- * @param {object} [options]
- * @param {string[]} [options.unreadableFiles] - collector for files that
- *   stopped being readable after classification
  * @returns {{fileCount, lines, files, languages, reasons, sites, sitesTruncated}}
  */
-function scanTextOnly(index, name, options = {}) {
+function scanTextOnly(index, name) {
     const bucket = {
         fileCount: 0, lines: 0, files: [], languages: {}, reasons: {},
         sites: [], sitesTruncated: false,
@@ -359,21 +424,24 @@ function scanTextOnly(index, name, options = {}) {
     if (textOnly.length === 0 || !name) return bucket;
     const languages = new Map();
     const reasons = new Map();
-    for (const entry of textOnly) {
+    for (const entry of [...textOnly]) {
         const absolutePath = path.join(index.root, entry.relativePath);
         let matched = 0;
+        const sites = [];
         try {
             scanChunksForName(textOnlyChunks(index, absolutePath, entry.size), name, (line, text) => {
                 matched++;
-                if (bucket.sites.length < SITE_CAP) {
-                    bucket.sites.push({ file: entry.relativePath, line, text });
-                } else {
-                    bucket.sitesTruncated = true;
-                }
+                sites.push({ file: entry.relativePath, line, text });
             });
-        } catch (_) {
-            if (options.unreadableFiles) options.unreadableFiles.push(entry.relativePath);
+        } catch (error) {
+            // Not searched: the path becomes opaque, the one channel every
+            // consumer of this model reports (accounts, lookups, health).
+            demoteToOpaque(index, entry, error);
             continue;
+        }
+        for (const site of sites) {
+            if (bucket.sites.length < SITE_CAP) bucket.sites.push(site);
+            else bucket.sitesTruncated = true;
         }
         if (matched === 0) continue;
         bucket.fileCount++;
@@ -424,6 +492,7 @@ function scanTextOnlyNames(index, names, extraFiles = []) {
             relativePath: entry.relativePath,
             reason: entry.reason,
             size: entry.size,
+            textOnly: entry,
         })),
     ];
     for (const entry of entries) {
@@ -434,8 +503,9 @@ function scanTextOnlyNames(index, names, extraFiles = []) {
             const found = scanChunksForNames(
                 () => textOnlyChunks(index, entry.absolutePath, size), names);
             for (const name of found) matchedNames.add(name);
-        } catch (_) {
+        } catch (error) {
             unreadableFiles.push(entry.relativePath);
+            if (entry.textOnly) demoteToOpaque(index, entry.textOnly, error);
         }
     }
     return {
@@ -511,14 +581,20 @@ function refreshTextOnly(index, { maxFileSize } = {}) {
     const current = index._sourceUniverse;
     if (!current) return 'unchanged';
     let changed = false;
-    for (const entry of current.textOnly) {
-        let stat;
-        try {
-            stat = fs.statSync(path.join(index.root, entry.relativePath));
-        } catch (_) {
-            return 'reindex';
+    // Every candidate, not only the ones currently searched: a file the
+    // budget left out, or one that could not be read, changes the
+    // assignment for the others when it shrinks or becomes readable.
+    for (const entry of current.candidates || []) {
+        const absolutePath = path.join(index.root, entry.relativePath);
+        const stat = readableStat(absolutePath);
+        if (!stat.readable) {
+            // Gone: the set of discovered files may differ. Still unreadable
+            // as before: nothing moved.
+            if (!fs.existsSync(absolutePath)) return 'reindex';
+            if (entry.readable) changed = true;
+            continue;
         }
-        if (stat.size === entry.size && stat.mtimeMs === entry.mtimeMs) continue;
+        if (entry.readable && stat.size === entry.size && stat.mtimeMs === entry.mtimeMs) continue;
         if (entry.reason === 'max-file-size' && maxFileSize != null && stat.size <= maxFileSize) {
             return 'reindex';
         }

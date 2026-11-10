@@ -1378,6 +1378,11 @@ const HANDLERS = {
                 enumerable: false, writable: true, configurable: true,
             });
         }
+        // An inventory is incomplete wherever a path could not be searched
+        // (asked after the scan above: a file that fails to read while being
+        // scanned becomes such a path).
+        const unsearched = require('./source-universe').unsearchedNote(index);
+        if (unsearched) notes.push(unsearched);
         const failed = accountTools.scanFailedFiles(index, p.name);
         if (failed.unparsed.lines > 0) {
             notes.push(`${failed.unparsed.lines} matching line(s) in ${failed.unparsed.fileCount} unparsed file(s) were not classified: ${failed.unparsed.files.join(', ')}.`);
@@ -1529,6 +1534,8 @@ const HANDLERS = {
                 });
                 notes.push(`${unsupported.lines} matching line(s) in ${unsupported.fileCount} unanalyzed file(s) were not searched; verify with grep/ripgrep.`);
             }
+            const unsearched = require('./source-universe').unsearchedNote(index);
+            if (unsearched) notes.push(unsearched);
         }
         const tNote = truncationNote(index);
         if (tNote) notes.push(tNote);
@@ -1629,6 +1636,8 @@ const HANDLERS = {
                     enumerable: false, writable: true, configurable: true,
                 });
             }
+            const unsearched = require('./source-universe').unsearchedNote(index);
+            if (unsearched) testNotes.push(unsearched);
         }
         return {
             ok: true,

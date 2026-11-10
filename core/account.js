@@ -116,7 +116,7 @@ function computeGroundSet(index, name) {
     // grep would show. Their matching lines join the ground set as
     // `unsupported`, with sites listed so the caller answer strictly
     // dominates grep instead of silently under-reporting it.
-    const unsupported = scanUnsupportedFiles(index, name, { unreadableFiles });
+    const unsupported = scanUnsupportedFiles(index, name);
     // Paths whose contents cannot be read name by name (an unreadable
     // directory, a failed git listing, text beyond the scan budget). They
     // say nothing about this name in particular, so they weaken the claim
@@ -241,13 +241,15 @@ function scanFailedFiles(index, name) {
  * must not stay silent when a repo has occurrences UCN cannot analyze. The
  * scan itself belongs to core/source-universe.js.
  *
+ * A file that cannot be read while it is scanned becomes an unsearchable
+ * path of the universe (reported through `opaqueSummary` / `unsearchedNote`),
+ * never a silently shorter answer.
+ *
  * @param {object} index - ProjectIndex
  * @param {string} name - Symbol name (matched with word boundaries)
- * @param {object} [opts]
- * @param {string[]} [opts.unreadableFiles] - collector for read failures
  */
-function scanUnsupportedFiles(index, name, opts = {}) {
-    return scanTextOnly(index, name, opts);
+function scanUnsupportedFiles(index, name) {
+    return scanTextOnly(index, name);
 }
 
 /**

@@ -125,6 +125,7 @@ class ProjectIndex {
         this.macroExpansionDirty = false;  // persisted C/C++ macro-expansion records (core/macro-expansion.js)
         this._macroExpansionPersisted = null;
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
+        this._failedFileStats = new Map(); // failed file -> { size, mtimeMs } AT the failure (see _noteFailedFile)
         this.unsupportedFiles = [];      // common source files skipped by the parser registry
         this.discoveryIssues = [];       // explicit reasons the index may be partial
         this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
@@ -544,6 +545,29 @@ class ProjectIndex {
     }
 
     /**
+     * Record a file the parser could not ingest, with what it looked like
+     * when it failed. A failed file is in no index, so its size and mtime
+     * are the only way to tell that it changed and deserves another try;
+     * they must be taken here, at the failure, never at the first later
+     * check (by then a repaired file already looks "unchanged").
+     */
+    _noteFailedFile(filePath) {
+        this.failedFiles.add(filePath);
+        if (!this._failedFileStats) this._failedFileStats = new Map();
+        try {
+            const stat = fs.statSync(filePath);
+            this._failedFileStats.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs });
+        } catch (_) {
+            this._failedFileStats.delete(filePath);
+        }
+    }
+
+    _clearFailedFile(filePath) {
+        this.failedFiles.delete(filePath);
+        if (this._failedFileStats) this._failedFileStats.delete(filePath);
+    }
+
+    /**
      * Load .ucn.json config if present (data-only, no code execution)
      */
     loadConfig() {
@@ -736,6 +760,7 @@ class ProjectIndex {
         let indexed = 0;
         let changed = 0;
         if (!this.failedFiles) this.failedFiles = new Set();
+        if (!this._failedFileStats) this._failedFileStats = new Map();
 
         // Try parallel build for large projects
         const workersSetting = options.workers;
@@ -855,9 +880,9 @@ class ProjectIndex {
                     try {
                         if (this.indexFile(file)) changed++;
                         indexed++;
-                        this.failedFiles.delete(file); // Succeeded now, remove from failed
+                        this._clearFailedFile(file); // Succeeded now, remove from failed
                     } catch (e) {
-                        this.failedFiles.add(file); // Track files that fail to index
+                        this._noteFailedFile(file); // Track files that fail to index
                         if (!quiet) {
                             console.error(`  Warning: Could not index ${file}: ${e.message}`);
                         }
