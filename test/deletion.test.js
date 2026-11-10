@@ -293,6 +293,131 @@ describe('deletion: exposure is a policy, a contract is a fact', () => {
     });
 });
 
+describe('deletion: a member a project contract requires is withheld', () => {
+    it('the implementation a type owes to an interface, abstract class or trait', () => {
+        const dir = tmp({
+            'package.json': '{"name":"slot-fixture"}',
+            'shape.ts': [
+                'interface Shape { area(): number; }',
+                'class Circle implements Shape {',
+                '    area(): number { return 1; }',
+                '}',
+                'const made = new Circle();',
+                'console.log(made);',
+            ].join('\n'),
+            'base.py': [
+                'import abc',
+                '',
+                '',
+                'class _Contract(metaclass=abc.ABCMeta):',
+                '    @abc.abstractmethod',
+                '    def slot(self):',
+                '        raise NotImplementedError',
+                '',
+                '',
+                'class _Impl(_Contract):',
+                '    marker = 1',
+                '',
+                '    def slot(self):',
+                '        return 1',
+                '',
+                '',
+                '_INSTANCE = _Impl()',
+            ].join('\n'),
+            'contract.go': [
+                'package main',
+                '',
+                'type contract interface {',
+                '\tgoSlot() int',
+                '}',
+                '',
+                'type impl struct{}',
+                '',
+                'func (impl) goSlot() int {',
+                '\treturn 1',
+                '}',
+                '',
+                'var _ contract = impl{}',
+                '',
+                'func main() {}',
+            ].join('\n'),
+            'tr.rs': [
+                'trait Contract {',
+                '    fn rust_slot(&self) -> i32;',
+                '    fn defaulted(&self) -> i32 { 0 }',
+                '}',
+                'struct Impl;',
+                'impl Contract for Impl {',
+                '    fn rust_slot(&self) -> i32 { 1 }',
+                '    fn defaulted(&self) -> i32 { 2 }',
+                '}',
+                'fn main() { let _ = Impl; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const implementation = (name, file) => {
+                const defs = (index.symbols.get(name) || []).filter(def =>
+                    def.relativePath === file && def.className && !/ontract|Shape/.test(def.className));
+                assert.strictEqual(defs.length, 1, `${file}:${name}`);
+                return assessDeletion(index, defs[0]);
+            };
+            for (const [name, file] of [['area', 'shape.ts'], ['slot', 'base.py'],
+                ['goSlot', 'contract.go']]) {
+                const answer = implementation(name, file);
+                assert.deepStrictEqual([answer.verdict, answer.reason], ['review', 'required-slot'],
+                    `${file}:${name}`);
+            }
+            // A Rust trait implementation was already withheld (the language
+            // adapter treats trait methods as entry points); it stays so.
+            assert.strictEqual(implementation('rust_slot', 'tr.rs').verdict, 'review');
+            const listed = claimed(index);
+            assert.ok(!listed.some(row => /:(area|slot|goSlot|rust_slot)$/.test(row) &&
+                !/shape\.ts:1:|base\.py:6:|contract\.go:4:|tr\.rs:2:/.test(row)), listed.join(' '));
+            assert.strictEqual(deadcode(index, {}).excludedRequiredSlot, 3);
+        } finally { rm(dir); }
+    });
+
+    it('a plain override of a concrete method is not a requirement', () => {
+        const dir = tmp({
+            'package.json': '{"name":"override-fixture"}',
+            'run.js': [
+                'class Base { run() { return 1; } }',
+                'class Child extends Base { run() { return 2; } }',
+                'console.log(new Base(), new Child());',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(claimed(index), ['run.js:1:run', 'run.js:2:run']);
+            for (const def of index.symbols.get('run')) {
+                assert.strictEqual(assessDeletion(index, def).verdict, 'no-static-dependents');
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a base member a descendant says it overrides is held in place', () => {
+        const dir = tmp({
+            'package.json': '{"name":"marked-fixture"}',
+            'run.ts': [
+                'class Base { run(): number { return 1; } }',
+                'class Child extends Base { override run(): number { return 2; } }',
+                'console.log(new Base(), new Child());',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const base = index.symbols.get('run').find(def => def.className === 'Base');
+            const child = index.symbols.get('run').find(def => def.className === 'Child');
+            assert.deepStrictEqual(
+                [assessDeletion(index, base).verdict, assessDeletion(index, base).reason],
+                ['review', 'required-slot']);
+            // The override itself can go: calls fall back to Base.run.
+            assert.strictEqual(assessDeletion(index, child).verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+});
+
 describe('deletion: a declaration the index no longer holds', () => {
     it('is assessed from its record against the uses that remain', () => {
         const dir = tmp({

@@ -15,7 +15,8 @@ const { splitParentList } = require('./graph-build');
 const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, escapeRegExp } = require('./shared');
 const { projectComputedDispatch, projectReflectionSites } = require('./ast-analysis');
 const { reflectionPatternReferences, reflectionLiteralNames } = require('./reflection');
-const { protocolMemberOf, protocolTypeOf, typedLiteralContract, rustProjectTraits } = require('./contract-membership');
+const { protocolMemberOf, protocolTypeOf, typedLiteralContract, rustProjectTraits,
+    hierarchySlotClosure, goContractClosure } = require('./contract-membership');
 const { projectKind, downstreamExposureBlocks } = require('./deletion');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
@@ -244,6 +245,85 @@ function overridesOutOfTreeBase(index, symbol) {
 function typedLiteralExternalMember(index, symbol) {
     if (!symbol.registryContainerType || symbol.className) return false;
     return !!typedLiteralContract(index, symbol)?.external;
+}
+
+/**
+ * A member a subtype MUST supply: declared abstract, or a member of an
+ * interface or trait written without a body (a default-bodied member is an
+ * implementation, not a requirement).
+ */
+function isRequiredDeclaration(index, member) {
+    if (member.type === 'abstract' || (member.modifiers || []).includes('abstract') ||
+        /\babstract\b/.test(member.memberType || '')) return true;
+    if ((member.decorators || []).some(decorator =>
+        String(decorator).replace(/\(.*$/, '').split('.').pop() === 'abstractmethod')) return true;
+    if (!member.className) return false;
+    const enclosing = (index.symbols.get(member.className) || []).find(type =>
+        type.file === member.file && (type.type === 'interface' || type.type === 'trait'));
+    if (!enclosing) return false;
+    try {
+        return !memberText(index, member).includes('{');
+    } catch { return false; }
+}
+
+/**
+ * The member's own text. Its lines can hold more than the member (a
+ * one-line `interface Shape { area(): number; }` puts the interface's brace
+ * on the member's line), so the recorded span is used when it is addressable
+ * by column; whole lines are the fallback.
+ */
+function memberText(index, member) {
+    const lines = index._readFile(member.file).split('\n');
+    const span = member.sourceSpan;
+    const ascii = text => { for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0x7f) return false; return true; };
+    if (span && span.startLine != null && span.endLine != null &&
+        span.startColumn != null && span.endColumn != null) {
+        const first = lines[span.startLine - 1];
+        const last = lines[span.endLine - 1];
+        if (first != null && last != null && ascii(first) && ascii(last)) {
+            if (span.startLine === span.endLine) return first.slice(span.startColumn, span.endColumn);
+            return [first.slice(span.startColumn),
+                ...lines.slice(span.startLine, span.endLine - 1),
+                last.slice(0, span.endColumn)].join('\n');
+        }
+    }
+    return lines.slice(member.startLine - 1, member.endLine).join('\n');
+}
+
+/**
+ * Is this member held in place by a contract of the PROJECT? Two shapes,
+ * both invisible to a name count because a same-name declaration line is a
+ * declaration, never a use:
+ *   - it is the implementation a type owes to an interface, abstract class
+ *     or trait of the project (deleting it leaves the type incomplete), or,
+ *     where interfaces are satisfied implicitly, the method that makes a
+ *     type satisfy a project interface it is used as;
+ *   - a descendant declares that it overrides it (deleting it leaves an
+ *     override of nothing).
+ * A plain override of a concrete method is neither: with it gone, calls
+ * fall back to the inherited one.
+ */
+function requiredByProjectContract(index, symbol) {
+    if (!symbol.className) return false;
+    // A member OF an interface or trait is the requirement itself, not an
+    // implementation of one: only a descendant that says it overrides it
+    // (below) holds it in place.
+    const ownerIsContract = (index.symbols.get(symbol.className) || []).some(type =>
+        (type.type === 'interface' || type.type === 'trait') &&
+        path.dirname(type.file) === path.dirname(symbol.file));
+    if (!ownerIsContract) {
+        // Interfaces satisfied implicitly: the closure joins a project
+        // interface when the type satisfies it or is converted to it.
+        const implicit = goContractClosure(index, symbol);
+        const joined = implicit && implicit.interfaceNames;
+        if (joined && (joined.size ?? joined.length ?? 0) > 0) return true;
+    }
+    const closure = hierarchySlotClosure(index, symbol);
+    if (!closure) return false;
+    if ((closure.ancestors || []).some(ancestor =>
+        (ancestor.members || []).some(member => isRequiredDeclaration(index, member)))) return true;
+    return (closure.descendants || []).some(descendant =>
+        (descendant.members || []).some(member => isOverrideMarked(member)));
 }
 
 /**
@@ -777,6 +857,7 @@ function deadcode(index, options = {}) {
     let excludedRuntimeContract = 0;
     let excludedConstructors = 0;
     let excludedDynamicDispatch = 0;
+    let excludedRequiredSlot = 0;
     const computedDispatchByFile = projectComputedDispatch(index);
     const computedDispatchReceivers = new Set();
     const computedDispatchInfo = { count: 0, fileCount: 0, files: [] };
@@ -1613,6 +1694,15 @@ function deadcode(index, options = {}) {
                     withhold(symbol, 'external-contract');
                     continue;
                 }
+                // Held in place by a contract of the project itself: the
+                // implementation a type owes to an interface, abstract class
+                // or trait, or a member a descendant declares it overrides.
+                // A fact about the declaration, so no flag reveals it.
+                if (requiredByProjectContract(index, symbol)) {
+                    excludedRequiredSlot++;
+                    withhold(symbol, 'required-slot');
+                    continue;
+                }
                 // Collect decorators/annotations for hint display
                 // Python: symbol.decorators (e.g., ['app.route("/path")', 'login_required'])
                 // Java/Rust/Go: symbol.modifiers may contain annotations (e.g., 'bean', 'scheduled')
@@ -1733,6 +1823,7 @@ function deadcode(index, options = {}) {
     results.excludedRuntimeContract = excludedRuntimeContract;
     results.excludedConstructors = excludedConstructors;
     results.excludedDynamicDispatch = excludedDynamicDispatch;
+    results.excludedRequiredSlot = excludedRequiredSlot;
     results.computedDispatch = computedDispatchInfo;
     reflectionInfo.withheldByTable.sort((a, b) => codeUnitCompare(a.file, b.file) ||
         a.startLine - b.startLine || codeUnitCompare(a.name, b.name));

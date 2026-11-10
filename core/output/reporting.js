@@ -215,7 +215,7 @@ function formatDeadcode(results, options = {}) {
     if (results.length === 0 && !results.excludedDecorated &&
         !results.excludedExported && !results.excludedExternalContract &&
         !results.excludedRuntimeContract && !results.excludedConstructors && !results.pythonImplicitExportFiles &&
-        !results.excludedDynamicDispatch &&
+        !results.excludedDynamicDispatch && !results.excludedRequiredSlot &&
         results.projectKind !== 'application' && !results.computedDispatch?.count &&
         !results.reflection?.withheld && !results.reflection?.dynamicCount && !results.reflection?.literalCount &&
         results.coverage?.complete !== false) {
@@ -302,6 +302,9 @@ function formatDeadcode(results, options = {}) {
     if (results.excludedDynamicDispatch > 0) {
         lines.push(`\n${results.excludedDynamicDispatch} registry member(s) hidden because a matching computed dispatch (registry[key]()) may invoke them.`);
     }
+    if (results.excludedRequiredSlot > 0) {
+        lines.push(`\n${results.excludedRequiredSlot} member(s) withheld: required by an interface, abstract class or trait of the project, or overridden by a descendant that says so. Removing one breaks a type.`);
+    }
     if (results.projectKind === 'application') {
         lines.push('\nProject kind: application (.ucn.json). Exported symbols are audited; contracts, registrations and reflection still withhold.');
     }
@@ -383,6 +386,7 @@ function formatDeadcodeJson(results) {
             ...(results.excludedConstructors > 0 && { excludedConstructors: results.excludedConstructors }),
             ...(results.pythonImplicitExportFiles > 0 && { pythonImplicitExportFiles: results.pythonImplicitExportFiles }),
             ...(results.excludedDynamicDispatch > 0 && { excludedDynamicDispatch: results.excludedDynamicDispatch }),
+            ...(results.excludedRequiredSlot > 0 && { excludedRequiredSlot: results.excludedRequiredSlot }),
             ...(results.projectKind === 'application' && { projectKind: results.projectKind }),
             ...(results.computedDispatch?.count > 0 && { computedDispatch: results.computedDispatch }),
             ...(results.reflection?.count > 0 && { reflection: results.reflection }),

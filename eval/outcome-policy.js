@@ -1015,15 +1015,11 @@ const OUTCOME_GATE_THRESHOLDS = Object.freeze({
     // guidance: every gate repo must judge at least this many, whatever is
     // pinned below.
     minContractBoundTasks: 1,
-    // The one contract-bound false-safe of the baseline, pinned by repo and
-    // exact seeded target. Every other false-safe row, contract-bound or
-    // not, on this repo or any other, fails the gate. The entry is deleted
-    // when the required-slot shield lands.
-    //   websocket  the default audit claims the only implementer of an
-    //              interface (same-name declaration lines are not usages).
-    knownContractBoundFalseSafe: Object.freeze({
-        websocket: Object.freeze(['util.go:306:ucnqSlot4']),
-    }),
+    // Contract-bound false-safes pinned by repo and exact seeded target.
+    // Empty: the one row of the first baseline (websocket, the only
+    // implementer of an interface claimed by the default audit) was closed
+    // by the required-slot shield. Any contract-bound false-safe fails.
+    knownContractBoundFalseSafe: Object.freeze({}),
     // Precommit check. falseReady is the dangerous direction; the coverage
     // matrix keeps an empty board from passing; the READY floor on clean
     // changes is pinned per repo once check evaluates by change kind.

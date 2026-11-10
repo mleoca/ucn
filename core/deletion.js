@@ -74,6 +74,7 @@ const REASON_TEXT = Object.freeze({
     'used-only-within-itself': 'every use found is inside the declaration itself, and the audit does not clear a name that is in use',
     'downstream-exposure': 'exported from a library: consumers outside the repository may use it',
     'external-contract': 'implements or overrides something defined outside the project',
+    'required-slot': 'required by a contract of the project: removing it breaks the type that implements it',
     'runtime-contract': 'invoked by the language runtime, the compiler or an assignment, not by name',
     'registered': 'decorated or registered with a framework, which may invoke it without naming it',
     'entry-point': 'an entry point the runtime or a test runner invokes',

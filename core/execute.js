@@ -1702,6 +1702,7 @@ const HANDLERS = {
             if (result.excludedRuntimeContract != null) sliced.excludedRuntimeContract = result.excludedRuntimeContract;
             if (result.excludedConstructors != null) sliced.excludedConstructors = result.excludedConstructors;
             if (result.excludedDynamicDispatch != null) sliced.excludedDynamicDispatch = result.excludedDynamicDispatch;
+            if (result.excludedRequiredSlot != null) sliced.excludedRequiredSlot = result.excludedRequiredSlot;
             if (result.projectKind != null) sliced.projectKind = result.projectKind;
             if (result.pythonImplicitExportFiles != null) sliced.pythonImplicitExportFiles = result.pythonImplicitExportFiles;
             if (result.computedDispatch != null) sliced.computedDispatch = result.computedDispatch;
