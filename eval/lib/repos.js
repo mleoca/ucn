@@ -563,6 +563,18 @@ const REPOS = [
         language: 'python',
         targetCandidates: ['.'],
     },
+    {
+        // An APPLICATION, not a library: a Django site whose static assets
+        // vendor two bundled `*.min.js` files beside its Python and
+        // JavaScript sources. The board had no repository where unindexed
+        // text sits next to indexed source, which is the shape where a
+        // completeness claim has to be made per name.
+        name: 'djangoproject',
+        url: 'https://github.com/django/djangoproject.com',
+        commit: '83a027bb6aac5bb36b9ef48dad8cb4ff45a2e84f',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
 ];
 
 // Publish-blocking board. Keep this as a named subset of REPOS so every
