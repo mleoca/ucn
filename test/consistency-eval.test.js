@@ -10,6 +10,7 @@ const {
     compareMultiset,
     compareStructured,
     evaluateConsistencySummary,
+    measureAnswerTax,
 } = require('../eval/consistency-gate-policy');
 const {
     consistencyBoard,
@@ -213,6 +214,68 @@ describe('deterministic disagreement evaluation', () => {
         ], { encoding: 'utf8' });
         assert.notStrictEqual(result.status, 0);
         assert.match(result.stderr, /positive integer/);
+    });
+});
+
+describe('answer tax (report only)', () => {
+    const answer = body => ['HEADER', body, 'CONTRACT: the same sentence every time', ''].join('\n');
+
+    it('counts characters on lines repeated across nearly every answer', () => {
+        const texts = ['alpha', 'beta', 'gamma', 'delta', 'epsilon'].map(answer);
+        const tax = measureAnswerTax(texts);
+        const constant = 'HEADER'.length + 'CONTRACT: the same sentence every time'.length;
+        assert.strictEqual(tax.answers, 5);
+        assert.strictEqual(tax.taxChars, constant * 5);
+        assert.strictEqual(tax.chars, texts.reduce((sum, text) => sum + text.length, 0));
+        assert.strictEqual(tax.share, Number((tax.taxChars / tax.chars).toFixed(4)));
+        // Largest repeated line first.
+        assert.strictEqual(tax.lines[0].line, 'CONTRACT: the same sentence every time');
+        assert.strictEqual(tax.lines[0].answers, 5);
+    });
+
+    it('a line missing from more than a tenth of the answers is an answer, not tax', () => {
+        const texts = [
+            ...Array.from({ length: 8 }, (_, i) => `only ${i}\nWARNING: skipped file`),
+            'only 8', 'only 9',
+        ];
+        assert.strictEqual(measureAnswerTax(texts).taxChars, 0); // 8 of 10 < 90%
+        const nine = [...texts.slice(0, 9), 'only 9\nWARNING: skipped file'];
+        assert.strictEqual(measureAnswerTax(nine).taxChars, 'WARNING: skipped file'.length * 9);
+    });
+
+    it('a repeated line is charged once per occurrence, blank lines never', () => {
+        const texts = Array.from({ length: 5 }, (_, i) => `x${i}\n\nNOTE\nNOTE\n`);
+        assert.strictEqual(measureAnswerTax(texts).taxChars, 'NOTE'.length * 2 * 5);
+    });
+
+    it('withholds the share below the minimum board size', () => {
+        const tax = measureAnswerTax(['a\nSAME', 'b\nSAME']);
+        assert.strictEqual(tax.share, null);
+        assert.strictEqual(tax.taxChars, null);
+        assert.strictEqual(tax.answers, 2);
+    });
+
+    it('evaluateProject reports the tax per command without touching the verdict', () => {
+        const files = { 'package.json': '{"name":"tax-fixture"}' };
+        const calls = [];
+        for (let i = 0; i < 8; i++) {
+            files[`lib${i}.js`] = `function helper${i}(value) { return value + ${i}; }\n` +
+                `module.exports = { helper${i} };\n`;
+            calls.push(`require('./lib${i}').helper${i}(${i});`);
+        }
+        files['main.js'] = `${calls.join('\n')}\n`;
+        const dir = tmp(files);
+        try {
+            const result = evaluateProject(dir, { name: 'tax-fixture' }, 20);
+            assert.deepStrictEqual(result.failures, [], JSON.stringify(result.witnesses, null, 2));
+            const tax = result.answerTax;
+            assert.ok(tax.byCommand.show.answers >= 5);
+            assert.ok(tax.byCommand.show.share > 0 && tax.byCommand.show.share < 1);
+            assert.ok(tax.share > 0 && tax.share < 1);
+            assert.ok(tax.byCommand.show.topLines.length > 0);
+            assert.strictEqual(tax.chars,
+                Object.values(tax.byCommand).reduce((sum, row) => sum + row.chars, 0));
+        } finally { rm(dir); }
     });
 });
 

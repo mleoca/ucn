@@ -506,8 +506,19 @@ describe('outcome-policy: gate thresholds', () => {
             'ucn-contract': { brokenBuildRate: 0.1 },
         } } },
         delete: { aggregate: { perArm: {
-            'ucn-contract': { falseSafe: 0, saidSafe: 2 },
+            'ucn-contract': {
+                falseSafe: 0, saidSafe: 2,
+                positive: { tasks: 2, safe: 2, rate: 1 },
+                contractBound: { tasks: 1, falseSafe: 0 },
+            },
         } } },
+        language: 'python',
+        check: {
+            applicability: Object.fromEntries(policy.CHECK_TASK_KINDS.map(kind => [kind, true])),
+            aggregate: policy.aggregateCheckTasks(policy.CHECK_TASK_KINDS.map(kind => ({
+                kind, verdict: policy.CHECK_VERDICTS.review, outsideNew: 0, insideNew: 0,
+            }))),
+        },
     });
 
     it('passes a clean report', () => {
@@ -536,6 +547,311 @@ describe('outcome-policy: gate thresholds', () => {
         const even = cleanReport();
         even.rename.aggregate.perArm['ucn-contract'].brokenBuildRate = 0.3;
         assert.deepStrictEqual(policy.evaluateOutcomeGate([even]), []);
+    });
+});
+
+describe('outcome-policy: deletion guidance metrics', () => {
+    const arms = ['ucn-contract'];
+    const row = (verdict, groundBroken, extra = {}) => ({
+        groundBroken, ...extra,
+        arms: { 'ucn-contract': typeof verdict === 'string' ? { verdict } : verdict },
+    });
+
+    it('reports positive, negative and abstention views separately', () => {
+        const tasks = [
+            row('safe', false, { positiveSet: 'seeded-dead' }),
+            row({ verdict: 'review', verdictReason: 'not-claimed-by-audit' }, false,
+                { positiveSet: 'private-zero' }),
+            row('unsafe', true),
+            row({ verdict: 'review', verdictReason: 'audit-coverage-incomplete' }, true),
+            row('unsafe', false),
+        ];
+        const contract = policy.aggregateDeleteTasks(tasks, arms).perArm['ucn-contract'];
+        assert.deepStrictEqual(contract.positive, { tasks: 2, safe: 1, rate: 0.5 });
+        assert.deepStrictEqual(contract.negative,
+            { tasks: 2, unsafe: 1, review: 1, safe: 0, correctRate: 0.5 });
+        assert.deepStrictEqual(contract.abstention, {
+            review: 2, rate: 0.4,
+            byReason: { 'audit-coverage-incomplete': 1, 'not-claimed-by-audit': 1 },
+        });
+    });
+
+    it('a positive-set row whose deletion broke the build is not a positive case', () => {
+        const contract = policy.aggregateDeleteTasks(
+            [row('safe', true, { positiveSet: 'private-zero' })], arms).perArm['ucn-contract'];
+        assert.strictEqual(contract.positive.tasks, 0);
+        assert.strictEqual(contract.positive.rate, null);
+        assert.strictEqual(contract.falseSafe, 1);
+    });
+
+    const gateReport = tasks => ({
+        repo: 'demo', language: 'python', judgeErrors: 0,
+        renameProposalErrors: 0, deleteProposalErrors: 0,
+        delete: { aggregate: policy.aggregateDeleteTasks(tasks, arms) },
+    });
+    const floors = {
+        ...policy.OUTCOME_GATE_THRESHOLDS,
+        requireCheckCoverage: false,
+        contractPositiveVerdictFloor: { demo: 0.5 },
+    };
+    const positives = verdict => [
+        row(verdict, false, { positiveSet: 'seeded-dead' }),
+        row(verdict, false, { positiveSet: 'seeded-dead' }),
+        row('unsafe', true),
+    ];
+
+    it('an always-unsafe arm is fully decisive and still fails the gate', () => {
+        const report = gateReport(positives('unsafe'));
+        const contract = report.delete.aggregate.perArm['ucn-contract'];
+        assert.strictEqual(contract.falseSafe, 0);
+        assert.strictEqual(contract.review, 0); // decisive on every task
+        assert.strictEqual(contract.positive.rate, 0);
+        const failures = policy.evaluateOutcomeGate([report], floors);
+        assert.strictEqual(failures.length, 1);
+        assert.match(failures[0], /positive-verdict rate 0 below floor 0\.5/);
+    });
+
+    it('an always-review arm fails the same floor; a correct arm passes', () => {
+        assert.strictEqual(
+            policy.evaluateOutcomeGate([gateReport(positives('review'))], floors).length, 1);
+        assert.deepStrictEqual(
+            policy.evaluateOutcomeGate([gateReport(positives('safe'))], floors), []);
+    });
+
+    it('a positive set below the coverage minimum fails even without a floor', () => {
+        const thin = gateReport([row('safe', false, { positiveSet: 'seeded-dead' })]);
+        const failures = policy.evaluateOutcomeGate([thin],
+            { ...policy.OUTCOME_GATE_THRESHOLDS, requireCheckCoverage: false });
+        assert.strictEqual(failures.length, 1);
+        assert.match(failures[0], /positive delete set has 1 task\(s\) \(min 2\)/);
+    });
+
+    it('seeded contract-bound falseSafe is always counted and gated on request', () => {
+        const tasks = [
+            ...positives('safe').slice(0, 2),
+            row('safe', true, { seededKind: 'contract-bound' }),
+        ];
+        const report = gateReport(tasks);
+        const contract = report.delete.aggregate.perArm['ucn-contract'];
+        assert.strictEqual(contract.falseSafe, 1); // never hidden from the report
+        assert.deepStrictEqual(contract.contractBound, { tasks: 1, falseSafe: 1 });
+        const base = { ...policy.OUTCOME_GATE_THRESHOLDS, requireCheckCoverage: false };
+        assert.deepStrictEqual(policy.evaluateOutcomeGate([report], base), []);
+        const enforced = policy.evaluateOutcomeGate([report],
+            { ...base, enforceSeededContractBound: true });
+        assert.strictEqual(enforced.length, 1);
+        assert.match(enforced[0], /contract delete falseSafe 1/);
+    });
+
+    it('language privacy is read from the header, unknown is not private', () => {
+        assert.strictEqual(policy.isLanguagePrivate('python', '_helper', 'def _helper():'), true);
+        assert.strictEqual(policy.isLanguagePrivate('python', 'helper', 'def helper():'), false);
+        assert.strictEqual(policy.isLanguagePrivate('python', '__init__', 'def __init__(self):'), false);
+        assert.strictEqual(policy.isLanguagePrivate('go', 'helper', 'func helper() {'), true);
+        assert.strictEqual(policy.isLanguagePrivate('go', 'Helper', 'func Helper() {'), false);
+        assert.strictEqual(policy.isLanguagePrivate('rust', 'helper', 'fn helper() {'), true);
+        assert.strictEqual(policy.isLanguagePrivate('rust', 'helper', 'pub(crate) fn helper() {'), false);
+        assert.strictEqual(policy.isLanguagePrivate('java', 'helper', 'private int helper() {'), true);
+        assert.strictEqual(policy.isLanguagePrivate('java', 'helper', 'int helper() {'), false);
+        assert.strictEqual(policy.isLanguagePrivate('typescript', 'helper', 'function helper() {'), false);
+    });
+});
+
+describe('outcome-policy: judge diagnostics keep locations', () => {
+    it('each judge parser returns key, file and line; key lists are unchanged', () => {
+        const go = './conn.go:12:3: undefined: x\nvet: ./a.go:7: bad';
+        assert.deepStrictEqual(policy.parseGoDiagnostics(go), [
+            { key: './conn.go|undefined: x', file: 'conn.go', line: 12 },
+            { key: './a.go|bad', file: 'a.go', line: 7 },
+        ]);
+        assert.deepStrictEqual(policy.parseGoErrors(go), ['./conn.go|undefined: x', './a.go|bad']);
+
+        const cargo = [
+            'src/lib.rs:3:1: error[E0425]: nope',
+            'src/lib.rs:3:1: error[E0425]: nope', // second target context
+            'src/lib.rs:9:1: error[E0425]: nope',
+        ].join('\n');
+        assert.deepStrictEqual(policy.parseCargoDiagnostics(cargo).map(d => d.line), [3, 9]);
+        assert.deepStrictEqual(policy.parseCargoErrors(cargo), ['src/lib.rs|nope']);
+
+        const pyright = { generalDiagnostics: [
+            { severity: 'error', file: '/r/app/a.py', rule: 'reportCallIssue',
+              message: 'Missing argument', range: { start: { line: 4, character: 0 } } },
+            { severity: 'warning', file: '/r/app/a.py', message: 'ignored' },
+        ] };
+        assert.deepStrictEqual(policy.parsePyrightDiagnostics(pyright, '/r'), [
+            { key: 'app/a.py|reportCallIssue|Missing argument', file: 'app/a.py', line: 5 },
+        ]);
+
+        assert.deepStrictEqual(policy.parseJavacDiagnostics('A.java:8: error: cannot find symbol'),
+            [{ key: 'A.java|cannot find symbol', file: 'A.java', line: 8 }]);
+        assert.deepStrictEqual(policy.parseTscDiagnostics('src/a.ts(3,5): error TS2339: nope'),
+            [{ key: 'src/a.ts|TS2339|nope', file: 'src/a.ts', line: 3 }]);
+    });
+
+    it('places new diagnostics inside or outside the edit ranges', () => {
+        const after = [
+            { key: 'a.py|r|in the edit', file: 'a.py', line: 5 },
+            { key: 'b.py|r|a caller broke', file: 'b.py', line: 40 },
+            { key: 'a.py|r|pre-existing', file: 'a.py', line: 90 },
+        ];
+        const placed = policy.classifyNewDiagnostics(
+            ['a.py|r|pre-existing'], after, [{ file: './a.py', startLine: 4, endLine: 6 }]);
+        assert.strictEqual(placed.inside, 1);
+        assert.strictEqual(placed.outside, 1);
+        assert.deepStrictEqual(placed.outsideSamples, ['b.py|r|a caller broke']);
+    });
+
+    it('a key seen both inside and outside the edit counts as outside', () => {
+        const after = [
+            { key: 'a.py|r|same message', file: 'a.py', line: 5 },
+            { key: 'a.py|r|same message', file: 'a.py', line: 60 },
+        ];
+        const placed = policy.classifyNewDiagnostics(
+            [], after, [{ file: 'a.py', startLine: 5, endLine: 5 }]);
+        assert.strictEqual(placed.inside, 0);
+        assert.strictEqual(placed.outside, 2);
+    });
+
+    it('a deletion is zero-width: nothing is inside it', () => {
+        const placed = policy.classifyNewDiagnostics([],
+            [{ key: 'a.go|undefined: gone', file: 'a.go', line: 10 }],
+            [{ file: 'a.go', startLine: 10, endLine: 9 }]);
+        assert.strictEqual(placed.outside, 1);
+    });
+});
+
+describe('outcome-policy: precommit-check tasks', () => {
+    const { ready, review, blocked } = policy.CHECK_VERDICTS;
+
+    it('scores readiness against dependents, not against the changed lines', () => {
+        const agg = policy.aggregateCheckTasks([
+            { kind: 'additive', verdict: blocked, outsideNew: 0, insideNew: 0 },
+            { kind: 'additive', verdict: ready, outsideNew: 0, insideNew: 2 },
+            { kind: 'required-param', verdict: blocked, outsideNew: 3, insideNew: 0 },
+            { kind: 'return-contract-edit', verdict: ready, outsideNew: 1, insideNew: 0 },
+            { kind: 'inert-body-edit', verdict: review, outsideNew: 0, insideNew: 0 },
+        ]);
+        assert.strictEqual(agg.tasks, 5);
+        assert.strictEqual(agg.falseReady, 1);
+        assert.strictEqual(agg.brokenFlagged, 1);
+        assert.strictEqual(agg.groundClean, 3);
+        assert.strictEqual(agg.blockedOnClean, 1);
+        assert.strictEqual(agg.readyOnClean, 1);
+        assert.strictEqual(agg.insideOnlyDiagnostics, 1);
+        assert.strictEqual(agg.readyOnCleanRate, 0.3333);
+        assert.strictEqual(agg.byKind.additive.blockedOnCleanRate, 0.5);
+        assert.strictEqual(agg.byKind['return-contract-edit'].falseReady, 1);
+        assert.strictEqual(agg.byKind['return-contract-edit'].readyOnCleanRate, null);
+    });
+
+    it('derives applicability from traits, never from a language name', () => {
+        const inferring = policy.checkKindApplicability(
+            { inferredReturnForms: ['unannotated'], callableKindFromBody: ['generator'] });
+        assert.strictEqual(inferring['return-contract-edit'], true);
+        assert.strictEqual(inferring['generator-transition'], true);
+        const declared = policy.checkKindApplicability(
+            { inferredReturnForms: [], callableKindFromBody: [] });
+        assert.strictEqual(declared['return-contract-edit'], false);
+        assert.strictEqual(declared['generator-transition'], false);
+        assert.strictEqual(declared['required-param'], true);
+        // A placeholder or opaque return is inferred too, but the board has
+        // no mutation for it: not applicable to this instrument.
+        assert.strictEqual(policy.checkKindApplicability(
+            { inferredReturnForms: ['opaque'] })['return-contract-edit'], false);
+    });
+
+    it('the shipped traits give the board its languages\' real matrix', () => {
+        const { langTraits } = require('../languages');
+        const python = policy.checkKindApplicability(langTraits('python'));
+        assert.strictEqual(python['return-contract-edit'], true);
+        assert.strictEqual(python['generator-transition'], true);
+        for (const language of ['go', 'rust', 'java']) {
+            const matrix = policy.checkKindApplicability(langTraits(language));
+            assert.strictEqual(matrix['return-contract-edit'], false, language);
+            assert.strictEqual(matrix['generator-transition'], false, language);
+            assert.strictEqual(matrix['inert-body-edit'], true, language);
+        }
+        // JS infers an unannotated return; only a header (`function*`) makes
+        // a generator.
+        const js = policy.checkKindApplicability(langTraits('javascript'));
+        assert.strictEqual(js['return-contract-edit'], true);
+        assert.strictEqual(js['generator-transition'], false);
+    });
+
+    const report = (repo, language, applicability, kinds) => ({
+        repo, language, judgeErrors: 0,
+        check: {
+            applicability,
+            aggregate: policy.aggregateCheckTasks(kinds.map(kind => ({
+                kind, verdict: review, outsideNew: 0, insideNew: 0,
+            }))),
+        },
+    });
+    const all = Object.fromEntries(policy.CHECK_TASK_KINDS.map(kind => [kind, true]));
+    const declaredOnly = { ...all, 'return-contract-edit': false, 'generator-transition': false };
+    const declaredKinds = policy.CHECK_TASK_KINDS.filter(kind => declaredOnly[kind]);
+
+    it('an inapplicable pair is N/A; the board still needs every kind somewhere', () => {
+        const board = [
+            report('py', 'python', all, policy.CHECK_TASK_KINDS),
+            report('gorepo', 'go', declaredOnly, declaredKinds),
+        ];
+        assert.deepStrictEqual(policy.evaluateCheckCoverage(board), []);
+        const goOnly = policy.evaluateCheckCoverage([board[1]]);
+        assert.deepStrictEqual(goOnly, [
+            'board: check kind return-contract-edit is judged on no repo',
+            'board: check kind generator-transition is judged on no repo',
+        ]);
+    });
+
+    it('an applicable pair with no judged task fails by name', () => {
+        const thin = report('py', 'python', all,
+            policy.CHECK_TASK_KINDS.filter(kind => kind !== 'required-param'));
+        const failures = policy.evaluateCheckCoverage([thin]);
+        assert.deepStrictEqual(failures, [
+            'py: no judged required-param check task (applicable to python)',
+            'board: check kind required-param is judged on no repo',
+        ]);
+    });
+
+    it('a report without check tasks cannot pass the gate', () => {
+        const failures = policy.evaluateOutcomeGate([{ repo: 'demo', judgeErrors: 0 }]);
+        assert.ok(failures.includes('demo: no check tasks in the report'));
+    });
+
+    it('a known false-ready row is pinned by id; a new one still fails', () => {
+        const tasks = [
+            ...policy.CHECK_TASK_KINDS.map(kind => ({
+                id: `a.py:1:${kind}`, kind, verdict: review, outsideNew: 0 })),
+            { id: 'a.py:9:known', kind: 'generator-transition', verdict: ready, outsideNew: 4 },
+        ];
+        const pinned = report('py', 'python', all, policy.CHECK_TASK_KINDS);
+        pinned.check.tasks = tasks;
+        pinned.check.aggregate = policy.aggregateCheckTasks(tasks);
+        const thresholds = {
+            ...policy.OUTCOME_GATE_THRESHOLDS, knownCheckFalseReady: { py: ['a.py:9:known'] },
+        };
+        assert.strictEqual(pinned.check.aggregate.falseReady, 1); // still reported
+        assert.deepStrictEqual(policy.evaluateOutcomeGate([pinned], thresholds), []);
+        pinned.check.tasks = [...tasks,
+            { id: 'b.py:3:fresh', kind: 'required-param', verdict: ready, outsideNew: 1 }];
+        pinned.check.aggregate = policy.aggregateCheckTasks(pinned.check.tasks);
+        const failures = policy.evaluateOutcomeGate([pinned], thresholds);
+        assert.deepStrictEqual(failures, ['py: check falseReady 1 (max 0): b.py:3:fresh']);
+    });
+
+    it('the gate fails on falseReady and on a missed READY floor', () => {
+        const bad = report('py', 'python', all, policy.CHECK_TASK_KINDS);
+        bad.check.aggregate = policy.aggregateCheckTasks([
+            ...policy.CHECK_TASK_KINDS.map(kind => ({ kind, verdict: review, outsideNew: 0 })),
+            { kind: 'required-param', verdict: ready, outsideNew: 2 },
+        ]);
+        const failures = policy.evaluateOutcomeGate([bad], {
+            ...policy.OUTCOME_GATE_THRESHOLDS, checkReadyOnCleanFloor: { py: 0.5 },
+        });
+        assert.ok(failures.some(text => /py: check falseReady 1 \(max 0\)/.test(text)));
+        assert.ok(failures.some(text => /py: check READY rate on clean changes 0 below floor 0\.5/.test(text)));
     });
 });
 

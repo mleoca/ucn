@@ -77,8 +77,10 @@ const {
     seededRandom,
 } = require('./lib/repos');
 const policy = require('./outcome-policy');
+const mutations = require('./outcome-mutations');
 const { ProjectIndex } = require('..');
 const { isTestPath } = require('../core/shared');
+const { langTraits } = require('../languages');
 
 const CLI_PATH = path.join(__dirname, '..', 'cli', 'index.js');
 // UCN_EVAL_REPORTS_DIR keeps evaluation artifacts out of the tracked tree,
@@ -174,6 +176,18 @@ function cliJson(repoPath, args) {
     }
 }
 
+/** JSON document of a command whose exit code is part of its answer:
+ *  `check` prints its result and exits 1 on BLOCKED. */
+function cliJsonAnyExit(repoPath, args) {
+    const run = runCli(repoPath, args, { json: true });
+    if (run.error) return { ok: false, error: run.error, ms: run.ms };
+    try {
+        return { ok: true, doc: JSON.parse(run.stdout), ms: run.ms };
+    } catch (error) {
+        return { ok: false, error: run.stderr.trim() || `JSON parse: ${error.message}`, ms: run.ms };
+    }
+}
+
 // ── Toolchain judges ────────────────────────────────────────────────────────
 
 function spawnJudge(command, args, cwd) {
@@ -202,7 +216,12 @@ function makeJudge(repo, repoPath) {
                 label: 'go vet ./...',
                 run() {
                     const out = spawnJudge('go', ['vet', './...'], repoPath);
-                    return { keys: policy.parseGoErrors(`${out.stdout}\n${out.stderr}`), ms: out.ms };
+                    const text = `${out.stdout}\n${out.stderr}`;
+                    return {
+                        keys: policy.parseGoErrors(text),
+                        diagnostics: policy.parseGoDiagnostics(text),
+                        ms: out.ms,
+                    };
                 },
             };
         case 'rust':
@@ -212,7 +231,12 @@ function makeJudge(repo, repoPath) {
                     const out = spawnJudge('cargo',
                         ['check', '--workspace', '--all-targets', '--message-format=short'],
                         repoPath);
-                    return { keys: policy.parseCargoErrors(`${out.stdout}\n${out.stderr}`), ms: out.ms };
+                    const text = `${out.stdout}\n${out.stderr}`;
+                    return {
+                        keys: policy.parseCargoErrors(text),
+                        diagnostics: policy.parseCargoDiagnostics(text),
+                        ms: out.ms,
+                    };
                 },
             };
         case 'python':
@@ -227,7 +251,12 @@ function makeJudge(repo, repoPath) {
                         throw new Error(
                             `pyright output unparseable: ${error.message}`, { cause: error });
                     }
-                    return { keys: policy.parsePyrightErrors(doc, fs.realpathSync(repoPath)), ms: out.ms };
+                    const root = fs.realpathSync(repoPath);
+                    return {
+                        keys: policy.parsePyrightErrors(doc, root),
+                        diagnostics: policy.parsePyrightDiagnostics(doc, root),
+                        ms: out.ms,
+                    };
                 },
             };
         case 'java': {
@@ -251,8 +280,10 @@ function makeJudge(repo, repoPath) {
                     const out = spawnJudge(javac, ['-d', path.join(outDir, 'classes'),
                         '-proc:none', '-nowarn', '-Xmaxerrs', '10000',
                         `@${argFile}`], repoPath);
+                    const text = `${out.stdout}\n${out.stderr}`;
                     return {
-                        keys: policy.parseJavacErrors(`${out.stdout}\n${out.stderr}`),
+                        keys: policy.parseJavacErrors(text),
+                        diagnostics: policy.parseJavacDiagnostics(text),
                         ms: out.ms,
                     };
                 },
@@ -327,7 +358,10 @@ function collectJavaSources(repoPath) {
     return sources.sort(codeUnitCompare);
 }
 
-function restoreRepo(repoPath) {
+function restoreRepo(repoPath, createdFiles = []) {
+    // `git checkout` restores tracked files only; a file a mutation created
+    // is removed by name (never a blanket clean of the clone).
+    for (const created of createdFiles) fs.rmSync(created, { force: true });
     const result = spawnSync('git', ['checkout', '-q', '--', '.'], {
         cwd: repoPath, encoding: 'utf8', timeout: 120000,
     });
@@ -772,7 +806,7 @@ function judgeWithGoImportRepair(judge, repoPath, baselineKeys, language) {
         result = judge.run();
         newKeys = policy.diffErrorKeys(baselineKeys, result.keys);
     }
-    return { newKeys, ms: result.ms, repairs };
+    return { newKeys, diagnostics: result.diagnostics || [], ms: result.ms, repairs };
 }
 
 function collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit) {
@@ -843,6 +877,246 @@ function collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit) {
             },
         },
     };
+}
+
+// ── Seeded mutations (shared by seeded delete tasks and check tasks) ────────
+
+function writeMutation(repoPath, mutation) {
+    const created = [];
+    for (const file of mutation.files) {
+        const absolute = path.join(repoPath, file.path);
+        if (file.created) {
+            if (fs.existsSync(absolute)) {
+                throw new Error(`mutation would overwrite ${file.path}`);
+            }
+            created.push(absolute);
+        }
+        fs.writeFileSync(absolute, file.content);
+    }
+    return created;
+}
+
+function patchedContent(contentByFile, mutation) {
+    const next = new Map(contentByFile);
+    for (const file of mutation.files) next.set(file.path, file.content);
+    return next;
+}
+
+/** Independent sampling stream per phase: adding a phase never moves the
+ *  rename/delete samples of an existing board. */
+function phaseRandom(seed, salt) {
+    return seededRandom((seed ^ salt) >>> 0);
+}
+
+/**
+ * Seeded delete tasks. Sampling existing symbols cannot tell whether an arm
+ * gives positive deletion guidance: a library's zero-occurrence symbols are
+ * mostly public API, where "review" is the right answer. Two seeded kinds
+ * have a ground truth by construction:
+ *   dead-addition   a private callable nothing refers to, appended to an
+ *                   existing file. Deleting it restores the pristine tree.
+ *   contract-bound  the only implementation of a contract member, never
+ *                   called by name. Deleting it breaks the type; the judge
+ *                   confirms.
+ * The seeded state itself is judged first: a seed that adds diagnostics of
+ * its own is rejected, never scored.
+ */
+function runSeededDeleteTasks(context, options) {
+    const { repo, repoPath, contentByFile, candidates, judge, baseline, log } = context;
+    const rand = phaseRandom(options.seed, 0x5eedde1);
+    const hostFiles = [...new Set(candidates.filter(candidate => !candidate.indexMissing)
+        .map(candidate => candidate.relativePath))];
+    const hosts = sampleWithout(hostFiles, hostFiles.length, rand);
+    const planned = [
+        ...Array(options.seededDead).fill('dead-addition'),
+        ...Array(options.seededContractBound).fill('contract-bound'),
+    ];
+    const rows = [];
+    let rejected = 0;
+    let judgeErrors = 0;
+    let proposalErrors = 0;
+    let serial = 0;
+    let hostIndex = 0;
+    for (const kind of planned) {
+        let scored = false;
+        for (let attempt = 0; !scored && attempt < 4 && hostIndex < hosts.length; attempt++) {
+            const host = hosts[hostIndex++];
+            serial++;
+            const input = {
+                language: repo.language,
+                relativePath: host,
+                content: contentByFile.get(host),
+            };
+            const build = variant => (kind === 'dead-addition'
+                ? mutations.seededDeadAddition(input, serial, variant)
+                : mutations.seededContractBound(input, serial));
+            const plain = build({});
+            if (!plain) break; // no seed of this kind in this language
+            const marked = kind === 'dead-addition' ? build({ allowDead: true }) : null;
+            const variants = marked && marked.files[0].content !== plain.files[0].content
+                ? [plain, marked] : [plain];
+            for (const mutation of variants) {
+                let created = [];
+                try {
+                    created = writeMutation(repoPath, mutation);
+                    const seededState = judge.run();
+                    if (policy.diffErrorKeys(baseline.keys, seededState.keys).length > 0) {
+                        rejected++;
+                        continue;
+                    }
+                    const patched = patchedContent(contentByFile, mutation);
+                    const auditJson = cliJson(repoPath, ['deadcode']);
+                    const auditText = runCli(repoPath, ['deadcode']);
+                    const audit = auditJson.ok ? {
+                        data: auditJson.doc || {},
+                        share: { outputChars: auditText.stdout.length, toolCalls: 1 },
+                    } : null;
+                    const target = mutation.target;
+                    const verdicts = collectDeleteVerdicts(repoPath, patched, target, audit);
+                    if (verdicts.error) {
+                        proposalErrors++;
+                        log(`  seeded ${kind} ${target.name}: ${verdicts.error}`);
+                        break;
+                    }
+                    let ground = { broken: false, newErrors: 0, samples: [], repairs: 0,
+                        source: 'construction' };
+                    if (kind === 'contract-bound') {
+                        applyStandardDeletion(repoPath, patched, target);
+                        const judged = judgeWithGoImportRepair(
+                            judge, repoPath, baseline.keys, repo.language);
+                        ground = {
+                            broken: judged.newKeys.length > 0,
+                            newErrors: judged.newKeys.length,
+                            samples: judged.newKeys.slice(0, 3),
+                            repairs: judged.repairs,
+                            source: 'judge',
+                        };
+                    }
+                    rows.push({
+                        id: `${target.relativePath}:${target.startLine}:${target.name}`,
+                        name: target.name,
+                        kind: target.type,
+                        seededKind: kind,
+                        ...(kind === 'dead-addition' && { positiveSet: 'seeded-dead' }),
+                        groundBroken: ground.broken,
+                        groundNewErrors: ground.newErrors,
+                        groundErrorSamples: ground.samples,
+                        groundSource: ground.source,
+                        importRepairs: ground.repairs,
+                        arms: verdicts.arms,
+                    });
+                    const armSummary = ARMS.map(arm =>
+                        `${arm}=${policy.armDeleteVerdict(verdicts.arms[arm])}`).join(' ');
+                    log(`  seeded ${kind} ${target.name}: ` +
+                        `ground=${ground.broken ? 'BREAKS' : 'clean'} ${armSummary}`);
+                    scored = true;
+                    break;
+                } catch (error) {
+                    judgeErrors++;
+                    log(`  seeded ${kind}: JUDGE ERROR ${error.message}`);
+                    break;
+                } finally {
+                    restoreRepo(repoPath, created);
+                }
+            }
+        }
+    }
+    return { rows, rejected, judgeErrors, proposalErrors };
+}
+
+/**
+ * Precommit-check tasks: one seeded mutation, the public `check` verdict,
+ * and the toolchain as ground truth. READY_FOR_TOOLCHAIN is a statement
+ * about dependents, so the ground outcome is the new diagnostics OUTSIDE
+ * the mutation's own lines; diagnostics inside them are counted apart.
+ */
+function runCheckTasks(context, options, pools) {
+    const { repo, repoPath, contentByFile, judge, baseline, log } = context;
+    const applicability = policy.checkKindApplicability(langTraits(repo.language));
+    const rand = phaseRandom(options.seed, 0x0c4ec4);
+    const rows = [];
+    let judgeErrors = 0;
+    let proposalErrors = 0;
+    let serial = 0;
+    for (const kind of policy.CHECK_TASK_KINDS) {
+        if (!applicability[kind]) continue;
+        const pool = pools[kind] || [];
+        const order = sampleWithout(pool, pool.length, rand);
+        let judged = 0;
+        for (const candidate of order) {
+            if (judged >= options.checkTasks) break;
+            serial++;
+            const input = {
+                language: repo.language,
+                relativePath: candidate.relativePath,
+                content: contentByFile.get(candidate.relativePath),
+                def: candidate,
+            };
+            const isDelete = kind === 'delete-referenced' || kind === 'delete-unreferenced';
+            let mutation = null;
+            if (kind === 'additive') mutation = mutations.additiveSymbol(input, serial);
+            else if (!isDelete) mutation = mutations.DEFINITION_MUTATIONS[kind](input);
+            if (!isDelete && !mutation) continue; // cannot be placed on this definition
+            // An addition is named by what it adds, not by its host symbol.
+            const id = kind === 'additive'
+                ? mutation.files[0].path
+                : `${candidate.relativePath}:${candidate.startLine}:${candidate.name}`;
+            const label = kind === 'additive' ? mutation.files[0].path : candidate.name;
+            let created = [];
+            try {
+                if (isDelete) applyStandardDeletion(repoPath, contentByFile, candidate);
+                else created = writeMutation(repoPath, mutation);
+                const checkJson = cliJsonAnyExit(repoPath, ['check']);
+                const checkText = runCli(repoPath, ['check']);
+                const data = checkJson.ok ? checkJson.doc.data : null;
+                const verdict = data && data.ok !== false && data.trust
+                    ? data.trust.status : null;
+                if (!verdict) {
+                    proposalErrors++;
+                    log(`  check ${kind} ${label}: no verdict ` +
+                        `(${checkJson.error || (data && data.error) || 'check did not run'})`);
+                    continue;
+                }
+                // A pure deletion is zero-width: every new diagnostic is a
+                // dependent's. The Go import repair is the trivial cleanup
+                // any agent performs after a deletion.
+                const placed = isDelete
+                    ? (() => {
+                        const repaired = judgeWithGoImportRepair(
+                            judge, repoPath, baseline.keys, repo.language);
+                        return policy.classifyNewDiagnostics(
+                            baseline.keys, repaired.diagnostics, []);
+                    })()
+                    : policy.classifyNewDiagnostics(
+                        baseline.keys, judge.run().diagnostics, mutation.changedRanges);
+                rows.push({
+                    id,
+                    kind,
+                    name: label,
+                    verdict,
+                    trust: data.trust,
+                    outsideNew: placed.outside,
+                    insideNew: placed.inside,
+                    outsideSamples: placed.outsideSamples,
+                    cost: {
+                        outputChars: checkText.stdout.length,
+                        toolCalls: 1,
+                        wallMs: checkText.ms,
+                    },
+                });
+                judged++;
+                log(`  check ${kind} ${label}: ${verdict} · ` +
+                    `dependents ${placed.outside > 0 ? `BROKE (${placed.outside})` : 'clean'}` +
+                    `${placed.inside > 0 ? ` · ${placed.inside} in the change` : ''}`);
+            } catch (error) {
+                judgeErrors++;
+                log(`  check ${kind} ${label}: JUDGE ERROR ${error.message}`);
+            } finally {
+                restoreRepo(repoPath, created);
+            }
+        }
+    }
+    return { applicability, rows, judgeErrors, proposalErrors };
 }
 
 // ── Per-repo run ────────────────────────────────────────────────────────────
@@ -1044,10 +1318,19 @@ async function runRepo(repo, options) {
             applyStandardDeletion(repoPath, contentByFile, task);
             const judged = judgeWithGoImportRepair(
                 judge, repoPath, baseline.keys, repo.language);
+            // Independently justified positive case: zero occurrences, a
+            // language-private header and a judge-clean deletion. The
+            // engine's own export verdict is never consulted.
+            const headerLine = (contentByFile.get(task.relativePath) || '')
+                .split('\n')[task.nameLine - 1];
+            const positive = judged.newKeys.length === 0 &&
+                occurrencesOutsideDef(contentByFile, task) === 0 &&
+                policy.isLanguagePrivate(repo.language, task.name, headerLine);
             const row = {
                 id: `${task.relativePath}:${task.startLine}:${task.name}`,
                 name: task.name,
                 kind: task.type,
+                ...(positive && { positiveSet: 'private-zero' }),
                 groundBroken: judged.newKeys.length > 0,
                 groundNewErrors: judged.newKeys.length,
                 groundErrorSamples: judged.newKeys.slice(0, 3),
@@ -1066,8 +1349,33 @@ async function runRepo(repo, options) {
         }
     }
 
+    // Phases C and D run after the sampled boards and draw from their own
+    // sampling streams, so the rename and delete rows above are unchanged.
+    const context = { repo, repoPath, contentByFile, candidates, judge, baseline, log };
+    const seeded = options.seededDead + options.seededContractBound > 0
+        ? runSeededDeleteTasks(context, options)
+        : { rows: [], rejected: 0, judgeErrors: 0, proposalErrors: 0 };
+    deleteResults.push(...seeded.rows);
+    judgeErrors += seeded.judgeErrors;
+
+    const referenced = withOccurrences.filter(row => row.occurrences >= 1)
+        .map(row => row.candidate);
+    const indexed = withOccurrences.map(row => row.candidate);
+    const check = options.checkTasks > 0
+        ? runCheckTasks(context, options, {
+            'additive': indexed,
+            'inert-body-edit': indexed,
+            'return-contract-edit': referenced,
+            'generator-transition': referenced,
+            'required-param': referenced,
+            'delete-referenced': lowUse,
+            'delete-unreferenced': zeroUse,
+        })
+        : null;
+    if (check) judgeErrors += check.judgeErrors;
+
     const report = {
-        schemaVersion: 2,
+        schemaVersion: 3,
         generatedAt: new Date().toISOString(),
         repo: repo.name,
         language: repo.language,
@@ -1092,7 +1400,14 @@ async function runRepo(repo, options) {
         }),
         judgeErrors,
         renameProposalErrors: renameRows.filter(row => row.proposal.error).length,
-        deleteProposalErrors: deleteRows.filter(row => row.verdicts.error).length,
+        deleteProposalErrors: deleteRows.filter(row => row.verdicts.error).length +
+            seeded.proposalErrors,
+        checkProposalErrors: check ? check.proposalErrors : 0,
+        seededDelete: {
+            deadAdditions: seeded.rows.filter(row => row.seededKind === 'dead-addition').length,
+            contractBound: seeded.rows.filter(row => row.seededKind === 'contract-bound').length,
+            rejectedSeeds: seeded.rejected,
+        },
         ...(sharedAudit && {
             sharedAudit: {
                 outputChars: sharedAudit.outputChars,
@@ -1108,10 +1423,20 @@ async function runRepo(repo, options) {
             tasks: deleteResults,
             aggregate: policy.aggregateDeleteTasks(deleteResults, ARMS),
         },
+        ...(check && {
+            check: {
+                applicability: check.applicability,
+                tasksPerKind: options.checkTasks,
+                tasks: check.rows,
+                aggregate: policy.aggregateCheckTasks(check.rows),
+            },
+        }),
         disclosures: [
             'Judge verdicts are lower bounds on breakage: type-checkers cannot see dynamically dispatched call sites (untyped receivers), string/comment damage, or runtime-only failures.',
             'falseUnsafe counts are upper bounds: a compile-clean deletion can still be runtime-unsafe.',
             'Tasks where every arm broke carry no discriminating signal (allArmsBroke) — typically renames of interface/contract members every arm would need extra knowledge to complete.',
+            'Seeded delete tasks have a ground truth by construction: a dead addition is deletable (the positive set, with language-private zero-occurrence symbols the judge confirmed clean); a contract-bound member is the only implementation of a contract member and is judged after deletion. A seed that adds diagnostics of its own is rejected, never scored.',
+            'Check tasks score READY_FOR_TOOLCHAIN against dependents: the ground outcome is new diagnostics outside the mutation\'s own lines. Diagnostics inside those lines are reported separately and never gated. A mutation kind a language cannot express is N/A for that repo.',
             "The contract arm's delete verdict is tri-state: 'review' means zero text evidence but not provably dead by the default deadcode audit (exported symbols, external contracts, entry points). falseSafe is computed over 'safe' verdicts only; review rows are reported with their ground outcomes.",
         ],
     };
@@ -1149,6 +1474,40 @@ function formatDeleteTable(aggregate) {
     return lines;
 }
 
+/** Deletion guidance of the contract arm: three views one constant answer
+ *  cannot satisfy together. */
+function formatGuidanceTable(aggregate) {
+    const row = aggregate.perArm['ucn-contract'];
+    if (!row || !row.positive) return [];
+    const reasons = Object.entries(row.abstention.byReason)
+        .map(([reason, count]) => `${reason} ${count}`).join(', ') || '-';
+    return [
+        '| positive set | answered safe | positive-verdict rate | judge-broken | answered unsafe | reviewed | abstention rate | review reasons | contract-bound false-safe |',
+        '|---:|---:|---:|---:|---:|---:|---:|---|---:|',
+        `| ${row.positive.tasks} | ${row.positive.safe} | ${row.positive.rate == null ? '-' : row.positive.rate} | ` +
+            `${row.negative.tasks} | ${row.negative.unsafe} | ${row.negative.review} | ` +
+            `${row.abstention.rate} | ${reasons} | ` +
+            `${row.contractBound.falseSafe} / ${row.contractBound.tasks} |`,
+    ];
+}
+
+function formatCheckTable(check) {
+    const lines = [
+        '| kind | tasks | READY | REVIEW | BLOCKED | dependents broke | false-ready (dangerous) | blocked on clean | READY on clean |',
+        '|---|---:|---:|---:|---:|---:|---:|---:|---:|',
+    ];
+    const cell = (bucket, label) => `| ${label} | ${bucket.tasks} | ${bucket.ready} | ${bucket.review} | ` +
+        `${bucket.blocked} | ${bucket.groundBroken} | ${bucket.falseReady} | ` +
+        `${bucket.blockedOnClean} / ${bucket.groundClean} | ${bucket.readyOnClean} / ${bucket.groundClean} |`;
+    for (const kind of policy.CHECK_TASK_KINDS) {
+        if (!check.applicability[kind]) { lines.push(`| ${kind} | N/A | | | | | | | |`); continue; }
+        const bucket = check.aggregate.byKind[kind];
+        lines.push(bucket ? cell(bucket, kind) : `| ${kind} | 0 | - | - | - | - | - | - | - |`);
+    }
+    lines.push(cell(check.aggregate, '**all**'));
+    return lines;
+}
+
 function formatMarkdown(reports) {
     const lines = [
         '# Task-outcome eval (paired, toolchain-judged)',
@@ -1183,6 +1542,28 @@ function formatMarkdown(reports) {
         lines.push('');
         lines.push(...formatDeleteTable(report.delete.aggregate));
         lines.push('');
+        const guidance = formatGuidanceTable(report.delete.aggregate);
+        if (guidance.length > 0) {
+            lines.push('Deletion guidance, contract arm ' +
+                `(${report.seededDelete ? report.seededDelete.deadAdditions : 0} seeded dead additions, ` +
+                `${report.seededDelete ? report.seededDelete.contractBound : 0} seeded contract-bound members, ` +
+                `${report.seededDelete ? report.seededDelete.rejectedSeeds : 0} rejected seeds):`);
+            lines.push('');
+            lines.push(...guidance);
+            lines.push('');
+        }
+        if (report.check) {
+            lines.push(`### Precommit check (${report.check.tasks.length} tasks)`);
+            lines.push('');
+            lines.push(...formatCheckTable(report.check));
+            lines.push('');
+            const falseReady = report.check.tasks.filter(task =>
+                task.verdict === policy.CHECK_VERDICTS.ready && task.outsideNew > 0);
+            for (const task of falseReady) {
+                lines.push(`- false-ready \`${task.id}\` (${task.kind}): ${task.outsideSamples[0] || ''}`);
+            }
+            if (falseReady.length > 0) lines.push('');
+        }
         const brokenRows = report.rename.tasks.filter(row =>
             ARMS.some(arm => row.arms[arm] && row.arms[arm].broken));
         if (brokenRows.length > 0) {
@@ -1243,6 +1624,10 @@ async function main() {
         : [seedRaw == null ? DEFAULT_SEED : parseSeed(seedRaw)];
     const renameTasks = Number(readArgValue(argv, '--rename-tasks') || 10);
     const deleteTasks = Number(readArgValue(argv, '--delete-tasks') || 6);
+    // Seeded delete tasks and check tasks (judged mutations per kind).
+    const seededDead = Number(readArgValue(argv, '--seeded-dead') ?? 2);
+    const seededContractBound = Number(readArgValue(argv, '--seeded-contract-bound') ?? 1);
+    const checkTasks = Number(readArgValue(argv, '--check-tasks') ?? 2);
     const repoFilterRaw = readArgValue(argv, '--repo');
     const targetsRaw = readArgValue(argv, '--targets');
     const targets = targetsRaw
@@ -1296,8 +1681,13 @@ async function main() {
     const reports = [];
     let failures = 0;
     for (const seed of seeds) {
+        // Value mode and directed handles measure renames only.
+        const callableBoard = kinds !== 'value' && !targets;
         const options = { seed, renameTasks, deleteTasks: kinds === 'value' ? 0 : deleteTasks,
-            targets, oracleTargets: kinds === 'value' ? false : oracleTargets, kinds };
+            targets, oracleTargets: kinds === 'value' ? false : oracleTargets, kinds,
+            seededDead: callableBoard ? seededDead : 0,
+            seededContractBound: callableBoard ? seededContractBound : 0,
+            checkTasks: callableBoard ? checkTasks : 0 };
         for (const repo of repos) {
             try {
                 const report = await runRepo(repo, options);
@@ -1352,6 +1742,21 @@ async function main() {
                 ? `${arm}=${del[arm].falseSafe}/${del[arm].saidSafe}` +
                     (del[arm].review > 0 ? ` (review ${del[arm].review})` : '')
                 : `${arm}=-`).join(' ') + '\n');
+        const contract = del['ucn-contract'];
+        if (contract && contract.positive) {
+            process.stdout.write(`${label}: delete guidance positive ` +
+                `${contract.positive.safe}/${contract.positive.tasks} · ` +
+                `judge-broken answered unsafe ${contract.negative.unsafe}/${contract.negative.tasks} · ` +
+                `review ${contract.abstention.review} · ` +
+                `contract-bound falseSafe ${contract.contractBound.falseSafe}/${contract.contractBound.tasks}\n`);
+        }
+        if (report.check) {
+            const check = report.check.aggregate;
+            process.stdout.write(`${label}: check falseReady ${check.falseReady} · ` +
+                `blocked-on-clean ${check.blockedOnClean}/${check.groundClean} · ` +
+                `READY-on-clean ${check.readyOnClean}/${check.groundClean} · ` +
+                `broken flagged ${check.brokenFlagged}/${check.groundBroken}\n`);
+        }
     }
 
     if (gateMode) {
@@ -1364,10 +1769,31 @@ async function main() {
             for (const failure of gateFailures) process.stdout.write(`  - ${failure}\n`);
             process.exitCode = 1;
         } else {
+            const thresholds = policy.OUTCOME_GATE_THRESHOLDS;
+            const floors = Object.keys(thresholds.contractPositiveVerdictFloor).length;
+            const readyFloors = Object.keys(thresholds.checkReadyOnCleanFloor).length;
             process.stdout.write('OUTCOME GATE: PASS ' +
                 `(${reports.length} tuned repos; thresholds: judgeErrors 0, ` +
                 'proposalErrors 0, contract delete falseSafe 0, ' +
-                'contract rename <= grep baseline)\n');
+                'contract rename <= grep baseline, check falseReady 0, ' +
+                `check coverage by applicability, positive delete set >= ${thresholds.minPositiveDeleteTasks}; ` +
+                `positive-verdict floors on ${floors} repo(s), READY floors on ${readyFloors} repo(s), ` +
+                `seeded contract-bound ${thresholds.enforceSeededContractBound ? 'enforced' : 'reported, not enforced'})\n`);
+            // Pinned defects stay on screen for as long as they are pinned.
+            for (const [repoName, ids] of Object.entries(thresholds.knownCheckFalseReady)) {
+                for (const id of ids) {
+                    process.stdout.write(`  known false-ready (pinned): ${repoName} ${id}\n`);
+                }
+            }
+            if (!thresholds.enforceSeededContractBound) {
+                for (const report of reports) {
+                    const bound = report.delete.aggregate.perArm['ucn-contract'];
+                    if (bound && bound.contractBound && bound.contractBound.falseSafe > 0) {
+                        process.stdout.write('  known false-safe (seeded contract-bound, not enforced): ' +
+                            `${report.repo} ${bound.contractBound.falseSafe}/${bound.contractBound.tasks}\n`);
+                    }
+                }
+            }
         }
     }
     if (failures > 0) process.exitCode = 1;

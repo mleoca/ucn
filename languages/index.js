@@ -104,6 +104,14 @@ const JAVA_LANG_NOT_SERIALIZABLE = ['Object', 'Runnable', 'AutoCloseable', 'Comp
 
 const STRUCTURAL_TRAITS = {
     typeSystem: 'structural',
+    // How a callable's return contract can come from its body instead of its
+    // header. 'unannotated': a callable with no return annotation takes the
+    // type its body returns; 'placeholder': a written placeholder type is
+    // deduced from the body; 'opaque': a declared opaque type still exposes
+    // properties of the concrete value. Empty: the header is the contract.
+    inferredReturnForms: ['unannotated'],
+    // Callable kinds a body statement alone selects, with no header change.
+    callableKindFromBody: [],
     // A write on the instance can replace an inherited method with a
     // callable value, including a wrapper of the previous method.
     instanceAttributesShadowMethods: true,
@@ -371,6 +379,9 @@ const STRUCTURAL_TRAITS = {
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
+    // See STRUCTURAL_TRAITS: a declared return type is the whole contract.
+    inferredReturnForms: [],
+    callableKindFromBody: [],
     instanceAttributesShadowMethods: false,
     inherentMethodsPrecedeTraitImpls: false,
     derefFieldAccess: false,
@@ -651,6 +662,8 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-python'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            // `yield` in the body makes the callable a generator.
+            callableKindFromBody: ['generator'],
             selfParam: ['self', 'cls'],
             // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
             // and `self.__class__(..)` in an instance method construct the
@@ -794,6 +807,8 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-rust'),
         traits: {
             ...NOMINAL_TRAITS,
+            // `-> impl Trait` hides the type but leaks the value's auto traits.
+            inferredReturnForms: ['opaque'],
             selfParam: ['self', '&self', '&mut self', 'mut self'],
             inherentMethodsPrecedeTraitImpls: true,
             derefFieldAccess: true,
@@ -1007,6 +1022,8 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-cpp'),
         traits: {
             ...NOMINAL_TRAITS,
+            // `auto` / `decltype(auto)` return types are deduced from the body.
+            inferredReturnForms: ['placeholder'],
             // An override overrides every base's virtual of its signature; an
             // inherited member never implements another base's pure virtual
             // (fix #426).

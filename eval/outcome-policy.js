@@ -404,15 +404,53 @@ function truncateMessage(message) {
     return String(message || '').replace(/\s+/g, ' ').trim().slice(0, 160);
 }
 
-/** `go build` / `go vet` stderr → error keys. */
-function parseGoErrors(text) {
-    const keys = [];
+/** Diagnostic paths as the judges print them → repo-relative, slash-separated. */
+function normalizeDiagnosticFile(file) {
+    return String(file || '').replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+// Each judge has two views of one parse. `parse*Diagnostics` keeps the
+// location ({ key, file, line }) so a new diagnostic can be placed inside or
+// outside a mutation's edit ranges; `parse*Errors` is the line-independent
+// key list the baseline diff uses, unchanged.
+
+/** `go build` / `go vet` stderr → diagnostics. */
+function parseGoDiagnostics(text) {
+    const diagnostics = [];
     for (const raw of String(text || '').split('\n')) {
         const line = raw.replace(/^vet:\s*/, '');
         const match = line.match(/^(.+?\.go):(\d+)(?::\d+)?:\s*(.+)$/);
-        if (match) keys.push(`${match[1]}|${truncateMessage(match[3])}`);
+        if (!match) continue;
+        diagnostics.push({
+            key: `${match[1]}|${truncateMessage(match[3])}`,
+            file: normalizeDiagnosticFile(match[1]),
+            line: Number(match[2]),
+        });
     }
-    return keys;
+    return diagnostics;
+}
+
+/** `go build` / `go vet` stderr → error keys. */
+function parseGoErrors(text) {
+    return parseGoDiagnostics(text).map(diagnostic => diagnostic.key);
+}
+
+/** `cargo check --message-format=short` output → diagnostics, deduped by
+ *  key and line (the same diagnostic replayed under a second target context
+ *  is one diagnostic). */
+function parseCargoDiagnostics(text) {
+    const seen = new Set();
+    const diagnostics = [];
+    for (const raw of String(text || '').split('\n')) {
+        const match = raw.match(/^(.+?\.rs):(\d+):(\d+):\s*error(?:\[[^\]]+\])?:\s*(.+)$/);
+        if (!match) continue;
+        const key = `${match[1]}|${truncateMessage(match[4])}`;
+        const identity = `${key}\0${match[2]}`;
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+        diagnostics.push({ key, file: normalizeDiagnosticFile(match[1]), line: Number(match[2]) });
+    }
+    return diagnostics;
 }
 
 /** `cargo check --message-format=short` output → error keys.
@@ -425,53 +463,79 @@ function parseGoErrors(text) {
  *  bench file. Identical file|message keys are compilation-context echoes,
  *  not distinct errors. */
 function parseCargoErrors(text) {
-    const keys = new Set();
-    for (const raw of String(text || '').split('\n')) {
-        const match = raw.match(/^(.+?\.rs):(\d+):(\d+):\s*error(?:\[[^\]]+\])?:\s*(.+)$/);
-        if (match) keys.add(`${match[1]}|${truncateMessage(match[4])}`);
-    }
-    return [...keys];
+    return [...new Set(parseCargoDiagnostics(text).map(diagnostic => diagnostic.key))];
 }
 
-/** pyright --outputjson document → error keys (errors only, warnings out).
+/** pyright --outputjson document → diagnostics (errors only, warnings out).
  *  Pass root to relativize diagnostic paths (report readability). */
-function parsePyrightErrors(doc, root) {
-    const keys = [];
+function parsePyrightDiagnostics(doc, root) {
+    const diagnostics = [];
     const prefix = root ? String(root).replace(/\/?$/, '/') : null;
     for (const diag of (doc && doc.generalDiagnostics) || []) {
         if (diag.severity !== 'error') continue;
         let file = String(diag.file || '');
         if (prefix && file.startsWith(prefix)) file = file.slice(prefix.length);
-        keys.push(`${file}|${diag.rule || ''}|${truncateMessage(diag.message)}`);
+        const startLine = diag.range && diag.range.start &&
+            Number.isInteger(diag.range.start.line) ? diag.range.start.line + 1 : null;
+        diagnostics.push({
+            key: `${file}|${diag.rule || ''}|${truncateMessage(diag.message)}`,
+            file: normalizeDiagnosticFile(file),
+            line: startLine,
+        });
     }
-    return keys;
+    return diagnostics;
 }
 
-/** javac output → error keys (`path:line: error: message`; the `N errors`
- *  footer and warnings are ignored). Keys are deduped like cargo's — javac
- *  repeats a diagnostic when a file is reached through several compilation
- *  paths. Pass root to relativize absolute paths for report readability. */
-function parseJavacErrors(text, root) {
-    const keys = new Set();
+/** pyright --outputjson document → error keys. */
+function parsePyrightErrors(doc, root) {
+    return parsePyrightDiagnostics(doc, root).map(diagnostic => diagnostic.key);
+}
+
+/** javac output → diagnostics (`path:line: error: message`; the `N errors`
+ *  footer and warnings are ignored), deduped by key and line. Pass root to
+ *  relativize absolute paths for report readability. */
+function parseJavacDiagnostics(text, root) {
+    const seen = new Set();
+    const diagnostics = [];
     const prefix = root ? String(root).replace(/\/?$/, '/') : null;
     for (const raw of String(text || '').split('\n')) {
         const match = raw.match(/^(.+?\.java):(\d+):\s*error:\s*(.+)$/);
         if (!match) continue;
         let file = match[1];
         if (prefix && file.startsWith(prefix)) file = file.slice(prefix.length);
-        keys.add(`${file}|${truncateMessage(match[3])}`);
+        const key = `${file}|${truncateMessage(match[3])}`;
+        const identity = `${key}\0${match[2]}`;
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+        diagnostics.push({ key, file: normalizeDiagnosticFile(file), line: Number(match[2]) });
     }
-    return [...keys];
+    return diagnostics;
+}
+
+/** javac output → error keys. Keys are deduped like cargo's — javac repeats
+ *  a diagnostic when a file is reached through several compilation paths. */
+function parseJavacErrors(text, root) {
+    return [...new Set(parseJavacDiagnostics(text, root).map(diagnostic => diagnostic.key))];
+}
+
+/** tsc --noEmit output → diagnostics. */
+function parseTscDiagnostics(text) {
+    const diagnostics = [];
+    for (const raw of String(text || '').split('\n')) {
+        const match = raw.match(/^(.+?)\((\d+),(\d+)\):\s*error\s+(TS\d+):\s*(.+)$/);
+        if (!match) continue;
+        diagnostics.push({
+            key: `${match[1]}|${match[4]}|${truncateMessage(match[5])}`,
+            file: normalizeDiagnosticFile(match[1]),
+            line: Number(match[2]),
+        });
+    }
+    return diagnostics;
 }
 
 /** tsc --noEmit output → error keys. */
 function parseTscErrors(text) {
-    const keys = [];
-    for (const raw of String(text || '').split('\n')) {
-        const match = raw.match(/^(.+?)\((\d+),(\d+)\):\s*error\s+(TS\d+):\s*(.+)$/);
-        if (match) keys.push(`${match[1]}|${match[4]}|${truncateMessage(match[5])}`);
-    }
-    return keys;
+    return parseTscDiagnostics(text).map(diagnostic => diagnostic.key);
 }
 
 function errorMultiset(keys) {
@@ -490,6 +554,49 @@ function diffErrorKeys(baselineKeys, afterKeys) {
         for (let i = 0; i < extra; i++) newKeys.push(key);
     }
     return newKeys.sort(codeUnitCompare);
+}
+
+/**
+ * Place the NEW diagnostics of a judged mutation inside or outside the
+ * mutation's own edit ranges.
+ *
+ * changedRanges: [{ file, startLine, endLine }] in POST-edit coordinates; a
+ * pure deletion is zero-width (endLine < startLine) and contains nothing.
+ * Keys stay line-independent for the baseline diff, so a new key is located
+ * through every post-edit diagnostic that carries it. It counts as inside
+ * only when ALL of those locations are inside an edit range: when a key
+ * exists both in the changed lines and elsewhere, the conservative reading
+ * for a readiness gate is that a dependent broke.
+ */
+function classifyNewDiagnostics(baselineKeys, afterDiagnostics, changedRanges) {
+    const diagnostics = afterDiagnostics || [];
+    const newKeys = diffErrorKeys(baselineKeys, diagnostics.map(diagnostic => diagnostic.key));
+    const ranges = (changedRanges || []).map(range => ({
+        file: normalizeDiagnosticFile(range.file),
+        startLine: range.startLine,
+        endLine: range.endLine,
+    }));
+    const insideRange = diagnostic => diagnostic.line != null && ranges.some(range =>
+        range.file === diagnostic.file &&
+        diagnostic.line >= range.startLine && diagnostic.line <= range.endLine);
+    const locationsByKey = new Map();
+    for (const diagnostic of diagnostics) {
+        if (!locationsByKey.has(diagnostic.key)) locationsByKey.set(diagnostic.key, []);
+        locationsByKey.get(diagnostic.key).push(diagnostic);
+    }
+    let inside = 0;
+    let outside = 0;
+    const outsideSamples = [];
+    for (const key of newKeys) {
+        const locations = locationsByKey.get(key) || [];
+        if (locations.length > 0 && locations.every(insideRange)) {
+            inside++;
+            continue;
+        }
+        outside++;
+        if (outsideSamples.length < 3 && !outsideSamples.includes(key)) outsideSamples.push(key);
+    }
+    return { newKeys, inside, outside, outsideSamples };
 }
 
 // ── Aggregation ─────────────────────────────────────────────────────────────
@@ -567,19 +674,42 @@ function aggregateDeleteTasks(tasks, armNames) {
     const perArm = {};
     for (const arm of armNames) {
         const rows = tasks
-            .map(task => ({ ground: task.groundBroken, verdict: task.arms[arm] }))
+            .map(task => ({
+                ground: task.groundBroken,
+                verdict: task.arms[arm],
+                positiveSet: task.positiveSet || null,
+                seededKind: task.seededKind || null,
+            }))
             .filter(row => row.verdict);
         if (rows.length === 0) { perArm[arm] = null; continue; }
-        const byVerdict = verdict => rows.filter(row =>
+        const said = (list, verdict) => list.filter(row =>
             armDeleteVerdict(row.verdict) === verdict);
-        const saidSafe = byVerdict('safe');
-        const saidUnsafe = byVerdict('unsafe');
-        const review = byVerdict('review');
+        const saidSafe = said(rows, 'safe');
+        const saidUnsafe = said(rows, 'unsafe');
+        const review = said(rows, 'review');
         const falseSafe = saidSafe.filter(row => row.ground).length;
         const falseUnsafe = saidUnsafe.filter(row => !row.ground).length;
         const decisive = saidSafe.length + saidUnsafe.length;
         const decisiveCorrect = saidSafe.filter(row => !row.ground).length +
             saidUnsafe.filter(row => row.ground).length;
+        // "Decisive" alone is gameable: an arm that always answers unsafe is
+        // 100% decisive with zero falseSafe and gives no deletion guidance.
+        // The three views below cannot be satisfied by one constant answer.
+        //   positive:   tasks independently known deletable (seeded dead
+        //               additions; language-private zero-occurrence symbols
+        //               the judge confirmed clean) — share answered safe;
+        //   negative:   judge-broken tasks — share answered unsafe;
+        //   abstention: review answers, by the arm's stated reason.
+        const positiveRows = rows.filter(row => row.positiveSet && !row.ground);
+        const positiveSafe = said(positiveRows, 'safe').length;
+        const negativeRows = rows.filter(row => row.ground);
+        const negativeUnsafe = said(negativeRows, 'unsafe').length;
+        const byReason = {};
+        for (const row of review) {
+            const reason = row.verdict.verdictReason || 'unspecified';
+            byReason[reason] = (byReason[reason] || 0) + 1;
+        }
+        const contractBound = rows.filter(row => row.seededKind === 'contract-bound');
         perArm[arm] = {
             tasks: rows.length,
             saidSafe: saidSafe.length,
@@ -592,6 +722,29 @@ function aggregateDeleteTasks(tasks, armNames) {
             reviewGroundClean: review.filter(row => !row.ground).length,
             // Agreement over decisive verdicts only; review abstains.
             agreementWithJudge: round(decisive === 0 ? 0 : decisiveCorrect / decisive),
+            positive: {
+                tasks: positiveRows.length,
+                safe: positiveSafe,
+                rate: positiveRows.length === 0 ? null : round(positiveSafe / positiveRows.length),
+            },
+            negative: {
+                tasks: negativeRows.length,
+                unsafe: negativeUnsafe,
+                review: said(negativeRows, 'review').length,
+                safe: said(negativeRows, 'safe').length,
+                correctRate: negativeRows.length === 0 ? null
+                    : round(negativeUnsafe / negativeRows.length),
+            },
+            abstention: {
+                review: review.length,
+                rate: round(review.length / rows.length),
+                byReason: Object.fromEntries(Object.entries(byReason)
+                    .sort((a, b) => codeUnitCompare(a[0], b[0]))),
+            },
+            contractBound: {
+                tasks: contractBound.length,
+                falseSafe: said(contractBound, 'safe').filter(row => row.ground).length,
+            },
             avgOutputChars: Math.round(rows.reduce((sum, row) =>
                 sum + ((row.verdict.cost && row.verdict.cost.outputChars) || 0), 0) / rows.length),
             avgToolCalls: round(rows.reduce((sum, row) =>
@@ -599,6 +752,171 @@ function aggregateDeleteTasks(tasks, armNames) {
         };
     }
     return { perArm };
+}
+
+/**
+ * Language-level privacy of a definition, read from its own header line.
+ * This is the independent half of the positive delete set: it never asks the
+ * engine whether the symbol is exported. Unknown is false (a symbol whose
+ * privacy the header does not state never joins the positive set).
+ */
+function isLanguagePrivate(language, name, headerLine) {
+    const header = String(headerLine || '');
+    switch (language) {
+        case 'python':
+            return /^_[^_]/.test(name);
+        case 'go':
+            return /^[a-z_]/.test(name);
+        case 'rust':
+            return /\bfn\b/.test(header) && !/\bpub\b/.test(header.split(/\bfn\b/)[0]);
+        case 'java':
+            return /\bprivate\b/.test(header);
+        default:
+            return false;
+    }
+}
+
+// ── Precommit-check tasks ───────────────────────────────────────────────────
+//
+// A check task applies one seeded mutation to the pristine repo, asks the
+// public `check` for its verdict, and lets the toolchain decide what broke.
+// READY_FOR_TOOLCHAIN is a claim about DEPENDENTS, so the ground outcome is
+// "new diagnostics outside the changed lines"; diagnostics inside the changed
+// lines are the toolchain's own job and are reported, never gated.
+
+const CHECK_TASK_KINDS = Object.freeze([
+    'additive',
+    'inert-body-edit',
+    'return-contract-edit',
+    'generator-transition',
+    'required-param',
+    'delete-referenced',
+    'delete-unreferenced',
+]);
+
+const CHECK_VERDICTS = Object.freeze({
+    ready: 'READY_FOR_TOOLCHAIN',
+    review: 'REVIEW_REQUIRED',
+    blocked: 'BLOCKED',
+});
+
+/**
+ * Which mutation kinds exist in a language, read from its traits rather than
+ * its name. A return-contract edit needs a return contract the checker infers
+ * from the body; a generator transition needs a body statement that changes
+ * the callable's kind without touching its header. Everything else applies
+ * wherever a callable can be declared.
+ */
+function checkKindApplicability(traits) {
+    const inferredForms = new Set((traits && traits.inferredReturnForms) || []);
+    const bodyKinds = new Set((traits && traits.callableKindFromBody) || []);
+    return {
+        'additive': true,
+        'inert-body-edit': true,
+        'return-contract-edit': inferredForms.has('unannotated'),
+        'generator-transition': bodyKinds.has('generator'),
+        'required-param': true,
+        'delete-referenced': true,
+        'delete-unreferenced': true,
+    };
+}
+
+function emptyCheckBucket() {
+    return {
+        tasks: 0, ready: 0, review: 0, blocked: 0,
+        groundBroken: 0, groundClean: 0,
+        falseReady: 0, brokenFlagged: 0,
+        readyOnClean: 0, reviewOnClean: 0, blockedOnClean: 0,
+        insideOnlyDiagnostics: 0,
+    };
+}
+
+function finishCheckBucket(bucket) {
+    return {
+        ...bucket,
+        readyOnCleanRate: bucket.groundClean === 0 ? null
+            : round(bucket.readyOnClean / bucket.groundClean),
+        blockedOnCleanRate: bucket.groundClean === 0 ? null
+            : round(bucket.blockedOnClean / bucket.groundClean),
+    };
+}
+
+/**
+ * Aggregate check tasks. Each task: { kind, verdict, outsideNew, insideNew }.
+ *   falseReady      READY while a dependent broke — the dangerous direction;
+ *   blockedOnClean  BLOCKED while nothing outside the change broke — the
+ *                   failure that makes a gate unusable;
+ *   brokenFlagged   a dependent broke and the verdict was not READY.
+ */
+function aggregateCheckTasks(tasks) {
+    const total = emptyCheckBucket();
+    const byKind = {};
+    for (const task of tasks || []) {
+        if (!byKind[task.kind]) byKind[task.kind] = emptyCheckBucket();
+        const broken = (task.outsideNew || 0) > 0;
+        for (const bucket of [total, byKind[task.kind]]) {
+            bucket.tasks++;
+            const ready = task.verdict === CHECK_VERDICTS.ready;
+            const blocked = task.verdict === CHECK_VERDICTS.blocked;
+            const review = task.verdict === CHECK_VERDICTS.review;
+            if (ready) bucket.ready++;
+            if (review) bucket.review++;
+            if (blocked) bucket.blocked++;
+            if (broken) {
+                bucket.groundBroken++;
+                if (ready) bucket.falseReady++;
+                else bucket.brokenFlagged++;
+            } else {
+                bucket.groundClean++;
+                if (ready) bucket.readyOnClean++;
+                if (review) bucket.reviewOnClean++;
+                if (blocked) bucket.blockedOnClean++;
+                if ((task.insideNew || 0) > 0) bucket.insideOnlyDiagnostics++;
+            }
+        }
+    }
+    const kinds = {};
+    for (const kind of Object.keys(byKind).sort(codeUnitCompare)) {
+        kinds[kind] = finishCheckBucket(byKind[kind]);
+    }
+    return { ...finishCheckBucket(total), byKind: kinds };
+}
+
+/**
+ * Coverage of the check board against the applicability matrix. Every
+ * applicable (repo, kind) pair needs at least one judged task; a kind the
+ * language cannot express is N/A for that repo; every kind must be judged
+ * somewhere on the board, or the board cannot speak for it.
+ */
+function evaluateCheckCoverage(reports) {
+    const failures = [];
+    const coveredSomewhere = new Set();
+    let anyCheck = false;
+    for (const report of reports) {
+        const check = report.check;
+        if (!check) {
+            failures.push(`${report.repo}: no check tasks in the report`);
+            continue;
+        }
+        anyCheck = true;
+        const byKind = (check.aggregate && check.aggregate.byKind) || {};
+        for (const kind of CHECK_TASK_KINDS) {
+            const judged = byKind[kind] ? byKind[kind].tasks : 0;
+            if (judged > 0) coveredSomewhere.add(kind);
+            if (check.applicability && check.applicability[kind] && judged === 0) {
+                failures.push(`${report.repo}: no judged ${kind} check task ` +
+                    `(applicable to ${report.language})`);
+            }
+        }
+    }
+    if (anyCheck) {
+        for (const kind of CHECK_TASK_KINDS) {
+            if (!coveredSomewhere.has(kind)) {
+                failures.push(`board: check kind ${kind} is judged on no repo`);
+            }
+        }
+    }
+    return failures;
 }
 
 // ── Gate policy (pinned tuned set only — unpinned holdouts never gate) ──────
@@ -619,6 +937,44 @@ const OUTCOME_GATE_THRESHOLDS = Object.freeze({
     maxProposalErrors: 0,
     maxContractDeleteFalseSafe: 0,
     contractRenameNoWorseThanGrep: true,
+    // Deletion guidance. Reports are not tracked, so every baseline is a
+    // constant here. A floor of null is reported and not enforced; a floor
+    // joins enforcement only after a green run on the enforcing environment.
+    //   minPositiveDeleteTasks       positive-set size per repo (coverage);
+    //   contractPositiveVerdictFloor per-repo share of the positive set the
+    //                                contract arm must answer safe.
+    minPositiveDeleteTasks: 2,
+    // Baseline 2026-11-10 (seed 42): websocket 2/2, flask 2/3 (the reviewed
+    // row is cli.py `_path_is_ancestor`, private and unreferenced, not
+    // claimed by the default audit), serde_json 2/2.
+    contractPositiveVerdictFloor: Object.freeze({
+        websocket: 1,
+        flask: 0.6667,
+        serde_json: 1,
+    }),
+    // Seeded contract-bound members (the only implementer of an interface,
+    // abstract or trait member) are measured from the first run. Their
+    // falseSafe joins the hard zero when the required-slot shield lands.
+    enforceSeededContractBound: false,
+    // Precommit check. falseReady is the dangerous direction; the coverage
+    // matrix keeps an empty board from passing; the READY floor on clean
+    // changes is pinned per repo once check evaluates by change kind.
+    maxCheckFalseReady: 0,
+    // False-ready rows of the 2026-11-10 baseline, pinned by task id so a
+    // NEW false-ready row fails the gate while these stay visible in every
+    // report. Each names a defect class the change-kind check closes; the
+    // entry is deleted with the fix, never widened.
+    //   websocket  a required parameter on a function that is only used as
+    //              a value (`http.HandleFunc("/r", f)`): no call site drifts.
+    //   flask      a body `yield` turns the callable into a generator; the
+    //              header is unchanged and 22 dependents break.
+    knownCheckFalseReady: Object.freeze({
+        websocket: Object.freeze([
+            'examples/autobahn/server.go:154:echoReadAllWritePreparedMessage']),
+        flask: Object.freeze(['examples/tutorial/flaskr/db.py:9:get_db']),
+    }),
+    requireCheckCoverage: true,
+    checkReadyOnCleanFloor: Object.freeze({}),
 });
 
 function evaluateOutcomeGate(reports, thresholds = OUTCOME_GATE_THRESHOLDS) {
@@ -630,15 +986,38 @@ function evaluateOutcomeGate(reports, thresholds = OUTCOME_GATE_THRESHOLDS) {
                 `(max ${thresholds.maxJudgeErrors})`);
         }
         const proposalErrors = (report.renameProposalErrors || 0) +
-            (report.deleteProposalErrors || 0);
+            (report.deleteProposalErrors || 0) + (report.checkProposalErrors || 0);
         if (proposalErrors > thresholds.maxProposalErrors) {
             failures.push(`${repo}: ${proposalErrors} proposal failure(s) ` +
                 `(max ${thresholds.maxProposalErrors})`);
         }
         const deleteArm = report.delete && report.delete.aggregate.perArm['ucn-contract'];
-        if (deleteArm && deleteArm.falseSafe > thresholds.maxContractDeleteFalseSafe) {
-            failures.push(`${repo}: contract delete falseSafe ${deleteArm.falseSafe} ` +
-                `(max ${thresholds.maxContractDeleteFalseSafe})`);
+        if (deleteArm) {
+            const contractBoundFalseSafe = (deleteArm.contractBound &&
+                deleteArm.contractBound.falseSafe) || 0;
+            const gatedFalseSafe = thresholds.enforceSeededContractBound
+                ? deleteArm.falseSafe
+                : deleteArm.falseSafe - contractBoundFalseSafe;
+            if (gatedFalseSafe > thresholds.maxContractDeleteFalseSafe) {
+                failures.push(`${repo}: contract delete falseSafe ${gatedFalseSafe} ` +
+                    `(max ${thresholds.maxContractDeleteFalseSafe})`);
+            }
+            if (thresholds.minPositiveDeleteTasks != null) {
+                const positiveTasks = deleteArm.positive ? deleteArm.positive.tasks : 0;
+                if (positiveTasks < thresholds.minPositiveDeleteTasks) {
+                    failures.push(`${repo}: positive delete set has ${positiveTasks} task(s) ` +
+                        `(min ${thresholds.minPositiveDeleteTasks})`);
+                }
+            }
+            const floor = thresholds.contractPositiveVerdictFloor &&
+                thresholds.contractPositiveVerdictFloor[repo];
+            if (floor != null) {
+                const rate = deleteArm.positive ? deleteArm.positive.rate : null;
+                if (rate == null || rate < floor) {
+                    failures.push(`${repo}: contract positive-verdict rate ` +
+                        `${rate == null ? 'n/a' : rate} below floor ${floor}`);
+                }
+            }
         }
         if (thresholds.contractRenameNoWorseThanGrep && report.rename) {
             const perArm = report.rename.aggregate.perArm;
@@ -651,7 +1030,38 @@ function evaluateOutcomeGate(reports, thresholds = OUTCOME_GATE_THRESHOLDS) {
                     `${grep.brokenBuildRate}`);
             }
         }
+        const check = report.check && report.check.aggregate;
+        if (check) {
+            if (thresholds.maxCheckFalseReady != null) {
+                // Rows are matched by id when the report carries them; a
+                // report with only the aggregate is held to the bare count.
+                const known = new Set((thresholds.knownCheckFalseReady &&
+                    thresholds.knownCheckFalseReady[repo]) || []);
+                const rows = Array.isArray(report.check.tasks)
+                    ? report.check.tasks.filter(task =>
+                        task.verdict === CHECK_VERDICTS.ready && (task.outsideNew || 0) > 0)
+                    : null;
+                const unexpected = rows
+                    ? rows.filter(task => !known.has(task.id))
+                    : null;
+                const count = unexpected ? unexpected.length : check.falseReady;
+                if (count > thresholds.maxCheckFalseReady) {
+                    failures.push(`${repo}: check falseReady ${count} ` +
+                        `(max ${thresholds.maxCheckFalseReady})` +
+                        (unexpected ? `: ${unexpected.map(task => task.id).join(', ')}` : ''));
+                }
+            }
+            const readyFloor = thresholds.checkReadyOnCleanFloor &&
+                thresholds.checkReadyOnCleanFloor[repo];
+            if (readyFloor != null &&
+                (check.readyOnCleanRate == null || check.readyOnCleanRate < readyFloor)) {
+                failures.push(`${repo}: check READY rate on clean changes ` +
+                    `${check.readyOnCleanRate == null ? 'n/a' : check.readyOnCleanRate} ` +
+                    `below floor ${readyFloor}`);
+            }
+        }
     }
+    if (thresholds.requireCheckCoverage) failures.push(...evaluateCheckCoverage(reports));
     return failures;
 }
 
@@ -672,14 +1082,27 @@ module.exports = {
     deadcodeClaimForTask,
     deleteVerdictTriState,
     armDeleteVerdict,
+    isLanguagePrivate,
     OUTCOME_GATE_THRESHOLDS,
     evaluateOutcomeGate,
+    CHECK_TASK_KINDS,
+    CHECK_VERDICTS,
+    checkKindApplicability,
+    aggregateCheckTasks,
+    evaluateCheckCoverage,
+    normalizeDiagnosticFile,
+    parseGoDiagnostics,
+    parseCargoDiagnostics,
+    parsePyrightDiagnostics,
+    parseJavacDiagnostics,
+    parseTscDiagnostics,
     parseGoErrors,
     parseCargoErrors,
     parsePyrightErrors,
     parseJavacErrors,
     parseTscErrors,
     diffErrorKeys,
+    classifyNewDiagnostics,
     aggregateRenameTasks,
     aggregateDeleteTasks,
     siteKey,

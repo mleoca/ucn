@@ -688,6 +688,14 @@ const OUTCOME_TUNED = [
     // environment (#292b).
     { name: 'mux', url: 'https://github.com/gorilla/mux', language: 'go', commit: 'db9d1d0073d27a0a2d9a8c1bc52aa0af4374d265', targetCandidates: ['.'], gate: false },
     { name: 'requests', url: 'https://github.com/psf/requests', language: 'python', commit: '8f8b212de8c2129d7954c6cd373762880375620a', targetCandidates: ['.'], gate: false },
+    // Pinned 2026-11-10 as a measurement row (gate: false): a small
+    // APPLICATION that vendors bundled assets (two `*.min.js` under static/)
+    // beside its Python and JavaScript sources. One skipped file withdraws
+    // every contract on such a repo, so it carries the before/after numbers
+    // for the precommit-check tasks and the answer tax. It joins the gate
+    // after that behavior changes AND a green run on the enforcing
+    // environment (#292b).
+    { name: 'djangoproject', url: 'https://github.com/django/djangoproject.com', language: 'python', commit: '83a027bb6aac5bb36b9ef48dad8cb4ff45a2e84f', targetCandidates: ['.'], gate: false },
 ];
 
 /**

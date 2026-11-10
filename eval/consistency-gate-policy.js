@@ -86,7 +86,58 @@ function evaluateConsistencySummary(summary) {
     return { failures };
 }
 
+/**
+ * Answer tax: the share of an answer's characters that sit on lines repeated
+ * across (nearly) every answer of the same command on one board.
+ *
+ * A line present in at least `threshold` of the answers does not depend on
+ * the symbol asked about: a standing caveat, a repo-level notice, a fixed
+ * header. Those characters are paid on every call and carry no answer. The
+ * measure is a report, never a gate, and is withheld below `minAnswers`
+ * (with a handful of answers "nearly every" is not a meaningful statement).
+ *
+ * texts: string[] — one formatted answer per board symbol.
+ */
+function measureAnswerTax(texts, { threshold = 0.9, minAnswers = 5 } = {}) {
+    const answers = (texts || []).filter(text => typeof text === 'string');
+    const chars = answers.reduce((sum, text) => sum + text.length, 0);
+    if (answers.length < minAnswers) {
+        return { answers: answers.length, chars, taxChars: null, share: null, lines: [] };
+    }
+    const presence = new Map();
+    const split = answers.map(text => text.split('\n'));
+    for (const lines of split) {
+        for (const line of new Set(lines)) {
+            if (line.trim() === '') continue;
+            presence.set(line, (presence.get(line) || 0) + 1);
+        }
+    }
+    const constant = new Map();
+    for (const [line, count] of presence) {
+        if (count / answers.length >= threshold) constant.set(line, 0);
+    }
+    let taxChars = 0;
+    for (const lines of split) {
+        for (const line of lines) {
+            if (!constant.has(line)) continue;
+            taxChars += line.length;
+            constant.set(line, constant.get(line) + line.length);
+        }
+    }
+    const lines = [...constant.entries()]
+        .map(([line, total]) => ({ line, chars: total, answers: presence.get(line) }))
+        .sort((a, b) => b.chars - a.chars || (a.line < b.line ? -1 : a.line > b.line ? 1 : 0));
+    return {
+        answers: answers.length,
+        chars,
+        taxChars,
+        share: chars === 0 ? 0 : Number((taxChars / chars).toFixed(4)),
+        lines,
+    };
+}
+
 module.exports = {
+    measureAnswerTax,
     stableValue,
     stableJson,
     multisetDifference,

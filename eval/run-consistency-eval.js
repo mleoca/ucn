@@ -28,6 +28,7 @@ const { performance } = require('perf_hooks');
 
 const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
+const output = require('../core/output');
 const {
     CALLABLE_SYMBOL_KINDS,
     codeUnitCompare,
@@ -37,6 +38,7 @@ const {
 const {
     REPOS,
     RELEASE_REPOS,
+    OUTCOME_TUNED = [],
     cloneAtCommit,
     resolveTarget,
 } = require('./lib/repos');
@@ -44,6 +46,7 @@ const {
     compareMultiset,
     compareStructured,
     evaluateConsistencySummary,
+    measureAnswerTax,
 } = require('./consistency-gate-policy');
 
 const argv = process.argv.slice(2);
@@ -236,6 +239,7 @@ function runCommands(index, handle) {
         tests: { name: handle, depth: 0, all: true },
     };
     const results = {};
+    const notes = {};
     const errors = [];
     for (const [command, params] of Object.entries(specs)) {
         const response = execute(index, command, params);
@@ -243,14 +247,30 @@ function runCommands(index, handle) {
             errors.push({ command, error: response.error || 'unknown error' });
         } else {
             results[command] = response.result;
+            notes[command] = response.note;
         }
     }
-    return { results, errors };
+    return { results, errors, specs, notes };
+}
+
+/** The public text of each command's answer, as the CLI prints it before
+ *  any output budget. Formatting runs after the structural comparisons: the
+ *  formatter may localize hints on the result object. A formatter failure
+ *  drops that answer from the tax measure, never from the consistency gate. */
+function answerTexts(results, specs, notes) {
+    const texts = {};
+    for (const command of Object.keys(results)) {
+        try {
+            texts[command] = output.formatPublicText(command, results[command], specs[command],
+                { surface: 'cli', note: notes[command] });
+        } catch (_) { /* excluded from the measure */ }
+    }
+    return texts;
 }
 
 function evaluateDefinition(index, row) {
     const { def, handle, stratum } = row;
-    const { results, errors } = runCommands(index, handle);
+    const { results, errors, specs, notes } = runCommands(index, handle);
     if (errors.length > 0) {
         return {
             handle,
@@ -338,6 +358,7 @@ function evaluateDefinition(index, row) {
         comparisons,
         errors: [],
         disagreements,
+        texts: answerTexts(results, specs, notes),
     };
 }
 
@@ -381,6 +402,33 @@ function evaluateProject(projectPath, metadata = {}, sample = 40) {
             }
         }
     }
+    // Answer tax per command and overall (report only).
+    const textsByCommand = {};
+    for (const row of rows) {
+        for (const [command, text] of Object.entries(row.texts || {})) {
+            (textsByCommand[command] = textsByCommand[command] || []).push(text);
+        }
+    }
+    const answerTax = { byCommand: {}, answers: 0, chars: 0, taxChars: 0, share: null };
+    for (const command of Object.keys(textsByCommand).sort(codeUnitCompare)) {
+        const measured = measureAnswerTax(textsByCommand[command]);
+        answerTax.byCommand[command] = {
+            answers: measured.answers,
+            chars: measured.chars,
+            taxChars: measured.taxChars,
+            share: measured.share,
+            topLines: measured.lines.slice(0, 3).map(line => ({
+                line: line.line.slice(0, 160), chars: line.chars, answers: line.answers,
+            })),
+        };
+        if (measured.taxChars == null) continue;
+        answerTax.answers += measured.answers;
+        answerTax.chars += measured.chars;
+        answerTax.taxChars += measured.taxChars;
+    }
+    if (answerTax.chars > 0) {
+        answerTax.share = Number((answerTax.taxChars / answerTax.chars).toFixed(4));
+    }
     const parseFailures = index.failedFiles?.size || 0;
     const summary = {
         sampledSymbols: rows.length,
@@ -401,6 +449,7 @@ function evaluateProject(projectPath, metadata = {}, sample = 40) {
         durationMs: Number((performance.now() - started).toFixed(3)),
         ...summary,
         byCheck,
+        answerTax,
         omittedWitnesses: Math.max(0, disagreements + commandErrors - witnesses.length),
         witnesses,
         failures: verdict.failures,
@@ -426,6 +475,23 @@ function formatMarkdown(report) {
             `${report.summary.comparisons} comparisons, ${report.summary.disagreements} disagreements, ` +
             `${report.summary.commandErrors} command errors.`,
     ];
+    const taxed = report.results.filter(result => result.answerTax && result.answerTax.share != null);
+    if (taxed.length > 0) {
+        const commands = [...new Set(taxed.flatMap(result =>
+            Object.keys(result.answerTax.byCommand)))].sort(codeUnitCompare);
+        const share = value => (value == null ? '-' : `${(value * 100).toFixed(1)}%`);
+        lines.push('', '## Answer tax (report only)', '',
+            'Share of answer characters on lines repeated across at least 90% of a command\'s',
+            'board answers in one project: text that does not depend on the symbol asked about.', '',
+            `| project | all | ${commands.join(' | ')} |`,
+            `|---|---:|${commands.map(() => '---:').join('|')}|`,
+            ...taxed.map(result => `| ${result.project} | ${share(result.answerTax.share)} | ` +
+                `${commands.map(command => share(result.answerTax.byCommand[command]?.share)).join(' | ')} |`));
+        if (report.answerTax && report.answerTax.share != null) {
+            lines.push('', `Board: ${share(report.answerTax.share)} of ` +
+                `${report.answerTax.chars} characters over ${report.answerTax.answers} answers.`);
+        }
+    }
     const witnesses = report.results.flatMap(result =>
         result.witnesses.map(witness => ({ project: result.project, ...witness })));
     if (witnesses.length > 0) {
@@ -454,7 +520,22 @@ function aggregate(results) {
         ]) summary[key] += result[key] || 0;
     }
     const verdict = evaluateConsistencySummary(summary);
-    return { summary, failures: verdict.failures, passed: verdict.failures.length === 0 };
+    // Board-level answer tax over the projects that measured one.
+    const answerTax = { answers: 0, chars: 0, taxChars: 0, share: null };
+    for (const result of results) {
+        const tax = result.answerTax;
+        if (!tax || tax.share == null) continue;
+        answerTax.answers += tax.answers;
+        answerTax.chars += tax.chars;
+        answerTax.taxChars += tax.taxChars;
+    }
+    if (answerTax.chars > 0) {
+        answerTax.share = Number((answerTax.taxChars / answerTax.chars).toFixed(4));
+    }
+    return {
+        summary, answerTax,
+        failures: verdict.failures, passed: verdict.failures.length === 0,
+    };
 }
 
 function workerMain() {
@@ -546,6 +627,15 @@ function main() {
             : null;
         const base = release ? RELEASE_REPOS : REPOS;
         const repos = base.filter(repo => !names || names.has(repo.name));
+        // A named repo may also be a pinned outcome-board row: those carry
+        // the answer-tax measure for shapes the oracle board has no repo for.
+        if (names && !release) {
+            for (const repo of OUTCOME_TUNED) {
+                if (names.has(repo.name) && !repos.some(row => row.name === repo.name)) {
+                    repos.push(repo);
+                }
+            }
+        }
         const unknown = names
             ? [...names].filter(name => !repos.some(repo => repo.name === name))
             : [];
