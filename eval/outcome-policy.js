@@ -397,6 +397,26 @@ function deleteVerdictTriState({ confirmedCallers, usageEvidence, audit }) {
     return { verdict: 'review', reason: 'not-claimed-by-audit' };
 }
 
+/**
+ * Contract-arm delete verdict from the engine's own deletion assessment
+ * (`plan <handle> --delete --json`). The arm no longer composes a verdict
+ * out of three commands: it reports what the engine says, so the eval
+ * scores the answer an agent actually gets.
+ *   no-static-dependents  -> safe
+ *   has-static-dependents -> unsafe
+ *   review                -> review, with the engine's reason
+ * A missing or malformed answer routes review, never safe.
+ */
+function deleteVerdictFromAssessment(doc) {
+    const data = doc && doc.data;
+    if (!data || data.operation !== 'delete' || typeof data.verdict !== 'string') {
+        return { verdict: 'review', reason: 'assessment-unavailable' };
+    }
+    if (data.verdict === 'no-static-dependents') return { verdict: 'safe', reason: data.reason };
+    if (data.verdict === 'has-static-dependents') return { verdict: 'unsafe', reason: data.reason };
+    return { verdict: 'review', reason: data.reason || 'review' };
+}
+
 // ── Judge-output parsing (error keys are line-INDEPENDENT so deletions that
 //    shift line numbers do not manufacture phantom "new" errors) ─────────────
 
@@ -1184,6 +1204,7 @@ module.exports = {
     grepDeleteVerdict,
     deadcodeClaimForTask,
     deleteVerdictTriState,
+    deleteVerdictFromAssessment,
     armDeleteVerdict,
     isLanguagePrivate,
     OUTCOME_GATE_THRESHOLDS,

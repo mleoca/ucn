@@ -71,10 +71,41 @@ function groupedReviewLines(items, cap = 20) {
  * Format plan command output - text
  * Shows before/after signatures and all changes needed
  */
+/**
+ * A deletion assessment: the verdict, its basis and where the declaration
+ * is. What the verdict never means (a guarantee) is stated once, in the
+ * tool description and the usage guide.
+ */
+function formatDeletion(assessment) {
+    const d = assessment.declaration;
+    const owner = d.className ? `${d.className}.` : '';
+    const lines = [
+        `Deletion assessment: ${owner}${d.name}`,
+        '═'.repeat(60),
+        `${d.file}:${d.startLine}${d.type ? `  (${d.type})` : ''}`,
+        `VERDICT: ${assessment.verdict}`,
+        `  basis: ${assessment.basis}`,
+    ];
+    if (assessment.site) {
+        const site = assessment.site;
+        lines.push(`  first use: ${site.file}${site.line != null ? `:${site.line}` : ''}`);
+    }
+    if (assessment.projectKind === 'application') {
+        lines.push('  project kind: application (.ucn.json): exported symbols are assessed');
+    }
+    if (assessment.verdict === 'has-static-dependents') {
+        lines.push(`  next: ucn show ${d.file}:${d.startLine}:${d.name} lists the callers; ucn usages ${d.name} lists every occurrence`);
+    } else if (assessment.reason === 'downstream-exposure') {
+        lines.push('  next: declare "kind": "application" in .ucn.json if nothing outside this repository consumes it');
+    }
+    return lines.join('\n');
+}
+
 function formatPlan(plan, options = {}) {
     if (!plan) {
         return 'Function not found.';
     }
+    if (plan.operation === 'delete') return formatDeletion(plan);
     if (!plan.found) {
         return `Function "${plan.function}" not found.`;
     }

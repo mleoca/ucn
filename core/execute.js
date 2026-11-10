@@ -526,8 +526,9 @@ function validatePublicParams(command, p) {
     if (command === 'plan') {
         const operations = [p.addParam, p.removeParam, p.renameTo]
             .filter(value => value != null && String(value).trim() !== '');
+        if (p.delete) operations.push('delete');
         if (operations.length !== 1) {
-            return 'plan requires exactly one operation: addParam, removeParam, or renameTo.';
+            return 'plan requires exactly one operation: addParam, removeParam, renameTo, or delete.';
         }
         if (p.defaultValue != null && !p.addParam) {
             return 'plan defaultValue is valid only with addParam.';
@@ -2292,8 +2293,18 @@ const HANDLERS = {
         if (classErr) return { ok: false, error: classErr };
         const pinErr = checkDefinitionPin(index, p);
         if (pinErr) return { ok: false, error: pinErr };
+        if (p.delete) {
+            // The same eligibility rule the dead-code audit runs over every
+            // name, asked about this one declaration (core/deletion.js).
+            const resolved = index.resolveSymbol(p.name, {
+                file: p.file, className: p.className, line: p.line,
+            });
+            if (!resolved.def) return { ok: false, error: symbolNotFound(index, p.name) };
+            const assessment = require('./deletion').assessDeletion(index, resolved.def);
+            return { ok: true, result: { found: true, operation: 'delete', ...assessment } };
+        }
         if (!p.addParam && !p.removeParam && !p.renameTo) {
-            return { ok: false, error: 'Plan requires an operation: add_param, remove_param, or rename_to.' };
+            return { ok: false, error: 'Plan requires an operation: add_param, remove_param, rename_to, or delete.' };
         }
         const result = index.plan(p.name, {
             addParam: p.addParam,

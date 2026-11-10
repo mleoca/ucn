@@ -124,7 +124,7 @@ describe('deterministic disagreement evaluation', () => {
         try {
             const result = evaluateProject(dir, { name: 'wrapper-fixture' }, 20);
             assert.ok(result.sampledSymbols >= 2);
-            assert.strictEqual(result.comparisons, result.sampledSymbols * 20);
+            assert.strictEqual(result.comparisons, result.sampledSymbols * 21);
             assert.deepStrictEqual(result.failures, [],
                 JSON.stringify(result.witnesses, null, 2));
             assert.strictEqual(result.disagreements, 0,

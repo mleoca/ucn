@@ -145,7 +145,7 @@ const FLAG_APPLICABILITY = {
     deps:         ['file', 'exclude', 'depth', 'direction', 'all', 'detailed', 'cycles'],
     api:          ['file', 'in', 'limit', 'includeTests'],
     check:        ['name', 'file', 'className', 'line', 'includeMethods', 'base', 'staged', 'limit'],
-    plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
+    plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue', 'delete'],
     repo:         ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in', 'functions', 'hot', 'deep', 'sections'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
     entrypoints:  ['file', 'exclude', 'includeTests', 'excludeTests', 'limit', 'type', 'framework'],
@@ -309,7 +309,7 @@ function formatSurfaceMessage(message, surface = 'cli') {
         'expandUnverified', 'withSource', 'all', 'compact', 'exact',
         'regex', 'exported', 'unused', 'staged', 'detailed', 'functions',
         'hot', 'deep', 'cycles', 'bridge', 'unmatched', 'diverse', 'git',
-        'raw', 'lines',
+        'raw', 'lines', 'delete',
     ]);
     if (surface === 'mcp') {
         rendered = rendered.replace(/--([a-z][a-z0-9-]*)(?:=([^\s,.)]+))?/g,

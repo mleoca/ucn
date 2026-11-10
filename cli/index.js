@@ -331,6 +331,7 @@ function parseFlags(tokens) {
         addParam: getValueFlag('--add-param'),
         removeParam: getValueFlag('--remove-param'),
         renameTo: getValueFlag('--rename-to'),
+        delete: tokens.includes('--delete') || undefined,
         defaultValue: getValueFlag('--default-value') ?? getValueFlag('--default'),
         base: getValueFlag('--base'),
         staged: tokens.includes('--staged') || undefined,
@@ -1089,7 +1090,7 @@ Commands:
   entrypoints            Detect runtime, framework, task, and test entry points
   endpoints              List server/client HTTP endpoints (--bridge to match)
   check [name]           Symbol signature check, or pre-commit check without a name
-  plan <name>            Preview refactoring (--add-param=, --remove-param=, --rename-to=, --default-value=)
+  plan <name>            Preview refactoring (--add-param=, --remove-param=, --rename-to=, --default-value=, --delete)
   stacktrace <text>      Parse a stack trace
   api                    Show public symbols
   audit-async            Find likely missing-await calls (JS/TS/Python/C#)

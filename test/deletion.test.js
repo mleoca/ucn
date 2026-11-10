@@ -193,6 +193,9 @@ describe('deletion: one rule for the audit and for one declaration', () => {
             for (const row of ['store.js:3:clear', 'svc.py:6:_run', 'wrap.rs:3:len']) {
                 assert.ok(!listed.includes(row), `${row} is not claimed`);
             }
+            const params = { name: 'svc.py:2:_run', delete: true };
+            const text = output.formatPublicText('plan', execute(index, 'plan', params).result, params);
+            assert.match(text, /VERDICT: has-static-dependents\n {2}basis: a call of this name exists outside the declaration\n {2}first use: svc\.py:7\n/);
         } finally { rm(dir); }
     });
 
@@ -449,6 +452,53 @@ describe('deletion: a declaration the index no longer holds', () => {
             const sameLine = assessDeletion(index, record('kept', 'lib.js',
                 { startLine: 2, endLine: 2 }));
             assert.strictEqual(sameLine.verdict, 'has-static-dependents');
+        } finally { rm(dir); }
+    });
+});
+
+describe('deletion: plan --delete', () => {
+    it('answers through the public command, in text and JSON', () => {
+        const dir = tmp({
+            'package.json': '{"name":"plan-delete"}',
+            'lib.js': 'function used() { return 1; }\nfunction unused() { return 2; }\nmodule.exports = { run: () => used() };',
+        });
+        try {
+            const index = idx(dir);
+            const done = execute(index, 'plan', { name: 'unused', delete: true });
+            assert.ok(done.ok, done.error);
+            assert.strictEqual(done.result.operation, 'delete');
+            assert.strictEqual(done.result.verdict, 'no-static-dependents');
+            const text = output.formatPublicText('plan', done.result, { name: 'unused', delete: true });
+            assert.match(text, /^Deletion assessment: unused\n/);
+            assert.match(text, /lib\.js:2 {2}\(function\)/);
+            assert.match(text, /VERDICT: no-static-dependents\n {2}basis: /);
+            const json = JSON.parse(output.formatPublicJson('plan', done.result,
+                { name: 'unused', delete: true }, { ...done, surface: 'cli' }));
+            assert.strictEqual(json.data.verdict, 'no-static-dependents');
+            assert.strictEqual(json.data.safeToDelete, false);
+
+            const used = execute(index, 'plan', { name: 'used', delete: true }).result;
+            assert.strictEqual(used.verdict, 'has-static-dependents');
+            assert.match(output.formatPublicText('plan', used, { name: 'used', delete: true }),
+                /next: ucn show lib\.js:1:used lists the callers/);
+            // The handle form pins the declaration.
+            const pinned = execute(index, 'plan', { name: 'lib.js:2:unused', delete: true });
+            assert.strictEqual(pinned.result.declaration.startLine, 2);
+        } finally { rm(dir); }
+    });
+
+    it('is one operation: it cannot be combined, and plan still needs one', () => {
+        const dir = tmp({ 'package.json': '{}', 'lib.js': 'function f() {}\n' });
+        try {
+            const index = idx(dir);
+            const both = execute(index, 'plan', { name: 'f', delete: true, renameTo: 'g' });
+            assert.strictEqual(both.ok, false);
+            assert.match(both.error, /exactly one operation/);
+            const none = execute(index, 'plan', { name: 'f' });
+            assert.strictEqual(none.ok, false);
+            assert.match(none.error, /delete/);
+            const missing = execute(index, 'plan', { name: 'nope', delete: true });
+            assert.strictEqual(missing.ok, false);
         } finally { rm(dir); }
     });
 });

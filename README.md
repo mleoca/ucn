@@ -261,6 +261,7 @@ bundles while respecting user exclusions; it bypasses the shared cache.
 |-----|--------|
 | `exclude` | Patterns that are not indexed. Their source is still searched per name. |
 | `outsideProject` | Patterns that are not part of the project, such as vendored trees. No claim covers them; `repo --sections=health` lists them. |
+| `kind` | `"application"` declares that nothing outside the repository consumes its exports, so `deadcode` and `plan --delete` assess exported symbols. Anything else is a library: exported symbols are review. |
 | `maxFiles`, `maxDepth`, `maxFileSize` | Discovery limits. |
 | `textScanBudgetBytes` | Bytes of unindexed source searched per name (default 256 MB). Source past the budget counts as unreadable. |
 | `aliases`, `includePaths` | Import resolution. |

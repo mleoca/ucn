@@ -243,7 +243,7 @@ Use UCN for semantic questions: exact definitions, symbol-aware callers/callees,
 - impact: symbol impact when name is set; Git-diff impact when it is omitted.
 - tests: static direct links by default; depth>0 includes transitive affected links. Empty results are not runtime coverage proof.
 - deps/api/entrypoints/endpoints: architecture and public surfaces.
-- check: symbol signature check when name is set; precommit check when omitted. plan previews the selected declaration plus indexed call/import/export edits.
+- check: symbol signature check when name is set; precommit check when omitted. plan previews the selected declaration plus indexed call/import/export edits; with delete=true it assesses deleting the declaration (no-static-dependents, has-static-dependents, or review with the reason), by the rule deadcode applies to every name. A .ucn.json "kind": "application" lets exported symbols be assessed.
 - deadcode/audit_async/stacktrace: focused audits and runtime evidence. Computed dispatch is reported as a health/deletion blind spot; unknown decorators and member-assigned handlers are withheld from default dead-code claims.
 
 CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review; when same-name definitions compete, show returns their stable handles once above the sites. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. CONTRACT is a state: text-complete means every literal-name line of project source was classified, never that aliases, indirect calls, generated code or runtime dispatch are absent. Source UCN reads without analyzing (bundles, paths excluded in .ucn.json, oversized files, unsupported languages) is searched for each name and listed only when the name occurs there; a path that cannot be read degrades every account. repo health states the scope once. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Releases are gated on pinned real repositories: sampled callers, callees, value references, and dead-code claims are compared with ts-morph, Pyright, gopls, rust-analyzer, JDT LS, Roslyn, and clangd, and one handle's claims must agree across find, show, source, impact, tests, check, and caller trace.` + generateMcpParamSection();
@@ -306,6 +306,7 @@ const INPUT_SHAPE = {
     remove_param: stringParam('Parameter name to remove (plan command)'),
     rename_to: stringParam('New name for the function, method, or type (plan command)'),
     default_value: stringParam('Default value for added parameter (plan command)'),
+    delete: booleanParam('plan: assess deleting the declaration. Returns no-static-dependents, has-static-dependents or review with its basis; static evidence, never a deletion guarantee.'),
     stack: stringParam('The stack trace text to parse (stacktrace command)'),
     range: stringParam('source line range, e.g. "10-20" or "15", of the file given as file or name.'),
     base: stringParam('Git ref (default: HEAD). impact/check without a symbol: diff against it; check with a symbol: compare the declaration with its version there. E.g. "HEAD~3", "main", a commit SHA'),

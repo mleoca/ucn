@@ -809,44 +809,22 @@ function judgeWithGoImportRepair(judge, repoPath, baselineKeys, language) {
     return { newKeys, diagnostics: result.diagnostics || [], ms: result.ms, repairs };
 }
 
-function collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit) {
+function collectDeleteVerdicts(repoPath, contentByFile, task) {
     const handle = `${task.relativePath}:${task.startLine}:${task.name}`;
     const showJson = cliJson(repoPath,
         ['show', handle, '--sections=summary,callers']);
     if (!showJson.ok) return { error: `show failed: ${showJson.error}` };
     const showText = runCli(repoPath, ['show', handle, '--sections=summary,callers']);
-    const usagesJson = cliJson(repoPath,
-        ['usages', task.name, '--include-tests']);
-    const usagesText = runCli(repoPath, ['usages', task.name, '--include-tests']);
-    const usageRows = usagesJson.ok ? (usagesJson.doc.data || []) : null;
 
     const grep = policy.grepDeleteVerdict(
         contentByFile, task.name, task.relativePath, task.startLine, task.endLine);
     const confirmed = policy.deleteVerdictFromShow(showJson.doc.data || {});
-    const contractBase = usageRows
-        ? policy.deleteVerdictFromUsages(usageRows, {
-            file: task.relativePath,
-            startLine: task.startLine,
-            endLine: task.endLine,
-        })
-        : { safe: false, usageEvidence: -1 };
-    // Tri-state contract verdict: confirmed callers or usage evidence →
-    // unsafe; zero evidence is 'safe' only when the engine's default
-    // deadcode audit CLAIMS the symbol dead (every shield the audit encodes
-    // — exported exclusion, external contracts, heritage closure — lands
-    // here as 'review' instead of a blind 'safe').
-    const audit = sharedAudit && sharedAudit.data
-        ? policy.deadcodeClaimForTask(sharedAudit.data, task)
-        : null;
-    const tri = policy.deleteVerdictTriState({
-        confirmedCallers: confirmed.confirmedCallers,
-        usageEvidence: contractBase.usageEvidence,
-        audit,
-    });
-
-    // The scripted contract agent runs the audit once per repo and reuses it
-    // across delete triages — each verdict pays an amortized share.
-    const auditShare = sharedAudit ? sharedAudit.share : { outputChars: 0, toolCalls: 0 };
+    // The contract arm asks the engine the question itself: one command,
+    // the engine's verdict and its stated reason. (It used to compose a
+    // verdict from show + usages + a shared deadcode audit.)
+    const assessJson = cliJson(repoPath, ['plan', handle, '--delete']);
+    const assessText = runCli(repoPath, ['plan', handle, '--delete']);
+    const contract = policy.deleteVerdictFromAssessment(assessJson.ok ? assessJson.doc : null);
 
     return {
         handle,
@@ -864,16 +842,10 @@ function collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit) {
                 cost: { outputChars: showText.stdout.length, toolCalls: 1, wallMs: showText.ms },
             },
             'ucn-contract': {
-                verdict: tri.verdict,
-                verdictReason: tri.reason,
-                safe: tri.verdict === 'safe',
-                evidence: Math.max(contractBase.usageEvidence, confirmed.confirmedCallers),
-                cost: {
-                    outputChars: showText.stdout.length + usagesText.stdout.length +
-                        auditShare.outputChars,
-                    toolCalls: 2 + auditShare.toolCalls,
-                    wallMs: showText.ms + usagesText.ms,
-                },
+                verdict: contract.verdict,
+                verdictReason: contract.reason,
+                safe: contract.verdict === 'safe',
+                cost: { outputChars: assessText.stdout.length, toolCalls: 1, wallMs: assessText.ms },
             },
         },
     };
@@ -1011,14 +983,8 @@ function runSeededDeleteTasks(context, options) {
                         continue;
                     }
                     const patched = patchedContent(contentByFile, mutation);
-                    const auditJson = cliJson(repoPath, ['deadcode']);
-                    const auditText = runCli(repoPath, ['deadcode']);
-                    const audit = auditJson.ok ? {
-                        data: auditJson.doc || {},
-                        share: { outputChars: auditText.stdout.length, toolCalls: 1 },
-                    } : null;
                     const target = mutation.target;
-                    const verdicts = collectDeleteVerdicts(repoPath, patched, target, audit);
+                    const verdicts = collectDeleteVerdicts(repoPath, patched, target);
                     if (verdicts.error) {
                         proposalErrors++;
                         log(`  seeded ${kind} ${target.name}: ${verdicts.error}`);
@@ -1303,31 +1269,9 @@ async function runRepo(repo, options) {
         renameRows.push({ task, proposal });
         if (proposal.error) log(`  rename ${task.name}: ${proposal.error}`);
     }
-    // One shared deadcode audit per repo for the contract arm's tri-state
-    // delete verdicts; its cost is amortized over the delete tasks.
-    let sharedAudit = null;
-    if (deleteTasksSampled.length > 0) {
-        const auditJson = cliJson(repoPath, ['deadcode']);
-        const auditText = runCli(repoPath, ['deadcode']);
-        if (auditJson.ok) {
-            sharedAudit = {
-                data: auditJson.doc || {},
-                outputChars: auditText.stdout.length,
-                wallMs: auditText.ms,
-                share: {
-                    outputChars: Math.round(
-                        auditText.stdout.length / deleteTasksSampled.length),
-                    toolCalls: Number(
-                        (1 / deleteTasksSampled.length).toFixed(2)),
-                },
-            };
-        } else {
-            log(`  deadcode audit failed (contract delete verdicts route review): ${auditJson.error}`);
-        }
-    }
     const deleteRows = [];
     for (const task of deleteTasksSampled) {
-        const verdicts = collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit);
+        const verdicts = collectDeleteVerdicts(repoPath, contentByFile, task);
         deleteRows.push({ task, verdicts });
         if (verdicts.error) log(`  delete ${task.name}: ${verdicts.error}`);
     }
@@ -1497,13 +1441,6 @@ async function runRepo(repo, options) {
         // Sampled deletions the judge called clean without checking the
         // deleted declaration (never part of the positive set).
         groundCleanUnverified: deleteResults.filter(row => row.judgeCovered === false).length,
-        ...(sharedAudit && {
-            sharedAudit: {
-                outputChars: sharedAudit.outputChars,
-                wallMs: sharedAudit.wallMs,
-                amortizedOver: deleteTasksSampled.length,
-            },
-        }),
         rename: {
             tasks: renameResults,
             aggregate: policy.aggregateRenameTasks(renameResults, ARMS),
@@ -1529,7 +1466,7 @@ async function runRepo(repo, options) {
             'A task is scored only where the judge checks the mutated code: a probe naming something undeclared is placed in the same declaration first, and a judge that stays silent about it (a module behind a disabled feature, a file outside the build) leaves the task unscored. Unscored check tasks are listed and replaced; a sampled deletion judged clean without that coverage is counted as unverified and never joins the positive set.',
             'A mutation kind has three standings per language: applicable, not applicable (the language cannot express it), unsupported (the language can express it and this board has no mutation for it). Unsupported is a coverage gap of the instrument and is listed as one.',
             'Check tasks score READY_FOR_TOOLCHAIN against dependents: the ground outcome is new diagnostics outside the mutation\'s own lines. Diagnostics inside those lines are reported separately and never gated. A mutation kind a language cannot express is N/A for that repo.',
-            "The contract arm's delete verdict is tri-state: 'review' means zero text evidence but not provably dead by the default deadcode audit (exported symbols, external contracts, entry points). falseSafe is computed over 'safe' verdicts only; review rows are reported with their ground outcomes.",
+            "The contract arm's delete verdict is the engine's own deletion assessment (`plan <handle> --delete`): no-static-dependents is scored as safe, has-static-dependents as unsafe, review as review with the engine's stated reason (downstream exposure, an external or project contract, a registration, reflection, unsearchable source). falseSafe is computed over 'safe' verdicts only; review rows are reported with their ground outcomes.",
         ],
     };
     return report;

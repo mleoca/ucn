@@ -13,7 +13,9 @@
  *   - confirmed caller-site multisets across show / impact / check;
  *   - unverified caller-site multisets across show / impact / check;
  *   - the complete literal-name account across all four commands;
- *   - each command's reported site total against its own visible site rows.
+ *   - each command's reported site total against its own visible site rows;
+ *   - the deletion rule: the dead-code audit lists a declaration exactly when
+ *     `plan --delete` answers no-static-dependents for it.
  *
  * Every failure carries a stable handle and a minimal only-in/value witness.
  */
@@ -268,9 +270,23 @@ function answerTexts(results, specs, notes) {
     return texts;
 }
 
+/** Declarations the default dead-code audit lists, by handle. Read from the
+ *  engine (the public command applies a listing limit). */
+function auditedDead(index) {
+    if (!index._consistencyDead) {
+        const { deadcode } = require('../core/deadcode');
+        index._consistencyDead = new Set(deadcode(index, {})
+            .map(item => `${item.file}:${item.startLine}:${item.name}`));
+    }
+    return index._consistencyDead;
+}
+
 function evaluateDefinition(index, row) {
     const { def, handle, stratum } = row;
     const { results, errors, specs, notes } = runCommands(index, handle);
+    // One deletion rule on two surfaces.
+    const assessment = execute(index, 'plan', { name: handle, delete: true });
+    if (!assessment.ok) errors.push({ command: 'plan --delete', error: assessment.error || 'unknown error' });
     if (errors.length > 0) {
         return {
             handle,
@@ -349,6 +365,10 @@ function evaluateDefinition(index, row) {
         results.impact.totalCallSites, 'rows', confirmed.impact.length));
     add(compareStructured('check-visible-total', 'reported',
         results.check.totalCalls, 'rows', confirmed.check.length));
+    const declared = assessment.result.declaration;
+    add(compareStructured('deletion-rule', 'deadcode',
+        auditedDead(index).has(`${declared.file}:${declared.startLine}:${declared.name}`),
+        'plan', assessment.result.verdict === 'no-static-dependents'));
 
     return {
         handle,
@@ -667,6 +687,7 @@ function main() {
             'unverified caller multiset and reason: show = impact = check',
             'literal-name caller account: show = impact = check = caller trace',
             'reported visible totals equal emitted site rows',
+            'deletion rule: deadcode lists a declaration exactly when plan --delete answers no-static-dependents',
         ],
         ...totals,
         results,
