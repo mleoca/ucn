@@ -16,6 +16,7 @@ const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, esca
 const { projectComputedDispatch, projectReflectionSites } = require('./ast-analysis');
 const { reflectionPatternReferences, reflectionLiteralNames } = require('./reflection');
 const { protocolMemberOf, protocolTypeOf, typedLiteralContract, rustProjectTraits } = require('./contract-membership');
+const { projectKind, downstreamExposureBlocks } = require('./deletion');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -245,27 +246,18 @@ function typedLiteralExternalMember(index, symbol) {
     return !!typedLiteralContract(index, symbol)?.external;
 }
 
-// Go satisfies interfaces implicitly, so no `implements` edge exists for
-// compiler/stdlib callbacks. A zero textual usage for one of these exact
-// method shapes is not evidence of deadness (sort.Interface, http.Handler,
-// io.Reader, encoding marshalers, database/sql contracts, errors helpers).
-const GO_PROTOCOL_METHODS = new Map([
-    ['Len', 0], ['Less', 2], ['Swap', 2], ['ServeHTTP', 2],
-    ['Error', 0], ['String', 0], ['Read', 1], ['Write', 1], ['Close', 0],
-    ['Seek', 2], ['ReadAt', 2], ['WriteAt', 2], ['ReadByte', 0],
-    ['WriteByte', 1], ['ReadRune', 0], ['UnreadByte', 0], ['UnreadRune', 0],
-    ['MarshalJSON', 0], ['UnmarshalJSON', 1], ['MarshalText', 0],
-    ['UnmarshalText', 1], ['MarshalBinary', 0], ['UnmarshalBinary', 1],
-    ['Scan', 1], ['Value', 0], ['LogValue', 0], ['Unwrap', 0],
-    ['Is', 1], ['As', 1],
-]);
-
-function goImplicitExternalContract(symbol) {
-    if (!symbol.className || !GO_PROTOCOL_METHODS.has(symbol.name)) return false;
+/**
+ * A method shaped like a member of a standard contract the language lets a
+ * type satisfy without naming it (trait `implicitStandardContracts`: Go's
+ * sort.Interface, http.Handler, io.Reader, the encoding marshalers ...).
+ */
+function implicitStandardContract(symbol, lang) {
+    const methods = langTraits(lang)?.implicitStandardContracts;
+    if (!methods || !symbol.className || !methods.has(symbol.name)) return false;
     const arity = Array.isArray(symbol.paramsStructured)
         ? symbol.paramsStructured.length
         : null;
-    return arity == null || arity === GO_PROTOCOL_METHODS.get(symbol.name);
+    return arity == null || arity === methods.get(symbol.name);
 }
 
 // Symbol types whose definition NAME line provably cannot reference a
@@ -732,6 +724,53 @@ function deadcode(index, options = {}) {
     index._beginOp();
     try {
     const results = [];
+    // This pipeline IS the deletion eligibility rule. The audit runs it over
+    // every name; a deletion assessment (core/deletion.js) runs the same
+    // code over one name and asks why each declaration was or was not
+    // claimed. `names` restricts the pass, `explain(symbol, reason, detail)`
+    // reports every outcome (detail: the audit row of a claim, the sites of
+    // a use). Neither changes what is claimed.
+    const onlyNames = options.names instanceof Set ? options.names : null;
+    const explain = typeof options.explain === 'function' ? options.explain : null;
+    const withhold = (symbol, reason, detail) => { if (explain) explain(symbol, reason, detail); };
+    // Assessment only: names whose every call site the caller has shown to
+    // lie inside the declaration being assessed. Those calls are deleted
+    // with it, so the name goes on to the text scan under the recursion
+    // carve-out below. The audit never sets this.
+    const ownBodyOnly = options.ownBodyOnly instanceof Set ? options.ownBodyOnly : null;
+    // Declarations the index does not hold (deleted since, or read from a
+    // base revision), assessed from their own record against this index's
+    // uses of the name. Their line numbers describe a file that no longer
+    // has them, so they never mark a definition site in the current text.
+    const absent = new Map(); // symbol record -> file entry of its revision
+    const absentByName = new Map();
+    for (const extra of Array.isArray(options.declarations) ? options.declarations : []) {
+        const symbol = extra.symbol;
+        if (!symbol || !symbol.name) continue;
+        if (!symbol.relativePath) {
+            symbol.relativePath = path.relative(index.root, symbol.file).split(path.sep).join('/');
+        }
+        // With no file facts from the revision it was declared in, only what
+        // the record itself says is known: nothing is exported by a list the
+        // file no longer has.
+        absent.set(symbol, extra.fileEntry || index.files.get(symbol.file) || {
+            language: detectLanguage(symbol.file, index.root),
+            relativePath: symbol.relativePath,
+            symbols: [], exports: [], exportDetails: [], imports: [], bindings: [],
+        });
+        if (!absentByName.has(symbol.name)) absentByName.set(symbol.name, []);
+        absentByName.get(symbol.name).push(symbol);
+    }
+    const symbolsOf = name => (absentByName.has(name)
+        ? [...(index.symbols.get(name) || []), ...absentByName.get(name)]
+        : index.symbols.get(name) || []);
+    const fileEntryOf = symbol => absent.get(symbol) || index.files.get(symbol.file);
+    const namedSymbols = absent.size === 0 ? index.symbols : (function* merged() {
+        for (const [name] of index.symbols) yield [name, symbolsOf(name)];
+        for (const name of absentByName.keys()) {
+            if (!index.symbols.has(name)) yield [name, symbolsOf(name)];
+        }
+    })();
     let excludedDecorated = 0;
     let excludedExported = 0;
     let excludedExternalContract = 0;
@@ -827,9 +866,14 @@ function deadcode(index, options = {}) {
     const classAuditSet = new Set(CLASS_AUDIT_KINDS);
     const callableNames = new Set();
     for (const [symbolName, symbols] of index.symbols) {
+        if (onlyNames && !onlyNames.has(symbolName)) continue;
         if (symbols.some(s => auditTypeSet.has(s.type))) {
             callableNames.add(symbolName);
         }
+    }
+    for (const [symbolName, symbols] of absentByName) {
+        if (onlyNames && !onlyNames.has(symbolName)) continue;
+        if (symbols.some(s => auditTypeSet.has(s.type))) callableNames.add(symbolName);
     }
 
     // Pre-filter: names in the callee index have call sites → definitely used → not dead.
@@ -842,7 +886,7 @@ function deadcode(index, options = {}) {
     for (const name of callableNames) {
         if (!index.calleeIndex.has(name)) {
             potentiallyDeadNames.add(name);
-        } else if (nameOnlySelfRecursive(index, name)) {
+        } else if ((ownBodyOnly && ownBodyOnly.has(name)) || nameOnlySelfRecursive(index, name)) {
             selfRecursiveNames.add(name);
             potentiallyDeadNames.add(name);
         }
@@ -851,12 +895,12 @@ function deadcode(index, options = {}) {
     // Pre-filter exported symbols from the scan set when not auditing exports.
     // Go exports ~63K capitalized names on K8s — scanning these in Phase 2 only to
     // skip them in Phase 3 wastes O(63K × 11K files) = ~700M comparisons.
-    if (!options.includeExported) {
+    if (downstreamExposureBlocks(index, true, options)) {
         const narrowed = new Set();
         for (const name of potentiallyDeadNames) {
-            const syms = index.symbols.get(name) || [];
+            const syms = symbolsOf(name);
             // Keep the name only if at least one definition is NOT exported
-            const allExported = syms.every(s => symbolIsExported(index, s, index.files.get(s.file)));
+            const allExported = syms.every(s => symbolIsExported(index, s, fileEntryOf(s)));
             if (!allExported) narrowed.add(name);
         }
         potentiallyDeadNames = narrowed;
@@ -868,7 +912,7 @@ function deadcode(index, options = {}) {
     if (options.file) {
         const filteredNames = new Set();
         for (const name of potentiallyDeadNames) {
-            const syms = index.symbols.get(name) || [];
+            const syms = symbolsOf(name);
             if (syms.some(s => s.relativePath && s.relativePath.includes(options.file))) {
                 filteredNames.add(name);
             }
@@ -921,11 +965,6 @@ function deadcode(index, options = {}) {
     }
 
     const coverage = scanDeadcodeCoverage(index, potentiallyDeadNames);
-    const coverageSuppressedNames = new Set([
-        ...coverage.matchedNames,
-        ...literalReflectionNames,
-        ...macroSuppressedNames,
-    ]);
     if (coverage.claimsWithdrawn) {
         // An unreadable file/directory can contain a use of any candidate.
         // Returning no deletion candidates is the only sound verdict.
@@ -1229,8 +1268,16 @@ function deadcode(index, options = {}) {
         }
     }
 
-    for (const [name, symbols] of index.symbols) {
-        if (coverage.claimsWithdrawn || coverageSuppressedNames.has(name)) continue;
+    for (const [name, symbols] of namedSymbols) {
+        if (onlyNames && !onlyNames.has(name)) continue;
+        // A name-level withdrawal: no declaration of this name is claimed.
+        // The audit skips the name; an assessment still walks the chain so
+        // a more specific reason (the name has callers) is reported first.
+        const withdrawn = coverage.claimsWithdrawn ? 'unsearchable-source'
+            : literalReflectionNames.has(name) ? 'reflection'
+                : macroSuppressedNames.has(name) ? 'macro-reference'
+                    : coverage.matchedNames.has(name) ? 'unanalyzed-occurrence' : null;
+        if (withdrawn && !explain) continue;
         // Definition NAME lines of same-name def-kind symbols are
         // declarations, not usages — two never-called same-name methods used
         // to keep each other alive (fix #243: three unreferenced `delete`
@@ -1241,6 +1288,7 @@ function deadcode(index, options = {}) {
             if (sameNameDefLines) return sameNameDefLines;
             sameNameDefLines = new Map();
             for (const other of symbols) {
+                if (absent.has(other)) continue;
                 if (!DEF_NAME_LINE_KINDS.has(other.type)) continue;
                 const ln = other.nameLine ?? other.startLine;
                 if (ln == null) continue;
@@ -1261,6 +1309,7 @@ function deadcode(index, options = {}) {
             if (sameNameDefRanges) return sameNameDefRanges;
             sameNameDefRanges = new Map();
             for (const other of symbols) {
+                if (absent.has(other)) continue;
                 if (!DEF_NAME_LINE_KINDS.has(other.type)) continue;
                 let arr = sameNameDefRanges.get(other.file);
                 if (!arr) { arr = []; sameNameDefRanges.set(other.file, arr); }
@@ -1272,6 +1321,7 @@ function deadcode(index, options = {}) {
         for (const symbol of symbols) {
             // Skip non-audited types (callableTypes defined above)
             if (!auditTypeSet.has(symbol.type)) {
+                withhold(symbol, 'kind-not-audited');
                 continue;
             }
 
@@ -1281,19 +1331,22 @@ function deadcode(index, options = {}) {
             // surface (ECMA-262 body-only scope). Auditing them claims
             // callback handlers dead (`app.on('ready', function boot(){})`).
             if (symbol.bodyScopedName) {
+                withhold(symbol, 'expression-scoped-name');
                 continue;
             }
             // Generated by a project macro_rules! invocation (fix #374): the
             // definition is the macro's template or the invocation's
             // arguments, never a deletable declaration of its own.
             if (symbol.macroExpansion) {
+                withhold(symbol, 'macro-generated');
                 continue;
             }
-            const fileEntry = index.files.get(symbol.file);
+            const fileEntry = fileEntryOf(symbol);
             const lang = fileEntry?.language;
 
             // Skip bundled/minified files (webpack bundles, build artifacts)
             if (fileEntry?.isBundled) {
+                withhold(symbol, 'bundled-file');
                 continue;
             }
 
@@ -1305,6 +1358,7 @@ function deadcode(index, options = {}) {
             if (/^operator(?:\b|[^a-zA-Z0-9_$])/.test(symbol.name) ||
                 symbol.name === 'this[]' ||
                 ((lang === 'c' || lang === 'cpp') && symbol.name.startsWith('~'))) {
+                withhold(symbol, 'operator-surface');
                 continue;
             }
 
@@ -1314,22 +1368,26 @@ function deadcode(index, options = {}) {
             if (lang === 'rust' && (symbol.modifiers || []).some(modifier =>
                 modifier === 'pymethods' || modifier === 'pymodule_init')) {
                 excludedRuntimeContract++;
+                withhold(symbol, 'runtime-contract');
                 continue;
             }
 
             // Skip test files unless requested
             if (!options.includeTests && isTestFile(symbol.relativePath, lang)) {
+                withhold(symbol, 'test-file');
                 continue;
             }
 
             // Apply file filter (scopes deadcode to matching files)
             if (options.file && !symbol.relativePath.includes(options.file)) {
+                withhold(symbol, 'out-of-scope');
                 continue;
             }
 
             // Apply exclude and in filters
             if ((options.exclude && options.exclude.length > 0) || options.in) {
                 if (!index.matchesFilters(symbol.relativePath, { exclude: options.exclude, in: options.in })) {
+                    withhold(symbol, 'out-of-scope');
                     continue;
                 }
             }
@@ -1342,6 +1400,7 @@ function deadcode(index, options = {}) {
             // compile time and describes external/global shapes — nothing in
             // it is deletable code, so nothing in it is claimable.
             if (symbol.relativePath.endsWith('.d.ts')) {
+                withhold(symbol, 'ambient-declaration');
                 continue;
             }
             // The same holds for a `declare global` / `declare module 'x'`
@@ -1349,6 +1408,7 @@ function deadcode(index, options = {}) {
             // with declarations outside the project, whose readers UCN
             // cannot see (`interface Window`, a library's `Register`).
             if (symbol.ambientAugmentation) {
+                withhold(symbol, 'ambient-declaration');
                 continue;
             }
 
@@ -1356,6 +1416,7 @@ function deadcode(index, options = {}) {
             // Each language module declares its own isEntryPoint() rules.
             const langModule = getLanguageAdapter(lang);
             if (langModule.isEntryPoint?.(symbol)) {
+                withhold(symbol, 'entry-point');
                 continue;
             }
             // A constructor participates in the type's allocation protocol,
@@ -1369,6 +1430,7 @@ function deadcode(index, options = {}) {
                 (symbol.className && !classAuditSet.has(symbol.type) &&
                     langTraits(lang)?.constructorProtocol?.initializer === name)) {
                 excludedConstructors++;
+                withhold(symbol, 'constructor');
                 continue;
             }
             // Members the runtime/compiler invokes by name (trait
@@ -1377,6 +1439,7 @@ function deadcode(index, options = {}) {
             // pattern-bound members, JS toJSON/then/[Symbol.*] (fix #363).
             if (protocolMemberOf(index, symbol) || protocolTypeOf(index, symbol)) {
                 excludedRuntimeContract++;
+                withhold(symbol, 'runtime-contract');
                 continue;
             }
 
@@ -1386,6 +1449,7 @@ function deadcode(index, options = {}) {
             // contract (CS0535); classify it with other external contracts.
             if (lang === 'csharp' && symbol.explicitInterface) {
                 excludedExternalContract++;
+                withhold(symbol, 'external-contract');
                 continue;
             }
 
@@ -1404,6 +1468,7 @@ function deadcode(index, options = {}) {
             if ((hasFrameworkEntrypoint || hasDecoratorMetadata) &&
                 !options.includeDecorated) {
                 excludedDecorated++;
+                withhold(symbol, 'registered');
                 continue;
             }
 
@@ -1417,18 +1482,25 @@ function deadcode(index, options = {}) {
             // explicitly enables exported-surface review.
             if (symbol.memberAssigned && !symbol.registryMember && !isExported) {
                 excludedRuntimeContract++;
+                withhold(symbol, 'runtime-contract');
                 continue;
             }
 
             // Skip exported unless requested
-            if (isExported && !options.includeExported) {
+            // POLICY, not fact: an exported symbol may have consumers outside
+            // the repository. A library keeps it out of the audit; a project
+            // declared an application, or --include-exported, audits it.
+            // `isExported` stays the fact other shields read (above).
+            if (downstreamExposureBlocks(index, isExported, options)) {
                 excludedExported++;
+                withhold(symbol, 'downstream-exposure');
                 continue;
             }
 
             // Fast path: name has call sites in callee index → definitely used → not dead
             // (unless every site is the name's own recursion — fix #253c).
             if (index.calleeIndex.has(name) && !selfRecursiveNames.has(name)) {
+                withhold(symbol, 'has-callers');
                 continue;
             }
             // Class-kind claims (fix #253a): a class whose member the runtime
@@ -1444,15 +1516,20 @@ function deadcode(index, options = {}) {
                 // live. This is the normal invocation form for C# extension
                 // containers and other static helper types.
                 if (members.some(m => index.calleeIndex.has(m.name))) {
+                    withhold(symbol, 'member-in-use', explain && {
+                        members: members.filter(m => index.calleeIndex.has(m.name)).map(m => m.name),
+                    });
                     continue;
                 }
                 if (members.some(m => langModule.isEntryPoint?.(m))) {
+                    withhold(symbol, 'entry-point');
                     continue;
                 }
                 if (members.some(m => isFrameworkEntrypoint(m, index) ||
                     hasUnknownRegistrationDecorator(m))) {
                     if (!options.includeDecorated) {
                         excludedDecorated++;
+                        withhold(symbol, 'registered');
                         continue;
                     }
                 }
@@ -1468,7 +1545,9 @@ function deadcode(index, options = {}) {
             // resolves to — `user.load` keeps user.js's load alive, never an
             // unrelated module's same-name symbol.
             let nonDefUsages = allUsages.filter(u =>
-                !(u.file === symbol.file && (u.line === symbol.startLine || u.line === symbol.nameLine)) &&
+                // (an absent declaration has no definition site in this text)
+                !(!absent.has(symbol) && u.file === symbol.file &&
+                    (u.line === symbol.startLine || u.line === symbol.nameLine)) &&
                 !(defNameLines().get(u.file)?.has(u.line)) &&
                 // Self-recursion carve-out names (fix #253c): a reference
                 // inside a same-name def's own body is the recursion itself.
@@ -1494,7 +1573,7 @@ function deadcode(index, options = {}) {
             // AST ranges, not line prefixes (fix #247): a multi-line
             // `export { a,\n b }` block's continuation lines counted as
             // consumption, silently hiding every symbol exported that way.
-            if (isExported && options.includeExported) {
+            if (isExported && !downstreamExposureBlocks(index, isExported, options)) {
                 nonDefUsages = nonDefUsages.filter(u => {
                     if (u.file !== symbol.file) return true; // cross-file usage always counts
                     const ranges = exportSiteRanges(u.file);
@@ -1505,7 +1584,15 @@ function deadcode(index, options = {}) {
             // Total includes all usage types (calls, references, callbacks, re-exports)
             const totalUsages = nonDefUsages.length;
 
+            if (totalUsages > 0) withhold(symbol, 'has-usages', explain && { usages: nonDefUsages });
             if (totalUsages === 0) {
+                // A name-level withdrawal applies to every declaration the
+                // chain did not already explain (assessment only: the audit
+                // skipped this name before the chain).
+                if (withdrawn) {
+                    withhold(symbol, withdrawn);
+                    continue;
+                }
                 // External-contract override: the method may be invoked through
                 // an out-of-tree base class UCN can't index (deadcode analog of
                 // fix #210). A zero usage count is not evidence of deadness.
@@ -1520,9 +1607,10 @@ function deadcode(index, options = {}) {
                     ? _heritageReachesExternalBase(index, symbol, lang, false)
                     : overridesOutOfTreeBase(index, symbol) ||
                         typedLiteralExternalMember(index, symbol) ||
-                        (lang === 'go' && goImplicitExternalContract(symbol));
+                        implicitStandardContract(symbol, lang);
                 if (isExternalContract && !options.includeExported) {
                     excludedExternalContract++;
+                    withhold(symbol, 'external-contract');
                     continue;
                 }
                 // Collect decorators/annotations for hint display
@@ -1567,6 +1655,7 @@ function deadcode(index, options = {}) {
                     computedDispatchReceivers.has(symbol.registryContainer);
                 if (dynamicallyDispatched) {
                     excludedDynamicDispatch++;
+                    withhold(symbol, 'dynamic-dispatch');
                     continue;
                 }
 
@@ -1583,6 +1672,7 @@ function deadcode(index, options = {}) {
                     reflectionWithheldByPattern.set(pattern,
                         (reflectionWithheldByPattern.get(pattern) || 0) + 1);
                     reflectionInfo.withheld++;
+                    withhold(symbol, 'reflection');
                     continue;
                 }
 
@@ -1601,6 +1691,7 @@ function deadcode(index, options = {}) {
                         reflectionInfo.withheldByTable.push({ name: symbol.name,
                             file: symbol.relativePath, line, startLine: symbol.startLine,
                             reason: 'literal-name-near-dynamic-reflection' });
+                        withhold(symbol, 'reflection');
                         continue;
                     }
                 }
@@ -1624,6 +1715,7 @@ function deadcode(index, options = {}) {
                     ...(declaredOn && { declaredOn }),
                     ...(isExternalContract && { externalContract: true })
                 });
+                if (explain) explain(symbol, 'claimed', results[results.length - 1]);
             }
         }
     }
@@ -1669,9 +1761,13 @@ function deadcode(index, options = {}) {
         reasons: coverage.reasons,
         parseRecoveries: coverage.parseRecoveries,
     };
-    results.pythonImplicitExportFiles = [...index.files.values()].filter(entry =>
-        isPythonPackageFile(index, entry) &&
-        !(entry.exportDetails || []).some(exp => exp.type === '__all__')).length;
+    // The Python public-surface rule is an exposure rule: it shields nothing
+    // in a project declared an application.
+    results.projectKind = projectKind(index);
+    results.pythonImplicitExportFiles = results.projectKind === 'application' ? 0
+        : [...index.files.values()].filter(entry =>
+            isPythonPackageFile(index, entry) &&
+            !(entry.exportDetails || []).some(exp => exp.type === '__all__')).length;
 
     return results;
     } finally { index._endOp(); }

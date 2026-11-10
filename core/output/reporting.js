@@ -215,7 +215,8 @@ function formatDeadcode(results, options = {}) {
     if (results.length === 0 && !results.excludedDecorated &&
         !results.excludedExported && !results.excludedExternalContract &&
         !results.excludedRuntimeContract && !results.excludedConstructors && !results.pythonImplicitExportFiles &&
-        !results.excludedDynamicDispatch && !results.computedDispatch?.count &&
+        !results.excludedDynamicDispatch &&
+        results.projectKind !== 'application' && !results.computedDispatch?.count &&
         !results.reflection?.withheld && !results.reflection?.dynamicCount && !results.reflection?.literalCount &&
         results.coverage?.complete !== false) {
         return 'No dead code found.';
@@ -301,6 +302,9 @@ function formatDeadcode(results, options = {}) {
     if (results.excludedDynamicDispatch > 0) {
         lines.push(`\n${results.excludedDynamicDispatch} registry member(s) hidden because a matching computed dispatch (registry[key]()) may invoke them.`);
     }
+    if (results.projectKind === 'application') {
+        lines.push('\nProject kind: application (.ucn.json). Exported symbols are audited; contracts, registrations and reflection still withhold.');
+    }
     if (results.computedDispatch?.count > 0) {
         lines.push(`\nWARNING: ${results.computedDispatch.count} computed dispatch call(s) in ${results.computedDispatch.fileCount} file(s). Dead-code results are review candidates; runtime-selected members may not have a named static edge.`);
     }
@@ -379,6 +383,7 @@ function formatDeadcodeJson(results) {
             ...(results.excludedConstructors > 0 && { excludedConstructors: results.excludedConstructors }),
             ...(results.pythonImplicitExportFiles > 0 && { pythonImplicitExportFiles: results.pythonImplicitExportFiles }),
             ...(results.excludedDynamicDispatch > 0 && { excludedDynamicDispatch: results.excludedDynamicDispatch }),
+            ...(results.projectKind === 'application' && { projectKind: results.projectKind }),
             ...(results.computedDispatch?.count > 0 && { computedDispatch: results.computedDispatch }),
             ...(results.reflection?.count > 0 && { reflection: results.reflection }),
             ...(results.macroPaste && { macroPaste: results.macroPaste }),

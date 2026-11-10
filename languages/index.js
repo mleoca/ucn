@@ -311,6 +311,10 @@ const STRUCTURAL_TRAITS = {
     // text dependencies; no other language checks a test function's name
     // against a declaration.
     nameBoundTestFunctions: null,
+    // Methods a type declares to satisfy a standard-library contract it
+    // never names (interfaces satisfied implicitly): name -> parameter
+    // count. A zero textual use of one is not evidence that it is unused.
+    implicitStandardContracts: null,
     // Whether a top-level type is declared in a source file named after it
     // (fix #386): javac requires `public class Widget` in Widget.java, so a
     // type rename renames that file too.
@@ -527,6 +531,10 @@ const NOMINAL_TRAITS = {
     // Test functions the toolchain binds to a declared identifier by NAME
     // (fix #383); see GO_EXAMPLE_NAMES. null: no such convention.
     nameBoundTestFunctions: null,
+    // Methods a type declares to satisfy a standard-library contract it
+    // never names (interfaces satisfied implicitly): name -> parameter
+    // count. A zero textual use of one is not evidence that it is unused.
+    implicitStandardContracts: null,
     // A top-level type lives in a file named after it (fix #386, Java).
     typeNamedSourceFile: false,
     // Compiler-resolved doc references (fix #390, C# crefs).
@@ -554,6 +562,21 @@ const NOMINAL_TRAITS = {
  * lower-case letter is a suffix, not a member. Renaming the identifier or
  * member without the example fails vet ("refers to unknown field or method").
  */
+// Go satisfies interfaces implicitly, so no `implements` edge exists for
+// compiler/stdlib callbacks. A zero textual usage for one of these exact
+// method shapes is not evidence of deadness (sort.Interface, http.Handler,
+// io.Reader, encoding marshalers, database/sql contracts, errors helpers).
+const GO_STANDARD_CONTRACT_METHODS = new Map([
+    ['Len', 0], ['Less', 2], ['Swap', 2], ['ServeHTTP', 2],
+    ['Error', 0], ['String', 0], ['Read', 1], ['Write', 1], ['Close', 0],
+    ['Seek', 2], ['ReadAt', 2], ['WriteAt', 2], ['ReadByte', 0],
+    ['WriteByte', 1], ['ReadRune', 0], ['UnreadByte', 0], ['UnreadRune', 0],
+    ['MarshalJSON', 0], ['UnmarshalJSON', 1], ['MarshalText', 0],
+    ['UnmarshalText', 1], ['MarshalBinary', 0], ['UnmarshalBinary', 1],
+    ['Scan', 1], ['Value', 0], ['LogValue', 0], ['Unwrap', 0],
+    ['Is', 1], ['As', 1],
+]);
+
 const GO_EXAMPLE_NAMES = {
     kind: 'go-example',
     prefix: 'Example',
@@ -794,6 +817,7 @@ const LANGUAGES = {
             },
             testFileCandidates: (base, ext) => [`${base}_test.go`],
             nameBoundTestFunctions: GO_EXAMPLE_NAMES,
+            implicitStandardContracts: GO_STANDARD_CONTRACT_METHODS,
             // One package-level name declared in files of one package under
             // different build constraints is one item (fix #425).
             conditionalDefinitions: 'build-constraint',
