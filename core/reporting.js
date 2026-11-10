@@ -825,16 +825,30 @@ function doctor(index, options = {}) {
     }
     fileCounts.unsupported = blindSpots.unsupportedSources.fileCount;
 
-    for (const issue of index.discoveryIssues || []) {
-        const rel = issue.relativePath || '.';
-        if (!matchInFilter(rel)) continue;
+    // Source that is not indexed, from the one model every claim uses
+    // (core/source-universe.js): files searched as text only (a bundle, an
+    // excluded path, an oversized file; unsupported languages are counted
+    // above) and paths nothing can be read from. `unsearchable` is the part
+    // no name can be cleared against.
+    const sourceUniverse = require('./source-universe').universe(index);
+    let unsearchablePaths = 0;
+    const noteSkipped = (rel, reason) => {
+        if (!matchInFilter(rel)) return false;
         const skipped = blindSpots.skippedSources;
         skipped.count++;
         skipped.fileCount++;
-        skipped.reasons[issue.reason || 'unknown'] =
-            (skipped.reasons[issue.reason || 'unknown'] || 0) + 1;
+        skipped.reasons[reason] = (skipped.reasons[reason] || 0) + 1;
         if (skipped.files.length < BLINDSPOT_FILE_CAP) skipped.files.push(rel);
+        return true;
+    };
+    for (const entry of sourceUniverse.textOnly) {
+        if (entry.reason === 'unsupported-language') continue;
+        noteSkipped(entry.relativePath, entry.reason);
     }
+    for (const entry of sourceUniverse.opaque) {
+        if (noteSkipped(entry.relativePath, entry.reason || 'unknown')) unsearchablePaths++;
+    }
+    blindSpots.skippedSources.unsearchable = unsearchablePaths;
     fileCounts.skipped = blindSpots.skippedSources.fileCount;
 
     // C/C++ token-pasting macro invocations whose expansion cannot be
@@ -910,7 +924,7 @@ function doctor(index, options = {}) {
     if (blindSpots.skippedSources.count > 0) {
         const reasons = Object.entries(blindSpots.skippedSources.reasons)
             .map(([reason, count]) => `${reason} ${count}`).join(', ');
-        blindSignals.push(`${blindSpots.skippedSources.count} source discovery gap(s): ${reasons}`);
+        blindSignals.push(`${blindSpots.skippedSources.count} source path(s) not indexed: ${reasons}`);
     }
 
     // Trust is task-specific. A healthy index can be excellent for navigation
@@ -932,8 +946,10 @@ function doctor(index, options = {}) {
                 ? `${blindSpots.parseRecoveries.count} file(s) required parser recovery; indexed results may be partial`
                 : cache.fresh === false ? 'index cache is stale'
                     : index.truncated ? `file discovery stopped at maxFiles=${index.truncated.maxFiles}`
+                        : unsearchablePaths > 0
+                            ? `${unsearchablePaths} path(s) could not be searched; no caller account is complete until they can`
                         : blindSpots.skippedSources.count > 0
-                            ? `${blindSpots.skippedSources.count} source path(s) were not indexed; inspect discovery reasons`
+                            ? `${blindSpots.skippedSources.count} source file(s) are searched as text only; a name that occurs in them is listed, not analyzed`
                         : unsupportedCount > 0
                             ? `${fileCounts.scanned} supported file(s) indexed; ${unsupportedCount} unsupported source file(s) require grep/ripgrep`
                             : 'fresh index; no parse failures';
@@ -965,8 +981,11 @@ function doctor(index, options = {}) {
         : 'no known runtime blind spots detected; alias/dynamic completeness is not compiler-verified locally';
 
     const navigationLevel = indexLevel;
+    // A path nothing can be read from leaves every caller account
+    // incomplete, which is what blocks `check`: the two must agree.
     const hardIndexRisk = blindSpots.parseFailures.count > 0 ||
-        blindSpots.parseRecoveries.count > 0 || cache.fresh === false || !!index.truncated;
+        blindSpots.parseRecoveries.count > 0 || cache.fresh === false || !!index.truncated ||
+        unsearchablePaths > 0;
     const refactorLevel = indexLevel === 'UNKNOWN' ? 'UNKNOWN'
         : indexLevel === 'UNSUPPORTED' ? 'UNSUPPORTED'
             : hardIndexRisk ? 'LOW'
@@ -1005,6 +1024,9 @@ function doctor(index, options = {}) {
         symbols: totalSymbols,
         languages: langs,
         blindSpots,
+        // What completeness claims range over: text-only, unsearchable and
+        // declared-outside paths, stated here once.
+        scope: require('./source-universe').scopeSummary(index),
         evidenceProfile,
         cache,
         commandTrust: summarizeCommandTrust(),

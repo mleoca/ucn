@@ -61,6 +61,17 @@ const DEFAULT_IGNORES = [
 // These can contain user code: disclose their exclusion, unlike dependency
 // and VCS directories. Source maps are data and cannot be parsed as code.
 const BUNDLED_PATTERNS = ['*.min.js', '*.bundle.js', '*.map'];
+let _defaultPolicy = null;
+function defaultPolicy() {
+    if (!_defaultPolicy) _defaultPolicy = compileIgnoreList(DEFAULT_IGNORES);
+    return _defaultPolicy;
+}
+
+// Source files under paths the project's config excludes from indexing are
+// still listed, so a name can be searched in them. Past this many files the
+// excluded root is reported as one unscanned gap instead.
+const MAX_TEXT_ONLY_FILES = 20000;
+
 let _bundledList = null;
 function bundledList() {
     if (!_bundledList) _bundledList = compileIgnoreList(BUNDLED_PATTERNS);
@@ -345,6 +356,8 @@ function expandGlob(pattern, options = {}) {
         onDiscoveryIssue: options.onDiscoveryIssue,
         disclosureIgnores: options.disclosureIgnores,
         disclosure: options.disclosureIgnores?.length ? compileIgnoreList(options.disclosureIgnores) : null,
+        outside: options.outsideIgnores?.length ? compileIgnoreList(options.outsideIgnores) : null,
+        textOnlyState: { files: 0 },
         onFile: (filePath) => {
             if (files.length < maxFiles) {
                 files.push(filePath);
@@ -580,6 +593,7 @@ function walkDir(dir, options, depth = 0, visited = new Set(), knownRealDir = nu
         context = walkContext(options.anchorRoot || dir, dir, options.gitignoreRules || null);
     }
     const policy = options.policy || (options.policy = compileIgnoreList(options.ignores || DEFAULT_IGNORES));
+    const customIgnores = !!options.ignores && options.ignores !== DEFAULT_IGNORES;
     const rules = context.inside ? options.gitignoreRules || null : null;
     const trackedFiles = options.trackedPaths?.files;
     const trackedDirectories = options.trackedPaths?.directories;
@@ -592,14 +606,19 @@ function walkDir(dir, options, depth = 0, visited = new Set(), knownRealDir = nu
         const relative = context.rel ? `${context.rel}/${name}` : name;
         const policyIgnored = policy.matches(name, relative, entryIsDirectory) ||
             conditionallyIgnored(name, dir);
+        // Without project ignores the policy IS the built-in list: one match.
+        const defaultIgnored = customIgnores
+            ? defaultPolicy().matches(name, relative, entryIsDirectory) ||
+                conditionallyIgnored(name, dir)
+            : policyIgnored;
         // .gitignore verdict for the untracked view of this entry. Tracked
         // paths are never excluded by rules (git keeps tracking them), but a
         // tracked DIRECTORY still needs the verdict: its untracked contents
         // inherit an exclusion (git cannot re-include below an excluded
-        // directory).
+        // directory). An entry the built-in ignores already drop needs none.
         let tracked = false;
         let excluded = false;
-        if (!policyIgnored && context.inside) {
+        if (context.inside && !(policyIgnored && defaultIgnored)) {
             tracked = entryIsDirectory
                 ? !!trackedDirectories?.has(relative)
                 : !!trackedFiles?.has(relative);
@@ -608,17 +627,33 @@ function walkDir(dir, options, depth = 0, visited = new Set(), knownRealDir = nu
                 excluded = rules.decide(context.scopes, relative, context.segments, name, entryIsDirectory);
             }
         }
-        if (policyIgnored || (excluded && !tracked)) {
-            if (options.disclosure && options.disclosure.matches(name, relative, entryIsDirectory)) {
+        const gitExcluded = excluded && !tracked;
+        // Why an entry is not indexed decides what it means for a claim:
+        //   declared outside the project   no part of any claim, stated once;
+        //   built-in ignores, .gitignore   no part of any claim (as ever);
+        //   excluded by config ALONE       "do not index": its source is
+        //                                  still listed so a name can be
+        //                                  searched in it (text-only).
+        let textOnly = context.textOnly || null;
+        if (policyIgnored || gitExcluded || textOnly) {
+            if (options.outside && options.outside.matches(name, relative, entryIsDirectory)) {
                 options.onDiscoveryIssue?.({
                     path: fullPath,
                     kind: entryIsDirectory ? 'directory' : 'file',
-                    reason: 'config-exclude',
-                    detail: 'excluded by .ucn.json',
+                    reason: 'outside-project',
+                    detail: 'declared outside the project by .ucn.json',
                 });
+                continue;
             }
-            continue;
+            if (defaultIgnored || gitExcluded) continue;
+            if (!textOnly) {
+                const configOnly = options.disclosure &&
+                    options.disclosure.matches(name, relative, entryIsDirectory);
+                if (!configOnly) continue;
+                textOnly = 'config-exclude';
+            }
         }
+        const textOnlyRoot = textOnly ? (context.textOnlyRoot || fullPath) : null;
 
         let isDir = entry.isDirectory();
         let isFile = entry.isFile();
@@ -643,8 +678,32 @@ function walkDir(dir, options, depth = 0, visited = new Set(), knownRealDir = nu
                         segments: context.segments + 1,
                         scopes: rules && !excluded ? rules.scopesFor(context.scopes, relative) : context.scopes,
                         excluded,
+                        textOnly,
+                        textOnlyRoot,
                     });
             }
+        } else if (isFile && textOnly) {
+            // Listed, never indexed: only what discovery would have treated
+            // as source (a supported or known unsupported language, a
+            // bundle). Source maps and other data stay out, as everywhere.
+            const source = options.filePattern.test(entry.name) ||
+                !!classifyUnsupportedSourceFile(fullPath) ||
+                (bundledList().matches(entry.name, null, false) && !entry.name.endsWith('.map'));
+            if (!source) continue;
+            const state = options.textOnlyState || (options.textOnlyState = { files: 0 });
+            if (state.files >= MAX_TEXT_ONLY_FILES) {
+                options.onDiscoveryIssue?.({
+                    path: textOnlyRoot, kind: 'directory', reason: 'text-scan-budget',
+                    detail: `more than ${MAX_TEXT_ONLY_FILES} source files under paths ` +
+                        'excluded by .ucn.json; declare vendored trees in outsideProject',
+                });
+                continue;
+            }
+            state.files++;
+            options.onDiscoveryIssue?.({
+                path: fullPath, kind: 'file', reason: textOnly,
+                detail: 'excluded by .ucn.json',
+            });
         } else if (isFile) {
             if (bundledList().matches(entry.name, null, false) &&
                 (!options.includeBundled || entry.name.endsWith('.map'))) {
@@ -1008,8 +1067,43 @@ function findTestFileFor(sourceFile, language) {
     return null;
 }
 
+function patternList(value) {
+    if (Array.isArray(value)) return value.map(String);
+    return value ? [String(value)] : [];
+}
+
+/**
+ * The discovery options a project's configuration implies. The build and
+ * the staleness walk both start here: a walk that reads the config
+ * differently sees a different file set and calls a fresh index stale (or a
+ * stale one fresh).
+ *
+ * @param {object} config - parsed .ucn.json (may be empty)
+ * @param {object} [overrides] - explicit maxFiles / maxDepth / maxFileSize /
+ *   followSymlinks / includeBundled; undefined keeps the config or default
+ */
+function projectDiscoveryOptions(root, config = {}, overrides = {}) {
+    const exclude = patternList(config.exclude);
+    const outsideProject = patternList(config.outsideProject);
+    const options = {
+        root,
+        maxFiles: overrides.maxFiles || config.maxFiles || 50000,
+        maxDepth: overrides.maxDepth ?? config.maxDepth,
+        maxFileSize: overrides.maxFileSize ?? config.maxFileSize,
+        followSymlinks: overrides.followSymlinks,
+        includeBundled: overrides.includeBundled === true,
+        disclosureIgnores: exclude,
+        outsideIgnores: outsideProject,
+    };
+    if (exclude.length > 0 || outsideProject.length > 0) {
+        options.ignores = [...DEFAULT_IGNORES, ...exclude, ...outsideProject];
+    }
+    return options;
+}
+
 module.exports = {
     expandGlob,
+    projectDiscoveryOptions,
     parseGlobPattern,
     globToRegex,
     walkDir,

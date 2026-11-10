@@ -364,53 +364,37 @@ function nameOnlySelfRecursive(index, name) {
  * part of both text and JSON output.
  */
 function scanDeadcodeCoverage(index, names) {
-    const matchedNames = new Set();
-    const files = new Set();
-    const unreadableFiles = new Set();
     const reasons = {};
-    let unknownCoverage = false;
     let parseRecoveries = 0;
 
-    const recordReason = (reason) => {
-        const key = reason || 'unknown';
-        reasons[key] = (reasons[key] || 0) + 1;
-    };
-    const scanContent = (content) => {
-        const identifiers = new Set(String(content).match(/\b[a-zA-Z_]\w*\b/g) || []);
-        for (const name of names) {
-            if (/^[a-zA-Z_]\w*$/.test(name)
-                ? identifiers.has(name)
-                : String(content).includes(name)) matchedNames.add(name);
-        }
-    };
-    const scanFile = (absPath, rel, reason) => {
-        files.add(rel);
-        recordReason(reason);
-        try {
-            const stat = fs.statSync(absPath);
-            if (!stat.isFile()) {
-                unknownCoverage = true;
-                return;
-            }
-            scanContent(index._readFile(absPath));
-        } catch (_) {
-            unreadableFiles.add(rel);
-            unknownCoverage = true;
-        }
-    };
-
+    // One classification and one scanner for every command
+    // (core/source-universe.js): parse failures and text-only source are
+    // searched for the candidate names in a single pass per file; a path
+    // nothing can be read from withdraws every claim.
+    const sourceUniverse = require('./source-universe');
+    const failed = [];
     for (const failedPath of index.failedFiles || []) {
         if (index.files.has(failedPath)) continue;
-        scanFile(failedPath, path.relative(index.root, failedPath), 'parse-failure');
+        failed.push({
+            absolutePath: failedPath,
+            relativePath: path.relative(index.root, failedPath),
+            reason: 'parse-failure',
+        });
     }
-    for (const skipped of index.unsupportedFiles || []) {
-        const rel = skipped.relativePath;
-        scanFile(path.join(index.root, rel), rel, 'unsupported-language');
+    const scanned = sourceUniverse.scanTextOnlyNames(index, names, failed);
+    const matchedNames = scanned.matchedNames;
+    const files = new Set(scanned.files);
+    const unreadableFiles = new Set(scanned.unreadableFiles);
+    for (const [reason, count] of Object.entries(scanned.reasons)) reasons[reason] = count;
+    const { opaque } = sourceUniverse.universe(index);
+    for (const entry of opaque) {
+        files.add(entry.relativePath);
+        const key = entry.reason || 'discovery-gap';
+        reasons[key] = (reasons[key] || 0) + 1;
+        if (entry.reason === 'unreadable-file') unreadableFiles.add(entry.relativePath);
     }
-    for (const issue of index.discoveryIssues || []) {
-        const rel = issue.relativePath || '.';
-        scanFile(path.join(index.root, rel), rel, issue.reason || 'discovery-gap');
-    }
+    const unknownCoverage = opaque.length > 0 || unreadableFiles.size > 0;
+
     for (const [, fileEntry] of index.files) {
         if (fileEntry.parseRecovery || fileEntry.parseError) parseRecoveries++;
     }

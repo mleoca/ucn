@@ -16,13 +16,17 @@
  *                   strings, and scanner-skipped tokens such as JS builtins —
  *                   deliberately named "unclassified", not "comment")
  *   unparsed      - line in a file that failed to parse (still readable text)
- *   unsupported   - line in a source file whose language UCN cannot parse
- *                   (index.unsupportedFiles — e.g. .rb in a mixed repo).
- *                   Text-scanned only, never analyzed; sites are listed so the
- *                   answer is a superset of grep, and the CONTRACT sentence
- *                   degrades whenever this bucket is non-zero. Without it a
- *                   mixed-language repo got "partition complete" over a ground
- *                   set that silently excluded whole languages.
+ *   unsupported   - line in TEXT-ONLY source: readable source UCN does not
+ *                   analyze (an unsupported language such as .rb in a mixed
+ *                   repo, a bundled/minified file, a file over the size or
+ *                   file limit, a path `.ucn.json` excludes from indexing —
+ *                   core/source-universe.js). Text-scanned only; sites are
+ *                   listed so the answer is a superset of grep, and the
+ *                   CONTRACT degrades for THIS name whenever the bucket is
+ *                   non-zero. Without it a mixed-language repo got "partition
+ *                   complete" over a ground set that silently excluded whole
+ *                   languages; with a repo-wide withdrawal instead, one
+ *                   vendored bundle degraded every answer in the repository.
  *   unaccounted   - residual; 0 when the arithmetic is conserved
  *
  * Conservation invariant:
@@ -50,15 +54,10 @@
 
 'use strict';
 
-const fs = require('fs');
 const path = require('path');
 const { codeUnitCompare, literalNameRegex } = require('./shared');
 const { compareNames } = require('./discovery');
-
-// Unsupported-language site listings are capped so a Rails-sized repo cannot
-// flood the account object; the counts always cover the full set.
-const UNSUPPORTED_SITE_CAP = 50;
-const UNSUPPORTED_SITE_TEXT_MAX = 160;
+const { scanTextOnly, countNameLines, opaqueSummary } = require('./source-universe');
 
 /**
  * Compute the text-occurrence ground set for a symbol name.
@@ -75,7 +74,9 @@ const UNSUPPORTED_SITE_TEXT_MAX = 160;
  *                  languages: Object<string, number>,
  *                  sites: Array<{file: string, line: number, text: string}>,
  *                  sitesTruncated: boolean },
- *   unreadableFiles: string[]           // relative paths; OUTSIDE the arithmetic
+ *   unreadableFiles: string[],          // relative paths; OUTSIDE the arithmetic
+ *   opaque: { count: number, reasons: Object<string, number>,
+ *             sample: Array<{path: string, reason: string}> }  // paths no name can be checked against
  * }}
  */
 function computeGroundSet(index, name) {
@@ -116,8 +117,11 @@ function computeGroundSet(index, name) {
     // `unsupported`, with sites listed so the caller answer strictly
     // dominates grep instead of silently under-reporting it.
     const unsupported = scanUnsupportedFiles(index, name, { unreadableFiles });
-    const skippedSources = Array.isArray(index.discoveryIssues)
-        ? index.discoveryIssues.map(issue => ({ ...issue })) : [];
+    // Paths whose contents cannot be read name by name (an unreadable
+    // directory, a failed git listing, text beyond the scan budget). They
+    // say nothing about this name in particular, so they weaken the claim
+    // for every name; everything readable was scanned above.
+    const opaque = opaqueSummary(index);
     unreadableFiles.sort();
 
     // fix #367e: ground lines inside a parser-recovery region of an indexed
@@ -155,7 +159,7 @@ function computeGroundSet(index, name) {
         recovered,
         unsupported,
         unreadableFiles,
-        skippedSources,
+        opaque,
     };
     if (index._groundSetCache) {
         const weight = result.total + result.fileCount;
@@ -209,20 +213,14 @@ function scanFailedFiles(index, name) {
     if (!index.failedFiles || index.failedFiles.size === 0) {
         return { unparsed, unreadableFiles };
     }
-    const wordRe = literalNameRegex(name);
     for (const failedPath of index.failedFiles) {
         if (index.files.has(failedPath)) continue;
-        let content;
+        let matched;
         try {
-            content = fs.readFileSync(failedPath, 'utf-8');
+            matched = countNameLines(failedPath, name);
         } catch (_) {
             unreadableFiles.push(path.relative(index.root, failedPath));
             continue;
-        }
-        if (!content.includes(name)) continue;
-        let matched = 0;
-        for (const line of content.split('\n')) {
-            if (line.includes(name) && wordRe.test(line)) matched++;
         }
         if (matched > 0) {
             unparsed.fileCount++;
@@ -236,66 +234,20 @@ function scanFailedFiles(index, name) {
 }
 
 /**
- * Word-boundary-scan index.unsupportedFiles for `name`. Returns the
- * `unsupported` account bucket ({ fileCount, lines, files, languages, sites,
- * sitesTruncated }). Shared by computeGroundSet and by commands whose result
- * is not account-shaped (tests, usages) but still must not stay silent when
- * a mixed-language repo has occurrences UCN cannot analyze.
+ * Word-boundary-scan the project's text-only source for `name`. Returns the
+ * `unsupported` account bucket ({ fileCount, lines, files, languages,
+ * reasons, sites, sitesTruncated }). Shared by computeGroundSet and by
+ * commands whose result is not account-shaped (tests, usages) but still
+ * must not stay silent when a repo has occurrences UCN cannot analyze. The
+ * scan itself belongs to core/source-universe.js.
  *
  * @param {object} index - ProjectIndex
- * @param {string} name - Symbol name (matched with \b word boundaries)
+ * @param {string} name - Symbol name (matched with word boundaries)
  * @param {object} [opts]
  * @param {string[]} [opts.unreadableFiles] - collector for read failures
  */
 function scanUnsupportedFiles(index, name, opts = {}) {
-    const unsupported = {
-        fileCount: 0, lines: 0, files: [], languages: {}, sites: [],
-        sitesTruncated: false,
-    };
-    if (!Array.isArray(index.unsupportedFiles) || index.unsupportedFiles.length === 0) {
-        return unsupported;
-    }
-    const wordRe = literalNameRegex(name);
-    const languageCounts = new Map();
-    for (const skipped of index.unsupportedFiles) {
-        const absPath = path.join(index.root, skipped.relativePath);
-        let content;
-        try {
-            content = index._readFile(absPath);
-        } catch (e) {
-            if (opts.unreadableFiles) opts.unreadableFiles.push(skipped.relativePath);
-            continue;
-        }
-        if (!content.includes(name)) continue;
-        const lines = content.split('\n');
-        let matched = 0;
-        for (let i = 0; i < lines.length; i++) {
-            if (!lines[i].includes(name) || !wordRe.test(lines[i])) continue;
-            matched++;
-            if (unsupported.sites.length < UNSUPPORTED_SITE_CAP) {
-                unsupported.sites.push({
-                    file: skipped.relativePath,
-                    line: i + 1,
-                    text: lines[i].trim().slice(0, UNSUPPORTED_SITE_TEXT_MAX),
-                });
-            } else {
-                unsupported.sitesTruncated = true;
-            }
-        }
-        if (matched > 0) {
-            unsupported.fileCount++;
-            unsupported.lines += matched;
-            unsupported.files.push(skipped.relativePath);
-            const lang = skipped.language || skipped.extension || 'unknown';
-            languageCounts.set(lang, (languageCounts.get(lang) || 0) + matched);
-        }
-    }
-    unsupported.files.sort(codeUnitCompare);
-    unsupported.sites.sort((a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line);
-    for (const lang of [...languageCounts.keys()].sort(codeUnitCompare)) {
-        unsupported.languages[lang] = languageCounts.get(lang);
-    }
-    return unsupported;
+    return scanTextOnly(index, name, opts);
 }
 
 /**
@@ -544,13 +496,16 @@ function buildAccount(index, name, parts) {
         groundSet.unparsed.lines + unsupported.lines;
     const unaccounted = groundSet.total - accountedTotal;
 
-    // Occurrences in unsupported-language files break the whole-text claim:
-    // UCN cannot adjudicate them, so "partition complete" would be false.
+    // The claim is about THIS name. An occurrence in text-only source
+    // breaks it (UCN cannot adjudicate the line); a path nothing can be
+    // read from breaks it for every name; unindexed source the name does
+    // not occur in leaves it standing.
+    const opaque = groundSet.opaque || { count: 0, reasons: {}, sample: [] };
     const textComplete = unaccounted === 0 &&
         groundSet.unparsed.fileCount === 0 &&
         unsupported.lines === 0 &&
         groundSet.unreadableFiles.length === 0 &&
-        (!groundSet.skippedSources || groundSet.skippedSources.length === 0);
+        opaque.count === 0;
     const observedTextZero = textComplete && confirmed === 0 && unverified === 0 &&
         beyondText.count === 0;
 
@@ -570,7 +525,7 @@ function buildAccount(index, name, parts) {
         ...(groundSet.recovered?.lines > 0 && { recovered: groundSet.recovered }),
         unsupported,
         unreadableFiles: groundSet.unreadableFiles,
-        skippedSources: groundSet.skippedSources || [],
+        opaque,
         beyondText,
         unaccounted,
         conserved: unaccounted === 0,

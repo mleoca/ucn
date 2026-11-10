@@ -3034,7 +3034,10 @@ describe('fix #382: discovery keeps tracked files and discloses git failures', (
             assert.equal(execute(index, 'doctor', {}).result.trust, 'PARTIAL');
             const account = index.context('target', { file: 'src/lib.py' }).meta.account;
             assert.equal(account.contract.textComplete, false, 'the completeness claim is withdrawn');
-            assert.ok(account.skippedSources.some(s => s.reason === 'git-listing-failed'));
+            // No name can be cleared against an unknown file set: the gap is
+            // opaque, so it degrades every account and names its reason.
+            assert.deepEqual(account.opaque.reasons, { 'git-listing-failed': 1 });
+            assert.deepEqual(account.opaque.sample, [{ path: '.', reason: 'git-listing-failed' }]);
         } finally { rm(dir); }
     });
 

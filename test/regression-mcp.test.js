@@ -559,7 +559,7 @@ describe('MCP two-tier output limits', () => {
             // fix #367g: the section-aware cut keeps ACCOUNT/CONTRACT in
             // place; other answers carry them in the preserved block.
             assert.ok(text.includes('ACCOUNT: "target"'), text);
-            assert.ok(text.includes('CONTRACT: literal-name text partition complete'), text);
+            assert.ok(text.includes('CONTRACT: text-complete'), text);
             // Fix #284: no structuredContent side-channel — clients that
             // prefer structured results would render it INSTEAD of the text
             // and discard the entire payload. The text block is the response.

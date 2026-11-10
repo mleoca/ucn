@@ -18,9 +18,9 @@ Use this reference when an agent, CI job, or script will make decisions from UCN
 
 Caller, callee and trace views carry the applicable trust lines below, preserved through truncation. Source, definition and test-reference lists do not supply a caller account; request `show` or `impact` when one is needed.
 
-- `ACCOUNT` partitions every line where the name occurs: confirmed, unverified, non-call (import, definition, reference, other text), other-target, unaccounted. In mixed-language repositories it also counts occurrences in unsupported-language source files.
-- `CONTRACT` states the scope of that partition. When unsupported-language files contain the name, it says so and limits the partition-complete claim to supported languages. Semantic completeness is never claimed.
-- `WARNING` identifies unreadable, unparsed, or partially indexed files (including `git-listing-failed`), lines in syntax-error recovery regions, and unsupported-language occurrence sites (file:line plus the line text). `usages` and `tests` carry the same disclosure as a note.
+- `ACCOUNT` partitions every line where the name occurs: confirmed, unverified, non-call (import, definition, reference, other text), other-target, unanalyzed (a line in source UCN reads without analyzing), unaccounted.
+- `CONTRACT` is the state of that partition: `text-complete` (every literal-name line of project source was classified), `text-complete, zero observed; not deletion proof`, `text-complete over indexed source; N lines in unanalyzed source` (the name also occurs in a bundle, a path excluded in `.ucn.json`, an oversized file or an unsupported language, listed in the WARNING), or `degraded; see WARNING`. No state is semantic completeness: aliases, indirect calls, generated code and runtime dispatch may exist.
+- `WARNING` identifies what weakens the claim for this name: unparsed files that contain it, lines in syntax-error recovery regions, its occurrence sites in unanalyzed source (file:line plus the line text), and paths that could not be searched at all (including `git-listing-failed`), which degrade every account. Unanalyzed source the name does not occur in is not mentioned. `usages` and `tests` carry the same disclosure as a note.
 - `FILTERED` means query options hid evidence.
 - `CALLEE ACCOUNT` partitions a function's call sites (confirmed, unverified, external/builtin, excluded, filtered); `TREE ACCOUNT` does the same for the interior of a caller-direction `trace`.
 
@@ -32,7 +32,7 @@ Required automation checks:
 
 1. `account.conserved` is true.
 2. `account.contract.textComplete` is true.
-3. No unreadable or unparsed files are reported, and no ground line sits in a syntax-error recovery region (`account.recovered`, WARNING line).
+3. No unreadable or unparsed files are reported, `account.opaque.count` is 0, and no ground line sits in a syntax-error recovery region (`account.recovered`, WARNING line).
 4. No contract metadata was lost to truncation.
 5. Unverified and excluded reasons are retained for review.
 

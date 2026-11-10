@@ -116,7 +116,15 @@ function formatDoctor(result, options = {}) {
                 const reasons = Object.entries(info.reasons || {})
                     .map(([reason, count]) => `${reason} ${count}`).join(', ');
                 lines.push(`  ${label}: ${fileCount} path${fileCount === 1 ? '' : 's'} not indexed${reasons ? ` (${reasons})` : ''}`);
-                lines.push('    The index is partial; adjust .ucn.json or discovery limits before relying on completeness-sensitive commands.');
+                const unsearchable = info.unsearchable || 0;
+                if (unsearchable > 0) {
+                    lines.push(`    ${unsearchable} could not be searched: no caller account is complete until ` +
+                        'they can be read (fix the path, raise the limit, or declare it in .ucn.json outsideProject).');
+                }
+                if (fileCount > unsearchable) {
+                    lines.push(`    ${unsearchable > 0 ? 'The rest is searched' : 'Searched'} as text for each name: ` +
+                        'an occurrence there is listed, not analyzed.');
+                }
             } else {
                 lines.push(`  ${label}: ${info.count} ${unit}${info.count === 1 ? '' : 's'} in ${fileCount} file${fileCount === 1 ? '' : 's'}`);
             }
@@ -128,6 +136,31 @@ function formatDoctor(result, options = {}) {
         }
     }
     if (!anyBlindSpot) lines.push('  (none detected)');
+
+    // What a completeness claim ranges over and what it never means: said
+    // here once, so an answer only carries its own state.
+    lines.push('');
+    lines.push('Contract scope:');
+    const scope = result.scope;
+    if (scope) {
+        const list = reasons => Object.entries(reasons || {})
+            .map(([reason, count]) => `${reason} ${count}`).join(', ');
+        lines.push(`  Indexed source, plus ${scope.textOnly.count} file${scope.textOnly.count === 1 ? '' : 's'} ` +
+            `searched as text for each name${scope.textOnly.count > 0 ? ` (${list(scope.textOnly.reasons)})` : ''}.`);
+        if (scope.opaque.count > 0) {
+            lines.push(`  Not searchable: ${scope.opaque.count} path${scope.opaque.count === 1 ? '' : 's'} ` +
+                `(${list(scope.opaque.reasons)}); every caller account is degraded until they are.`);
+        }
+        if (scope.outside.count > 0) {
+            const sample = scope.outside.sample.slice(0, 3).map(entry => entry.path).join(', ');
+            lines.push(`  Outside the project: ${scope.outside.count} path${scope.outside.count === 1 ? '' : 's'} ` +
+                `(${list(scope.outside.reasons)}), no part of any claim: ${sample}` +
+                `${scope.outside.count > 3 ? ', ...' : ''}`);
+        }
+    }
+    lines.push('  CONTRACT text-complete: every literal-name line in that scope was classified.');
+    lines.push('  It is never semantic completeness (aliases, indirect calls, generated code and');
+    lines.push('  runtime dispatch may exist), and a zero is never deletion proof.');
 
     // Task-specific readiness. One scalar cannot honestly describe navigation,
     // refactoring, and deletion risk.

@@ -196,12 +196,56 @@ describe('UCN v5 prerelease audit regressions', () => {
         } finally { rm(dir); }
     });
 
-    it('UCN5-004/104: config exclusions and malformed config degrade trust and accounting', () => {
+    it('outsideProject takes a path out of every claim; a redundant exclude changes nothing', () => {
+        const declared = tmp({
+            'package.json': '{}',
+            '.ucn.json': JSON.stringify({ outsideProject: ['consumers/**'] }),
+            'lib.js': 'export function keep() { return 1; }',
+            'consumers/use.js': 'import { keep } from "../lib.js";\nkeep();',
+        });
+        const redundant = tmp({
+            'package.json': '{}',
+            '.ucn.json': JSON.stringify({ exclude: ['node_modules', 'ignored/**'] }),
+            '.gitignore': 'ignored/\n',
+            'lib.js': 'export function keep() { return 1; }',
+            'node_modules/dep/index.js': 'keep();',
+            'ignored/gen.js': 'keep();',
+        });
+        try {
+            // Declared outside: no part of the claim, stated once in scope.
+            const outside = idx(declared);
+            assert.deepEqual(outside.discoveryIssues.map(issue => [issue.reason, issue.relativePath]),
+                [['outside-project', 'consumers']]);
+            const account = execute(outside, 'show', { name: 'keep' }).result.context.meta.account;
+            assert.equal(account.contract.textComplete, true);
+            assert.equal(account.unsupported.lines, 0);
+            const health = execute(outside, 'doctor', {}).result;
+            assert.deepEqual(health.scope.outside.reasons, { 'outside-project': 1 });
+            assert.equal(health.blindSpots.skippedSources.count, 0);
+            assert.match(output.formatPublicText('repo', execute(outside, 'repo',
+                { sections: 'health' }).result, { sections: 'health' }),
+            /Outside the project: 1 path \(outside-project 1\), no part of any claim: consumers/);
+
+            // Naming a path the built-in ignores or .gitignore already drop
+            // is no exclusion of its own: nothing is listed, nothing degrades.
+            const same = idx(redundant);
+            assert.deepEqual(same.discoveryIssues, []);
+            const kept = execute(same, 'show', { name: 'keep' }).result.context.meta.account;
+            assert.equal(kept.contract.textComplete, true);
+            assert.equal(execute(same, 'doctor', {}).result.trust, 'HIGH');
+        } finally {
+            rm(declared);
+            rm(redundant);
+        }
+    });
+
+    it('UCN5-004/104: a config exclusion is searched per name; a malformed config degrades every account', () => {
         const excluded = tmp({
             'package.json': '{}',
             '.ucn.json': JSON.stringify({ exclude: ['consumers/**'] }),
-            'lib.js': 'export function keep() { return 1; }',
+            'lib.js': 'export function keep() { return 1; }\nexport function quiet() { return 2; }',
             'consumers/use.js': 'import { keep } from "../lib.js";\nkeep();',
+            'consumers/notes.txt': 'keep quiet',
         });
         const malformed = tmp({
             'package.json': '{}',
@@ -210,17 +254,44 @@ describe('UCN v5 prerelease audit regressions', () => {
         });
         try {
             const index = idx(excluded);
-            assert.ok(index.discoveryIssues.some(issue => issue.reason === 'config-exclude'));
+            // `exclude` means "do not index": the excluded source is listed
+            // file by file so a name can still be searched in it.
+            assert.deepEqual(index.discoveryIssues.map(issue =>
+                [issue.reason, issue.kind, issue.relativePath]),
+            [['config-exclude', 'file', 'consumers/use.js']]);
+            assert.equal(index.files.has(path.join(excluded, 'consumers', 'use.js')), false);
+            // The caller in the excluded path is not hidden: the claim
+            // degrades for this name and the lines are listed.
             const shown = execute(index, 'show', { name: 'keep' }).result;
             const account = shown.context.meta.account;
             assert.equal(account.contract.textComplete, false);
-            assert.match(output.formatPublicText('show', shown, { name: 'keep' }),
-                /source discovery gap|partial/i);
+            assert.equal(account.unsupported.lines, 2);
+            assert.deepEqual(account.unsupported.reasons, { 'config-exclude': 2 });
+            assert.equal(account.opaque.count, 0);
+            const text = output.formatPublicText('show', shown, { name: 'keep' });
+            assert.match(text, /CONTRACT: text-complete over indexed source; 2 lines in unanalyzed source/);
+            assert.match(text, /excluded by \.ucn\.json: 2/);
+            assert.match(text, /consumers\/use\.js:2 {2}keep\(\);/);
+            // A name that does not occur there keeps a complete claim, and
+            // its answer says nothing about the exclusion.
+            const quiet = execute(index, 'show', { name: 'quiet' }).result;
+            assert.equal(quiet.context.meta.account.contract.textComplete, true);
+            const quietText = output.formatPublicText('show', quiet, { name: 'quiet' });
+            assert.match(quietText, /CONTRACT: text-complete, zero observed; not deletion proof/);
+            assert.doesNotMatch(quietText, /WARNING|\.ucn\.json|unanalyzed/);
             assert.equal(execute(index, 'doctor', {}).result.trust, 'PARTIAL');
 
+            // An unusable config says nothing about any name: every account
+            // degrades, and the answer says why.
             const broken = idx(malformed);
             assert.ok(broken.discoveryIssues.some(issue => issue.reason === 'invalid-config'));
             assert.equal(execute(broken, 'doctor', {}).result.trust, 'PARTIAL');
+            const run = execute(broken, 'show', { name: 'run' }).result;
+            assert.equal(run.context.meta.account.contract.textComplete, false);
+            assert.deepEqual(run.context.meta.account.opaque.reasons, { 'invalid-config': 1 });
+            const runText = output.formatPublicText('show', run, { name: 'run' });
+            assert.match(runText, /CONTRACT: degraded; see WARNING/);
+            assert.match(runText, /WARNING: 1 path could not be searched \(invalid-config 1\)/);
         } finally {
             rm(excluded);
             rm(malformed);
@@ -1916,7 +1987,7 @@ describe('UCN v5 prerelease audit regressions', () => {
 
             const unsupported = execute(index, 'search', { term: 'unsupportedNeedle' });
             assert.equal(unsupported.ok, true);
-            assert.match(unsupported.note, /unsupported-language.*grep\/ripgrep/i);
+            assert.match(unsupported.note, /unanalyzed file.*grep\/ripgrep/i);
             const json = JSON.parse(publicOutput.formatPublicJson('search',
                 unsupported.result, { term: 'unsupportedNeedle' }, {
                     surface: 'cli', note: unsupported.note,

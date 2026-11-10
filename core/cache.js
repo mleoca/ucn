@@ -10,8 +10,8 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const {
-    expandGlob, detectProjectPattern, parseGitignore, gitTrackedPaths, gitListing, DEFAULT_IGNORES,
-    classifyUnsupportedSourceFile,
+    expandGlob, detectProjectPattern, parseGitignore, gitTrackedPaths, gitListing,
+    classifyUnsupportedSourceFile, projectDiscoveryOptions,
 } = require('./discovery');
 const { codeUnitCompare } = require('./shared');
 const { syntaxWeightKind } = require('./source-memo');
@@ -998,7 +998,10 @@ function clearAllCaches() {
 // v326: C++ files retain raw base-clause positions and their syntactic scopes.
 // v327: Python explicit-argument super calls retain a producer, not a lexical parent receiver.
 // v328: ambiguous C++ direct initializers retain empty template-call records.
-const CACHE_FORMAT_VERSION = 330;
+// v331: source paths excluded by .ucn.json are recorded one issue per source
+// file (searched as text per name), with `outside-project` and
+// `text-scan-budget` reasons; parse-failed files keep their size and mtime.
+const CACHE_FORMAT_VERSION = 331;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {
@@ -1270,6 +1273,9 @@ function saveCache(index, cachePath) {
         failedFiles: index.failedFiles
             ? Array.from(index.failedFiles).map(f => path.relative(root, f))
             : [],
+        // A parse failure is retried when its file changes: keep what the
+        // file looked like when it failed.
+        failedFileStats: failedFileStats(index, root),
         unsupportedFiles: Array.isArray(index.unsupportedFiles)
             ? index.unsupportedFiles
             : [],
@@ -1453,6 +1459,7 @@ function loadCache(index, cachePath) {
         index._clearParsedTreeCache?.();
         index._groundSetCache = new Map();
         index._groundSetCacheLines = 0;
+        index._sourceUniverse = null;
         index._nameBindingReachCache = new Map();
         index._returnTypeFlowCache = new Map();
         index._classIdentity = null;
@@ -1551,6 +1558,8 @@ function loadCache(index, cachePath) {
                 cacheData.failedFiles.map(f => path.isAbsolute(f) ? f : toAbs(f))
             );
         }
+        index._failedFileStats = new Map(Object.entries(cacheData.failedFileStats || {})
+            .map(([relative, stat]) => [toAbs(relative), { size: stat[0], mtimeMs: stat[1] }]));
         index.unsupportedFiles = Array.isArray(cacheData.unsupportedFiles)
             ? cacheData.unsupportedFiles
             : [];
@@ -1651,6 +1660,18 @@ function loadCache(index, cachePath) {
  * @param {object} index - ProjectIndex instance
  * @returns {boolean} - True if cache needs rebuilding
  */
+function failedFileStats(index, root) {
+    const stats = {};
+    for (const failedPath of index.failedFiles || []) {
+        const known = index._failedFileStats && index._failedFileStats.get(failedPath);
+        try {
+            const stat = known || fs.statSync(failedPath);
+            stats[path.relative(root, failedPath)] = [stat.size, stat.mtimeMs];
+        } catch (_) { /* gone: the next staleness check rebuilds */ }
+    }
+    return stats;
+}
+
 function isCacheStale(index) {
     const currentConfigHash = crypto.createHash('md5')
         .update(JSON.stringify(index.config || {})).digest('hex');
@@ -1706,6 +1727,39 @@ function isCacheStale(index) {
         }
     }
 
+    // A file that failed to parse is a source file: when it changes, a
+    // build must try it again (it is in no other sweep, so a repaired file
+    // used to stay "failed" until something else forced a rebuild).
+    if (index.failedFiles && index.failedFiles.size > 0) {
+        if (!index._failedFileStats) index._failedFileStats = new Map();
+        for (const failedPath of index.failedFiles) {
+            if (index.files.has(failedPath)) continue;
+            let stat;
+            try { stat = fs.statSync(failedPath); } catch (_) { return true; }
+            const known = index._failedFileStats.get(failedPath);
+            if (!known) {
+                index._failedFileStats.set(failedPath, { size: stat.size, mtimeMs: stat.mtimeMs });
+            } else if (known.size !== stat.size || known.mtimeMs !== stat.mtimeMs) {
+                return true;
+            }
+        }
+    }
+
+    // Text-only source (core/source-universe.js) is searched per name, never
+    // indexed. An edit that leaves a file text-only changes no symbol: the
+    // classification is refreshed and name scans are dropped, with no
+    // rebuild. An edit that can change WHAT is indexed (a file gone, an
+    // oversized file back under the limit) is a rebuild.
+    const discovery = projectDiscoveryOptions(index.root, index.config || {},
+        { includeBundled: index.includeBundled === true });
+    const refreshed = require('./source-universe').refreshTextOnly(index,
+        { maxFileSize: discovery.maxFileSize ?? (8 * 1024 * 1024) });
+    if (refreshed === 'reindex') return true;
+    if (refreshed === 'refreshed') {
+        index._groundSetCache = new Map();
+        index._groundSetCacheLines = 0;
+    }
+
     // Cargo manifests steer Rust import resolution (fix #372).
     if (index.cargoManifests &&
         !require('./imports').workspaceManifestsCurrent(index.root, index.cargoManifests)) {
@@ -1723,13 +1777,14 @@ function isCacheStale(index) {
     // Only reached when all cached files are unchanged.
     const pattern = detectProjectPattern(index.root);
     const currentUnsupported = [];
-    const currentBundled = [];
+    const currentIssues = [];
     const currentManifests = [];
+    // The same options the build used (shared with project.js): a walk that
+    // reads the configuration differently sees a different file set.
     const globOpts = {
-        root: index.root,
-        includeBundled: index.includeBundled === true,
+        ...discovery,
         onDiscoveryIssue: issue => {
-            if (issue.reason === 'bundled') currentBundled.push(path.relative(index.root, issue.path));
+            currentIssues.push(`${issue.reason}\0${path.relative(index.root, issue.path || index.root) || '.'}`);
         },
         onSkippedFile: (filePath) => {
             if (path.basename(filePath) === 'Cargo.toml') {
@@ -1746,16 +1801,19 @@ function isCacheStale(index) {
     if (!gitignoreRules) gitignoreRules = parseGitignore(index.root, gitListingOnce());
     globOpts.gitignoreRules = gitignoreRules;
     globOpts.trackedPaths = gitTrackedPaths(index.root, gitListingOnce());
-    const configExclude = index.config.exclude || [];
-    if (configExclude.length > 0) {
-        globOpts.ignores = [...DEFAULT_IGNORES, ...configExclude];
-    }
     const currentFiles = expandGlob(pattern, globOpts);
-    const cachedBundled = (index.discoveryIssues || [])
-        .filter(issue => issue.reason === 'bundled').map(issue => issue.relativePath).sort();
-    currentBundled.sort();
-    if (cachedBundled.length !== currentBundled.length ||
-        cachedBundled.some((value, i) => value !== currentBundled[i])) return true;
+    // Every path the walk reports as not indexed, with its reason: a file
+    // that became a bundle, crossed the size limit, entered or left an
+    // excluded path changes what a claim ranges over. Issues the build
+    // records about itself (an unusable config, a failed git listing) are
+    // not the walk's to compare.
+    const BUILD_ISSUES = new Set(['invalid-config', 'git-listing-failed']);
+    const cachedIssues = [...new Set((index.discoveryIssues || [])
+        .filter(issue => !BUILD_ISSUES.has(issue.reason))
+        .map(issue => `${issue.reason}\0${issue.relativePath || '.'}`))].sort();
+    const walkedIssues = [...new Set(currentIssues)].sort();
+    if (cachedIssues.length !== walkedIssues.length ||
+        cachedIssues.some((value, i) => value !== walkedIssues[i])) return true;
     const cachedPaths = new Set(index.files.keys());
     const currentPaths = new Set(currentFiles);
 

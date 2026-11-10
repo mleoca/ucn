@@ -884,6 +884,7 @@ function runGlobCommand(pattern, command, arg) {
     index.discoveryIssues.push(...discoveryIssues.map(issue => ({
         ...issue, relativePath: path.relative(index.root, issue.path), path: undefined,
     })));
+    index._sourceUniverse = null; // classify with the glob walk's facts included
 
     if (!isPublicCommand(canonical)) {
         fail(unknownCommandMessage(command));

@@ -573,7 +573,11 @@ function formatOrient(result, options = {}) {
     if (result.skippedSources?.count > 0) {
         const reasons = Object.entries(result.skippedSources.reasons || {})
             .map(([reason, count]) => `${reason} ${count}`).join(', ');
-        lines.push(`SKIPPED SOURCE: ${result.skippedSources.count} path(s) were not indexed${reasons ? ` (${reasons})` : ''} — completeness claims are withdrawn.`);
+        const unsearchable = result.skippedSources.unsearchable || 0;
+        lines.push(`SKIPPED SOURCE: ${result.skippedSources.count} path(s) not indexed${reasons ? ` (${reasons})` : ''} — ` +
+            (unsearchable > 0
+                ? `${unsearchable} could not be searched, so no caller account is complete.`
+                : 'searched as text for each name; an occurrence there is listed, not analyzed.'));
     }
     lines.push('');
 

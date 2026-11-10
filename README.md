@@ -246,11 +246,24 @@ test files included, unless a limit or `--exclude-tests` is given. Broad `find` 
 totals before calculating definition-pinned caller activity, and disclose
 that selection when limited.
 
-Files named `*.min.js`, `*.bundle.js`, and `*.map` are reported as skipped
-sources and make completeness partial. `--include-bundled` (MCP
-`include_bundled=true`) indexes the JavaScript bundles while respecting user
-exclusions; it bypasses the shared cache. Source maps remain disclosed but
-unindexed.
+Some source is read without being analyzed: files named `*.min.js` and
+`*.bundle.js`, paths excluded in `.ucn.json`, files over the size limit, and
+unsupported languages. It is searched for each name. An answer lists such an
+occurrence and limits its completeness claim to indexed source only when the
+name occurs there; every other answer is unaffected. A path that cannot be read
+at all degrades every caller account. `*.map` files are data and belong to no
+claim. `--include-bundled` (MCP `include_bundled=true`) indexes the JavaScript
+bundles while respecting user exclusions; it bypasses the shared cache.
+
+`.ucn.json` at the project root configures discovery:
+
+| Key | Effect |
+|-----|--------|
+| `exclude` | Patterns that are not indexed. Their source is still searched per name. |
+| `outsideProject` | Patterns that are not part of the project, such as vendored trees. No claim covers them; `repo --sections=health` lists them. |
+| `maxFiles`, `maxDepth`, `maxFileSize` | Discovery limits. |
+| `textScanBudgetBytes` | Bytes of unindexed source searched per name (default 256 MB). Source past the budget counts as unreadable. |
+| `aliases`, `includePaths` | Import resolution. |
 
 ## AI setup
 

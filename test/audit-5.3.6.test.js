@@ -89,13 +89,13 @@ describe('5.3.6 audit regressions', () => {
         } finally { rm(dir); }
     });
 
-    it('F3: bundles and maps are disclosed, withdraw completeness, and survive warm caches', () => {
+    it('F3: bundles are searched per name, maps are data, and both survive warm caches', () => {
         const dir = tmp({
             'package.json': '{}',
-            'lib.js': 'export function target() {}',
+            'lib.js': 'export function target() {}\nexport function untouched() {}',
             'vendor.min.js': 'function bundledOnly() {}\ntarget();',
             'vendor.bundle.js': 'target();',
-            'vendor.js.map': '{"sourcesContent":["target();"]}',
+            'vendor.js.map': '{"sourcesContent":["target(); untouched();"]}',
             '.gitignore': 'ignored.min.js\n',
             'ignored.min.js': 'target();',
         });
@@ -104,16 +104,35 @@ describe('5.3.6 audit regressions', () => {
             assert.deepEqual(index.discoveryIssues.map(i => i.relativePath),
                 ['vendor.bundle.js', 'vendor.js.map', 'vendor.min.js']);
             const repo = execute(index, 'repo', { sections: 'summary,health' });
-            assert.deepEqual(repo.result.summary.skippedSources.reasons, { bundled: 3 });
+            // Two bundles are source UCN reads and does not analyze; the
+            // source map is data, outside every claim, and stated in scope.
+            assert.deepEqual(repo.result.summary.skippedSources.reasons, { bundled: 2 });
+            assert.equal(repo.result.summary.skippedSources.unsearchable, 0);
+            assert.deepEqual(repo.result.health.scope.outside.reasons, { 'source-map': 1 });
             assert.equal(repo.result.health.trust, 'PARTIAL');
+            // A name that occurs in a bundle: the claim degrades for it and
+            // the lines are listed. The map's copy is not a source line.
             const impact = execute(index, 'impact', { name: 'target' });
-            assert.equal(impact.result.account.contract.textComplete, false);
-            assert.equal(impact.result.account.skippedSources.length, 3);
-            for (const command of ['find', 'usages']) {
-                const response = execute(index, command, { name: 'bundledOnly', exact: true });
-                assert.match(response.note, /UCN skipped 3 bundled/);
-                assert.match(response.note, /--include-bundled/);
-            }
+            const account = impact.result.account;
+            assert.equal(account.contract.textComplete, false);
+            assert.equal(account.unsupported.lines, 2);
+            assert.deepEqual(account.unsupported.reasons, { bundled: 2 });
+            assert.deepEqual(account.unsupported.files, ['vendor.bundle.js', 'vendor.min.js']);
+            assert.equal(account.opaque.count, 0);
+            assert.equal(account.skippedSources, undefined);
+            // A name that occurs in no bundle keeps a complete claim, with
+            // the same bundles in the repository.
+            const clean = execute(index, 'impact', { name: 'untouched' }).result.account;
+            assert.equal(clean.contract.textComplete, true);
+            assert.equal(clean.unsupported.lines, 0);
+            const found = execute(index, 'find', { name: 'bundledOnly', exact: true });
+            assert.match(found.note, /1 literal match\(es\) exist in 1 unanalyzed file\(s\) \(bundled\/minified\)/);
+            assert.match(found.note, /--include-bundled/);
+            const usages = execute(index, 'usages', { name: 'bundledOnly', exact: true });
+            assert.match(usages.note, /1 line\(s\) in 1 unanalyzed file\(s\) \(bundled\/minified\) also match/);
+            // No answer about another name mentions the bundles at all.
+            const other = execute(index, 'find', { name: 'untouched', exact: true });
+            assert.doesNotMatch(String(other.note || ''), /bundle|unanalyzed|skipped/i);
             const cacheFile = path.join(dir, '.cache-test', 'index.json');
             saveCache(index, cacheFile);
             const warm = new ProjectIndex(dir);
@@ -153,12 +172,13 @@ describe('5.3.6 audit regressions', () => {
             await client.start();
             await client.initialize();
             const params = { project_dir: dir, command: 'find', name: 'bundledOnly', exact: true };
-            assert.match((await client.callTool(params)).text, /UCN skipped 1/);
+            const defaultNote = /2 literal match\(es\) exist in 1 unanalyzed file\(s\) \(bundled\/minified\)/;
+            assert.match((await client.callTool(params)).text, defaultNote);
             const mcp = await client.callTool({ ...params, include_bundled: true });
             assert.equal(!!mcp.isError, false, mcp.text);
             assert.match(mcp.text, /tiny.min.js:1:bundledOnly/);
             assert.doesNotMatch(mcp.text, /ignored \(not applicable/);
-            assert.match((await client.callTool(params)).text, /UCN skipped 1/);
+            assert.match((await client.callTool(params)).text, defaultNote);
             assert.equal(JSON.parse(cli(dir, 'find', 'bundledOnly', '--exact', '--json').stdout).data.length, 0);
         } finally { client.stop(); rm(dir); }
     });

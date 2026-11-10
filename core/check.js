@@ -33,11 +33,29 @@ function summarizeAccount(account) {
         safeToDelete: false,
         unparsedFiles: account.unparsed ? account.unparsed.fileCount || 0 : 0,
         unreadableFiles: Array.isArray(account.unreadableFiles) ? account.unreadableFiles.length : 0,
+        // Lines of this name in source UCN reads but does not analyze, and
+        // paths nothing could be read from: why an account is incomplete.
+        unanalyzedLines: account.unsupported ? account.unsupported.lines || 0 : 0,
+        unsearchablePaths: account.opaque ? account.opaque.count || 0 : 0,
         unaccounted: account.unaccounted || 0,
         filtered: account.filtered ? account.filtered.total || 0 : 0,
         beyondTextCallers: account.beyondText ? account.beyondText.count || 0 : 0,
         requiresUsageReview: contract.requiresUsageReview === true,
     };
+}
+
+/** Why an account is not text-complete, in the account's own terms. */
+function incompleteReason(account) {
+    if (!account || !account.available) {
+        return account && account.reason ? ` (${account.reason})` : '';
+    }
+    const parts = [];
+    if (account.unanalyzedLines > 0) parts.push(`${account.unanalyzedLines} line(s) in unanalyzed source`);
+    if (account.unparsedFiles > 0) parts.push(`${account.unparsedFiles} unparsed file(s)`);
+    if (account.unreadableFiles > 0) parts.push(`${account.unreadableFiles} unreadable file(s)`);
+    if (account.unsearchablePaths > 0) parts.push(`${account.unsearchablePaths} unsearchable path(s)`);
+    if (account.unaccounted > 0) parts.push(`${account.unaccounted} unaccounted line(s)`);
+    return parts.length ? ` (${parts.join(', ')})` : '';
 }
 
 /**
@@ -264,7 +282,8 @@ function check(index, options = {}) {
             actions.push({
                 severity: 'error',
                 kind: 'incomplete_account',
-                message: `${it.name}: caller evidence is not text-complete; inspect warnings and usages manually`,
+                message: `${it.name}: caller evidence is not text-complete` +
+                    `${incompleteReason(it.account)}; inspect warnings and usages manually`,
             });
         }
         if (it.unverifiedCallerCount > 0) {

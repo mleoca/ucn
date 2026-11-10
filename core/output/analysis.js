@@ -6,6 +6,7 @@ const path = require('path');
 const { langTraits } = require('../../languages');
 const { dynamicImportsNote, formatGitLine, unverifiedReasonLabel } = require('./shared');
 const { provenanceReplacer } = require('./provenance');
+const { matchLabelCounts, reasonList } = require('../source-universe');
 
 /**
  * One short sentence (~80 chars) of a docstring, suitable for inline display
@@ -94,11 +95,42 @@ function formatAmbiguityCandidates(lines, ambiguity) {
 }
 
 /**
- * Render the conservation contract lines: ACCOUNT and CONTRACT (always),
- * WARNING (unparsed files containing the symbol), FILTERED (display-filter
- * hides). Returns [] when no account is present (e.g. class-type context).
+ * The account lines that hold for every symbol of the repository: paths
+ * nothing could be read from, so no name can be cleared against them. One
+ * line, with the reasons; the paths are listed in `repo` health.
  */
-function formatAccountLines(account) {
+function formatSharedAccountLines(account) {
+    const opaque = account && account.opaque;
+    if (!opaque || opaque.count === 0) return [];
+    const sample = (opaque.sample || []).map(entry => `${entry.path} (${entry.reason})`);
+    const more = opaque.count - sample.length;
+    return [`WARNING: ${opaque.count} path${opaque.count === 1 ? '' : 's'} could not be searched ` +
+        `(${reasonList(opaque.reasons)}), so no name is cleared against ${opaque.count === 1 ? 'it' : 'them'}: ` +
+        `${sample.join(', ')}${more > 0 ? `, +${more} more` : ''}. See repo --sections=health.`];
+}
+
+/**
+ * Render the conservation contract lines: ACCOUNT and CONTRACT (always),
+ * WARNING (what weakens the claim for THIS symbol), FILTERED (display-filter
+ * hides). Returns [] when no account is present (e.g. class-type context).
+ *
+ * CONTRACT is a state, not a sentence. What the states never mean is the
+ * same for every answer and is stated where it is read once (the tool
+ * description, the usage guide, `repo` health): a complete text partition
+ * is not semantic completeness, and a zero is not deletion proof.
+ *   text-complete                      every literal-name line of project
+ *                                      source was classified;
+ *   text-complete, zero observed       ... and none is a use;
+ *   text-complete over indexed source  ... except lines in source UCN reads
+ *                                      but does not analyze, listed below;
+ *   degraded                           some line or path could not be
+ *                                      classified at all; see WARNING.
+ *
+ * `shared: false` leaves out the lines that hold for every symbol of the
+ * repository (paths nothing could be read from): a caller that prints many
+ * accounts prints those once, through formatSharedAccountLines.
+ */
+function formatAccountLines(account, { shared = true } = {}) {
     if (!account) return [];
     const lines = [];
     const nc = account.nonCall || { imports: 0, definitions: 0, references: 0, unclassifiedText: 0, total: 0 };
@@ -107,7 +139,7 @@ function formatAccountLines(account) {
         `${account.confirmed} confirmed, ${account.unverified} unverified, ` +
         `${nc.total} non-call (${nc.imports} import, ${nc.definitions} definition, ${nc.references} reference, ${nc.unclassifiedText} other-text), ` +
         `${account.excluded ? account.excluded.total : 0} other-target, ` +
-        `${account.unsupported && account.unsupported.lines > 0 ? `${account.unsupported.lines} unsupported-language, ` : ''}` +
+        `${account.unsupported && account.unsupported.lines > 0 ? `${account.unsupported.lines} unanalyzed, ` : ''}` +
         `${account.unaccounted} unaccounted`;
     if (account.beyondText && account.beyondText.count > 0) {
         line += ` (+${account.beyondText.count} beyond-text caller${account.beyondText.count === 1 ? '' : 's'})`;
@@ -115,31 +147,31 @@ function formatAccountLines(account) {
     lines.push(line);
     const contract = account.contract || {};
     const unsupported = account.unsupported ||
-        { fileCount: 0, lines: 0, files: [], languages: {}, sites: [], sitesTruncated: false };
+        { fileCount: 0, lines: 0, files: [], languages: {}, reasons: {}, sites: [], sitesTruncated: false };
+    const opaqueCount = account.opaque ? account.opaque.count : 0;
     const textComplete = contract.textComplete !== undefined
         ? contract.textComplete
         : Boolean(account.conserved) && !(account.unparsed && account.unparsed.fileCount > 0) &&
             unsupported.lines === 0 &&
-            !(account.unreadableFiles && account.unreadableFiles.length > 0);
-    // When the ONLY gap is unsupported-language occurrences, say exactly that
-    // instead of the generic DEGRADED sentence: the partition over supported
-    // languages is still conserved, and the gap is enumerated below.
-    const unsupportedOnly = !textComplete && unsupported.lines > 0 &&
+            !(account.unreadableFiles && account.unreadableFiles.length > 0) &&
+            opaqueCount === 0;
+    // When the ONLY gap is occurrences in unanalyzed source, say exactly
+    // that: the partition over indexed source is still conserved, and the
+    // gap is enumerated below.
+    const unanalyzedOnly = !textComplete && unsupported.lines > 0 &&
         Boolean(account.conserved) &&
         !(account.unparsed && account.unparsed.fileCount > 0) &&
-        !(account.unreadableFiles && account.unreadableFiles.length > 0);
-    if (unsupportedOnly) {
-        const langs = Object.keys(unsupported.languages).join(', ');
-        lines.push(`CONTRACT: literal-name text partition complete over SUPPORTED languages only — ` +
-            `${unsupported.lines} line${unsupported.lines === 1 ? '' : 's'} in unsupported-language file${unsupported.fileCount === 1 ? '' : 's'}` +
-            `${langs ? ` (${langs})` : ''} NOT analyzed (see WARNING; verify with grep/ripgrep). ` +
-            'Semantic completeness is not claimed.');
+        !(account.unreadableFiles && account.unreadableFiles.length > 0) &&
+        opaqueCount === 0;
+    if (unanalyzedOnly) {
+        lines.push('CONTRACT: text-complete over indexed source; ' +
+            `${unsupported.lines} line${unsupported.lines === 1 ? '' : 's'} in unanalyzed source (see WARNING)`);
     } else if (!textComplete) {
-        lines.push('CONTRACT: literal-name text partition is DEGRADED; review WARNING and unaccounted lines before acting. Semantic completeness is not claimed.');
+        lines.push('CONTRACT: degraded; see WARNING');
     } else if (contract.observedTextZero) {
-        lines.push('CONTRACT: observed-text zero only; every literal-name line was classified, but aliases, indirect calls, generated code, and runtime dispatch may exist. Not safe-delete proof.');
+        lines.push('CONTRACT: text-complete, zero observed; not deletion proof');
     } else {
-        lines.push('CONTRACT: literal-name text partition complete; semantic completeness is not claimed (aliases, indirect calls, generated code, and runtime dispatch may exist).');
+        lines.push('CONTRACT: text-complete');
     }
     if (account.unparsed && account.unparsed.fileCount > 0) {
         lines.push(`WARNING: ${account.unparsed.fileCount} unparsed file${account.unparsed.fileCount === 1 ? '' : 's'} ` +
@@ -156,12 +188,11 @@ function formatAccountLines(account) {
             `${rec.lines > shown.length ? `, ... and ${rec.lines - shown.length} more` : ''}`);
     }
     if (unsupported.lines > 0) {
-        const langParts = Object.entries(unsupported.languages)
-            .map(([lang, count]) => `${lang}: ${count}`).join(', ');
+        const kinds = matchLabelCounts(unsupported);
         lines.push(`WARNING: ${unsupported.lines} line${unsupported.lines === 1 ? '' : 's'} in ` +
-            `${unsupported.fileCount} unsupported-language file${unsupported.fileCount === 1 ? '' : 's'} ` +
+            `${unsupported.fileCount} unanalyzed file${unsupported.fileCount === 1 ? '' : 's'} ` +
             `contain${unsupported.lines === 1 ? 's' : ''} "${account.symbol}"` +
-            `${langParts ? ` (${langParts})` : ''} — NOT analyzed; verify with grep/ripgrep:`);
+            `${kinds ? ` (${kinds})` : ''} — NOT analyzed; verify with grep/ripgrep:`);
         const shown = unsupported.sites.slice(0, 5);
         for (const site of shown) {
             lines.push(`  ${site.file}:${site.line}  ${site.text}`);
@@ -173,14 +204,7 @@ function formatAccountLines(account) {
     if (account.unreadableFiles && account.unreadableFiles.length > 0) {
         lines.push(`WARNING: ${account.unreadableFiles.length} unreadable file(s) skipped: ${account.unreadableFiles.join(', ')}`);
     }
-    if (account.skippedSources && account.skippedSources.length > 0) {
-        const shown = account.skippedSources.slice(0, 5)
-            .map(issue => `${issue.relativePath} (${issue.reason})`);
-        lines.push(`WARNING: ${account.skippedSources.length} source discovery gap(s) make this index partial: ${shown.join(', ')}`);
-        if (account.skippedSources.length > shown.length) {
-            lines.push(`  ... and ${account.skippedSources.length - shown.length} more; run repo --sections=health for the full reason set.`);
-        }
-    }
+    if (shared) lines.push(...formatSharedAccountLines(account));
     if (account.filtered && account.filtered.total > 0) {
         const parts = [];
         const f = account.filtered.byFlag || {};
@@ -1325,6 +1349,7 @@ module.exports = {
     // Shared with output/tracing.js: the tree commands render the same
     // root-hop ACCOUNT/WARNING/FILTERED lines as context/impact.
     formatAccountLines,
+    formatSharedAccountLines,
     // Shared with output/analysis-ext.js (smart): single-node callee contract.
     formatCalleeAccountLine,
     unverifiedCalleeLines,

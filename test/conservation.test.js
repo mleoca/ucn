@@ -785,7 +785,7 @@ describe('mixed-language repos: unsupported files enter the ground set', () => {
         } finally { rm(dir); }
     });
 
-    it('contract lines render the supported-languages-only sentence with sites', () => {
+    it('contract lines state a claim over indexed source and list the unanalyzed sites', () => {
         const dir = tmp(MIXED_FILES);
         try {
             const index = idx(dir);
@@ -796,9 +796,9 @@ describe('mixed-language repos: unsupported files enter the ground set', () => {
             const text = output.formatPublicText('show', execution.result,
                 { name: 'processPayment' }, execution);
             assert.match(text, /ACCOUNT: "processPayment" occurs on 7 lines in 4 files/);
-            assert.match(text, /3 unsupported-language, 0 unaccounted/);
-            assert.match(text, /CONTRACT: literal-name text partition complete over SUPPORTED languages only — 3 lines in unsupported-language files \(Ruby\) NOT analyzed/);
-            assert.match(text, /WARNING: 3 lines in 2 unsupported-language files contain "processPayment" \(Ruby: 3\)/);
+            assert.match(text, /3 unanalyzed, 0 unaccounted/);
+            assert.match(text, /CONTRACT: text-complete over indexed source; 3 lines in unanalyzed source \(see WARNING\)/);
+            assert.match(text, /WARNING: 3 lines in 2 unanalyzed files contain "processPayment" \(Ruby: 3\)/);
             assert.match(text, /payments\/processor\.rb:2 {2}processPayment\(order\)/);
         } finally { rm(dir); }
     });
@@ -812,7 +812,7 @@ describe('mixed-language repos: unsupported files enter the ground set', () => {
 
             const usages = execute(index, 'usages', { name: 'processPayment' });
             assert.ok(usages.ok);
-            assert.match(usages.note, /3 line\(s\) in 2 unsupported-language file\(s\) \(Ruby\) also match/);
+            assert.match(usages.note, /3 line\(s\) in 2 unanalyzed file\(s\) \(Ruby\) also match/);
             const usagesJson = JSON.parse(output.formatPublicJson(
                 'usages', usages.result, { name: 'processPayment' },
                 { ...usages, surface: 'cli' }));
@@ -821,7 +821,7 @@ describe('mixed-language repos: unsupported files enter the ground set', () => {
 
             const tests = execute(index, 'tests', { name: 'processPayment' });
             assert.ok(tests.ok);
-            assert.match(tests.note, /unsupported-language file\(s\) \(Ruby\) — their test files are invisible to UCN/);
+            assert.match(tests.note, /unanalyzed file\(s\) \(Ruby\) — their test files are invisible to UCN/);
             const testsJson = JSON.parse(output.formatPublicJson(
                 'tests', tests.result, { name: 'processPayment' },
                 { ...tests, surface: 'cli' }));

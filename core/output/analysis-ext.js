@@ -3,7 +3,7 @@
  */
 
 const { dynamicImportsNote, formatLineRanges, unverifiedReasonLabel, advisoryLine } = require('./shared');
-const { formatAccountLines, formatCalleeAccountLine, unverifiedCalleeLines, initializerReviewLines } = require('./analysis');
+const { formatAccountLines, formatSharedAccountLines, formatCalleeAccountLine, unverifiedCalleeLines, initializerReviewLines } = require('./analysis');
 
 /**
  * Format related command output - text
@@ -275,11 +275,15 @@ function formatDiffImpact(result, options = {}) {
                 }
             }
 
-            // Conservation contract lines, indented inside the function block
-            for (const al of formatAccountLines(fn.account)) {
+            // Conservation contract lines, indented inside the function block.
+            // What holds for every symbol of the repository is said once,
+            // after the last function.
+            for (const al of formatAccountLines(fn.account, { shared: false })) {
                 lines.push(`  ${al}`);
             }
         }
+        const withAccount = result.functions.find(fn => fn.account);
+        if (withAccount) lines.push(...formatSharedAccountLines(withAccount.account));
     }
 
     // New functions

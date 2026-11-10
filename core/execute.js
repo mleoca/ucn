@@ -99,17 +99,20 @@ function symbolNotFound(index, name, label = 'Symbol') {
     } else {
         message = `${label} "${query}" not found. Use find with a shorter name, or search for a literal occurrence.`;
     }
+    // Unanalyzed source is searched for this name; it is mentioned only
+    // when the name occurs in it, or when part of the project could not be
+    // searched at all.
+    const universeTools = require('./source-universe');
     const unsupported = require('./account').scanUnsupportedFiles(index, query);
     if (unsupported.lines > 0) {
-        const languages = Object.keys(unsupported.languages).join(', ');
+        const labels = universeTools.matchLabels(unsupported);
         message += ` ${unsupported.lines} literal match(es) exist in ` +
-            `${unsupported.fileCount} unsupported-language file(s)` +
-            `${languages ? ` (${languages})` : ''}; this is not a semantic zero. ` +
-            'Use grep/ripgrep plus a language-native analyzer.';
-    } else if (index.unsupportedFiles?.length > 0) {
-        message += ` UCN skipped ${index.unsupportedFiles.length} unsupported source ` +
-            `file(s), so this is not a repository-wide semantic zero; verify with grep/ripgrep.`;
+            `${unsupported.fileCount} unanalyzed file(s)` +
+            `${labels ? ` (${labels})` : ''}; this is not a semantic zero. ` +
+            universeTools.matchAdvice(unsupported);
     }
+    const unsearched = universeTools.unsearchedNote(index);
+    if (unsearched) message += ` ${unsearched}`;
     return message;
 }
 
@@ -1232,18 +1235,21 @@ const HANDLERS = {
             notes.push(`Note: exact=true treats "${p.name}" as a literal name (glob expansion disabled).`);
         }
         let unsupportedMatches = null;
-        if (fullFindCount === 0 && index.unsupportedFiles?.length > 0) {
-            unsupportedMatches = require('./account').scanUnsupportedFiles(index, p.name);
-            const languages = Object.keys(unsupportedMatches.languages).join(', ');
-            if (unsupportedMatches.lines > 0) {
-                notes.push(`${unsupportedMatches.lines} literal match(es) exist in ` +
-                    `${unsupportedMatches.fileCount} unsupported-language file(s)` +
-                    `${languages ? ` (${languages})` : ''}; this is not a semantic zero. ` +
-                    'Use grep/ripgrep plus a language-native analyzer.');
-            } else {
-                notes.push(`UCN skipped ${index.unsupportedFiles.length} unsupported source ` +
-                    'file(s), so this is not a repository-wide semantic zero; verify with grep/ripgrep.');
+        if (fullFindCount === 0) {
+            const universeTools = require('./source-universe');
+            if (universeTools.hasTextOnly(index)) {
+                const matches = require('./account').scanUnsupportedFiles(index, p.name);
+                if (matches.lines > 0) {
+                    unsupportedMatches = matches;
+                    const labels = universeTools.matchLabels(matches);
+                    notes.push(`${matches.lines} literal match(es) exist in ` +
+                        `${matches.fileCount} unanalyzed file(s)` +
+                        `${labels ? ` (${labels})` : ''}; this is not a semantic zero. ` +
+                        universeTools.matchAdvice(matches));
+                }
             }
+            const unsearched = universeTools.unsearchedNote(index);
+            if (unsearched) notes.push(unsearched);
         }
         // Apply limit
         const limit = listingLimit(p);
@@ -1363,9 +1369,9 @@ const HANDLERS = {
         const accountTools = require('./account');
         const unsupportedMatches = accountTools.scanUnsupportedFiles(index, p.name);
         if (unsupportedMatches.lines > 0) {
-            const langs = Object.keys(unsupportedMatches.languages).join(', ');
+            const langs = require('./source-universe').matchLabels(unsupportedMatches);
             notes.push(`${unsupportedMatches.lines} line(s) in ${unsupportedMatches.fileCount} ` +
-                `unsupported-language file(s)${langs ? ` (${langs})` : ''} also match — ` +
+                `unanalyzed file(s)${langs ? ` (${langs})` : ''} also match — ` +
                 'NOT analyzed by UCN; verify with grep/ripgrep.');
             Object.defineProperty(limited, 'unsupportedMatches', {
                 value: unsupportedMatches,
@@ -1487,7 +1493,7 @@ const HANDLERS = {
                     value: unsupported,
                     enumerable: false, writable: true, configurable: true,
                 });
-                note = combineNotes([note, `${unsupported.lines} matching line(s) in ${unsupported.fileCount} unsupported-language file(s) were not structurally analyzed; verify with grep/ripgrep.`]);
+                note = combineNotes([note, `${unsupported.lines} matching line(s) in ${unsupported.fileCount} unanalyzed file(s) were not structurally analyzed; verify with grep/ripgrep.`]);
             }
             return { ok: true, result, structural: true, note };
         }
@@ -1521,7 +1527,7 @@ const HANDLERS = {
                     value: unsupported,
                     enumerable: false, writable: true, configurable: true,
                 });
-                notes.push(`${unsupported.lines} matching line(s) in ${unsupported.fileCount} unsupported-language file(s) were not searched; verify with grep/ripgrep.`);
+                notes.push(`${unsupported.lines} matching line(s) in ${unsupported.fileCount} unanalyzed file(s) were not searched; verify with grep/ripgrep.`);
             }
         }
         const tNote = truncationNote(index);
@@ -1614,9 +1620,9 @@ const HANDLERS = {
         if (!testsTargetIsFile) {
             const unsupportedMatches = require('./account').scanUnsupportedFiles(index, p.name);
             if (unsupportedMatches.lines > 0) {
-                const langs = Object.keys(unsupportedMatches.languages).join(', ');
+                const langs = require('./source-universe').matchLabels(unsupportedMatches);
                 testNotes.push(`"${p.name}" also occurs on ${unsupportedMatches.lines} line(s) in ` +
-                    `${unsupportedMatches.fileCount} unsupported-language file(s)${langs ? ` (${langs})` : ''} — ` +
+                    `${unsupportedMatches.fileCount} unanalyzed file(s)${langs ? ` (${langs})` : ''} — ` +
                     'their test files are invisible to UCN; verify with grep/ripgrep.');
                 Object.defineProperty(result, 'unsupportedMatches', {
                     value: unsupportedMatches,
@@ -2563,16 +2569,6 @@ function execute(index, command, params = {}) {
         }
         const response = handler(index, params);
         response.projectRoot = index.root;
-        const bundled = (index.discoveryIssues || []).filter(issue => issue.reason === 'bundled');
-        if (bundled.length > 0) {
-            const files = bundled.slice(0, 5).map(issue => issue.relativePath).join(', ');
-            const note = `UCN skipped ${bundled.length} bundled/minified or source-map file(s): ${files}` +
-                (bundled.length > 5 ? ', ...' : '') +
-                '. This is not a repository-wide semantic zero; use --include-bundled for JavaScript bundles ' +
-                '(source maps remain unindexed), or grep/ripgrep to inspect skipped files.';
-            if (response.ok) response.note = combineNotes([response.note, note]);
-            else response.error = `${response.error}\n${note}`;
-        }
         return response;
     } catch (e) {
         // A deliberate refusal keeps its message; an exception inside the

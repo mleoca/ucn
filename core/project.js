@@ -10,10 +10,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { UcnError } = require('./errors');
-const {
-    expandGlob, findProjectRoot, detectProjectPattern, isTestFile,
-    parseGitignore, gitTrackedPaths, gitListing, DEFAULT_IGNORES, compareNames, classifyUnsupportedSourceFile,
-} = require('./discovery');
+const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, gitTrackedPaths, gitListing, compareNames, classifyUnsupportedSourceFile, projectDiscoveryOptions } = require('./discovery');
 const { cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
 const { validateFileIR } = require('./ir');
@@ -154,6 +151,7 @@ class ProjectIndex {
         // Exact text-ground sets are likewise immutable for one built index.
         // The cache is cleared at every build and bounded in account.js.
         this._groundSetCache = new Map();
+        this._sourceUniverse = null; // non-indexed source classification (core/source-universe.js)
         this._groundSetCacheLines = 0;
         // Bounded cross-operation memo for immutable name-level export
         // ownership. Agent workflows ask show/impact/tests about related
@@ -574,6 +572,7 @@ class ProjectIndex {
         // a text-universe answer across that boundary. Hash-keyed usage
         // results remain safe and useful for unchanged files.
         this._groundSetCache = new Map();
+        this._sourceUniverse = null; // non-indexed source classification (core/source-universe.js)
         this._groundSetCacheLines = 0;
         this._nameBindingReachCache = new Map();
         this._returnTypeFlowCache = new Map();
@@ -630,14 +629,15 @@ class ProjectIndex {
                 pattern = detectProjectPattern(this.root);
             }
 
-            const globOpts = {
-                root: this.root,
-                maxFiles: options.maxFiles || this.config.maxFiles || 50000,
-                maxDepth: options.maxDepth ?? this.config.maxDepth,
-                maxFileSize: options.maxFileSize ?? this.config.maxFileSize,
+            // Shared with the staleness walk (cache.js): both must read the
+            // project's configuration the same way.
+            const globOpts = projectDiscoveryOptions(this.root, this.config, {
+                maxFiles: options.maxFiles,
+                maxDepth: options.maxDepth,
+                maxFileSize: options.maxFileSize,
                 followSymlinks: options.followSymlinks,
                 includeBundled: this.includeBundled,
-            };
+            });
 
             // Merge .gitignore and .ucn.json exclude into file discovery
             const listing = gitListing(this.root);
@@ -654,13 +654,6 @@ class ProjectIndex {
                     detail: `${listing.failure.detail}; tracked files that match .gitignore rules could not be identified and are not indexed`,
                 });
             }
-            const configExclude = Array.isArray(this.config.exclude)
-                ? this.config.exclude
-                : (this.config.exclude ? [String(this.config.exclude)] : []);
-            if (configExclude.length > 0) {
-                globOpts.ignores = [...DEFAULT_IGNORES, ...configExclude];
-            }
-            globOpts.disclosureIgnores = configExclude;
             globOpts.onDiscoveryIssue = recordDiscoveryIssue;
 
             if (implicitProjectDiscovery) {

@@ -58,7 +58,7 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `--top=N` | Cap listed callers/callees and ranked results; the header discloses the cut (`3 shown of 21`). Caller lists have no default cap. |
 | `--context=N` | Lines of context around `search`/`usages` matches. |
 | `--include-tests` / `--exclude-tests` | Lift or apply the language's test-file exclusions where a command filters them (`--exclude-tests`: `usages`, `endpoints`, `entrypoints`). `usages` ignores `--include-tests` (tests are listed by default) and says so. |
-| `--include-bundled` | Index `*.min.js` and `*.bundle.js`, respecting user exclusions and bypassing the shared cache. By default these and `*.map` are disclosed as skipped sources and completeness is partial. Source maps remain unindexed. MCP: `include_bundled=true`. |
+| `--include-bundled` | Index `*.min.js` and `*.bundle.js`, respecting user exclusions and bypassing the shared cache. By default they are searched for each name and listed only when the name occurs in them. `*.map` files are data and stay unindexed. MCP: `include_bundled=true`. |
 | `--depth=N` | Trace, dependency, or test traversal depth. |
 | `--direction=<value>` | Trace (`callees`/`callers`) or dependency (`imports`/`importers`/`both`) direction. |
 | `--all` | Lift result and formatter caps where a command supports it; the truncation notice says when it does. |
