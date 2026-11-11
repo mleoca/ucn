@@ -162,7 +162,7 @@ function callersOf(index, name, definition) {
  * Verdict of an ADDED declaration.
  * @returns {{verdict, reasons: string[], hazards?: string[], outside?: object[]}}
  */
-function assessAddition(index, entry, definition, addedLinesByFile, account, nonCallable = false) {
+function assessAddition(index, entry, definition, addedLinesByFile, account, judge, nonCallable = false) {
     if (!definition) return { verdict: 'review', reasons: ['declaration-not-indexed'] };
     const occurrences = occurrencesOutsideChange(index, entry.name, addedLinesByFile, definition);
     const summary = summarizeAccount(account);
@@ -188,7 +188,8 @@ function assessAddition(index, entry, definition, addedLinesByFile, account, non
     // literal declared as that type that does not: a break, not a hazard.
     const mustHave = hazards.includes('new-requirement') || shape === 'required';
     const lacking = ownerExisted && mustHave ? literalsLackingMember(index, definition)
-        .filter(site => !addedLinesByFile.get(site.file)?.has(site.line)) : [];
+        .filter(site => !addedLinesByFile.get(site.file)?.has(site.line) &&
+            !judge.suppressed(site, { kind: 'literal' })) : [];
     if (lacking.length > 0) {
         return { verdict: 'blocked', reasons: ['literal-lacks-new-member', ...reasons], outside: lacking };
     }
@@ -204,39 +205,50 @@ function assessAddition(index, entry, definition, addedLinesByFile, account, non
  * language's toolchain (or, with no checker, its runtime) will reject, so
  * a site it has been told to skip, or an import written as a call it never
  * resolves, is not what blocks: it is listed as what it is.
+ *
+ * A reader belongs to ONE check: it reads the files as they are when the
+ * check runs, and nothing it reads outlives the check (an index is rebuilt
+ * between checks).
  */
-const SITE_READERS = new WeakMap();
 function siteReader(index) {
-    if (SITE_READERS.has(index)) return SITE_READERS.get(index);
     let absolute = null;
     const at = relativePath => {
         if (!absolute) {
             absolute = new Map();
-            for (const [file, entry] of index.files) absolute.set(entry.relativePath, { file, entry });
+            for (const [file, entry] of index.files) absolute.set(entry.relativePath, { file, entry, memo: new Map() });
         }
         return absolute.get(relativePath) || null;
     };
-    const roots = new Map();
     const rootOf = found => {
-        if (!roots.has(found.file)) {
+        if (!found.memo.has('root')) {
             let root;
             try {
                 root = require('./change-kinds').parseRevision(index._readFile(found.file), found.entry.language);
             } catch (_) {
                 root = null;
             }
-            roots.set(found.file, root);
+            found.memo.set('root', root);
         }
-        return roots.get(found.file);
+        return found.memo.get('root');
     };
-    const reader = {
-        /** The checker has been told not to report this line (trait `checkSuppressedAt`). */
-        suppressed(site) {
+    return {
+        /**
+         * The checker has been told not to report this break (trait
+         * `checkSuppressedAt`).
+         * @param {object} site - { file, line }
+         * @param {object} diagnostic - { kind, name?, most? }: what kind
+         *   of break it is, which decides where and under which rule the
+         *   checker reports it
+         */
+        suppressed(site, diagnostic) {
             const found = site && site.line ? at(site.file) : null;
             const suppressedAt = found && langTraits(found.entry.language)?.checkSuppressedAt;
             if (typeof suppressedAt !== 'function') return false;
             try {
-                return !!suppressedAt(index._getFileLines(found.file), site.line, () => rootOf(found));
+                return !!suppressedAt({
+                    ...diagnostic, line: site.line, lines: index._getFileLines(found.file),
+                    root: rootOf(found), memo: found.memo,
+                });
             } catch (_) {
                 return false;
             }
@@ -254,27 +266,30 @@ function siteReader(index) {
             }
         },
     };
-    SITE_READERS.set(index, reader);
-    return reader;
 }
 
-/** Split sites of a break into the ones the judge sees and the ones it was told to skip. */
-function byJudge(index, sites) {
-    const reader = siteReader(index);
+/**
+ * Split the sites of a break into the ones the judge sees and the ones it
+ * was told to skip. `describe(site)` says what kind of break each is.
+ */
+function byJudge(judge, sites, describe) {
     const checked = [];
     const unchecked = [];
     for (const site of sites) {
-        if (reader.suppressed(site)) unchecked.push({ ...site, unchecked: true });
+        if (judge.suppressed(site, describe(site))) unchecked.push({ ...site, unchecked: true });
         else checked.push(site);
     }
     return { checked, unchecked };
 }
 
+// A site of a name that is gone: an import of it, or a bare call of it.
+const goneName = name => site => ({ kind: site.kind === 'call' ? 'undefined-name' : 'import-name', name });
+
 /**
  * Verdict of a DELETED declaration, from the base revision's record.
  * @returns {{verdict, reasons: string[], sites?: object[], basis?: string}}
  */
-function assessRemoval(index, deleted) {
+function assessRemoval(index, deleted, judge) {
     const declaration = deleted.declaration;
     if (!declaration) return { verdict: 'review', reasons: ['base-declaration-unreadable'] };
     let assessment;
@@ -284,7 +299,7 @@ function assessRemoval(index, deleted) {
         return { verdict: 'review', reasons: ['base-declaration-unreadable'] };
     }
     if (assessment.verdict === 'no-static-dependents') return { verdict: 'ready', reasons: [] };
-    const definite = byJudge(index, definiteDependentsOf(index, declaration));
+    const definite = byJudge(judge, definiteDependentsOf(index, declaration), goneName(declaration.name));
     if (definite.checked.length > 0) {
         return {
             verdict: 'blocked', reasons: ['still-referenced'],
@@ -315,7 +330,7 @@ function assessRemoval(index, deleted) {
  *
  * @returns {{verdict, reasons: string[], sites: object[]}}
  */
-function assessModuleChange(index, moved) {
+function assessModuleChange(index, moved, judge) {
     const sites = [];
     // Files that hold the whole module under a name (`import * as ns`,
     // `import m`): they reach its names as members, not as imports.
@@ -347,7 +362,7 @@ function assessModuleChange(index, moved) {
         }
     }
     sites.sort(bySite);
-    const importing = byJudge(index, sites);
+    const importing = byJudge(judge, sites, site => ({ kind: 'import-name', name: site.kind.replace(/^import /, '') }));
     if (importing.checked.length > 0) {
         return { verdict: 'blocked', reasons: ['no-longer-provided'], sites: [...importing.checked, ...importing.unchecked] };
     }
@@ -420,7 +435,7 @@ const PACKAGE_FILE = /(?:^|\/)(?:__init__|index|mod)$/;
  * @returns {{definite: object[], unchecked: object[], possible: object[]}}
  *   sites (file, line)
  */
-function importersOfDeletedFile(index, deleted) {
+function importersOfDeletedFile(index, deleted, judge) {
     const posix = path.posix;
     const stem = deleted.replace(SOURCE_EXTENSION, '');
     // A package's own file stands for its directory.
@@ -469,10 +484,15 @@ function importersOfDeletedFile(index, deleted) {
             (own.importDetails || []).some(detail => (detail.names || []).includes('*')) ? 'open' : 'none';
     };
     // A from-import of names that land on the deleted file.
+    // What the checker would report each definite site for: a module that
+    // cannot be found, or a name its module does not have.
+    const missing = new Map();
     const place = (site, named, packageFile, traits) => {
         const supplies = named.map(name => supplyOf(packageFile, name, traits));
-        if (supplies.includes('none')) (twin ? possible : definite).push(site);
-        else if (supplies.includes('open')) possible.push(site);
+        if (supplies.includes('none')) {
+            missing.set(site, { kind: 'import-name', name: named[supplies.indexOf('none')] });
+            (twin ? possible : definite).push(site);
+        } else if (supplies.includes('open')) possible.push(site);
     };
     const definite = [];
     const possible = [];
@@ -545,11 +565,10 @@ function importersOfDeletedFile(index, deleted) {
         }
     }
     const bySite = (a, b) => (a.file === b.file ? a.line - b.line : (a.file < b.file ? -1 : 1));
-    const reader = siteReader(index);
     const seen = [];
     const unchecked = [];
     for (const site of definite.sort(bySite)) {
-        if (reader.resolvesImport(site) && !reader.suppressed(site)) seen.push(site);
+        if (judge.resolvesImport(site) && !judge.suppressed(site, missing.get(site) || { kind: 'import-module' })) seen.push(site);
         else unchecked.push({ ...site, unchecked: true });
     }
     return { definite: seen, unchecked, possible: possible.sort(bySite) };
@@ -682,6 +701,8 @@ function check(live, options = {}) {
 }
 
 function checkTarget(index, options, repoRoot) {
+    // What this check reads about each site: nothing outlives it.
+    const judge = siteReader(index);
     let dr;
     try {
         dr = diffImpact(index, {
@@ -731,7 +752,7 @@ function checkTarget(index, options, repoRoot) {
     // its importers, which imports it dropped, what loose code it runs.
     const moduleItems = [];
     for (const moved of dr?.moduleChanges || []) {
-        const outcome = assessModuleChange(index, moved);
+        const outcome = assessModuleChange(index, moved, judge);
         if (outcome.verdict === 'ready') continue;
         moduleItems.push({
             name: '(module)',
@@ -749,7 +770,7 @@ function checkTarget(index, options, repoRoot) {
 
     // A file that is gone, and the imports that named it.
     for (const relativePath of dr?.deletedFiles || []) {
-        const importers = importersOfDeletedFile(index, relativePath);
+        const importers = importersOfDeletedFile(index, relativePath, judge);
         if (importers.definite.length + importers.unchecked.length + importers.possible.length === 0) continue;
         const broken = importers.definite.length > 0;
         const reasons = [];
@@ -847,7 +868,7 @@ function checkTarget(index, options, repoRoot) {
             if (fn._kind === 'added') {
                 // A new declaration under a new name, in a type that is new
                 // too, cannot be reached by anything that existed.
-                const outcome = assessAddition(index, fn, definitionOf(index, fn), addedLinesByFile, fn.impact?.account, true);
+                const outcome = assessAddition(index, fn, definitionOf(index, fn), addedLinesByFile, fn.impact?.account, judge, true);
                 item.verdict = outcome.verdict;
                 item.reasons = outcome.reasons;
                 if (outcome.outside) item.sites = outcome.outside;
@@ -855,9 +876,9 @@ function checkTarget(index, options, repoRoot) {
                 // Kinds the dead-code rule does not audit (fields, constants,
                 // aliases) are never cleared: what remains is the name's
                 // other occurrences, each a candidate.
-                const definite = byJudge(index, definiteDependentsOf(index, {
+                const definite = byJudge(judge, definiteDependentsOf(index, {
                     name: fn.name, file: fn.filePath, relativePath: filePath, className: fn.className,
-                }));
+                }), goneName(fn.name));
                 item.verdict = definite.checked.length > 0 ? 'blocked' : 'review';
                 item.reasons = definite.checked.length > 0 ? ['still-referenced']
                     : definite.unchecked.length > 0 ? ['site-not-checked']
@@ -908,9 +929,15 @@ function checkTarget(index, options, repoRoot) {
             // A call site the checker was told to skip is listed and does
             // not block (a deliberately wrong call under `@ts-expect-error`
             // is still one after the signature moves).
-            const reader = siteReader(index);
+            // The checker reports too few arguments at the call and one
+            // too many at that argument.
+            const most = mismatch => {
+                const counts = String(mismatch.expected === undefined ? '' : mismatch.expected).match(/\d+/g);
+                return counts ? Number(counts[counts.length - 1]) : undefined;
+            };
             const marked = mismatches.map(mismatch =>
-                (reader.suppressed(mismatch) ? { ...mismatch, unchecked: true } : mismatch));
+                (judge.suppressed(mismatch, { kind: 'arity', name: fn.name, most: most(mismatch) })
+                    ? { ...mismatch, unchecked: true } : mismatch));
             item.signatureMismatches = marked.filter(mismatch => !mismatch.unchecked).length;
             if (marked.length > 0) item.mismatches = marked;
             if (item.signatureMismatches > 0) {
@@ -946,7 +973,7 @@ function checkTarget(index, options, repoRoot) {
         // Added callable.
         const definition = definitionOf(index, fn);
         const found = callersOf(index, fn.name, definition);
-        const outcome = assessAddition(index, fn, definition, addedLinesByFile, found.account);
+        const outcome = assessAddition(index, fn, definition, addedLinesByFile, found.account, judge);
         const item = {
             name: fn.name,
             file: filePath,
@@ -980,7 +1007,7 @@ function checkTarget(index, options, repoRoot) {
     // Deleted callables: the base revision's declaration, assessed against
     // what the snapshot still holds.
     for (const d of deleted) {
-        const outcome = assessRemoval(index, d);
+        const outcome = assessRemoval(index, d, judge);
         items.push({
             name: d.name || '(unnamed)',
             file: d.relativePath || d.file || '',

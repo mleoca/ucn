@@ -384,9 +384,12 @@ const STRUCTURAL_TRAITS = {
     // The interface whose members every object has (`Object`): a project
     // that declares one adds members to every literal.
     universalObjectInterface: null,
-    // Has the language's checker been told not to report a line (`//
-    // @ts-ignore` above it, `# type: ignore` on its statement, a file-wide
-    // directive)? `(lines, line, rootOf) => boolean`. A break at such a
+    // Has the language's checker been told not to report a break, as its
+    // own scanner reads comments (`// @ts-ignore` above the line the break
+    // is reported on, `# type: ignore` on a line of the reported range, a
+    // rule turned off for the file)? `(site) => boolean` with site
+    // { lines, root, line, kind: 'arity' | 'import-name' | 'import-module'
+    // | 'undefined-name' | 'literal', name, most, memo }. A break at such a
     // site is one the toolchain will not show: check lists it and does not
     // block on it.
     checkSuppressedAt: null,
@@ -686,9 +689,12 @@ const NOMINAL_TRAITS = {
     // The interface whose members every object has (`Object`): a project
     // that declares one adds members to every literal.
     universalObjectInterface: null,
-    // Has the language's checker been told not to report a line (`//
-    // @ts-ignore` above it, `# type: ignore` on its statement, a file-wide
-    // directive)? `(lines, line, rootOf) => boolean`. A break at such a
+    // Has the language's checker been told not to report a break, as its
+    // own scanner reads comments (`// @ts-ignore` above the line the break
+    // is reported on, `# type: ignore` on a line of the reported range, a
+    // rule turned off for the file)? `(site) => boolean` with site
+    // { lines, root, line, kind: 'arity' | 'import-name' | 'import-module'
+    // | 'undefined-name' | 'literal', name, most, memo }. A break at such a
     // site is one the toolchain will not show: check lists it and does not
     // block on it.
     checkSuppressedAt: null,
@@ -863,7 +869,7 @@ const LANGUAGES = {
             classMemberRole: (classNode, name, line) => require('./javascript').classMemberRole(classNode, name, line),
             typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
             universalObjectInterface: 'Object',
-            checkSuppressedAt: (lines, line) => require('./javascript').checkSuppressedAt(lines, line),
+            checkSuppressedAt: site => require('./javascript').checkSuppressedAt(site),
             checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, true),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
@@ -891,7 +897,7 @@ const LANGUAGES = {
             classMemberRole: (classNode, name, line) => require('./javascript').classMemberRole(classNode, name, line),
             typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
             universalObjectInterface: 'Object',
-            checkSuppressedAt: (lines, line) => require('./javascript').checkSuppressedAt(lines, line),
+            checkSuppressedAt: site => require('./javascript').checkSuppressedAt(site),
             checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, true),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
@@ -924,7 +930,7 @@ const LANGUAGES = {
             ambientNeverCallables: new Set(['exit', 'quit']),
             neverReturnTypes: ['NoReturn', 'Never'],
             namedConditionsDecidable: true,
-            checkSuppressedAt: (lines, line, rootOf) => require('./python').checkSuppressedAt(lines, line, rootOf),
+            checkSuppressedAt: site => require('./python').checkSuppressedAt(site),
             checkedImportAt: (root, line) => require('./python').checkedImportAt(root, line),
             // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
             // and `self.__class__(..)` in an instance method construct the

@@ -2068,12 +2068,14 @@ function about(index, name, options = {}) {
  *
  * Declarations are read as the project holds them now, for both revisions:
  * a callee whose own declaration changed is a changed symbol of its own.
+ *
+ * @param {Map} cache - facts by file entry, kept for ONE diff: what a
+ *   callee declares can change between two diffs of the same index
  */
-const CALLEE_FACTS = new WeakMap();
 const NAMED_IMPORT_KINDS = new Set(['named', 'from']);
-function calleeFacts(index, entry, filePath) {
+function calleeFacts(index, entry, filePath, cache) {
     if (!entry) return null;
-    if (CALLEE_FACTS.has(entry)) return CALLEE_FACTS.get(entry);
+    if (cache.has(entry)) return cache.get(entry);
     const live = index.files.get(filePath);
     const traits = langTraits(live && live.language) || {};
     const fileNames = new Set();
@@ -2122,7 +2124,7 @@ function calleeFacts(index, entry, filePath) {
             return verdict;
         },
     };
-    CALLEE_FACTS.set(entry, facts);
+    cache.set(entry, facts);
     return facts;
 }
 
@@ -2274,6 +2276,7 @@ function diffImpact(index, options = {}) {
     // Files the diff removed: whoever imports one as a module lost it.
     const deletedFiles = [];
     const addedFiles = [];
+    const calleeFactsByEntry = new Map();
     const newFunctions = [];
     const deletedFunctions = [];
     const symbolChanges = { symbols: [], newSymbols: [], deletedSymbols: [] };
@@ -2383,8 +2386,8 @@ function diffImpact(index, options = {}) {
             }
             const base = baseCounterpart(baseEntryOf()?.symbols, symbol, isDiffCallable);
             return classifyChange(
-                base ? callableContract(baseRoot, fileLang, base, calleeFacts(index, baseEntryOf(), change.filePath)) : null,
-                callableContract(currentRoot, fileLang, symbol, calleeFacts(index, fileEntry, change.filePath)), fileLang);
+                base ? callableContract(baseRoot, fileLang, base, calleeFacts(index, baseEntryOf(), change.filePath, calleeFactsByEntry)) : null,
+                callableContract(currentRoot, fileLang, symbol, calleeFacts(index, fileEntry, change.filePath, calleeFactsByEntry)), fileLang);
         };
 
         // Several callables can share a changed line (`class Box {

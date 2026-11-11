@@ -818,25 +818,127 @@ describe('check: a declaration that says nothing about never returning', () => {
 
 describe('check: what the project\'s own judge looks at', () => {
     const { langTraits } = require('../languages');
-    it('typescript: a comment above the line, or before any code of the file', () => {
-        const suppressed = langTraits('typescript').checkSuppressedAt;
-        const lines = ['// @ts-ignore', 'f(1);', 'f(2);', '', '// note', '// @ts-expect-error wrong on purpose', '// more', 'f(3);'];
-        assert.deepStrictEqual([2, 3, 8].map(line => suppressed(lines, line)), [true, false, true]);
-        assert.strictEqual(suppressed(['#!/usr/bin/env node', '// @ts-nocheck', '', 'f(1);'], 4), true);
-        assert.strictEqual(suppressed(['const a = 1;', '// @ts-nocheck', 'f(1);'], 3), false, 'a directive after code is a comment');
+    // What each checker's own scanner reads as "do not report this",
+    // measured form by form against tsc and pyright.
+    const silenced = (language, source, line, diagnostic = { kind: 'arity', name: 'f' }) => {
+        const lines = source.split('\n');
+        return langTraits(language).checkSuppressedAt({
+            ...diagnostic, line, lines, root: parseRevision(source, language), memo: new Map(),
+        });
+    };
+    it('typescript: a directive starts its comment and sits above the reported line', () => {
+        const ROWS = [
+            ['// @ts-ignore\nf(1);\n', 2, true],
+            ['// @ts-ignore\n\nf(1);\n', 3, true],
+            ['// @ts-ignore\n// another comment\nf(1);\n', 3, true],
+            ['/* @ts-ignore */\nf(1);\n', 2, true],
+            ['const a = 1; // @ts-ignore\nf(1);\n', 2, true],
+            ['//@ts-ignore\nf(1);\n', 2, true],
+            ['// @ts-expect-error on purpose\nf(1);\n', 2, true],
+            // The scanner matches a prefix.
+            ['// @ts-ignored\nf(1);\n', 2, true],
+            // Not at the start of its comment.
+            ['// see @ts-ignore\nf(1);\n', 2, false],
+            ['/* text @ts-ignore */\nf(1);\n', 2, false],
+            ['/**\n * @ts-ignore\n */\nf(1);\n', 4, false],
+            // Only blank lines and `//` comments may stand between.
+            ['// @ts-ignore\n/* a block comment */\nf(1);\n', 3, false],
+            ['// @ts-ignore\ng(1);\nf(1);\n', 3, false],
+            // A call over several lines is reported at the callee's name.
+            ['// @ts-ignore\nf(\n  1,\n);\n', 2, true],
+            ['f(\n  // @ts-ignore\n  1,\n);\n', 1, false],
+        ];
+        for (const [source, line, expected] of ROWS) assert.strictEqual(silenced('typescript', source, line), expected, source);
+        // A member call is reported at the member's name.
+        assert.strictEqual(silenced('typescript', 'k\n  // @ts-ignore\n  .f(1);\n', 3), true);
+        assert.strictEqual(silenced('typescript', '// @ts-ignore\nk\n  .f(1);\n', 3), false);
+        // One argument too many is reported at that argument.
+        const tooMany = { kind: 'arity', name: 'f', most: 1 };
+        assert.strictEqual(silenced('typescript', 'f(\n  1,\n  // @ts-ignore\n  2,\n);\n', 1, tooMany), true);
+        assert.strictEqual(silenced('typescript', '// @ts-ignore\nf(\n  1,\n  2,\n);\n', 2, tooMany), false);
+        // An import is reported at the name, or at the module string.
+        const named = { kind: 'import-name', name: 'gone' };
+        assert.strictEqual(silenced('typescript', 'import {\n  // @ts-ignore\n  gone,\n} from "./lib";\n', 1, named), true);
+        assert.strictEqual(silenced('typescript', '// @ts-ignore\nimport {\n  gone,\n} from "./lib";\n', 2, named), false);
+        assert.strictEqual(silenced('typescript', 'import { x } from\n  // @ts-ignore\n  "./gone";\n', 1, { kind: 'import-module' }), true);
         assert.strictEqual(langTraits('javascript').checkSuppressedAt, null, 'no checker, nothing to suppress');
     });
 
-    it('python: a comment on any line of the statement, or a directive before any code', () => {
-        const suppressed = langTraits('python').checkSuppressedAt;
-        const source = 'n = f(\n    1,\n)  # type: ignore\n\nif f(\n    1,\n):  # pyright: ignore\n    k = f(1)\nm = f(1)\n';
-        const root = parseRevision(source, 'python');
-        const lines = source.split('\n');
-        assert.deepStrictEqual([1, 5, 8, 9].map(line => suppressed(lines, line, () => root)), [true, true, false, false]);
-        // Without the tree only the line itself is read.
-        assert.deepStrictEqual([1, 3].map(line => suppressed(lines, line)), [false, true]);
-        assert.strictEqual(suppressed(['# pyright: basic', 'f(1)'], 2), true);
-        assert.strictEqual(suppressed(['"doc"', '# type: ignore', 'f(1)'], 3), false);
+    it('typescript: `@ts-nocheck` is a `//` comment before the first token', () => {
+        const ROWS = [
+            ['// @ts-nocheck\nf(1);\n', 2, true],
+            ['\n\n// @ts-nocheck\nf(1);\n', 4, true],
+            ['#!/usr/bin/env node\n// license\n\n/* more */\n// @ts-nocheck\nf(1);\n', 6, true],
+            ['/* @ts-nocheck */\nf(1);\n', 2, false],
+            ['// note @ts-nocheck\nf(1);\n', 2, false],
+            ['/**\n * @ts-nocheck\n */\nf(1);\n', 4, false],
+            ['g(1);\n// @ts-nocheck\n\nf(1);\n', 4, false],
+        ];
+        for (const [source, line, expected] of ROWS) assert.strictEqual(silenced('typescript', source, line), expected, source);
+    });
+
+    it('python: a comment on a line of the reported range, naming the rule when it names any', () => {
+        const ROWS = [
+            ['f(1)  # type: ignore\n', 1, true],
+            ['f(1)  # type: ignore[arg-type]\n', 1, true],
+            ['f(1)  #type:ignore\n', 1, true],
+            ['f(1)  # note # type: ignore\n', 1, true],
+            ['f(1)  # pyright: ignore\n', 1, true],
+            ['f(1)  # pyright: ignore[reportCallIssue]\n', 1, true],
+            ['f(1)  # pyright: ignore[reportAttributeAccessIssue, reportCallIssue]\n', 1, true],
+            // Another rule's ignore is not this one's.
+            ['f(1)  # pyright: ignore[reportAttributeAccessIssue]\n', 1, false],
+            ['f(1)  # see type: ignore\n', 1, false],
+            ['f(1)  # TYPE: IGNORE\n', 1, false],
+            ['f(1)  # type: ignored\n', 1, false],
+            ['f(1)  # noqa\n', 1, false],
+            ['f(1); s = "# type: ignore"\n', 1, false],
+            ['x = 1\n# type: ignore\nf(1)\n', 3, false],
+            // The whole call is the range; the rest of its statement is not.
+            ['n = f(\n    1,\n)  # type: ignore\n', 1, true],
+            ['total = [\n    f(1),\n    2,\n]  # type: ignore\n', 2, false],
+        ];
+        for (const [source, line, expected] of ROWS) assert.strictEqual(silenced('python', source, line), expected, source);
+        // One argument too many is reported at that argument.
+        const tooMany = { kind: 'arity', name: 'f', most: 1 };
+        assert.strictEqual(silenced('python', 'n = f(\n    1,\n    2,  # type: ignore\n)\n', 1, tooMany), true);
+        assert.strictEqual(silenced('python', 'n = f(  # type: ignore\n    1,\n    2,\n)\n', 1, tooMany), false);
+        // An import is reported at the name under one rule, at the module under another.
+        const named = { kind: 'import-name', name: 'GONE' };
+        assert.strictEqual(silenced('python', 'from lib import (\n    GONE,  # type: ignore\n    KEEP,\n)\n', 1, named), true);
+        assert.strictEqual(silenced('python', 'from lib import (  # type: ignore\n    GONE,\n    KEEP,\n)\n', 1, named), false);
+        assert.strictEqual(silenced('python', 'from lib import GONE  # pyright: ignore[reportAttributeAccessIssue]\n', 1, named), true);
+        assert.strictEqual(silenced('python', 'from lib import GONE  # pyright: ignore[reportMissingImports]\n', 1, named), false);
+        assert.strictEqual(silenced('python', 'from .gone import X  # pyright: ignore[reportMissingImports]\n', 1, { kind: 'import-module' }), true);
+    });
+
+    it('python: what a comment says about the whole file', () => {
+        const ROWS = [
+            ['# type: ignore\nf(1)\n', 2, true],
+            ['#!/usr/bin/env python\n# -*- coding: utf-8 -*-\n\n# type: ignore[arg-type]\nf(1)\n', 5, true],
+            ['"doc"\n# type: ignore\nf(1)\n', 3, false],
+            // A rule set chooses rules; it turns none off.
+            ['# pyright: basic\nf(1)\n', 2, false],
+            ['# pyright: standard\nf(1)\n', 2, false],
+            ['# pyright: strict\nf(1)\n', 2, false],
+            // A rule comment silences its own rule, wherever it stands alone on a line.
+            ['# pyright: reportCallIssue=false\nf(1)\n', 2, true],
+            ['# pyright: reportCallIssue=none\nf(1)\n', 2, true],
+            ['# pyright: reportCallIssue=warning\nf(1)\n', 2, true],
+            ['# pyright: reportCallIssue = false\nf(1)\n', 2, true],
+            ['# pyright: strict, reportCallIssue=false\nf(1)\n', 2, true],
+            ['f(1)\n# pyright: reportCallIssue=false\n', 1, true],
+            ['# pyright: reportCallIssue=true\nf(1)\n', 2, false],
+            ['# pyright: reportAttributeAccessIssue=false\nf(1)\n', 2, false],
+            ['# pyright: reportGeneralTypeIssues=false\nf(1)\n', 2, false],
+            ['# pyright: reportCallIssue=false\n# pyright: strict\nf(1)\n', 3, false],
+            ['# note: pyright: reportCallIssue=false\nf(1)\n', 2, false],
+            ['f(1)  # pyright: reportCallIssue=false\n', 1, false],
+            // Not file-wide, and not this checker's.
+            ['# pyright: ignore\nf(1)\n', 2, false],
+            ['# mypy: ignore-errors\nf(1)\n', 2, false],
+        ];
+        for (const [source, line, expected] of ROWS) assert.strictEqual(silenced('python', source, line), expected, source);
     });
 
     it('an import the judge resolves, and a call it does not', () => {
@@ -867,6 +969,53 @@ describe('check: what the project\'s own judge looks at', () => {
             ['blocked', ['deleted-still-imported'], [{ file: 'use.js', line: 1, kind: 'import' }]]);
         assert.deepStrictEqual(answer('let gone = null;\ntry {\n  gone = require("./gone");\n} catch (error) {\n  gone = null;\n}\nmodule.exports = gone;\n'),
             ['review', ['deleted-still-loaded-unchecked'], [{ file: 'use.js', line: 3, kind: 'import', unchecked: true }]]);
+    });
+
+    it('nothing read about a site outlives the check that read it', () => {
+        // The same index, rebuilt between two checks: the second reads the
+        // files as they are then.
+        const dir = repo({
+            'lib.ts': 'export function f(a: number) { return a; }\n',
+            'use.ts': 'import { f } from "./lib";\nf(1);\n',
+        });
+        try {
+            write(dir, 'lib.ts', 'export function f(a: number, b: number) { return a + b; }\n');
+            const live = idx(dir);
+            assert.strictEqual(execute(live, 'check', {}).result.trust.status, 'BLOCKED');
+            // The caller is repaired, and a new caller is written under a suppression.
+            write(dir, 'use.ts', 'import { f } from "./lib";\nf(1, 2);\n');
+            write(dir, 'extra.ts', 'import { f } from "./lib";\n// @ts-ignore\nf(1);\n');
+            live.build(null, { quiet: true });
+            const reused = execute(live, 'check', {}).result;
+            const fresh = execute(idx(dir), 'check', {}).result;
+            const answer = result => [result.trust.status, result.changed.map(item => [item.name, item.verdict, item.reasons])];
+            assert.deepStrictEqual(answer(reused), answer(fresh));
+            assert.strictEqual(reused.trust.status, 'REVIEW_REQUIRED');
+            // And the other way: the suppression is removed.
+            write(dir, 'extra.ts', 'import { f } from "./lib";\nf(1);\n');
+            live.build(null, { quiet: true });
+            assert.strictEqual(execute(live, 'check', {}).result.trust.status, 'BLOCKED');
+        } finally { rm(dir); }
+    });
+
+    it('what a callee declares is read again by the next check', () => {
+        const dir = repo({
+            'helpers.ts': 'export function stop() {\n  console.log("stop");\n}\n',
+            'lib.ts': 'import { stop } from "./helpers";\nexport function pick(k: string) {\n  if (k === "a") return 1;\n  return 2;\n}\nexport const s = stop;\n',
+        });
+        try {
+            // A bare call of a project function that declares nothing: it returns.
+            write(dir, 'lib.ts', 'import { stop } from "./helpers";\nexport function pick(k: string) {\n  if (k === "a") return 1;\n  stop();\n  return 2;\n}\nexport const s = stop;\n');
+            const live = idx(dir);
+            const pick = result => result.changed.find(item => item.name === 'pick').verdict;
+            assert.strictEqual(pick(execute(live, 'check', {}).result), 'ready');
+            // Now the callee is declared never to return: the same call ends the path.
+            write(dir, 'helpers.ts', 'export function stop(): never {\n  throw new Error("stop");\n}\n');
+            live.build(null, { quiet: true });
+            const reused = execute(live, 'check', {}).result;
+            const fresh = execute(idx(dir), 'check', {}).result;
+            assert.deepStrictEqual([pick(reused), pick(fresh)], ['review', 'review']);
+        } finally { rm(dir); }
     });
 
     it('a site under a suppression is listed and is not what blocks', () => {
@@ -915,9 +1064,9 @@ describe('check: what an object literal declared as a type has', () => {
             'const box: Box = Object.freeze({ size: () => 1 });',
         ];
         for (const source of OPEN) assert.strictEqual(members(`${source}\n`, 1)[1], true, source);
-        assert.strictEqual(members('// @ts-ignore\nconst box: Box = { size: () => 1 };\n', 2)[1], true);
-        assert.strictEqual(members('// @ts-nocheck\n\nconst box: Box = { size: () => 1 };\n', 3)[1], true);
-        assert.strictEqual(members('// a note\nconst box: Box = { size: () => 1 };\n', 2)[1], false);
+        // Whether the declaration is checked at all is the judge's
+        // question (`checkSuppressedAt`), not the literal's.
+        assert.strictEqual(members('// @ts-ignore\nconst box: Box = { size: () => 1 };\n', 2)[1], false);
         assert.strictEqual(members('const n = 1;\n', 1), null);
     });
 });
@@ -1170,6 +1319,12 @@ describe('check: an addition is inert only when nothing that existed can reach i
             { 'a.ts': 'class Box {\n  private count = 0;\n  size() { return this.count; }\n}\nnew Box().size();\n' },
             dir => edit(dir, 'a.ts', '  size() { return this.count; }\n', '  size() { return this.count; }\n  private freshlyNamed() { return 2; }\n'),
             'freshlyNamed:added=ready'],
+        // The constructor's type is its own contract: a static member is
+        // part of it whatever the instances are held to.
+        ['ts: a novel private static method of a class that declares a private member',
+            { 'a.ts': 'class Box {\n  private count = 0;\n  size() { return this.count; }\n}\nnew Box().size();\n' },
+            dir => edit(dir, 'a.ts', '  size() { return this.count; }\n', '  size() { return this.count; }\n  private static freshlyNamed() { return 2; }\n'),
+            'freshlyNamed:added=review(shape-of-existing-type)'],
         ['ts: a private constructor is not a private member',
             { 'a.ts': 'class Box {\n  private constructor() {}\n  size() { return 1; }\n}\nexport const box: Box = { size: () => 1 };\n' },
             dir => edit(dir, 'a.ts', '  size() { return 1; }\n', '  size() { return 1; }\n  private freshlyNamed() { return 2; }\n'),

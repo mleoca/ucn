@@ -5895,44 +5895,129 @@ function annotatedReceiverType(tree, line, column, receiver) {
     return typeNameFromAnnotation(parameter.childForFieldName('type')) || undefined;
 }
 
+// The comments the type checker reads as directives (pyright's tokenizer).
+const TYPE_IGNORE = /(^|#)\s*type:\s*ignore(\[[\s\w-,]*\]|\s|$)/;
+const PYRIGHT_IGNORE = /(^|#)\s*pyright:\s*ignore(?:\[([\s\w-,]*)\]|\s|$)/;
+const CHECK_MODES = new Set(['basic', 'standard', 'strict']);
+// The rule each kind of break is reported under.
+const RULE_OF = Object.freeze({
+    'arity': 'reportCallIssue',
+    'import-name': 'reportAttributeAccessIssue',
+    'import-module': 'reportMissingImports',
+    'undefined-name': 'reportUndefinedVariable',
+});
+
 /**
- * Has the type checker been told not to report line `line` (1-based)? A
- * `# type: ignore` or `# pyright: ignore` comment on any line of the
- * statement written there (a report covers a range, and a comment on any
- * line of the range silences it), or a checker directive comment before
- * any code of the file.
- *
- * @param {function} [rootOf] - returns the file's syntax tree; without it
- *   only the line itself is read
+ * What the comments of a file tell the checker:
+ *   all      a `type: ignore` comment before any token: nothing is reported;
+ *   lines    line -> null (everything on it is ignored: `type: ignore`,
+ *            `pyright: ignore`) or the rules a `pyright: ignore[..]` names;
+ *   levels   rule -> level set by `# pyright: rule=level` comments, which
+ *            apply to the file wherever they stand, alone on their line.
+ *            `basic`, `standard` and `strict` choose a rule set: none of
+ *            them turns a rule off.
  */
-function checkSuppressedAt(lines, line, rootOf = null) {
-    let first = line;
-    let last = line;
-    const root = rootOf ? rootOf() : null;
-    if (root) {
-        let statement = null;
-        for (let node = root; node;) {
-            const child = node.namedChildren.find(candidate =>
-                candidate.startPosition.row + 1 <= line && candidate.endPosition.row + 1 >= line);
-            if (!child) break;
-            if (node.type === 'module' || node.type === 'block') statement = child;
-            node = child;
+function checkDirectives(root, lines) {
+    const ignored = new Map();
+    const levels = new Map();
+    let all = false;
+    const firstToken = root.children.find(child => child.type !== 'comment');
+    const codeStart = firstToken ? firstToken.startIndex : Infinity;
+    for (const comment of root.descendantsOfType('comment')) {
+        const text = comment.text;
+        const line = comment.startPosition.row + 1;
+        if (TYPE_IGNORE.test(text)) {
+            if (comment.startIndex < codeStart) all = true;
+            else ignored.set(line, null);
         }
-        if (statement) {
-            // A compound statement's own lines end where its block begins.
-            const block = statement.namedChildren.find(candidate => candidate.type === 'block');
-            first = Math.min(line, statement.startPosition.row + 1);
-            last = Math.max(line, block ? block.startPosition.row : statement.endPosition.row + 1);
+        const scoped = PYRIGHT_IGNORE.exec(text);
+        if (scoped && !(ignored.has(line) && ignored.get(line) === null)) {
+            ignored.set(line, scoped[2] === undefined ? null
+                : scoped[2].split(',').map(rule => rule.trim()).filter(Boolean));
+        }
+        const value = text.slice(1).trim();
+        const ownLine = String(lines[line - 1] === undefined ? '' : lines[line - 1]).trim().startsWith('#');
+        if (!ownLine || !value.startsWith('pyright:')) continue;
+        const operands = value.slice('pyright:'.length);
+        if (operands.trim().startsWith('ignore')) continue;
+        const list = operands.split(',').map(operand => operand.trim()).filter(Boolean);
+        if (list.some(operand => CHECK_MODES.has(operand))) levels.clear();
+        for (const operand of list) {
+            const [rule, level] = operand.split('=').map(part => part.trim());
+            if (level !== undefined && rule) levels.set(rule, level);
         }
     }
+    return { all, ignored, levels };
+}
+
+/**
+ * The lines of the range the checker reports a break over: a comment on
+ * any of them silences the report.
+ *   arity           the whole call, or the first argument too many;
+ *   import-name     the imported name; import-module: the module name;
+ *   undefined-name  the line itself.
+ */
+function reportedLines(root, site) {
+    const line = site.line;
+    const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
+    const rows = node => [node.startPosition.row + 1, node.endPosition.row + 1];
+    const spans = node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line;
+    if (site.kind === 'arity') {
+        const calls = root.descendantsOfType('call', ...range).filter(call => {
+            const callee = call.childForFieldName('function');
+            const named = callee && (callee.childForFieldName('attribute') || callee);
+            return !!named && named.startPosition.row + 1 === line;
+        });
+        const nameOf = call => {
+            const callee = call.childForFieldName('function');
+            return (callee.childForFieldName('attribute') || callee).text;
+        };
+        const call = calls.find(candidate => site.name && nameOf(candidate) === site.name) || calls[0];
+        if (!call) return [line, line];
+        const given = (call.childForFieldName('arguments')?.namedChildren || [])
+            .filter(argument => argument.type !== 'comment');
+        if (Number.isInteger(site.most) && given.length > site.most) return rows(given[site.most]);
+        return rows(call);
+    }
+    if (site.kind === 'import-name' || site.kind === 'import-module') {
+        for (const statement of root.descendantsOfType(['import_from_statement', 'import_statement'], ...range)) {
+            if (!spans(statement)) continue;
+            if (site.kind === 'import-name') {
+                const named = statement.descendantsOfType(['dotted_name', 'identifier'])
+                    .find(node => node.text === site.name);
+                if (named) return rows(named);
+            }
+            const module = statement.childForFieldName('module_name') ||
+                statement.namedChildren.find(child => child.type === 'dotted_name' || child.type === 'aliased_import');
+            if (module) return rows(module);
+        }
+    }
+    return [line, line];
+}
+
+/**
+ * Has the type checker been told not to report this break? As pyright
+ * reads its comments: a `type: ignore` before any code, the break's rule
+ * set to anything but an error by a `# pyright:` comment, or a
+ * `type: ignore` / `pyright: ignore` comment (naming the rule, when it
+ * names any) on a line of the reported range.
+ *
+ * @param {object} site - { lines, root, line, kind, name, most, memo }
+ */
+function checkSuppressedAt(site) {
+    const { lines, root, memo } = site;
+    if (!root) return false;
+    if (memo && !memo.has('directives')) memo.set('directives', checkDirectives(root, lines));
+    const directives = memo ? memo.get('directives') : checkDirectives(root, lines);
+    if (directives.all) return true;
+    const rule = RULE_OF[site.kind] || null;
+    const level = rule ? directives.levels.get(rule) : undefined;
+    if (level !== undefined && level !== 'true' && level !== 'error') return true;
+    const [first, last] = reportedLines(root, site);
     for (let at = first; at <= last; at++) {
-        if (/#\s*(?:type|pyright):\s*ignore\b/.test(String(lines[at - 1] || ''))) return true;
-    }
-    for (const raw of lines) {
-        const text = String(raw).trim();
-        if (text === '') continue;
-        if (!text.startsWith('#')) break;
-        if (/^#\s*(?:type:\s*ignore|pyright:|mypy:)/.test(text)) return true;
+        if (!directives.ignored.has(at)) continue;
+        const rules = directives.ignored.get(at);
+        if (rules === null || (rule !== null && rules.includes(rule))) return true;
     }
     return false;
 }

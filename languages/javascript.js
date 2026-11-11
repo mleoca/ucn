@@ -5965,24 +5965,107 @@ function classMemberRole(classNode, name, line) {
     return null;
 }
 
-const isCommentLine = text => text.startsWith('//') || text.startsWith('/*') || text.startsWith('*');
+// The comments the TypeScript scanner reads as directives. A directive
+// starts its comment (`// @ts-ignore`, `/* @ts-ignore */`, the last line
+// of a block comment) and is matched as a prefix (`@ts-ignored` is one);
+// `@ts-nocheck` is a pragma of a `//` comment.
+const TS_DIRECTIVE_LINE = /^\/\/\/?\s*@(?:ts-expect-error|ts-ignore)/;
+const TS_DIRECTIVE_BLOCK = /^(?:\/|\*)*\s*@(?:ts-expect-error|ts-ignore)/;
+const TS_NOCHECK = /^\/\/\/?\s*@ts-nocheck(?=$|\s)/i;
+
+/** Lines that hold a directive comment, and whether the file is unchecked. */
+function checkDirectives(root) {
+    const lines = new Set();
+    let unchecked = false;
+    for (const comment of root.descendantsOfType('comment')) {
+        const text = comment.text;
+        const directive = text.startsWith('//') ? TS_DIRECTIVE_LINE.test(text)
+            : TS_DIRECTIVE_BLOCK.test(text.slice(text.lastIndexOf('\n') + 1).trimStart());
+        if (directive) lines.add(comment.endPosition.row + 1);
+    }
+    // The pragma is read from the comments before the first token.
+    for (const first of root.children) {
+        if (first.type === 'hash_bang_line') continue;
+        if (first.type !== 'comment') break;
+        if (first.text.startsWith('//') && TS_NOCHECK.test(first.text)) unchecked = true;
+    }
+    return { lines, unchecked };
+}
 
 /**
- * Has the type checker been told not to report line `line` (1-based)? A
- * `@ts-ignore` or `@ts-expect-error` comment directly above it, or a
- * `@ts-nocheck` comment before any code of the file.
+ * The line the compiler reports a break on: the token it underlines.
+ *   arity        the callee's name (the property of a member call), or the
+ *                first argument too many;
+ *   import-name  the imported name; import-module: the module string;
+ *   literal      the declared name of the variable the literal is assigned to.
+ * `site.line` is where the engine saw the site; the two differ when a
+ * statement runs over several lines.
  */
-function checkSuppressedAt(lines, line) {
-    for (let above = line - 2; above >= 0; above--) {
-        const text = String(lines[above]).trim();
-        if (!isCommentLine(text)) break;
-        if (/@ts-(?:ignore|expect-error)\b/.test(text)) return true;
+function reportedLine(root, site) {
+    const line = site.line;
+    const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
+    const spans = node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line;
+    if (site.kind === 'arity') {
+        for (const call of root.descendantsOfType(['call_expression', 'new_expression'], ...range)) {
+            const callee = call.childForFieldName(call.type === 'new_expression' ? 'constructor' : 'function');
+            const named = callee && (callee.childForFieldName('property') || callee);
+            if (!named || named.startPosition.row + 1 !== line) continue;
+            if (call.type === 'call_expression' && site.name && named.text !== site.name) continue;
+            const given = (call.childForFieldName('arguments')?.namedChildren || [])
+                .filter(argument => argument.type !== 'comment');
+            if (Number.isInteger(site.most) && given.length > site.most) {
+                return given[site.most].startPosition.row + 1;
+            }
+            return (call.type === 'new_expression' ? call : named).startPosition.row + 1;
+        }
+        return line;
     }
-    for (const raw of lines) {
-        const text = String(raw).trim();
-        if (text === '' || text.startsWith('#!')) continue;
-        if (!isCommentLine(text)) break;
-        if (/@ts-nocheck\b/.test(text)) return true;
+    if (site.kind === 'import-name' || site.kind === 'import-module') {
+        for (const statement of root.descendantsOfType(['import_statement', 'export_statement'], ...range)) {
+            if (!spans(statement)) continue;
+            if (site.kind === 'import-name') {
+                const clause = statement.descendantsOfType('import_clause')[0];
+                const named = site.name === 'default' ? (clause ? clause.namedChildren[0] : null)
+                    : statement.descendantsOfType(['identifier', 'property_identifier', 'type_identifier'])
+                        .find(node => node.text === site.name);
+                if (named) return named.startPosition.row + 1;
+            }
+            const source = statement.childForFieldName('source');
+            if (source) return source.startPosition.row + 1;
+        }
+        const written = root.descendantsOfType('string', ...range).find(node => node.startPosition.row + 1 >= line);
+        return written ? written.startPosition.row + 1 : line;
+    }
+    if (site.kind === 'literal') {
+        for (const declarator of root.descendantsOfType('variable_declarator', ...range)) {
+            const value = declarator.childForFieldName('value');
+            if (value && value.startPosition.row + 1 === line) {
+                return (declarator.childForFieldName('name') || declarator).startPosition.row + 1;
+            }
+        }
+    }
+    return line;
+}
+
+/**
+ * Has the type checker been told not to report this break? As its own
+ * scanner decides: the file carries `@ts-nocheck`, or walking up from the
+ * line the break is reported on, through blank lines and `//` comments
+ * only, there is a line that holds a directive comment.
+ *
+ * @param {object} site - { lines, root, line, kind, name, most, memo }:
+ *   `memo` is a Map kept per file for one operation
+ */
+function checkSuppressedAt(site) {
+    const { lines, root, memo } = site;
+    if (!root) return false;
+    if (memo && !memo.has('directives')) memo.set('directives', checkDirectives(root));
+    const directives = memo ? memo.get('directives') : checkDirectives(root);
+    if (directives.unchecked) return true;
+    for (let above = reportedLine(root, site) - 1; above >= 1; above--) {
+        if (directives.lines.has(above)) return true;
+        const text = String(lines[above - 1] === undefined ? '' : lines[above - 1]).trim();
+        if (text !== '' && !/^\/\/.*$/.test(text)) return false;
     }
     return false;
 }
@@ -6027,7 +6110,6 @@ function checkedImportAt(root, line, typed) {
 // not write `toString` still has one.
 const OBJECT_MEMBERS = ['constructor', 'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty',
     'isPrototypeOf', 'propertyIsEnumerable'];
-const CHECK_SUPPRESSION = /@ts-(?:ignore|expect-error|nocheck)\b/;
 
 /**
  * The name a literal's key gives its member, or null when it cannot be
@@ -6044,11 +6126,10 @@ function literalKeyName(key) {
 /**
  * Members of the object literal that starts on `line` and is the whole
  * value of a declaration with a type annotation (`const box: Box = {..}`),
- * with the members every object has. `open`: what the literal has, or
- * whether it is checked at all, cannot be read: a spread, a computed,
- * escaped or numeric key; a literal that is not the declared value itself
- * (an assertion or a call around it decides its type); a comment that
- * tells the checker to skip the declaration or the file.
+ * with the members every object has. `open`: what the literal has cannot
+ * be read: a spread, a computed, escaped or numeric key; a literal that is
+ * not the declared value itself (an assertion or a call around it decides
+ * its type).
  * @returns {{names: Set<string>, open: boolean}|null} null: no object
  *   literal starts on that line
  */
@@ -6072,16 +6153,6 @@ function typedLiteralMembers(root, line) {
         const name = key ? literalKeyName(key) : null;
         if (name !== null) names.add(name);
         else open = true;
-    }
-    // The statement the declaration is, and what is written above it.
-    let statement = declared[0];
-    while (statement.parent && statement.parent.id !== root.id) statement = statement.parent;
-    for (let above = statement.previousSibling; above && above.type === 'comment'; above = above.previousSibling) {
-        if (CHECK_SUPPRESSION.test(above.text)) open = true;
-    }
-    for (const first of root.children) {
-        if (first.type !== 'comment') break;
-        if (/@ts-nocheck\b/.test(first.text)) open = true;
     }
     return { names, open };
 }

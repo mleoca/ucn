@@ -172,13 +172,14 @@ function treeReader(index) {
  *   'shape'     the type is something else to existing code, with no value
  *               that can be shown to lack the member: a public member of a
  *               class held by its own declaration (seen by `keyof` only),
- *               a static member (the constructor is compared by shape
- *               too), an optional member, a member whose role cannot be
- *               read; and a virtual member where that changes what the
- *               type is (trait `virtualMemberChangesShape`);
- *   null        nothing: a private or protected member of a class that
- *               already declares one, which no other code can hold, name
- *               or enumerate.
+ *               a static member, hidden or not (the constructor is
+ *               compared by shape whatever its instances are held to), an
+ *               optional member, a member whose role cannot be read; and a
+ *               virtual member where that changes what the type is (trait
+ *               `virtualMemberChangesShape`);
+ *   null        nothing: a private or protected INSTANCE member of a class
+ *               that already declares one, which no other code can hold,
+ *               name or enumerate.
  *
  * "Declares one of its own" is asked of the class AS IT WAS: members on
  * lines the change added are left out (the first private member of a class
@@ -201,8 +202,12 @@ function shapeChangeOf(index, definition, addedLinesByFile = null) {
         if (!member) { change = 'shape'; continue; }
         const added = (addedLinesByFile && addedLinesByFile.get(owner.relativePath)) || null;
         const ownDeclaration = !traits.classComparedByShape(node, added);
+        // The constructor's type is its own contract: a static member is
+        // part of it whatever the instances are held to, private included
+        // (anything with a matching construct signature was a `typeof T`).
+        if (member.role === 'static') { change = 'shape'; continue; }
         if (member.hidden && ownDeclaration) continue;
-        if (member.role !== 'static' && (member.hidden || (member.role === 'instance' && !ownDeclaration))) return 'required';
+        if (member.hidden || (member.role === 'instance' && !ownDeclaration)) return 'required';
         change = 'shape';
     }
     return change;
