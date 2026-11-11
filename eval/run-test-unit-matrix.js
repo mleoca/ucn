@@ -27,7 +27,10 @@
  * nothing runs (EMPTY-FILE) must be named by its case, and a file's count
  * must be the number of its listed tests that are not skipped (COUNT).
  * WRONG-SELECTOR is a command that runs nothing, something else, or more
- * than its unit (a second declaration of the same name included).
+ * than its unit (a second declaration of the same name included), and a
+ * joined command that does not run exactly what the files' own commands
+ * run. REPEATED is a body that executes more often than the tests listed
+ * for it, unless the case says the declaration stands for several.
  * FALSE-SUPPORT is a file called support that the runner executes tests
  * from. UNDECLARED is a test the runner executes and the engine does not
  * list: each one must be named by its case (a measured limit), never a
@@ -109,6 +112,24 @@ function materialize(name, content) {
     return content.split('\n').map((line, i) => rewrite(rewrite(line, i, '"'), i, "'")).join('\n');
 }
 
+/**
+ * The identity a case's `<file>::<label>` has once the project is written
+ * out: the line its mark stands on. A name that is no such mark (a line
+ * identity, a run-time label) is itself.
+ */
+function namedIdentities(testCase) {
+    const lines = new Map();
+    for (const [name, content] of Object.entries(testCase.files)) {
+        content.split('\n').forEach((line, i) => {
+            for (const found of line.matchAll(/mark\(\s*(["'])([^"'\n]*?::[^"'\n]*)\1\s*\)/gi)) {
+                if (found[2].startsWith(`${name}::`) && !lines.has(found[2])) lines.set(found[2], `${name}:${i + 1}`);
+            }
+        });
+    }
+    const resolve = list => (list || []).map(id => lines.get(id) || id);
+    return { ...testCase, undeclared: resolve(testCase.undeclared), repeats: resolve(testCase.repeats) };
+}
+
 function writeProject(dir, files) {
     for (const [name, content] of Object.entries(files)) {
         const target = path.join(dir, name);
@@ -157,6 +178,9 @@ function answerOf(dir) {
                     startLine: unit.startLine, endLine: unit.endLine, line: unit.line,
                     selector, conditional: !!unit.conditional, skipped: !!unit.skipped,
                     inherited: !!unit.inherited,
+                    // A declaration the engine says stands for several tests.
+                    generated: unit.dynamic === 'generated-cases' || unit.dynamic === 'name-not-literal' ||
+                        unit.dynamic === 'suite-name-not-literal' || unit.dynamic === 'declared-indirectly',
                     // Where the body of an inherited test stands.
                     ...(unit.inherited && {
                         origin: {
@@ -191,8 +215,11 @@ function runRecorded(commandLine, cwd, env) {
     } catch {
         ran = [];
     }
+    const counts = {};
+    for (const id of ran) counts[id] = (counts[id] || 0) + 1;
     return {
         ran: [...new Set(ran)].sort(),
+        counts,
         status: result.status,
         output: `${result.stdout || ''}${result.stderr || ''}`,
     };
@@ -230,9 +257,10 @@ function labelOf(unit) {
  * @param {object} testCase - the case (its named exceptions)
  * @param {{units: object[], files: object[]}} answer
  * @param {string[]} ran - identities the whole run executed
+ * @param {Object<string, number>} [counts] - how often each one executed
  * @returns {{problems: Array<{kind: string, detail: string}>, undeclared: string[]}}
  */
-function judgeWholeRun(testCase, answer, ran) {
+function judgeWholeRun(testCase, answer, ran, counts = {}) {
     const problems = [];
     const fail = (kind, detail) => problems.push({ kind, detail });
     for (const unit of answer.units) {
@@ -268,7 +296,38 @@ function judgeWholeRun(testCase, answer, ran) {
     if (!sameSet(undeclared, allowed)) {
         fail('UNDECLARED', `the runner executes [${undeclared.join(', ')}], the case names [${allowed.join(', ')}]`);
     }
+    // One declaration is one test: a body that executes more often than
+    // the tests listed for it is a test the engine does not list (a second
+    // name for one function, a class collected twice), unless the case
+    // says the declaration stands for several (a table of cases, a loop).
+    const repeated = ran.filter(id => {
+        const owners = answer.units.filter(unit => !unit.skipped && owns(unit, id));
+        if (owners.some(unit => unit.conditional || unit.generated)) return false;
+        return (counts[id] || 1) > Math.max(1, owners.length);
+    }).sort();
+    if (!sameSet(repeated, (testCase.repeats || []).slice().sort())) {
+        fail('REPEATED', `executed more often than the tests listed for them [${repeated.map(id => `${id} x${counts[id]}`).join(', ')}], the case names [${(testCase.repeats || []).slice().sort().join(', ')}]`);
+    }
     return { problems, undeclared };
+}
+
+/**
+ * What the joined commands say against the files' own: together they must
+ * execute exactly what the files' own commands execute one by one. A test
+ * one file's command runs and the joined one drops (a focus in another
+ * file of the same run) is lost; one only the joined command runs was never
+ * offered by a file.
+ * @param {string[]} own - identities the files' own commands executed
+ * @param {string[]} joined - identities the joined commands executed
+ * @returns {Array<{kind: string, detail: string}>}
+ */
+function judgeJoined(own, joined) {
+    const problems = [];
+    const lost = [...new Set(own)].filter(id => !joined.includes(id)).sort();
+    const extra = [...new Set(joined)].filter(id => !own.includes(id)).sort();
+    if (lost.length > 0) problems.push({ kind: 'WRONG-SELECTOR', detail: `the joined commands do not run ${lost.join(', ')}, which the files' own commands run` });
+    if (extra.length > 0) problems.push({ kind: 'WRONG-SELECTOR', detail: `the joined commands run ${extra.join(', ')}, which no file's own command runs` });
+    return problems;
 }
 
 function main() {
@@ -332,16 +391,18 @@ function main() {
                 fail('RUNNER-RAN-NOTHING', `${testCase.full || spec.full} (exit ${full.status})\n${full.output.slice(-1500)}`);
                 continue;
             }
-            const whole = judgeWholeRun(testCase, answer, full.ran);
+            const whole = judgeWholeRun(namedIdentities(testCase), answer, full.ran, full.counts);
             for (const problem of whole.problems) fail(problem.kind, problem.detail);
             totals.undeclared += whole.undeclared.length;
             const empty = [];
+            const ownRan = new Set();
             for (const file of answer.files) {
                 if (file.role !== 'tests' || !file.run) continue;
                 // What the file's own tests executed in the whole run.
                 const mine = full.ran.filter(id => answer.units.some(unit => unit.file === file.file && owns(unit, id)));
                 totals.fileCommands++;
                 const got = runRecorded(file.run, dir, env);
+                for (const id of got.ran) ownRan.add(id);
                 if (got.ran.length === 0) empty.push(file.file);
                 const lost = mine.filter(id => !got.ran.includes(id));
                 if (lost.length > 0) {
@@ -352,16 +413,16 @@ function main() {
             if (!sameSet(empty, (testCase.emptyTestFiles || []).slice().sort())) {
                 fail('EMPTY-FILE', `test files whose command runs nothing [${empty.join(', ')}], the case names [${(testCase.emptyTestFiles || []).slice().sort().join(', ')}]`);
             }
-            // Joined commands run what the files' own commands run, and a
-            // file that has no command of its own is in none of them.
-            const reachable = full.ran.filter(id => answer.units.some(unit => owns(unit, id) &&
-                answer.files.some(file => file.file === unit.file && file.role === 'tests' && file.run)));
-            if (answer.commands.length > 0 && reachable.length > 0) {
+            // Joined commands run what the files' own commands run, no
+            // less and no more, and a file that has no command of its own
+            // is in none of them.
+            if (answer.commands.length > 0) {
                 totals.joined = (totals.joined || 0) + answer.commands.length;
                 const ran = new Set();
                 for (const line of answer.commands) for (const id of runRecorded(line, dir, env).ran) ran.add(id);
-                const lost = reachable.filter(id => !ran.has(id));
-                if (lost.length > 0) fail('WRONG-SELECTOR', `the joined commands [${answer.commands.join(' ; ')}] do not run ${lost.join(', ')}`);
+                for (const problem of judgeJoined([...ownRan], [...ran])) {
+                    fail(problem.kind, `${problem.detail} [${answer.commands.join(' ; ')}]`);
+                }
             }
             for (const file of answer.files) {
                 if (file.role === 'tests' && file.run) continue;
@@ -417,4 +478,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { answerOf, materialize, judgeWholeRun, RUNNERS };
+module.exports = { answerOf, materialize, judgeWholeRun, judgeJoined, namedIdentities, RUNNERS };

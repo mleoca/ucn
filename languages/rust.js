@@ -6398,6 +6398,12 @@ function rustMacroNamespaceName(node, parent, attributeNode) {
 const RUST_CASE_ATTRIBUTES = new Set(['rstest', 'test_case', 'test_matrix', 'parameterized', 'test_casing',
     'apply', 'quickcheck', 'proptest', 'test_resources', 'datatest']);
 
+// Attributes of the language that leave a test as it is. Any other is a
+// macro that rewrites the function: what then runs is not read.
+const RUST_INERT_ATTRIBUTES = new Set(['test', 'ignore', 'should_panic', 'cfg', 'cfg_attr', 'allow', 'warn', 'deny',
+    'forbid', 'expect', 'doc', 'inline', 'cold', 'must_use', 'deprecated', 'track_caller', 'no_mangle', 'case',
+    'values', 'timeout']);
+
 /**
  * The tests a Rust file declares, as the test harness lists them: a
  * function carrying #[test] or an attribute whose path ends in ::test
@@ -6412,7 +6418,8 @@ function testUnits(fileEntry, helpers) {
     for (const symbol of fileEntry.symbols || []) {
         if (symbol.type !== 'function') continue;
         const attributes = symbol.attributesWithArgs || [];
-        const names = attributes.map(attribute => String(attribute.name));
+        // The attribute's path: `ignore = "why"` is the attribute `ignore`.
+        const names = attributes.map(attribute => String(attribute.name).split(/[\s=(]/)[0]);
         const plain = names.some(name => /(^|::)test$/.test(name));
         const cases = names.some(name => RUST_CASE_ATTRIBUTES.has(name.split('::').pop()));
         if (!plain && !cases) continue;
@@ -6430,6 +6437,9 @@ function testUnits(fileEntry, helpers) {
             // Declared, and left out of a run unless asked for.
             ...(names.includes('ignore') && { ignored: true, skipped: true }),
             ...((ownGate || gates > (inTestModule ? 1 : 0)) && { conditional: true, notInEveryBuild: true }),
+            ...(!(ownGate || gates > (inTestModule ? 1 : 0)) && names.some(name => !/(^|::)test$/.test(name) &&
+                !RUST_INERT_ATTRIBUTES.has(name) && !RUST_CASE_ATTRIBUTES.has(name.split('::').pop()) &&
+                !/^(clippy|rustfmt|rustc|diagnostic)(::|_)/.test(name)) && { conditional: true }),
             ...(cases && { dynamic: 'generated-cases' }),
         });
     }

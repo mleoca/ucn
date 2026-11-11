@@ -399,6 +399,9 @@ const STRUCTURAL_TRAITS = {
     // what a selector needs (core/test-units.js). Null: the language's
     // tests are not read, and nothing is said about them.
     testUnits: null,
+    // (fileEntry, helpers) => boolean: does this file hold code the runner
+    // asks at run time that may leave tests out (a conftest hook, a TestMain).
+    testGate: null,
     // Which family of runners executes the language's tests; the family's
     // manifests are the evidence a runner is named on. Null: none modeled.
     testRunnerFamily: null,
@@ -725,6 +728,9 @@ const NOMINAL_TRAITS = {
     // what a selector needs (core/test-units.js). Null: the language's
     // tests are not read, and nothing is said about them.
     testUnits: null,
+    // (fileEntry, helpers) => boolean: does this file hold code the runner
+    // asks at run time that may leave tests out (a conftest hook, a TestMain).
+    testGate: null,
     // Which family of runners executes the language's tests; the family's
     // manifests are the evidence a runner is named on. Null: none modeled.
     testRunnerFamily: null,
@@ -976,6 +982,7 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./python').testUnits(fileEntry, helpers),
+            testGate: (fileEntry, helpers) => require('./python').testGate(fileEntry, helpers),
             testRunnerFamily: 'python',
             testFileNames: [/^test_[^/]*\.py$/, /_test\.py$/],
             // `yield` in the body makes the callable a generator.
@@ -1105,6 +1112,7 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./go').testUnits(fileEntry, helpers),
+            testGate: (fileEntry, helpers) => require('./go').testGate(fileEntry, helpers),
             testRunnerFamily: 'go',
             testFileNames: [/_test\.go$/],
             selfParam: null,

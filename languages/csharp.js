@@ -2980,6 +2980,18 @@ function usagesInTree(code, name, parser, tree) {
 
 const CSHARP_TEST_ATTRIBUTES = new Set(['Fact', 'Theory', 'Test', 'TestCase', 'TestCaseSource',
     'TestMethod', 'DataTestMethod', 'SkippableFact', 'SkippableTheory']);
+// Attributes whose own arguments can leave a test, or one of its rows, out.
+const CSHARP_ROW_ATTRIBUTES = new Set(['InlineData', 'DataRow', 'TestCase', 'TestCaseSource']);
+// Attributes of the test frameworks and of the language that leave what
+// runs alone. Any other attribute on a test or its class may not.
+const CSHARP_INERT_ATTRIBUTES = new Set([...CSHARP_TEST_ATTRIBUTES, ...CSHARP_ROW_ATTRIBUTES,
+    'MemberData', 'ClassData', 'Trait', 'Collection', 'CollectionDefinition', 'Category', 'Description', 'Order',
+    'Timeout', 'MaxTime', 'Repeat', 'Retry', 'Property', 'Author', 'TestOf', 'Values', 'Range', 'ValueSource',
+    'Combinatorial', 'Pairwise', 'Sequential', 'TestFixture', 'SetUp', 'TearDown', 'OneTimeSetUp',
+    'OneTimeTearDown', 'NonParallelizable', 'Parallelizable', 'TestClass', 'TestInitialize', 'TestCleanup',
+    'ClassInitialize', 'ClassCleanup', 'DynamicData', 'TestCategory', 'Priority', 'Owner', 'TestProperty',
+    'DeploymentItem', 'WorkItem', 'DoNotParallelize', 'Obsolete', 'SuppressMessage', 'DebuggerStepThrough',
+    'ExcludeFromCodeCoverage', 'Ignore']);
 
 /**
  * The tests a C# file declares: a method carrying a test attribute of
@@ -2988,26 +3000,158 @@ const CSHARP_TEST_ATTRIBUTES = new Set(['Fact', 'Theory', 'Test', 'TestCase', 'T
  * runs through the closed types that derive from it. `classes` says, for
  * every type, what it derives from and which tests it declares, so the
  * tests a concrete class inherits can be found.
+ *
+ * What leaves a test out is read from the attribute's arguments as
+ * syntax: xUnit's Skip is a value, and only a string that is neither null
+ * nor empty skips (null, default, a cast null, an empty string and a
+ * constant of the file holding one of those do not; a constant declared
+ * elsewhere is not read: the test is conditional). [Ignore] skips; with
+ * Until it does so for a time. An attribute that is none of the
+ * frameworks' own may do anything: the test is conditional.
  */
 function testUnits(fileEntry, helpers) {
     const symbols = fileEntry.symbols || [];
+    const tree = helpers.tree();
+    if (!tree) return null;
     const units = [];
     const testsIn = new Map();
     const declared = new Map();
     const attributeNames = symbol => (symbol.decorators || [])
         .map(name => String(name).split('.').pop().replace(/Attribute$/, ''));
-    // [Ignore] (NUnit, MSTest) and Skip = "..." (xUnit): declared, not executed.
-    const withoutStrings = text => String(text || '')
-        .replace(/@"(?:[^"]|"")*"/g, '""').replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'(?:[^'\\]|\\.)*'/g, "''");
-    const skipped = symbol => attributeNames(symbol).includes('Ignore') ||
-        (symbol.attributesWithArgs || []).some(attribute => /(^|[\s,(])Skip\s*=/.test(withoutStrings(attribute.args)));
+
+    // Attributes as written, by the rows a declaration starts and is named
+    // on; constants of the file, by name and by `Type.Name`.
+    const written = new Map();
+    const constants = new Map();
+    const noteConstant = (key, node) => constants.set(key, constants.has(key) ? null : node);
+    const readAttribute = attribute => {
+        const head = attribute.namedChildren[0];
+        const list = attribute.namedChildren.find(child => child.type === 'attribute_argument_list');
+        return {
+            name: head ? head.text.replace(/<.*$/, '').split('.').pop().replace(/Attribute$/, '') : '',
+            args: (list ? list.namedChildren : []).filter(child => child.type === 'attribute_argument').map(argument => {
+                const inner = argument.namedChildren[argument.namedChildCount - 1];
+                if (inner && inner.type === 'assignment_expression') {
+                    return { name: inner.childForFieldName('left')?.text || null, value: inner.childForFieldName('right') };
+                }
+                return { name: null, value: inner || null };
+            }),
+        };
+    };
+    const visit = (node, owner) => {
+        let inner = owner;
+        if (/_declaration$/.test(node.type)) {
+            const name = node.childForFieldName('name');
+            const lists = node.namedChildren.filter(child => child.type === 'attribute_list');
+            if (name && lists.length > 0) {
+                const attributes = lists.flatMap(list => list.namedChildren.filter(child => child.type === 'attribute'))
+                    .map(readAttribute);
+                written.set(name.startPosition.row, attributes);
+                if (!written.has(node.startPosition.row)) written.set(node.startPosition.row, attributes);
+            }
+            if (name && /^(class|struct|record|interface)_declaration$/.test(node.type)) inner = name.text;
+            if (node.type === 'field_declaration' &&
+                node.namedChildren.some(child => child.type === 'modifier' && child.text === 'const')) {
+                const declaration = node.namedChildren.find(child => child.type === 'variable_declaration');
+                for (const declarator of declaration ? declaration.namedChildren : []) {
+                    if (declarator.type !== 'variable_declarator' || declarator.namedChildCount < 2) continue;
+                    const value = declarator.namedChildren[declarator.namedChildCount - 1];
+                    noteConstant(declarator.namedChildren[0].text, value);
+                    if (owner) noteConstant(`${owner}.${declarator.namedChildren[0].text}`, value);
+                }
+            }
+        }
+        for (const child of node.namedChildren) visit(child, inner);
+    };
+    visit(tree.rootNode, null);
+    // What a string-typed constant expression holds: 'null', 'empty',
+    // 'text', or null when it is not read here.
+    const textOf = (node, owner, depth = 0) => {
+        if (!node || depth > 6) return null;
+        switch (node.type) {
+            case 'null_literal': case 'default_expression': return 'null';
+            case 'string_literal': return node.text === '""' ? 'empty' : 'text';
+            case 'verbatim_string_literal': return node.text === '@""' ? 'empty' : 'text';
+            case 'raw_string_literal': return 'text';
+            case 'parenthesized_expression': return textOf(node.namedChildren[0], owner, depth + 1);
+            case 'cast_expression': return textOf(node.namedChildren[node.namedChildCount - 1], owner, depth + 1);
+            case 'invocation_expression':
+                // nameof(...) is the name: a string that is not empty.
+                return node.namedChildren[0] && node.namedChildren[0].text === 'nameof' ? 'text' : null;
+            case 'binary_expression': {
+                if (!node.children.some(child => child.type === '+')) return null;
+                const left = textOf(node.namedChildren[0], owner, depth + 1);
+                const right = textOf(node.namedChildren[node.namedChildCount - 1], owner, depth + 1);
+                if (left === 'text' || right === 'text') return 'text';
+                return left && right ? 'empty' : null;
+            }
+            case 'identifier': {
+                const held = constants.get(`${owner}.${node.text}`) || (owner ? null : constants.get(node.text));
+                return held ? textOf(held, owner, depth + 1) : null;
+            }
+            case 'member_access_expression': {
+                const held = constants.get(node.text.replace(/\s+/g, '').split('.').slice(-2).join('.'));
+                return held ? textOf(held, owner, depth + 1) : null;
+            }
+            default: return null;
+        }
+    };
+    const attributesOf = symbol => written.get((symbol.nameLine || symbol.startLine) - 1) ||
+        written.get(symbol.startLine - 1) || [];
+    /** 'skip', 'sometimes' or null: what a declaration's attributes do to its tests. */
+    const stateOf = (symbol, owner) => {
+        let answer = null;
+        const weaker = () => {
+            if (answer !== 'skip') answer = 'sometimes';
+        };
+        const attributes = attributesOf(symbol);
+        const makers = attributes.filter(attribute => CSHARP_TEST_ATTRIBUTES.has(attribute.name)).length;
+        for (const attribute of attributes) {
+            if (attribute.name === 'Ignore') {
+                // [Ignore("...", Until = "...")] ignores for a time.
+                if (attribute.args.some(argument => argument.name === 'Until')) weaker();
+                else answer = 'skip';
+                continue;
+            }
+            if (!CSHARP_INERT_ATTRIBUTES.has(attribute.name)) {
+                weaker();
+                continue;
+            }
+            for (const argument of attribute.args) {
+                if (!argument.name) continue;
+                if (/^(Skip|Ignore|IgnoreReason|IgnoreMessage)$/.test(argument.name)) {
+                    const held = textOf(argument.value, owner);
+                    if (held === 'text' && makers <= 1 && !CSHARP_ROW_ATTRIBUTES.has(attribute.name)) answer = 'skip';
+                    else if (held === 'text' && makers <= 1 && attribute.name === 'TestCase' &&
+                        attributes.filter(other => other.name === 'TestCase').length === 1) answer = 'skip';
+                    // Only xUnit's Skip takes null or an empty string and runs.
+                    else if (held === 'text' || held == null || argument.name !== 'Skip') weaker();
+                } else if (/^(Explicit|SkipUnless|SkipWhen|SkipType|SkipExceptions)$/.test(argument.name)) {
+                    weaker();
+                }
+            }
+        }
+        return answer;
+    };
     const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract') &&
         !(Array.isArray(cls.generics) ? cls.generics.length > 0 : !!cls.generics) &&
         !(cls.typeParameters && cls.typeParameters.length > 0);
+    // An attribute class of the project that derives from a framework's
+    // test attribute declares a test too ([RetryFact] : FactAttribute).
+    const derivedMemo = new Map();
+    const derivedTest = name => {
+        if (!derivedMemo.has(name)) {
+            const above = [...helpers.ancestors(`${name}Attribute`), ...helpers.ancestors(name)]
+                .map(base => String(base).split('.').pop().replace(/Attribute$/, ''));
+            derivedMemo.set(name, above.find(base => CSHARP_TEST_ATTRIBUTES.has(base)) || null);
+        }
+        return derivedMemo.get(name);
+    };
     for (const symbol of symbols) {
         if (!symbol.isMethod || symbol.type === 'constructor') continue;
         const attributes = (symbol.decorators || [])
-            .map(name => String(name).split('.').pop().replace(/Attribute$/, ''));
+            .map(name => String(name).split('.').pop().replace(/Attribute$/, ''))
+            .flatMap(name => CSHARP_TEST_ATTRIBUTES.has(name) || !derivedTest(name) ? [name] : [name, derivedTest(name)]);
         if (!attributes.some(name => CSHARP_TEST_ATTRIBUTES.has(name))) continue;
         const chain = helpers.enclosing(symbol).filter(outer => outer.type !== 'namespace');
         if (chain.length === 0 || chain.some(outer => !helpers.isContainer(outer))) continue;
@@ -3018,13 +3162,14 @@ function testUnits(fileEntry, helpers) {
         if (!xunit && !(symbol.modifiers || []).includes('public')) continue;
         if (attributes.some(name => name === 'TestMethod' || name === 'DataTestMethod') &&
             !attributeNames(chain[chain.length - 1]).includes('TestClass')) continue;
-        const off = [symbol, ...chain].some(skipped);
+        const owner = chain[chain.length - 1];
+        const states = [stateOf(symbol, owner.name), ...chain.map((cls, i) => stateOf(cls, i > 0 ? chain[i - 1].name : null))];
         const row = {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
-            ...(off && { skipped: true }),
+            ...(states.includes('skip') && { skipped: true }),
+            ...(!states.includes('skip') && states.includes('sometimes') && { conditional: true }),
         };
-        const owner = chain[chain.length - 1];
         if (!declared.has(owner)) declared.set(owner, []);
         declared.get(owner).push(row);
         if (chain.some(cls => !concrete(cls))) continue;
@@ -3044,7 +3189,8 @@ function testUnits(fileEntry, helpers) {
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases,
             runnable: [...chain, cls].every(concrete),
-            ...([...chain, cls].some(skipped) && { skipped: true }),
+            ...([...chain, cls].some(each => stateOf(each, null) === 'skip') && { skipped: true }),
+            ...([...chain, cls].some(each => stateOf(each, null) === 'sometimes') && { sometimes: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
             members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&

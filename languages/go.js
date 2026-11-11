@@ -3853,6 +3853,52 @@ function selectorReceiverIsLocal(tree, line, column) {
  * Benchmark runs only when asked for, so it is not one of the tests.
  */
 /**
+ * Does a Go test file hold a TestMain that may keep the package's tests
+ * from running. A TestMain decides nothing when the first statement of
+ * its body that can end it or run the tests is a plain statement holding
+ * `m.Run()` (`os.Exit(m.Run())`, `code := m.Run()`): nothing before it
+ * returns or exits. One that exits or returns in a branch first, never
+ * calls Run, or hands `m` to something else, decides.
+ */
+function testGate(fileEntry, helpers) {
+    if (!/_test\.go$/.test(fileEntry.relativePath)) return false;
+    if (!(fileEntry.symbols || []).some(symbol => symbol.name === 'TestMain' && !symbol.className)) return false;
+    const tree = helpers.tree();
+    if (!tree) return true;
+    const main = tree.rootNode.namedChildren.find(node => node.type === 'function_declaration' &&
+        node.childForFieldName('name')?.text === 'TestMain');
+    if (!main) return true;
+    const body = main.childForFieldName('body');
+    const list = main.childForFieldName('parameters');
+    const first = list && list.namedChildren[0];
+    const handle = first && first.childForFieldName('name') ? first.childForFieldName('name').text : null;
+    if (!body || !handle) return true;
+    const calls = (node, test) => (node.type === 'call_expression' && test(node)) || node.namedChildren.some(child => calls(child, test));
+    const runs = node => {
+        const callee = node.childForFieldName('function');
+        return !!callee && callee.type === 'selector_expression' && callee.childForFieldName('operand')?.text === handle &&
+            callee.childForFieldName('field')?.text === 'Run';
+    };
+    const ends = node => {
+        const callee = node.childForFieldName('function');
+        const text = callee ? callee.text : '';
+        const args = node.childForFieldName('arguments');
+        return /^(os\.Exit|panic|runtime\.Goexit|log\.(Fatal|Fatalf|Fatalln|Panic|Panicf|Panicln))$/.test(text) ||
+            (args ? args.namedChildren : []).some(argument => argument.type === 'identifier' && argument.text === handle);
+    };
+    const returns = node => node.type === 'return_statement' || (node.type !== 'func_literal' && node.namedChildren.some(returns));
+    const statements = body.namedChildren.filter(node => node.type !== 'comment');
+    for (const statement of statements.length === 1 && statements[0].type === 'statement_list' ? statements[0].namedChildren : statements) {
+        if (statement.type === 'comment') continue;
+        const running = calls(statement, runs);
+        if (!running && !calls(statement, ends) && !returns(statement)) continue;
+        const plain = ['expression_statement', 'short_var_declaration', 'assignment_statement', 'var_declaration'].includes(statement.type);
+        return !(running && plain && !calls(statement, node => !runs(node) && ends(node) && !/^os\.Exit$/.test(node.childForFieldName('function')?.text || '')));
+    }
+    return true;
+}
+
+/**
  * Does an Example function end in an output comment? go runs an example
  * only then. The comment is a comment of the function's body (vet insists
  * it is the last one): text inside a string is not one.
@@ -3975,5 +4021,6 @@ module.exports = {
     isEntryPoint,
     getEntryPointKind,
     testUnits,
+    testGate,
     parse
 };

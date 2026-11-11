@@ -2879,6 +2879,16 @@ function findUsagesInCode(code, name, parser, tree) {
 
 
 const JAVA_TEST_ANNOTATIONS = new Set(['Test', 'ParameterizedTest', 'RepeatedTest', 'TestFactory', 'TestTemplate']);
+// Annotations of JUnit and of the language that leave what runs alone.
+// Any other on a test or its class may disable it (a condition of
+// JUnit's, an extension, an annotation of the project that carries one).
+const JAVA_INERT_ANNOTATIONS = new Set([...JAVA_TEST_ANNOTATIONS, 'DisplayName', 'DisplayNameGeneration', 'Tag',
+    'Tags', 'Order', 'Timeout', 'TestMethodOrder', 'TestClassOrder', 'TestInstance', 'Nested', 'BeforeEach',
+    'AfterEach', 'BeforeAll', 'AfterAll', 'Before', 'After', 'BeforeClass', 'AfterClass', 'ValueSource',
+    'CsvSource', 'CsvFileSource', 'MethodSource', 'EnumSource', 'NullSource', 'EmptySource', 'NullAndEmptySource',
+    'ArgumentsSource', 'FieldSource', 'Override', 'SuppressWarnings', 'Deprecated', 'SafeVarargs',
+    'FunctionalInterface', 'Execution', 'ResourceLock', 'Isolated', 'FixMethodOrder', 'Disabled', 'Ignore',
+    'Retention', 'Target', 'Documented', 'Inherited', 'Repeatable']);
 
 /**
  * The tests a Java file declares: a method annotated as a test (JUnit 4
@@ -2895,9 +2905,36 @@ function testUnits(fileEntry, helpers) {
     const testsIn = new Map();
     const declared = new Map();
     const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract');
+    // The annotations on a declaration, an annotation the project declares
+    // standing for the ones it carries itself (JUnit's composed
+    // annotations): @Flaky declared with @Disabled disables.
+    const annotationMemo = new Map();
+    const annotationsOf = symbol => {
+        if (annotationMemo.has(symbol)) return annotationMemo.get(symbol);
+        const out = new Set();
+        const seen = new Set();
+        const add = (name, depth) => {
+            const meta = depth < 4 && !seen.has(name) && helpers.metaAnnotations ? helpers.metaAnnotations(name) : null;
+            if (!meta) {
+                out.add(name);
+                return;
+            }
+            seen.add(name);
+            for (const inner of meta) add(inner, depth + 1);
+        };
+        for (const annotation of symbol.annotationsWithArgs || []) {
+            const name = String(annotation.name).split('.').pop();
+            // @RunWith(JUnit4.class) names the runner JUnit uses anyway.
+            if (name === 'RunWith' && /^(org\.junit\.runners\.)?(JUnit4|BlockJUnit4ClassRunner)\.class$/.test(String(annotation.args || '').trim())) continue;
+            add(name, 0);
+        }
+        annotationMemo.set(symbol, out);
+        return out;
+    };
     // @Disabled (JUnit 5) and @Ignore (JUnit 4): declared, not executed.
-    const disabled = symbol => (symbol.annotationsWithArgs || [])
-        .some(annotation => /^(Disabled|Ignore)$/.test(String(annotation.name).split('.').pop()));
+    const disabled = symbol => annotationsOf(symbol).has('Disabled') || annotationsOf(symbol).has('Ignore');
+    // An annotation that is not one of those: the test may not run.
+    const unsettled = symbol => [...annotationsOf(symbol)].some(name => !JAVA_INERT_ANNOTATIONS.has(name));
     const legacyMemo = new Map();
     const legacy = cls => {
         if (!legacyMemo.has(cls)) {
@@ -2911,8 +2948,7 @@ function testUnits(fileEntry, helpers) {
         const chain = helpers.enclosing(symbol);
         if (chain.length === 0 || chain.some(outer => !helpers.isContainer(outer))) continue;
         const owner = chain[chain.length - 1];
-        const annotated = (symbol.annotationsWithArgs || [])
-            .some(annotation => JAVA_TEST_ANNOTATIONS.has(String(annotation.name).split('.').pop()));
+        const annotated = [...annotationsOf(symbol)].some(name => JAVA_TEST_ANNOTATIONS.has(name));
         if (!annotated && !(legacy(owner) && /^test/.test(symbol.name) &&
             (symbol.modifiers || []).includes('public'))) continue;
         // JUnit runs neither a private nor a static method as a test.
@@ -2922,6 +2958,7 @@ function testUnits(fileEntry, helpers) {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
             ...(off && { skipped: true }),
+            ...(!off && [symbol, ...chain].some(unsettled) && { conditional: true }),
         };
         if (!declared.has(owner)) declared.set(owner, []);
         declared.get(owner).push(row);
@@ -2950,6 +2987,7 @@ function testUnits(fileEntry, helpers) {
             name: cls.name, suite: chain.map(outer => outer.name), bases,
             runnable: [...chain, cls].every(concrete),
             ...([...chain, cls].some(disabled) && { skipped: true }),
+            ...([...chain, cls].some(unsettled) && { sometimes: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
             members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&

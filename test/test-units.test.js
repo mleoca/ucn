@@ -26,9 +26,10 @@ const output = require('../core/output');
 const {
     createTestModel, selectorText, unitLabel, linkFile, linkFiles, commandsFor,
     scriptRunners, nodeTestOptions, configWords, tableText, namesRequirement, focusedOut,
+    shellSplit, configArguments, pytestOptions, markSelects, nodeRunsFile,
 } = require('../core/test-units');
 const { CASES } = require('../eval/test-unit-matrix-cases');
-const { answerOf, judgeWholeRun } = require('../eval/run-test-unit-matrix');
+const { answerOf, judgeWholeRun, judgeJoined, namedIdentities } = require('../eval/run-test-unit-matrix');
 const PINNED = require('../eval/test-unit-matrix-answers.json');
 
 function git(dir, ...args) {
@@ -120,7 +121,7 @@ describe('test units: manifests are read as their own tools read them', () => {
 
 describe('test units: a line belongs to the innermost unit that holds it', () => {
     const FILES = {
-        'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+        'package.json': '{ "name": "x", "scripts": { "test": "node --test test/a.test.js" } }\n',
         'lib.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
         'test/a.test.js': [
             "const { describe, it, before } = require('node:test');",    // 1
@@ -468,7 +469,7 @@ describe('test units: the affected-test selection takes a declaration, not a nam
 
     it('support code a change reaches is named and is not something to run', () => {
         const dir = projectOf({
-            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test test/a.test.js" } }\n',
             'lib.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
             'test/helpers.js': "const { target } = require('../lib');\nfunction make() { return target(); }\nmodule.exports = { make };\n",
             'test/a.test.js': "const { it } = require('node:test');\nconst { make } = require('./helpers');\nit('uses the helper', () => { make(); });\n",
@@ -616,7 +617,7 @@ describe('test units: a runner bound under another name is still the runner', ()
 
     it('a file that binds the runner and declares nothing readable is a test file with a command, never support', () => {
         const dir = projectOf({
-            'package.json': MANIFEST,
+            'package.json': MANIFEST.replace('node --test', 'node --test test/computed.js'),
             'test/computed.js': "const runner = require('node:test');\nconst pick = runner[process.env.NAME || 'test'];\npick('at run time', () => {});\n",
             'test/hooks.js': "const { beforeEach } = require('node:test');\nmodule.exports = () => beforeEach(() => {});\n",
         });
@@ -963,7 +964,7 @@ describe('test units: a JavaScript name is what it is bound to where the call st
 
     it('a call through a name that is not read is no test, and the file stays a test file', () => {
         const dir = projectOf({
-            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test test/wrapped.js" } }\n',
             'test/wrapped.js': "const { it: real } = require('node:test');\nconst it = wrap(real);\nit('through a wrapper', () => {});\nfunction wrap(f) { return f; }\n",
             'test/values.js': "const runner = require('node:test');\nmodule.exports = { it: runner.it };\n",
         });
@@ -1084,5 +1085,481 @@ describe('test units: marks and proofs are read where they are written', () => {
         assert.strictEqual(namesRequirement('# we do not use pytest\nnose\n', 'pytest'), false);
         assert.strictEqual(namesRequirement('pytest-cov>=2\n', 'pytest'), false);
         assert.strictEqual(namesRequirement('mypytest\n', 'pytest'), false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// What is passed, written, imported and configured
+// ---------------------------------------------------------------------------
+
+/** The answer for one file of a project written out for the question. */
+function answerFor(files, relativePath) {
+    const dir = projectOf(files);
+    try {
+        const found = rowsOf(idx(dir), relativePath);
+        return { facts: found.facts, units: found.units.filter(unit => unit.kind === 'test') };
+    } finally {
+        rm(dir);
+    }
+}
+const labelsOf = (units, keep = () => true) => units.filter(keep).map(unit => unit.label);
+const NODE = { 'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n' };
+const NODE_HEAD = "const { test } = require('node:test');\n";
+
+describe('test units: the body of a test is whatever is passed for it', () => {
+    const units = source => answerFor({ ...NODE, 'test/b.test.js': NODE_HEAD + source }, 'test/b.test.js');
+
+    it('a named function, with or without options before it, is a body', () => {
+        const { facts, units: found } = units("function body() {}\ntest('named', body);\ntest('with options', { timeout: 1000 }, body);\n");
+        assert.strictEqual(facts.tests, 2);
+        assert.deepStrictEqual(found.map(unit => [unit.label, !!unit.skipped, !!unit.conditional]),
+            [['named', false, false], ['with options', false, false]]);
+    });
+
+    it('a member, the result of a call and a spread are taken to be one', () => {
+        const { units: found } = units("const bodies = { one() {} };\nconst wrap = fn => fn;\ntest('member', bodies.one);\ntest('wrapped', wrap(() => {}));\ntest(...['spread', () => {}]);\n");
+        assert.deepStrictEqual(found.map(unit => !!unit.skipped), [false, false, false]);
+    });
+
+    it('a test given nothing that can be a body has nothing to execute', () => {
+        const { facts, units: found } = units("const options = { timeout: 1 };\nconst nothing = undefined;\ntest('options only', options);\ntest('undefined', nothing);\ntest('none');\n");
+        assert.strictEqual(facts.tests, 0);
+        assert.deepStrictEqual(found.map(unit => !!unit.skipped), [true, true, true]);
+    });
+
+    it('a title that is a name is the title, not an option', () => {
+        const { units: found } = units("const title = 'computed';\ntest(title, () => {});\n");
+        assert.deepStrictEqual(found.map(unit => [!!unit.skipped, !!unit.conditional]), [[false, false]]);
+    });
+
+    it('a skip option is its value: a falsy literal does not skip, one that is not written out may', () => {
+        const state = source => {
+            const [unit] = units(source).units;
+            return unit.skipped ? 'skipped' : unit.conditional ? 'conditional' : 'runs';
+        };
+        for (const [options, expected] of [
+            ["{ skip: '' }", 'runs'], ['{ skip: 0 }', 'runs'], ['{ skip: null }', 'runs'], ['{ skip: undefined }', 'runs'],
+            ['{ skip: false }', 'runs'], ["{ skip: 'not today' }", 'skipped'], ['{ skip: 1 }', 'skipped'],
+            ["{ ['skip']: true }", 'skipped'], ['{ skip }', 'conditional'], ['{ ...opts }', 'conditional'],
+            ['opts', 'conditional'], ['{ skip: flag() }', 'conditional'],
+        ]) {
+            assert.strictEqual(state(`const skip = true;\nconst opts = { skip: true };\nconst flag = () => true;\ntest('t', ${options}, () => {});\n`), expected, options);
+        }
+    });
+});
+
+describe('test units: a name written more than once is read only where every write agrees', () => {
+    const FAKE = 'const fake = (name, fn) => name;\n';
+    const names = (source, file = 'test/b.test.js', manifest = NODE) =>
+        labelsOf(answerFor({ ...manifest, [file]: source }, file).units);
+
+    it('an alias assigned something else afterwards declares nothing', () => {
+        assert.deepStrictEqual(names(`${NODE_HEAD}${FAKE}let caseFn = test;\ncaseFn = fake;\ncaseFn('not a test', () => {});\ntest('real', () => {});\n`), ['real']);
+    });
+
+    it('a var in a block and a function declared later belong to the whole function', () => {
+        assert.deepStrictEqual(names(`${NODE_HEAD}${FAKE}if (true) { var it = fake; }\nit('not a test', () => {});\nspecify('not a test either', () => {});\nfunction specify(name, fn) { return name; }\ntest('real', () => {});\n`), ['real']);
+    });
+
+    it('a write inside a function, a destructuring assignment and a write to the global count', () => {
+        assert.deepStrictEqual(names(`${NODE_HEAD}${FAKE}let swapped = test;\nfunction swap() { swapped = fake; }\nswap();\nswapped('a', () => {});\nlet picked = test;\n({ picked } = { picked: fake });\npicked('b', () => {});\nglobalThis.fit = fake;\nfit('c', () => {});\ntest('real', () => {});\n`), ['real']);
+    });
+
+    it('a function declared in a block may be the name outside it', () => {
+        assert.deepStrictEqual(names(`${NODE_HEAD}${FAKE}{ function specify(name, fn) { return name; } }\nspecify('not a test', () => {});\ntest('real', () => {});\n`), ['real']);
+    });
+
+    it('inside with, and after eval in the same function, a name is not read', () => {
+        assert.deepStrictEqual(names(`${NODE_HEAD}${FAKE}with ({ test: fake }) {\n    test('inside with', () => {});\n}\nfunction scoped() {\n    eval('var test = fake');\n    test('after eval', () => {});\n}\nscoped();\ntest('real', () => {});\n`), ['real']);
+    });
+
+    it('a name declared bare and assigned once holds that value', () => {
+        assert.deepStrictEqual(names("let declare;\ndeclare = require('node:test').test;\ndeclare('assigned once', () => {});\n"), ['assigned once']);
+    });
+
+    it('a declaration for the type checker binds nothing at run time', () => {
+        assert.deepStrictEqual(names("declare const it: (name: string, fn: () => void) => void;\nit('global', () => {});\n", 'test/b.test.ts',
+            { 'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n' }), ['global']);
+    });
+
+    it('a call given the global object leaves the runner\'s globals, unless it defines or assigns them', () => {
+        const JEST = { 'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n' };
+        const under = source => labelsOf(answerFor({ ...JEST, 'test/a.test.js': source }, 'test/a.test.js').units);
+        assert.deepStrictEqual(under("jest.spyOn(global, 'fetch');\nsinon.stub(window, 'open');\nrender(globalThis);\ntest('kept', () => {});\n"), ['kept']);
+        assert.deepStrictEqual(under("Object.defineProperty(globalThis, 'matchMedia', { value: () => {} });\ntest('kept', () => {});\n"), ['kept']);
+        assert.deepStrictEqual(under("Object.defineProperty(globalThis, 'test', { value: () => {} });\ntest('not read', () => {});\n"), []);
+        assert.deepStrictEqual(under("Object.assign(global, { test: () => {} });\ntest('not read', () => {});\nit('kept', () => {});\n"), ['kept']);
+        assert.deepStrictEqual(under("Object.assign(global, require('./helpers'));\ntest('not read', () => {});\n"), []);
+    });
+
+    it('a name that is assigned from itself is not unread for that', () => {
+        const { facts } = answerFor({
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha test/a.test.js" } }\n',
+            'test/a.test.js': "it('a', () => {});\n",
+            'test/support/render.js': 'module.exports = function render(str, done) {\n    str = str.replace(/a/g, "b");\n    done(null, str.trim());\n};\n',
+        }, 'test/support/render.js');
+        assert.strictEqual(facts.role, 'support');
+    });
+
+    it('a helper that calls through its loop variables is not a test file', () => {
+        const { facts } = answerFor({
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test test/a.test.js" } }\n',
+            'test/a.test.js': `${NODE_HEAD}test('a', () => {});\n`,
+            'test/helpers/kill.js': 'function stop(children) {\n    for (const child of children) child.kill();\n    let n = 0;\n    n++;\n}\nmodule.exports = { stop };\n',
+        }, 'test/helpers/kill.js');
+        assert.strictEqual(facts.role, 'support');
+    });
+});
+
+describe('test units: what pytest collects is what the names hold when the module has run', () => {
+    const PYTEST = { 'pytest.ini': '[pytest]\n', 'tests/__init__.py': '' };
+    const units = (source, more = {}) => answerFor({ ...PYTEST, 'tests/test_x.py': source, ...more }, 'tests/test_x.py');
+    const stateOf = unit => unit.skipped ? 'skipped' : unit.conditional ? 'conditional' : 'runs';
+
+    it('a switch written again with a value that is not a literal no longer says off', () => {
+        for (const source of [
+            '__test__ = False\n__test__ = bool(1)\n\ndef test_actual():\n    pass\n',
+            '__test__ = False\nif True:\n    __test__ = True\n\ndef test_actual():\n    pass\n',
+            'class TestActual:\n    __test__ = False\n    __test__ = bool(1)\n    def test_actual(self):\n        pass\n',
+            'def test_actual():\n    pass\n\ntest_actual.__test__ = False\ntest_actual.__test__ = bool(1)\n',
+        ]) {
+            const { facts, units: found } = units(source);
+            assert.deepStrictEqual(found.map(unit => [unit.name, stateOf(unit), unit.selectorWithheld]),
+                [['test_actual', 'conditional', 'collection-switch']], source);
+            assert.notStrictEqual(facts.runWithheld, 'collection-switched-off', source);
+        }
+    });
+
+    it('the last literal write decides, for the module, a class and a function', () => {
+        assert.deepStrictEqual(units('__test__ = True\n__test__ = False\n\ndef test_off():\n    pass\n').facts.runWithheld, 'collection-switched-off');
+        assert.deepStrictEqual(units('class TestBackOn:\n    __test__ = False\n    __test__ = True\n    def test_on(self):\n        pass\n\ndef test_f():\n    pass\n\ntest_f.__test__ = False\ntest_f.__test__ = True\n')
+            .units.map(unit => [unit.label, stateOf(unit)]), [['TestBackOn > test_on', 'runs'], ['test_f', 'runs']]);
+    });
+
+    it('pytestmark is its last write: replaced, in a branch, added to', () => {
+        const mark = body => stateOf(units(`import pytest\n${body}\ndef test_a():\n    pass\n`).units[0]);
+        assert.strictEqual(mark('pytestmark = pytest.mark.skip\npytestmark = []\n'), 'runs');
+        assert.strictEqual(mark('pytestmark = []\npytestmark = pytest.mark.skip\n'), 'skipped');
+        assert.strictEqual(mark('if True:\n    pytestmark = pytest.mark.skip\n'), 'conditional');
+        assert.strictEqual(mark('pytestmark = []\npytestmark += [pytest.mark.skip]\n'), 'conditional');
+    });
+
+    it('a definition overwritten or deleted is gone; one in a branch exists only sometimes', () => {
+        const { units: found } = units('import sys\n\ndef test_gone():\n    pass\n\ntest_gone = None\n\ndef test_deleted():\n    pass\n\ndel test_deleted\n\ndef test_kept():\n    pass\n\nif sys.platform == "nope":\n    def test_never():\n        pass\nelse:\n    def test_else():\n        pass\n\nclass TestBody:\n    def test_none(self):\n        pass\n    test_none = None\n    if True:\n        def test_in_branch(self):\n            pass\n');
+        assert.deepStrictEqual(found.map(unit => [unit.label, stateOf(unit), unit.selectorWithheld || null]), [
+            ['test_kept', 'runs', null],
+            ['test_never', 'conditional', 'defined-conditionally'],
+            ['test_else', 'conditional', 'defined-conditionally'],
+            ['TestBody > test_in_branch', 'conditional', 'defined-conditionally'],
+        ]);
+    });
+
+    it('a class or function taken by an import is collected where it is imported, under the name it gets', () => {
+        const base = 'import unittest\n\nclass TestBase:\n    def test_shared(self):\n        pass\n\nclass CaseBase(unittest.TestCase):\n    def test_case_shared(self):\n        pass\n\nclass Plain:\n    def test_plain(self):\n        pass\n\ndef test_function_elsewhere():\n    pass\n';
+        const { units: found } = units('from tests.base import TestBase, CaseBase\nfrom tests.base import test_function_elsewhere\nfrom tests.base import TestBase as Renamed\nfrom tests.base import Plain as TestPlain\n\nclass ChildCase(CaseBase):\n    pass\n',
+            { 'tests/base.py': base });
+        assert.deepStrictEqual(found.map(unit => [unit.label, unit.inheritedFrom, unit.selector && unit.selector.command]), [
+            ['CaseBase > test_case_shared', 'tests/base.py:8', 'pytest tests/test_x.py::CaseBase::test_case_shared'],
+            ['TestBase > test_shared', 'tests/base.py:4', 'pytest tests/test_x.py::TestBase::test_shared'],
+            ['test_function_elsewhere', 'tests/base.py:15', 'pytest tests/test_x.py::test_function_elsewhere'],
+            ['TestPlain > test_plain', 'tests/base.py:12', 'pytest tests/test_x.py::TestPlain::test_plain'],
+            ['ChildCase > test_case_shared', 'tests/base.py:8', 'pytest tests/test_x.py::ChildCase::test_case_shared'],
+        ]);
+    });
+
+    it('a module whose name pytest does not look for declares no test, and still lends its classes', () => {
+        const files = {
+            ...PYTEST, 'tests/base.py': 'class TestBase:\n    def test_shared(self):\n        pass\n',
+            'tests/test_x.py': 'from tests.base import TestBase\n',
+        };
+        assert.deepStrictEqual([answerFor(files, 'tests/base.py').facts.role, answerFor(files, 'tests/base.py').units.length], ['support', 0]);
+        assert.strictEqual(answerFor(files, 'tests/test_x.py').facts.tests, 1);
+    });
+
+    it('a line of a body that runs elsewhere reaches the tests that run it', () => {
+        const dir = projectOf({
+            ...PYTEST, 'tests/base.py': 'class TestBase:\n    def test_shared(self):\n        pass\n\ndef test_fn():\n    pass\n',
+            'tests/test_x.py': 'from tests.base import TestBase, test_fn\n',
+        });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            const model = createTestModel(index);
+            const runs = line => model.runsAt(path.join(dir, 'tests/base.py'), line)
+                .map(run => `${path.relative(dir, run.filePath)}::${unitLabel(run.unit)}`);
+            assert.deepStrictEqual(runs(3), ['tests/test_x.py::TestBase > test_shared']);
+            assert.deepStrictEqual(runs(6), ['tests/test_x.py::test_fn']);
+            index._endOp();
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('test units: pytest options the project configures are applied or the command is withheld', () => {
+    const project = (addopts, source, more = {}) => ({
+        'pytest.ini': `[pytest]\naddopts = ${addopts}\n`, 'tests/__init__.py': '', 'tests/test_x.py': source, ...more,
+    });
+    const MARKED = 'import pytest\nfrom tests.deco import passthrough\n\nslow = pytest.mark.slow\n\n@pytest.mark.slow\ndef test_marked():\n    pass\n\n@slow\ndef test_through_a_name():\n    pass\n\n@pytest.mark.slow\nclass TestMarked:\n    def test_inside(self):\n        pass\n\nclass TestBodyMark:\n    pytestmark = pytest.mark.slow\n    def test_under(self):\n        pass\n\nclass TestDerived(TestBodyMark):\n    def test_own(self):\n        pass\n\n@passthrough\ndef test_decorated_elsewhere():\n    pass\n\ndef test_plain():\n    pass\n';
+
+    it('a mark expression leaves out the tests that carry the mark, however it reaches them', () => {
+        const { facts, units } = answerFor(project('-ra -m "not slow" --strict-markers', MARKED, { 'tests/deco.py': 'def passthrough(f):\n    return f\n' }), 'tests/test_x.py');
+        assert.deepStrictEqual(units.map(unit => [unit.label, unit.skipped ? unit.selectorWithheld : unit.conditional ? 'conditional' : 'runs']), [
+            ['test_marked', 'deselected-by-options'], ['test_through_a_name', 'deselected-by-options'],
+            ['TestMarked > test_inside', 'deselected-by-options'], ['TestBodyMark > test_under', 'deselected-by-options'],
+            ['TestDerived > test_under', 'deselected-by-options'], ['TestDerived > test_own', 'deselected-by-options'],
+            ['test_decorated_elsewhere', 'conditional'], ['test_plain', 'runs'],
+        ]);
+        assert.strictEqual(facts.tests, 2);
+    });
+
+    it('a file whose tests are all left out has no command; a test left out by its id is not counted', () => {
+        assert.strictEqual(answerFor(project('-m "not slow"', 'import pytest\npytestmark = [pytest.mark.slow]\n\ndef test_a():\n    pass\n'), 'tests/test_x.py').facts.runWithheld, 'deselected-by-options');
+        const { facts, units } = answerFor(project('--deselect tests/test_x.py::test_a', 'def test_a():\n    pass\n\ndef test_b():\n    pass\n'), 'tests/test_x.py');
+        assert.deepStrictEqual([facts.tests, units[0].selectorWithheld, units[1].selector.command], [1, 'deselected-by-options', 'pytest tests/test_x.py::test_b']);
+    });
+
+    it('an option that may select and is not modeled withholds every command', () => {
+        for (const addopts of ['-k "not thing"', 'tests/other', '-p my_plugin', '-o python_functions=check_*', '-p no:skipping']) {
+            const { facts, units } = answerFor(project(addopts, 'def test_a():\n    pass\n'), 'tests/test_x.py');
+            assert.deepStrictEqual([facts.runWithheld, units[0].selectorWithheld], ['runner-options-not-read', 'runner-options-not-read'], addopts);
+        }
+    });
+
+    it('options that select nothing leave the commands', () => {
+        for (const addopts of ['-ra --showlocals --strict-config --capture=sys -p no:logging -p no:tmpdir', '--tb short -W error --cov=src --cov-report term', '--ignore=tests/legacy --import-mode=importlib -n auto']) {
+            const { facts } = answerFor(project(addopts, 'def test_a():\n    pass\n'), 'tests/test_x.py');
+            assert.strictEqual(facts.run && facts.run.command, 'pytest tests/test_x.py', addopts);
+        }
+    });
+
+    it('the pure readers: words, options, mark expressions', () => {
+        assert.deepStrictEqual(shellSplit(`-m 'not slow' --tb=short "a b"\\ c`), ['-m', 'not slow', '--tb=short', 'a b c']);
+        assert.deepStrictEqual(configArguments({ file: 'pyproject.toml', table: 'addopts = [\n    "-m",\n    "not property",   # opt-in "only"\n    "-p", "no:logging",\n]\n' }, 'addopts'),
+            ['-m', 'not property', '-p', 'no:logging']);
+        assert.deepStrictEqual(configArguments({ file: 'pytest.ini', table: 'addopts = -ra\n    -m "not slow"\n' }, 'addopts'), ['-ra', '-m', 'not slow']);
+        assert.deepStrictEqual(pytestOptions(['-ra', '-m', 'not slow', '--deselect=a::b']), { markExpr: 'not slow', deselect: ['a::b'], unread: false });
+        assert.strictEqual(pytestOptions(null).unread, true);
+        const selects = (expression, marks, open = false) => markSelects(expression, new Set(marks), open);
+        assert.deepStrictEqual([selects('not slow', ['slow']), selects('not slow', []), selects('not slow', [], true)], [false, true, null]);
+        assert.deepStrictEqual([selects('slow or (fast and not net)', ['fast']), selects('slow and fast', ['slow'], true), selects('slow and fast', ['slow'])], [true, null, false]);
+        assert.strictEqual(selects('slow(reason="x")', ['slow']), null);
+    });
+});
+
+describe('test units: a decorator, an attribute and an annotation are read by what they are', () => {
+    const stateOf = unit => unit.skipped ? 'skipped' : unit.conditional ? 'conditional' : 'runs';
+
+    it('Python: marks by import, patches of the standard library, anything else may do anything', () => {
+        const { units } = answerFor({
+            'pytest.ini': '[pytest]\n', 'tests/__init__.py': '',
+            'tests/deco.py': 'import pytest\nrequires_db = pytest.mark.skip(reason="no db")\n',
+            'tests/test_x.py': 'import pytest\nfrom unittest import mock\nfrom tests.deco import requires_db\n\nlater = pytest.mark.skip(reason="later")\n\n@requires_db\ndef test_needs_db():\n    pass\n\n@pytest.mark.xfail(run=False)\ndef test_never_started():\n    pass\n\n@pytest.mark.xfail\ndef test_expected_to_fail():\n    pass\n\n@mock.patch("os.getcwd")\ndef test_patched(cwd):\n    pass\n\n@later\ndef test_marked_by_a_name_of_the_file():\n    pass\n\n@pytest.mark.usefixtures("tmp_path")\ndef test_with_fixture():\n    pass\n',
+        }, 'tests/test_x.py');
+        assert.deepStrictEqual(units.map(stateOf), ['conditional', 'skipped', 'runs', 'runs', 'skipped', 'runs']);
+    });
+
+    it('Python: a module that skips itself at its top runs only sometimes', () => {
+        for (const head of ['missing = pytest.importorskip("not_installed")', 'pytest.skip("no", allow_module_level=True)']) {
+            const { units } = answerFor({ 'pytest.ini': '[pytest]\n', 'tests/test_x.py': `import pytest\n${head}\n\ndef test_a():\n    pass\n` }, 'tests/test_x.py');
+            assert.deepStrictEqual(units.map(stateOf), ['conditional'], head);
+        }
+    });
+
+    it('Python: a TestCase reached through a class of the project is a TestCase', () => {
+        const { units } = answerFor({
+            'pytest.ini': '[pytest]\n', 'tests/__init__.py': '',
+            'tests/base.py': 'import unittest\n\nclass Base(unittest.TestCase):\n    pass\n',
+            'tests/test_x.py': 'from tests.base import Base\n\nclass Checks(Base):\n    def test_a(self):\n        pass\n',
+        }, 'tests/test_x.py');
+        assert.deepStrictEqual(labelsOf(units), ['Checks > test_a']);
+    });
+
+    it('C#: Skip is a value, read where the file holds it', () => {
+        const method = (attribute, name) => `        ${attribute}\n        public void ${name}() { }\n`;
+        const rows = [
+            ['[Fact(Skip = null)]', 'runs'], ['[Fact(Skip = (string)null)]', 'runs'], ['[Fact(Skip = default)]', 'runs'],
+            ['[Fact(Skip = Reasons.None)]', 'runs'], ['[Fact(Skip = "")]', 'runs'], ['[Fact(Skip = "why")]', 'skipped'],
+            ['[Fact(Skip = Local)]', 'skipped'], ['[Fact(Skip = Reasons.Later)]', 'skipped'], ['[Fact(Skip = nameof(Reasons))]', 'skipped'],
+            ['[Fact(Skip = "a" + "b")]', 'skipped'], ['[Fact(Skip = Elsewhere.Why)]', 'conditional'],
+            ['[Fact(DisplayName = "Skip = no")]', 'runs'], ['[RetryFact]', 'conditional'],
+        ];
+        const { units } = answerFor({
+            'App.Tests.csproj': '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="xunit" Version="2.9.3" /></ItemGroup></Project>\n',
+            'T.cs': `using Xunit;\nnamespace N\n{\n    public static class Reasons { public const string Later = "later"; public const string None = null; }\n    public class RetryFactAttribute : FactAttribute { }\n    public class T\n    {\n        const string Local = "x";\n${rows.map(([attribute], i) => method(attribute, `M${i}`)).join('')}    }\n}\n`,
+        }, 'T.cs');
+        assert.deepStrictEqual(units.map(stateOf), rows.map(([, expected]) => expected));
+    });
+
+    it('C#: [Ignore] skips, with Until for a time; an attribute that is not a framework\'s own may do anything', () => {
+        const { units } = answerFor({
+            'App.Tests.csproj': '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="NUnit" Version="4.0.0" /></ItemGroup></Project>\n',
+            'T.cs': 'using NUnit.Framework;\nnamespace N\n{\n    public class T\n    {\n        [Test, Ignore("why")]\n        public void Ignored() { }\n        [Test]\n        [Ignore("why", Until = "2099-01-01")]\n        public void IgnoredForNow() { }\n        [Test, Category("fast")]\n        public void Plain() { }\n        [Test, Platform("Win")]\n        public void OnAPlatform() { }\n    }\n}\n',
+        }, 'T.cs');
+        assert.deepStrictEqual(units.map(stateOf), ['skipped', 'conditional', 'runs', 'conditional']);
+    });
+
+    it('Rust: an attribute macro beside #[test] may rewrite the function; the language\'s own attributes do not', () => {
+        const { units } = answerFor({
+            'Cargo.toml': '[package]\nname = "x"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': '#[cfg(test)]\nmod tests {\n    #[test]\n    #[should_panic]\n    #[allow(unused)]\n    fn plain() {}\n\n    #[test]\n    #[serial]\n    fn under_a_macro() {}\n\n    #[tokio::test]\n    async fn by_a_test_macro() {}\n\n    #[test]\n    #[ignore = "slow"]\n    fn ignored() {}\n}\n',
+        }, 'src/lib.rs');
+        assert.deepStrictEqual(units.map(unit => [unit.name, stateOf(unit), !!unit.selector]),
+            [['plain', 'runs', true], ['under_a_macro', 'conditional', true], ['by_a_test_macro', 'runs', true], ['ignored', 'skipped', true]]);
+    });
+
+    it('Go and pytest: code the runner asks at run time makes the tests beside it conditional', () => {
+        const go = main => answerFor({
+            'go.mod': 'module example.com/x\n\ngo 1.21\n',
+            'main_test.go': `package x\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestMain(m *testing.M) {\n${main}\n}\n`,
+            'a_test.go': 'package x\n\nimport "testing"\n\nfunc TestA(t *testing.T) {}\n',
+        }, 'a_test.go').units.map(stateOf);
+        assert.deepStrictEqual(go('\tos.Exit(m.Run())'), ['runs']);
+        assert.deepStrictEqual(go('\tsetup()\n\tcode := m.Run()\n\tteardown()\n\tos.Exit(code)'), ['runs']);
+        assert.deepStrictEqual(go('\tif os.Getenv("CI") == "" {\n\t\tos.Exit(0)\n\t}\n\tos.Exit(m.Run())'), ['conditional']);
+        assert.deepStrictEqual(go('\tleak.VerifyTestMain(m)'), ['conditional']);
+        assert.deepStrictEqual(go('\tos.Exit(0)'), ['conditional']);
+        const hooked = {
+            'pytest.ini': '[pytest]\n', 'tests/__init__.py': '',
+            'tests/conftest.py': 'def pytest_collection_modifyitems(config, items):\n    del items[:]\n',
+            'tests/test_x.py': 'def test_a():\n    pass\n', 'other/test_y.py': 'def test_b():\n    pass\n',
+        };
+        assert.deepStrictEqual(answerFor(hooked, 'tests/test_x.py').units.map(stateOf), ['conditional']);
+        assert.deepStrictEqual(answerFor(hooked, 'other/test_y.py').units.map(stateOf), ['runs']);
+        const hook = body => answerFor({ ...hooked, 'tests/conftest.py': body }, 'tests/test_x.py').units.map(stateOf)[0];
+        assert.strictEqual(hook('import gc\n\ndef pytest_runtest_setup():\n    gc.collect()\n\ndef pytest_collection():\n    gc.disable()\n'), 'runs');
+        assert.strictEqual(hook('import pytest\n\ndef pytest_runtest_setup(item):\n    if "slow" in item.keywords:\n        pytest.skip("slow")\n'), 'conditional');
+        assert.strictEqual(hook('def pytest_ignore_collect(collection_path, config):\n    return collection_path.name.startswith("legacy")\n'), 'conditional');
+        assert.strictEqual(hook('from helpers import reorder\n\ndef pytest_collection_modifyitems(config, items):\n    reorder(items)\n'), 'conditional');
+    });
+
+    it('Java: an annotation of the project stands for the ones it carries', () => {
+        const annotation = (name, carried) => `package com.x;\nimport java.lang.annotation.Retention;\nimport java.lang.annotation.RetentionPolicy;\n@Retention(RetentionPolicy.RUNTIME)\n${carried}\npublic @interface ${name} {\n}\n`;
+        const { units } = answerFor({
+            'pom.xml': '<project></project>\n',
+            'src/test/java/com/x/Flaky.java': annotation('Flaky', '@org.junit.jupiter.api.Disabled("flaky")'),
+            'src/test/java/com/x/Quick.java': annotation('Quick', '@org.junit.jupiter.api.Test'),
+            'src/test/java/com/x/ATest.java': 'package com.x;\nimport org.junit.jupiter.api.Test;\nimport org.junit.jupiter.api.Tag;\nimport org.junit.jupiter.api.condition.EnabledOnOs;\nimport org.junit.jupiter.api.condition.OS;\nclass ATest {\n    @Test\n    @EnabledOnOs(OS.WINDOWS)\n    void onlyOnWindows() { }\n    @Test\n    @Flaky\n    void flaky() { }\n    @Quick\n    void composed() { }\n    @Test\n    @Tag("fast")\n    void plain() { }\n    @Test\n    @FromElsewhere\n    void unknown() { }\n}\n',
+        }, 'src/test/java/com/x/ATest.java');
+        assert.deepStrictEqual(units.map(unit => [unit.name, stateOf(unit)]),
+            [['onlyOnWindows', 'conditional'], ['flaky', 'skipped'], ['composed', 'runs'], ['plain', 'runs'], ['unknown', 'conditional']]);
+    });
+});
+
+describe('test units: a command follows the runner\'s own configuration, or is withheld', () => {
+    const MOCHA = { 'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n' };
+    const JEST = { 'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n' };
+    const one = "it('a', () => {});\n";
+    const run = (files, file) => {
+        const { facts } = answerFor(files, file);
+        return facts.run ? facts.run.command : facts.runWithheld;
+    };
+
+    it('mocha: a configuration that adds files, greps or ignores leaves no exact command; one that does not, does', () => {
+        for (const config of ['{ "spec": ["test/**/*.js"] }', '{ "grep": "a" }', '{ "ignore": ["test/b.test.js"] }', '{ "file": ["test/setup.js"] }']) {
+            assert.strictEqual(run({ ...MOCHA, '.mocharc.json': config, 'test/a.test.js': one }, 'test/a.test.js'), 'runner-config-not-read', config);
+        }
+        assert.strictEqual(run({ ...MOCHA, '.mocharc.yml': 'timeout: 5000\nreporter: dot\n', 'test/a.test.js': one }, 'test/a.test.js'), 'npx mocha test/a.test.js');
+        assert.strictEqual(run({ ...MOCHA, '.mocharc.yml': 'spec:\n  - test/**/*.js\n', 'test/a.test.js': one }, 'test/a.test.js'), 'runner-config-not-read');
+        assert.strictEqual(run({ ...MOCHA, '.mocharc.js': "module.exports = Object.assign({}, { grep: 'a' });\n", 'test/a.test.js': one }, 'test/a.test.js'), 'runner-config-not-read');
+        assert.strictEqual(run({ 'package.json': '{ "name": "x", "scripts": { "test": "mocha" }, "mocha": { "spec": "test" } }\n', 'test/a.test.js': one }, 'test/a.test.js'), 'runner-config-not-read');
+    });
+
+    it('mocha: what the project\'s script loads is loaded by the command, and a typed file needs it', () => {
+        const script = test => ({ 'package.json': JSON.stringify({ name: 'x', scripts: { test } }) });
+        assert.strictEqual(run({ ...script('mocha --require ./support/setup.js --reporter dot --timeout 500 test/'), 'test/a.test.js': one }, 'test/a.test.js'),
+            'npx mocha --require ./support/setup.js test/a.test.js');
+        assert.strictEqual(run({ ...script('mocha -r ts-node/register "test/**/*.ts"'), 'test/a.test.ts': one }, 'test/a.test.ts'), 'npx mocha -r ts-node/register test/a.test.ts');
+        assert.strictEqual(run({ ...script('mocha'), 'test/a.test.ts': one }, 'test/a.test.ts'), 'loader-unknown');
+        assert.strictEqual(run({ ...script('mocha'), '.mocharc.json': '{ "require": ["ts-node/register"] }', 'test/a.test.ts': one }, 'test/a.test.ts'), 'npx mocha test/a.test.ts');
+        assert.strictEqual(run({ ...script('mocha --config .mocharc.unit.json'), 'test/a.test.js': one }, 'test/a.test.js'), 'runner-config-not-read');
+    });
+
+    it('mocha: a focused file is run by itself, the others together', () => {
+        const dir = projectOf({ ...MOCHA, 'test/a.test.js': "it.only('focused', () => {});\n", 'test/b.test.js': one, 'test/c.test.js': one });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            const model = createTestModel(index);
+            assert.deepStrictEqual(commandsFor(model, ['a', 'b', 'c'].map(name => path.join(dir, `test/${name}.test.js`))),
+                ['npx mocha test/b.test.js test/c.test.js', 'npx mocha test/a.test.js']);
+            index._endOp();
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('jest: a configuration that chooses files is applied where it is roots and patterns, else nothing is offered', () => {
+        const t = "test('a', () => {});\n";
+        assert.strictEqual(run({ ...JEST, 'jest.config.js': "module.exports = { testMatch: ['**/*.spec.js'] };\n", 'test/a.test.js': t }, 'test/a.test.js'), 'runner-config-not-read');
+        assert.strictEqual(run({ ...JEST, 'jest.config.js': "const config = {\n    testEnvironment: 'node',\n    verbose: true,\n};\nmodule.exports = config;\n", 'test/a.test.js': t }, 'test/a.test.js'),
+            'npx jest --runTestsByPath test/a.test.js');
+        assert.strictEqual(run({ ...JEST, 'jest.config.ts': "import type { Config } from 'jest';\nexport default { testEnvironment: 'node' } satisfies Config;\n", 'test/a.test.js': t }, 'test/a.test.js'),
+            'npx jest --runTestsByPath test/a.test.js');
+        assert.strictEqual(run({ ...JEST, 'jest.config.js': "module.exports = { ...require('./base'), verbose: true };\n", 'test/a.test.js': t }, 'test/a.test.js'), 'runner-config-not-read');
+        const keyed = { 'package.json': '{ "name": "x", "scripts": { "test": "jest" }, "jest": { "roots": ["test"], "testRegex": "test/(.*?/)?.*test.js$", "testPathIgnorePatterns": ["/skipped/"] } }\n' };
+        const files = { ...keyed, 'test/a.test.js': t, 'test/sub/b.check-test.js': t, 'test/skipped/c.test.js': t, 'src/d.test.js': t };
+        assert.deepStrictEqual(['test/a.test.js', 'test/sub/b.check-test.js', 'test/skipped/c.test.js', 'src/d.test.js'].map(file => run(files, file)),
+            ['npx jest --runTestsByPath test/a.test.js', 'npx jest --runTestsByPath test/sub/b.check-test.js', 'outside-runner-config', 'outside-runner-config']);
+        assert.strictEqual(run({ 'package.json': '{ "name": "x", "scripts": { "test": "jest --config jest.unit.config.js" } }\n', 'test/a.test.js': t }, 'test/a.test.js'), 'runner-config-not-read');
+    });
+
+    it('vitest: the directory it is told to scan is applied; a focused file is allowed to run', () => {
+        const VITEST = { 'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n' };
+        const t = "import { test } from 'vitest';\ntest('a', () => {});\n";
+        const dirConfig = "import { defineConfig } from 'vitest/config';\nexport default defineConfig({\n    test: { globals: true, dir: 'tests' },\n});\n";
+        assert.strictEqual(run({ ...VITEST, 'vitest.config.ts': dirConfig, 'tests/a.test.js': t }, 'tests/a.test.js'), 'npx vitest run tests/a.test.js');
+        assert.strictEqual(run({ ...VITEST, 'vitest.config.ts': dirConfig, 'src/a.test.js': t }, 'src/a.test.js'), 'outside-runner-config');
+        assert.strictEqual(run({ ...VITEST, 'vitest.config.js': "export default { test: { include: ['**/*.spec.js'] } };\n", 'src/a.test.js': t }, 'src/a.test.js'), 'runner-config-not-read');
+        assert.strictEqual(run({ ...VITEST, 'vite.config.js': "export default { plugins: [] };\n", 'src/a.test.js': t }, 'src/a.test.js'), 'npx vitest run src/a.test.js');
+        assert.strictEqual(run({ ...VITEST, 'src/a.test.js': "import { test } from 'vitest';\ntest.only('a', () => {});\n" }, 'src/a.test.js'), 'npx vitest run --allowOnly src/a.test.js');
+    });
+
+    it('a configuration above the runner\'s directory is not read: nothing is offered below it', () => {
+        assert.strictEqual(run({
+            'jest.config.js': "module.exports = { projects: ['packages/*'] };\n", 'package.json': '{ "name": "root" }\n',
+            'packages/a/package.json': '{ "name": "a", "scripts": { "test": "jest" } }\n', 'packages/a/x.test.js': "test('a', () => {});\n",
+        }, 'packages/a/x.test.js'), 'runner-config-not-read');
+    });
+
+    it('node: a file the script names, or node looks for, is a test file though it declares none', () => {
+        const named = { 'package.json': '{ "name": "x", "scripts": { "test": "node --test test/a.test.js test/smoke.js" } }\n', 'test/a.test.js': `${NODE_HEAD}test('a', () => {});\n`, 'test/smoke.js': 'process.exitCode = 0;\n', 'test/helpers/util.js': 'module.exports = {};\n' };
+        assert.deepStrictEqual([answerFor(named, 'test/smoke.js').facts.role, run(named, 'test/smoke.js'), answerFor(named, 'test/helpers/util.js').facts.role],
+            ['tests', 'node --test test/smoke.js', 'support']);
+        const looked = { ...NODE, 'test/tools/setup.js': 'process.exitCode = 0;\n', 'lib/tools.js': 'module.exports = {};\n' };
+        assert.strictEqual(answerFor(looked, 'test/tools/setup.js').facts.role, 'tests');
+        assert.deepStrictEqual([nodeRunsFile({ script: 'node --test "test/**/*.spec.js"' }, 'test/a/b.spec.js'), nodeRunsFile({ script: 'node --test "test/**/*.spec.js"' }, 'test/a/b.test.js'),
+            nodeRunsFile({ script: 'node --test' }, 'lib/x.js'), nodeRunsFile({ script: 'npm run lint && node --test' }, 'test/x.js')], [true, false, false, null]);
+    });
+});
+
+describe('test units: the judge counts runs and holds joined commands to the files\' own', () => {
+    const unit = (line, more = {}) => ({
+        id: `a.test.js::t${line}`, file: 'a.test.js', line, startLine: line, endLine: line,
+        selector: null, conditional: false, skipped: false, inherited: false, ...more,
+    });
+    const files = tests => [{ file: 'a.test.js', role: 'tests', run: 'run a.test.js', tests }];
+    const kinds = (testCase, answer, ran, counts) => judgeWholeRun(testCase, answer, ran, counts).problems.map(problem => problem.kind);
+
+    it('a body that runs more often than the tests listed for it is a test not listed, unless the case says so', () => {
+        const answer = { units: [unit(3)], files: files(1) };
+        assert.deepStrictEqual(kinds({}, answer, ['a.test.js:3'], { 'a.test.js:3': 2 }), ['REPEATED']);
+        assert.deepStrictEqual(kinds({ repeats: ['a.test.js:3'] }, answer, ['a.test.js:3'], { 'a.test.js:3': 2 }), []);
+        assert.deepStrictEqual(kinds({ repeats: ['a.test.js:3'] }, answer, ['a.test.js:3'], { 'a.test.js:3': 1 }), ['REPEATED']);
+        assert.deepStrictEqual(kinds({}, { units: [unit(3, { generated: true })], files: files(1) }, ['a.test.js:3'], { 'a.test.js:3': 4 }), []);
+    });
+
+    it('joined commands must run exactly what the files\' own commands run', () => {
+        assert.deepStrictEqual(judgeJoined(['a:1', 'b:1'], ['a:1', 'b:1']), []);
+        assert.match(judgeJoined(['a:1', 'b:1'], ['a:1'])[0].detail, /do not run b:1/);
+        assert.match(judgeJoined(['a:1'], ['a:1', 'c:1'])[0].detail, /run c:1, which no file/);
+    });
+
+    it('a case names a repeat or an undeclared test by the mark as written', () => {
+        const named = namedIdentities({
+            files: { 'tests/test_a.py': 'def test_p(v):\n    mark("tests/test_a.py::test_p")\n' },
+            repeats: ['tests/test_a.py::test_p'], undeclared: ['tests/test_a.py:9', 'tests/x.py::T > m'],
+        });
+        assert.deepStrictEqual([named.repeats, named.undeclared], [['tests/test_a.py:2'], ['tests/test_a.py:9', 'tests/x.py::T > m']]);
     });
 });

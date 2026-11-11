@@ -15,7 +15,11 @@
  * (where a JavaScript case needs node_modules), `full` (the whole-project
  * command when it is not the runner's default), `sometimes` (units the
  * engine calls conditional: each must be meant), `emptyTestFiles` (files
- * the engine calls test files, with a command, from which nothing runs).
+ * the engine calls test files, with a command, from which nothing runs),
+ * `repeats` (bodies that execute more often than the tests listed for
+ * them: a table of cases, a second name for one function). `undeclared`
+ * and `repeats` name a mark as it is written (`<file>::<label>`), a line
+ * (`<file>:<line>`) or a run-time label.
  *
  * Two consumers share this data: eval/run-test-unit-matrix.js runs the
  * runners; test/test-units.test.js pins the engine's answer on every case
@@ -25,6 +29,8 @@
 'use strict';
 
 const PY = 'import os\ndef mark(i):\n    open(os.environ["UCN_RAN"], "a").write(i + "\\n")\n';
+// The identity of the pytest test that is running: `<file>::<suite > name>`.
+const RID = 'def rid():\n    n = os.environ["PYTEST_CURRENT_TEST"].split(" ")[0].split("::")\n    return n[0] + "::" + " > ".join(n[1:])\n';
 const CJS = "const mark = id => require('fs').appendFileSync(process.env.UCN_RAN, id + '\\n');\n";
 const ESM = "import { appendFileSync } from 'node:fs';\nconst mark = id => appendFileSync(process.env.UCN_RAN, id + '\\n');\n";
 const GO = pkg => `package ${pkg}\n\nimport (\n\t"os"\n)\n\nfunc mark(id string) {\n\tf, _ := os.OpenFile(os.Getenv("UCN_RAN"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)\n\tf.WriteString(id + "\\n")\n\tf.Close()\n}\n`;
@@ -57,6 +63,9 @@ const CASES = [
     // ------------------------------------------------------------------ pytest
     {
         id: 'pytest-what-is-collected', runner: 'pytest',
+        // A definition inside a branch exists only where the branch runs.
+        sometimes: ['tests/test_a.py::test_cond'],
+        repeats: ['tests/test_a.py::test_p'],
         files: {
             'pyproject.toml': '[tool.pytest.ini_options]\n',
             'tests/test_a.py': `${PY}import unittest
@@ -156,8 +165,8 @@ class TestOld:
 `,
             'tests/test_plain.py': `${PY}\ndef check_five():\n    mark("tests/test_plain.py::check_five")\n`,
         },
-        // An explicit path runs a file the configured names leave out.
-        notRunByDefault: ['tests/test_plain.py::check_five'],
+        // A module the configured names leave out is not collected: it
+        // declares no test.
     },
     {
         id: 'pytest-toml-array-names', runner: 'pytest',
@@ -208,8 +217,9 @@ class TestOld:
             'tests/base.py': `${PY}import inspect
 
 def ran(self, name):
-    cls = type(self)
-    mark(os.path.relpath(inspect.getfile(cls)).replace(os.sep, "/") + "::" + cls.__name__ + " > " + name)
+    # The test pytest is running: a class runs where it is collected.
+    n = os.environ["PYTEST_CURRENT_TEST"].split(" ")[0].split("::")
+    mark(n[0] + "::" + " > ".join(n[1:]))
 
 class Checks:
     def test_shared(self):
@@ -391,6 +401,8 @@ def test_plain():
     },
     {
         id: 'pytest-method-resolution-order', runner: 'pytest',
+        // A class behind a base that is not read runs the same bodies (named below).
+        repeats: ['tests/base.py::the only body', 'tests/base.py::the body in Right'],
         files: {
             'pytest.ini': '[pytest]\n',
             'tests/__init__.py': '',
@@ -552,6 +564,8 @@ def test_under_an_annotated_switch():
     // --------------------------------------------------------------- node:test
     {
         id: 'node-test-script', runner: 'node-test',
+        // node looks for every file under test/: a helper there is run as a test of its own.
+        emptyTestFiles: ['test/helpers.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/a.test.js': `${CJS}const { test, describe, it } = require('node:test');
@@ -635,6 +649,7 @@ nodeTest.describe('on default', () => {
     },
     {
         id: 'node-test-binding-not-followed', runner: 'node-test', full: 'node --test test/computed.js',
+        emptyTestFiles: ['test/hooks-only.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/computed.js': `${CJS}const runner = require('node:test');
@@ -1453,6 +1468,7 @@ mod tests {
     // ------------------------------------------------------------------ dotnet
     {
         id: 'dotnet-xunit', runner: 'dotnet-test',
+        repeats: ['FooTests.cs::FooTests > Rows'],
         files: {
             'App.Tests.csproj': CSPROJ(XUNIT),
             'FooTests.cs': `using Xunit;
@@ -1619,13 +1635,28 @@ ${CS}
 
         [Test]
         void PrivateTest() { Rec.Mark("Quiet.cs::Fixture > PrivateTest"); }
+
+        [TestCase(1, Ignore = "later")]
+        public void IgnoredCase(int x) { Rec.Mark("Quiet.cs::Fixture > IgnoredCase"); }
+
+        [Test]
+        [Ignore("for now", Until = "2099-01-01")]
+        public void IgnoredForNow() { Rec.Mark("Quiet.cs::Fixture > IgnoredForNow"); }
+
+        [Test, Explicit]
+        public void OnlyWhenAsked() { Rec.Mark("Quiet.cs::Fixture > OnlyWhenAsked"); }
+
+        [Test, Category("fast"), Description("plain")]
+        public void UnderPlainAttributes() { Rec.Mark("Quiet.cs::Fixture > UnderPlainAttributes"); }
     }
 }
 `,
         },
+        sometimes: ['Quiet.cs::Fixture > IgnoredForNow', 'Quiet.cs::Fixture > OnlyWhenAsked'],
     },
     {
         id: 'dotnet-mstest', runner: 'dotnet-test',
+        repeats: ['CalcTests.cs::CalcTests > Rows'],
         files: {
             'App.Tests.csproj': CSPROJ([['Microsoft.NET.Test.Sdk', '17.12.0'], ['MSTest.TestAdapter', '1.2.1'], ['MSTest.TestFramework', '1.2.1']]),
             'CalcTests.cs': `using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -1653,6 +1684,7 @@ ${CS}
 
     {
         id: 'dotnet-nunit', runner: 'dotnet-test',
+        repeats: ['QueueTests.cs::QueueTests > Rows'],
         files: {
             'App.Tests.csproj': CSPROJ([['Microsoft.NET.Test.Sdk', '17.12.0'], ['NUnit', '3.12.0'], ['NUnit3TestAdapter', '4.6.0']]),
             'QueueTests.cs': `using NUnit.Framework;
@@ -1681,6 +1713,7 @@ ${CS}
     // ------------------------------------------------------------------- maven
     {
         id: 'maven-junit5', runner: 'maven',
+        repeats: ['src/test/java/com/x/FooTest.java::FooTest > rows'],
         files: {
             'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
             'src/test/java/com/x/FooTest.java': `package com.x;
@@ -1821,6 +1854,762 @@ ${JAVA}
         files: {
             'build.gradle': "plugins { id 'java' }\n",
             'src/test/java/com/x/FooTest.java': 'package com.x;\n\nimport org.junit.jupiter.api.Test;\n\nclass FooTest {\n    @Test\n    void adds() {}\n}\n',
+        },
+    },
+    // ------------------------------------------- what a later write leaves
+    {
+        id: 'node-test-body-given-as-an-expression', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/b.test.js': `${CJS}const { test } = require('node:test');
+function body(t) { mark('test/b.test.js::' + t.name); }
+const bodies = { one(t) { mark('test/b.test.js::' + t.name); } };
+const wrap = fn => fn;
+const options = { timeout: 1000 };
+const nothing = undefined;
+test('named callback', body);
+test('named callback with options', { timeout: 1000 }, body);
+test('member callback', bodies.one);
+test('wrapped callback', wrap(t => { mark('test/b.test.js::' + t.name); }));
+test('options only', options);
+test('undefined body', nothing);
+test('no callback');
+test(...['spread title', () => { mark('test/b.test.js::spread'); }]);
+`,
+        },
+    },
+    {
+        id: 'node-test-names-written-again', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/r.test.js': `${CJS}const { test } = require('node:test');
+const fake = (name, fn) => name;
+let caseFn = test;
+caseFn = fake;
+caseFn('not a test: reassigned', () => { mark('test/r.test.js::not a test: reassigned'); });
+if (true) { var it = fake; }
+it('not a test: hoisted var', () => { mark('test/r.test.js::not a test: hoisted var'); });
+specify('not a test: hoisted function', () => { mark('test/r.test.js::not a test: hoisted function'); });
+function specify(name, fn) { return name; }
+let swapped = test;
+function swap() { swapped = fake; }
+swap();
+swapped('not a test: written in a function', () => { mark('test/r.test.js::not a test: written in a function'); });
+let picked = test;
+({ picked } = { picked: fake });
+picked('not a test: destructured over', () => { mark('test/r.test.js::not a test: destructured over'); });
+globalThis.fit = fake;
+fit('not a test: global written', () => { mark('test/r.test.js::not a test: global written'); });
+test('real', () => { mark('test/r.test.js::real'); });
+`,
+            'test/block.test.js': `${CJS}const { test } = require('node:test');
+const fake = (name, fn) => name;
+{ function specify(name, fn) { return fake(name, fn); } }
+specify('not a test: block function', () => { mark('test/block.test.js::not a test: block function'); });
+test('real beside a block', () => { mark('test/block.test.js::real beside a block'); });
+`,
+            'test/once.test.js': `${CJS}let declare;
+declare = require('node:test').test;
+declare('assigned once', () => { mark('test/once.test.js::assigned once'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-names-no-scope-settles', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/w.test.js': `${CJS}const { test } = require('node:test');
+const fake = (name, fn) => name;
+with ({ test: fake }) {
+    test('not a test: inside with', () => { mark('test/w.test.js::not a test: inside with'); });
+}
+function scoped() {
+    eval('var test = fake');
+    test('not a test: after eval', () => { mark('test/w.test.js::not a test: after eval'); });
+}
+scoped();
+test('real', () => { mark('test/w.test.js::real'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-skip-option-values', runner: 'node-test',
+        sometimes: ['test/o.test.js::named options', 'test/o.test.js::shorthand', 'test/o.test.js::spread options'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/o.test.js': `${CJS}const { test } = require('node:test');
+const skip = true;
+const opts = { skip: true };
+test('empty reason runs', { skip: '' }, () => { mark('test/o.test.js::empty reason runs'); });
+test('zero runs', { skip: 0 }, () => { mark('test/o.test.js::zero runs'); });
+test('null runs', { skip: null }, () => { mark('test/o.test.js::null runs'); });
+test('undefined runs', { skip: undefined }, () => { mark('test/o.test.js::undefined runs'); });
+test('reason skips', { skip: 'not today' }, () => { mark('test/o.test.js::reason skips'); });
+test('one skips', { skip: 1 }, () => { mark('test/o.test.js::one skips'); });
+test('shorthand', { skip }, () => { mark('test/o.test.js::shorthand'); });
+test('spread options', { ...opts }, () => { mark('test/o.test.js::spread options'); });
+test('named options', opts, () => { mark('test/o.test.js::named options'); });
+test('computed key', { ['skip']: true }, () => { mark('test/o.test.js::computed key'); });
+`,
+        },
+    },
+    {
+        // node runs a file that declares no test as one test.
+        id: 'node-test-files-the-script-names', runner: 'node-test',
+        full: 'npm test --silent',
+        undeclared: ['test/smoke.js::the script'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test test/a.test.js test/smoke.js" } }\n',
+            'test/a.test.js': `${CJS}const { test } = require('node:test');
+test('declared', () => { mark('test/a.test.js::declared'); });
+`,
+            'test/smoke.js': `${CJS}if (1 + 1 !== 2) process.exit(1);
+mark('test/smoke.js::the script');
+`,
+            'test/helpers/util.js': `${CJS}mark('test/helpers/util.js::never loaded');
+module.exports = {};
+`,
+        },
+    },
+    {
+        id: 'node-test-files-node-looks-for', runner: 'node-test',
+        undeclared: ['test/tools/setup.js::the script'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/a.test.js': `${CJS}const { test } = require('node:test');
+test('declared', () => { mark('test/a.test.js::declared'); });
+`,
+            'test/tools/setup.js': `${CJS}mark('test/tools/setup.js::the script');\n`,
+            'lib/tools.js': `${CJS}mark('lib/tools.js::never loaded');\nmodule.exports = {};\n`,
+        },
+    },
+    // ------------------------------------- one run, several files, a focus
+    {
+        id: 'jest-joined-with-a-focused-file', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'test/focus.test.js': `${CJS}test.only('focused', () => { mark('test/focus.test.js::focused'); });
+test('left out', () => { mark('test/focus.test.js::left out'); });
+`,
+            'test/plain.test.js': `${CJS}test('other file', () => { mark('test/plain.test.js::other file'); });\n`,
+        },
+    },
+    {
+        id: 'vitest-joined-with-a-focused-file', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'test/focus.test.js': `${ESM}import { test } from 'vitest';
+test.only('focused', () => { mark('test/focus.test.js::focused'); });
+test('left out', () => { mark('test/focus.test.js::left out'); });
+`,
+            'test/plain.test.js': `${ESM}import { test } from 'vitest';
+test('other file', () => { mark('test/plain.test.js::other file'); });
+`,
+        },
+    },
+    // -------------------------------------------- the runner's own config
+    {
+        id: 'mocha-config-adds-files', runner: 'mocha',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.json': '{ "spec": ["test/**/*.test.js"] }\n',
+            'test/a.test.js': `${CJS}it('first', function () { mark('test/a.test.js::first'); });\n`,
+            'test/deep/b.test.js': `${CJS}it('second', function () { mark('test/deep/b.test.js::second'); });\n`,
+        },
+    },
+    {
+        id: 'mocha-config-that-selects-nothing', runner: 'mocha',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.yml': 'timeout: 5000\nreporter: dot\n',
+            'test/a.test.js': `${CJS}it('first', function () { mark('test/a.test.js::first'); });\n`,
+            'test/b.test.js': `${CJS}it('second', function () { mark('test/b.test.js::second'); });\n`,
+        },
+    },
+    {
+        id: 'mocha-config-in-code', runner: 'mocha',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" }, "mocha": { "timeout": 4000 } }\n',
+            '.mocharc.js': "module.exports = Object.assign({}, { grep: 'first' });\n",
+            'test/a.test.js': `${CJS}it('first', function () { mark('test/a.test.js::first'); });\n`,
+            'test/b.test.js': `${CJS}it('second', function () { mark('test/b.test.js::second'); });\n`,
+        },
+        notRunByDefault: ['test/b.test.js::second'],
+    },
+    {
+        id: 'jest-config-chooses-files', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': "module.exports = { testMatch: ['**/*.spec.js'] };\n",
+            'test/a.spec.js': `${CJS}test('chosen', () => { mark('test/a.spec.js::chosen'); });\n`,
+            'test/b.test.js': `${CJS}test('left out by the config', () => { mark('test/b.test.js::left out by the config'); });\n`,
+        },
+        notRunByDefault: ['test/b.test.js::left out by the config'],
+    },
+    {
+        id: 'jest-config-roots-and-pattern', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" }, "jest": { "roots": ["<rootDir>/test"], "testRegex": ["test/(.*?/)?.*test.js$"], "testPathIgnorePatterns": ["<rootDir>/test/skipped/"], "collectCoverage": false } }\n',
+            'test/a.test.js': `${CJS}test('in the root', () => { mark('test/a.test.js::in the root'); });\n`,
+            'test/sub/b.test.js': `${CJS}test('deeper', () => { mark('test/sub/b.test.js::deeper'); });\n`,
+            'test/skipped/c.test.js': `${CJS}test('ignored path', () => { mark('test/skipped/c.test.js::ignored path'); });\n`,
+            'src/d.test.js': `${CJS}test('outside the roots', () => { mark('src/d.test.js::outside the roots'); });\n`,
+        },
+        notRunByDefault: ['src/d.test.js::outside the roots', 'test/skipped/c.test.js::ignored path'],
+    },
+    {
+        id: 'jest-config-that-selects-nothing', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': "/** @type {import('jest').Config} */\nconst config = {\n    testEnvironment: 'node',\n    verbose: true,\n};\nmodule.exports = config;\n",
+            'test/a.test.js': `${CJS}test('plain', () => { mark('test/a.test.js::plain'); });\n`,
+        },
+    },
+    {
+        id: 'vitest-config-chooses-files', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': "export default { test: { include: ['**/*.spec.js'] } };\n",
+            'test/a.spec.js': `${ESM}import { test } from 'vitest';
+test('chosen', () => { mark('test/a.spec.js::chosen'); });
+`,
+            'test/b.test.js': `${ESM}import { test } from 'vitest';
+test('left out by the config', () => { mark('test/b.test.js::left out by the config'); });
+`,
+        },
+        notRunByDefault: ['test/b.test.js::left out by the config'],
+    },
+    {
+        id: 'vitest-config-directory', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': "import { defineConfig } from 'vitest/config';\n\nexport default defineConfig({\n    test: {\n        name: 'unit',\n        globals: true,\n        environment: 'node',\n        dir: 'tests',\n    },\n});\n",
+            'tests/a.test.js': `${ESM}test('in the directory', () => { mark('tests/a.test.js::in the directory'); });\n`,
+            'src/b.test.js': `${ESM}test('outside the directory', () => { mark('src/b.test.js::outside the directory'); });\n`,
+        },
+        notRunByDefault: ['src/b.test.js::outside the directory'],
+    },
+    {
+        id: 'mocha-script-loads-what-the-tests-need', runner: 'mocha',
+        full: 'npm test --silent',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha --require ./support/setup.js --reporter dot test/" } }\n',
+            'support/setup.js': 'global.ready = true;\n',
+            'test/a.test.js': `${CJS}it('needs the setup', function () {
+    if (!global.ready) throw new Error('setup not loaded');
+    mark('test/a.test.js::needs the setup');
+});
+`,
+            'test/b.test.js': `${CJS}it('needs it too', function () {
+    if (!global.ready) throw new Error('setup not loaded');
+    mark('test/b.test.js::needs it too');
+});
+`,
+        },
+    },
+    {
+        id: 'jest-script-names-its-configuration', runner: 'jest',
+        full: 'npm test --silent',
+        notRunByDefault: ['test/b.test.js::under the default pattern'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest --config jest.unit.config.js" } }\n',
+            'jest.unit.config.js': "module.exports = { testMatch: ['**/*.unit.js'] };\n",
+            'test/a.unit.js': `${CJS}test('under the configuration the script names', () => { mark('test/a.unit.js::under the configuration the script names'); });\n`,
+            'test/b.test.js': `${CJS}test('under the default pattern', () => { mark('test/b.test.js::under the default pattern'); });\n`,
+        },
+    },
+    {
+        // Code the runner asks: a hook of a conftest.py, a TestMain.
+        id: 'pytest-hooks-decide-at-run-time', runner: 'pytest',
+        sometimes: ['tests/test_h.py::test_kept', 'tests/test_h.py::test_left_out'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/conftest.py': 'def pytest_collection_modifyitems(config, items):\n    items[:] = [item for item in items if item.name != "test_left_out"]\n',
+            'tests/test_h.py': `${PY}def test_left_out():
+    mark("tests/test_h.py::test_left_out")
+
+def test_kept():
+    mark("tests/test_h.py::test_kept")
+`,
+            // A hook that only does something else decides nothing.
+            'other/conftest.py': 'import gc\n\ndef pytest_runtest_setup():\n    gc.collect()\n\ndef pytest_collection():\n    gc.disable()\n',
+            'other/test_free.py': `${PY}def test_no_hook_above():
+    mark("other/test_free.py::test_no_hook_above")
+`,
+        },
+    },
+    {
+        id: 'go-test-main-decides', runner: 'go-test',
+        sometimes: ['gated/gated_test.go::TestBehindMain'],
+        emptyTestFiles: ['gated/gated_test.go'],
+        files: {
+            'go.mod': 'module example.com/mains\n\ngo 1.21\n',
+            'mark.go': GO('mains'),
+            'free_test.go': 'package mains\n\nimport "testing"\n\nfunc TestFree(t *testing.T) { mark("free_test.go::TestFree") }\n',
+            'gated/mark.go': GO('gated'),
+            'gated/main_test.go': 'package gated\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestMain(m *testing.M) {\n\tif os.Getenv("UCN_RUN_GATED") == "" {\n\t\tos.Exit(0)\n\t}\n\tos.Exit(m.Run())\n}\n',
+            'gated/gated_test.go': 'package gated\n\nimport "testing"\n\nfunc TestBehindMain(t *testing.T) { mark("gated/gated_test.go::TestBehindMain") }\n',
+            // A TestMain that sets up and runs decides nothing.
+            'plain/mark.go': GO('plain'),
+            'plain/main_test.go': 'package plain\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestMain(m *testing.M) {\n\tos.Setenv("UCN_SET_UP", "1")\n\tcode := m.Run()\n\tos.Exit(code)\n}\n',
+            'plain/plain_test.go': 'package plain\n\nimport "testing"\n\nfunc TestAfterSetup(t *testing.T) { mark("plain/plain_test.go::TestAfterSetup") }\n',
+        },
+    },
+    // ---------------------------------------------- pytest: later writes
+    {
+        id: 'pytest-a-later-write-decides', runner: 'pytest',
+        sometimes: [
+            'tests/test_class_and_function.py::TestComputed > test_actual',
+            'tests/test_class_and_function.py::test_function',
+            'tests/test_marks_branch.py::test_mark_in_branch',
+            'tests/test_marks_grown.py::test_mark_added',
+            'tests/test_module_branch.py::test_actual',
+            'tests/test_module_computed.py::test_actual',
+            'tests/test_rebound.py::TestBody > test_in_branch',
+            'tests/test_rebound.py::test_else',
+            'tests/test_rebound.py::test_never',
+        ],
+        // A second name for one function is a second test.
+        repeats: ['tests/test_rebound.py::test_kept', 'tests/test_rebound.py::TestBody > test_m'],
+        emptyTestFiles: ['tests/test_marks_branch.py', 'tests/test_marks_grown.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_module_computed.py': `${PY}__test__ = False
+__test__ = bool(1)
+
+def test_actual():
+    mark("tests/test_module_computed.py::test_actual")
+`,
+            'tests/test_module_branch.py': `${PY}__test__ = False
+if True:
+    __test__ = True
+
+def test_actual():
+    mark("tests/test_module_branch.py::test_actual")
+`,
+            'tests/test_class_and_function.py': `${PY}class TestComputed:
+    __test__ = False
+    __test__ = bool(1)
+
+    def test_actual(self):
+        mark("tests/test_class_and_function.py::TestComputed > test_actual")
+
+class TestBackOn:
+    __test__ = False
+    __test__ = True
+
+    def test_on(self):
+        mark("tests/test_class_and_function.py::TestBackOn > test_on")
+
+def test_function():
+    mark("tests/test_class_and_function.py::test_function")
+
+test_function.__test__ = False
+test_function.__test__ = bool(1)
+
+def test_function_back_on():
+    mark("tests/test_class_and_function.py::test_function_back_on")
+
+test_function_back_on.__test__ = False
+test_function_back_on.__test__ = True
+`,
+            'tests/test_marks.py': `${PY}import pytest
+
+pytestmark = pytest.mark.skip
+pytestmark = []
+
+def test_mark_replaced():
+    mark("tests/test_marks.py::test_mark_replaced")
+`,
+            'tests/test_marks_branch.py': `${PY}import pytest
+
+if True:
+    pytestmark = pytest.mark.skip
+
+def test_mark_in_branch():
+    mark("tests/test_marks_branch.py::test_mark_in_branch")
+`,
+            'tests/test_marks_grown.py': `${PY}import pytest
+
+pytestmark = []
+pytestmark += [pytest.mark.skip]
+
+def test_mark_added():
+    mark("tests/test_marks_grown.py::test_mark_added")
+`,
+            'tests/test_rebound.py': `${PY}import sys
+
+def test_gone():
+    mark("tests/test_rebound.py::test_gone")
+
+test_gone = None
+
+def test_deleted():
+    mark("tests/test_rebound.py::test_deleted")
+
+del test_deleted
+
+def test_kept():
+    mark("tests/test_rebound.py::test_kept")
+
+test_second_name = test_kept
+
+if sys.platform == "nope":
+    def test_never():
+        mark("tests/test_rebound.py::test_never")
+else:
+    def test_else():
+        mark("tests/test_rebound.py::test_else")
+
+class TestBody:
+    def test_m(self):
+        mark("tests/test_rebound.py::TestBody > test_m")
+
+    test_m_again = test_m
+
+    def test_none(self):
+        mark("tests/test_rebound.py::TestBody > test_none")
+
+    test_none = None
+
+    if True:
+        def test_in_branch(self):
+            mark("tests/test_rebound.py::TestBody > test_in_branch")
+`,
+        },
+    },
+    {
+        id: 'pytest-options-deselect', runner: 'pytest',
+        sometimes: [
+            'tests/test_marked.py::test_decorated_elsewhere',
+            'tests/test_marked.py::test_some_cases',
+        ],
+        files: {
+            'pytest.ini': '[pytest]\naddopts = -ra -m "not slow" --strict-markers --deselect tests/test_marked.py::test_deselected_by_id\nmarkers =\n    slow: takes long\n',
+            'tests/__init__.py': '',
+            'tests/deco.py': 'def passthrough(f):\n    return f\n',
+            'tests/test_marked.py': `${PY}import pytest
+from tests.deco import passthrough
+
+slow = pytest.mark.slow
+
+@pytest.mark.slow
+def test_marked():
+    mark("tests/test_marked.py::test_marked")
+
+@slow
+def test_marked_through_a_name():
+    mark("tests/test_marked.py::test_marked_through_a_name")
+
+@pytest.mark.slow
+class TestMarkedClass:
+    def test_inside(self):
+        mark("tests/test_marked.py::TestMarkedClass > test_inside")
+
+class TestMarkInBody:
+    pytestmark = pytest.mark.slow
+
+    def test_under_body_mark(self):
+        mark("tests/test_marked.py::the body under a body mark")
+
+class TestDerived(TestMarkInBody):
+    def test_own(self):
+        mark("tests/test_marked.py::TestDerived > test_own")
+
+@passthrough
+def test_decorated_elsewhere():
+    mark("tests/test_marked.py::test_decorated_elsewhere")
+
+def test_deselected_by_id():
+    mark("tests/test_marked.py::test_deselected_by_id")
+
+@pytest.mark.parametrize("v", [1, pytest.param(2, marks=pytest.mark.slow)])
+def test_some_cases(v):
+    mark("tests/test_marked.py::test_some_cases")
+
+def test_plain():
+    mark("tests/test_marked.py::test_plain")
+`,
+            'tests/test_module_marked.py': `${PY}import pytest
+
+pytestmark = [pytest.mark.slow]
+
+def test_under_module_mark():
+    mark("tests/test_module_marked.py::test_under_module_mark")
+`,
+        },
+    },
+    {
+        id: 'pytest-options-not-read', runner: 'pytest',
+        notRunByDefault: ['tests/test_k.py::test_thing'],
+        files: {
+            'pytest.ini': '[pytest]\naddopts = -k "not thing"\n',
+            'tests/__init__.py': '',
+            'tests/test_k.py': `${PY}def test_thing():
+    mark("tests/test_k.py::test_thing")
+
+def test_other():
+    mark("tests/test_k.py::test_other")
+`,
+        },
+    },
+    {
+        id: 'pytest-imported-tests-run-where-imported', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/base.py': `${PY}${RID}import unittest
+
+class TestBase:
+    def test_shared(self):
+        mark(rid())
+
+class CaseBase(unittest.TestCase):
+    def test_case_shared(self):
+        mark(rid())
+
+class Plain:
+    def test_under_another_name(self):
+        mark(rid())
+
+def test_function_elsewhere():
+    mark(rid())
+`,
+            'tests/test_child.py': `from tests.base import TestBase, CaseBase
+from tests.base import test_function_elsewhere
+from tests.base import TestBase as Renamed
+from tests.base import Plain as TestPlain
+
+class TestChild(TestBase):
+    pass
+
+class ChildCase(CaseBase):
+    pass
+`,
+        },
+    },
+    {
+        id: 'pytest-decorators-and-module-skips', runner: 'pytest',
+        sometimes: [
+            'tests/test_deco.py::test_needs_db',
+            'tests/test_deco.py::test_passed_through',
+            'tests/test_module_skip.py::test_unreached',
+            'tests/test_needs_module.py::test_needs_it',
+        ],
+        emptyTestFiles: ['tests/test_module_skip.py', 'tests/test_needs_module.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/deco.py': 'import pytest\n\nrequires_db = pytest.mark.skip(reason="no db")\n\ndef passthrough(f):\n    return f\n',
+            'tests/test_deco.py': `${PY}import pytest
+from unittest import mock
+from tests.deco import requires_db, passthrough
+
+@requires_db
+def test_needs_db():
+    mark("tests/test_deco.py::test_needs_db")
+
+@passthrough
+def test_passed_through():
+    mark("tests/test_deco.py::test_passed_through")
+
+@pytest.mark.xfail(run=False)
+def test_never_started():
+    mark("tests/test_deco.py::test_never_started")
+
+@pytest.mark.xfail
+def test_expected_to_fail():
+    mark("tests/test_deco.py::test_expected_to_fail")
+    assert False
+
+@mock.patch("os.getcwd")
+def test_patched(cwd):
+    mark("tests/test_deco.py::test_patched")
+
+@pytest.mark.usefixtures("tmp_path")
+def test_with_fixture():
+    mark("tests/test_deco.py::test_with_fixture")
+`,
+            'tests/test_needs_module.py': `${PY}import pytest
+
+missing = pytest.importorskip("a_module_that_is_not_installed")
+
+def test_needs_it():
+    mark("tests/test_needs_module.py::test_needs_it")
+`,
+            'tests/test_module_skip.py': `${PY}import pytest
+
+pytest.skip("not here", allow_module_level=True)
+
+def test_unreached():
+    mark("tests/test_module_skip.py::test_unreached")
+`,
+        },
+    },
+    // ------------------------------------- marks whose argument is a value
+    {
+        id: 'dotnet-xunit-skip-is-a-value', runner: 'dotnet-test',
+        sometimes: ['SkipValues.cs::SkipValues > ConstantElsewhere', 'SkipValues.cs::SkipValues > UnderAnAttributeOfTheProject'],
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Elsewhere.cs': 'namespace Values.Tests\n{\n    public static class Elsewhere { public const string Why = "elsewhere"; }\n}\n',
+            'SkipValues.cs': `using Xunit;
+
+namespace Values.Tests
+{
+${CS}
+    public static class Reasons
+    {
+        public const string Later = "later";
+        public const string None = null;
+    }
+
+    public class SkipValues
+    {
+        const string Local = "local reason";
+
+        [Fact(Skip = null)]
+        public void NullRuns() { Rec.Mark("SkipValues.cs::SkipValues > NullRuns"); }
+
+        [Fact(Skip = (string)null)]
+        public void CastNullRuns() { Rec.Mark("SkipValues.cs::SkipValues > CastNullRuns"); }
+
+        [Fact(Skip = default)]
+        public void DefaultRuns() { Rec.Mark("SkipValues.cs::SkipValues > DefaultRuns"); }
+
+        [Fact(Skip = Reasons.None)]
+        public void NullConstantRuns() { Rec.Mark("SkipValues.cs::SkipValues > NullConstantRuns"); }
+
+        [Fact(Skip = "why")]
+        public void LiteralSkips() { Rec.Mark("SkipValues.cs::SkipValues > LiteralSkips"); }
+
+        [Fact(Skip = Local)]
+        public void LocalConstantSkips() { Rec.Mark("SkipValues.cs::SkipValues > LocalConstantSkips"); }
+
+        [Fact(Skip = Reasons.Later)]
+        public void ConstantSkips() { Rec.Mark("SkipValues.cs::SkipValues > ConstantSkips"); }
+
+        [Fact(Skip = nameof(Reasons))]
+        public void NameofSkips() { Rec.Mark("SkipValues.cs::SkipValues > NameofSkips"); }
+
+        [Fact(Skip = "a" + "b")]
+        public void JoinedSkips() { Rec.Mark("SkipValues.cs::SkipValues > JoinedSkips"); }
+
+        [Fact(Skip = Elsewhere.Why)]
+        public void ConstantElsewhere() { Rec.Mark("SkipValues.cs::SkipValues > ConstantElsewhere"); }
+
+        [Fact(Skip = "")]
+        public void EmptyReason() { Rec.Mark("SkipValues.cs::SkipValues > EmptyReason"); }
+
+        [RetryFact]
+        public void UnderAnAttributeOfTheProject() { Rec.Mark("SkipValues.cs::SkipValues > UnderAnAttributeOfTheProject"); }
+    }
+
+    public class RetryFactAttribute : FactAttribute
+    {
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-junit5-conditions', runner: 'maven',
+        sometimes: [
+            'src/test/java/com/x/ConditionsTest.java::ConditionsTest > notOnWindows',
+            'src/test/java/com/x/ConditionsTest.java::ConditionsTest > onlyOnWindows',
+        ],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Flaky.java': `package com.x;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import org.junit.jupiter.api.Disabled;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Disabled("flaky")
+public @interface Flaky {
+}
+`,
+            'src/test/java/com/x/Quick.java': `package com.x;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+@Test
+@Tag("quick")
+public @interface Quick {
+}
+`,
+            'src/test/java/com/x/ConditionsTest.java': `package com.x;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+
+class ConditionsTest {
+${JAVA}
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    void onlyOnWindows() { mark("src/test/java/com/x/ConditionsTest.java::ConditionsTest > onlyOnWindows"); }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void notOnWindows() { mark("src/test/java/com/x/ConditionsTest.java::ConditionsTest > notOnWindows"); }
+
+    @Test
+    @Flaky
+    void underAnAnnotationOfTheProject() { mark("src/test/java/com/x/ConditionsTest.java::ConditionsTest > underAnAnnotationOfTheProject"); }
+
+    @Test
+    @Tag("fast")
+    @DisplayName("a name")
+    @Timeout(5)
+    void underJUnitsOwn() { mark("src/test/java/com/x/ConditionsTest.java::ConditionsTest > underJUnitsOwn"); }
+
+    @Quick
+    void declaredByAnAnnotationOfTheProject() { mark("src/test/java/com/x/ConditionsTest.java::ConditionsTest > declaredByAnAnnotationOfTheProject"); }
+}
+`,
+        },
+    },
+    {
+        id: 'cargo-ignored-on-a-condition', runner: 'cargo-test',
+        sometimes: ['src/lib.rs::tests > ignored_here', 'src/lib.rs::tests > ignored_elsewhere'],
+        files: {
+            'Cargo.toml': CARGO('case_cfg_attr'),
+            'src/lib.rs': `${RS}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn always() { mark("src/lib.rs::tests > always"); }
+
+    #[test]
+    #[cfg_attr(not(target_os = "none"), ignore)]
+    fn ignored_here() { mark("src/lib.rs::tests > ignored_here"); }
+
+    #[test]
+    #[cfg_attr(target_os = "none", ignore = "not there")]
+    fn ignored_elsewhere() { mark("src/lib.rs::tests > ignored_elsewhere"); }
+
+    #[test]
+    #[ignore = "takes long"]
+    fn ignored_with_a_reason() { mark("src/lib.rs::tests > ignored_with_a_reason"); }
+}
+`,
         },
     },
 ];

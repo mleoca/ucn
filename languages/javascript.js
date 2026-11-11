@@ -5904,10 +5904,6 @@ const TEST_RUNNER_MODULES = new Map([
 const TEST_CALLABLE_MODULES = new Set(['node:test', 'test', 'ava', 'tape']);
 // Objects every script can read the runner's globals from.
 const GLOBAL_OBJECTS = new Set(['globalThis', 'global', 'window', 'self']);
-// Values that cannot be a runner's declaring function.
-const INERT_VALUES = new Set(['function_expression', 'function', 'arrow_function', 'generator_function',
-    'class', 'number', 'string', 'template_string', 'object', 'array', 'true', 'false', 'null', 'undefined',
-    'regex', 'new_expression']);
 const WRAPPERS = new Set(['parenthesized_expression', 'as_expression', 'non_null_expression',
     'satisfies_expression', 'await_expression', 'type_assertion']);
 
@@ -5915,34 +5911,354 @@ function isTestApiName(name) {
     return TEST_SUITE_APIS.has(name) || TEST_CASE_APIS.has(name);
 }
 
-const SCOPE_BLOCKS = new Set(['statement_block', 'for_statement', 'for_in_statement', 'catch_clause',
-    'switch_body', 'class_static_block']);
+const BLOCK_SCOPES = new Set(['statement_block', 'for_statement', 'for_in_statement', 'catch_clause', 'switch_body']);
+const CLASS_NODES = new Set(['class_declaration', 'abstract_class_declaration', 'class']);
+// Declarations that exist for the type checker only.
+const AMBIENT_NODES = new Set(['ambient_declaration', 'type_alias_declaration', 'interface_declaration',
+    'function_signature']);
 const DECLARING = new Set(['import_statement', 'lexical_declaration', 'variable_declaration',
     'function_declaration', 'generator_function_declaration', 'class_declaration', 'export_statement']);
+// Values that are no function at all.
+const PLAIN_VALUES = new Set(['number', 'string', 'template_string', 'true', 'false', 'null', 'undefined', 'regex']);
+const BUILT_VALUES = new Set(['object', 'array', 'class', 'new_expression']);
+const OTHER = Object.freeze({ other: true });
+const UNREAD = Object.freeze({ unread: true });
+// The nodes the binder does something at; any other is only walked through.
+const BINDER_NODES = new Set([...AMBIENT_NODES, ...FUNCTION_NODES, ...CLASS_NODES, ...BLOCK_SCOPES,
+    'class_static_block', 'with_statement', 'import_statement', 'lexical_declaration', 'variable_declaration',
+    'enum_declaration', 'internal_module', 'module', 'assignment_expression', 'augmented_assignment_expression',
+    'update_expression', 'call_expression']);
+
+/** Every name a binding pattern introduces. */
+function patternNames(pattern, out = []) {
+    if (!pattern) return out;
+    switch (pattern.type) {
+        case 'identifier': case 'shorthand_property_identifier_pattern':
+            out.push(pattern.text);
+            return out;
+        case 'assignment_pattern': case 'object_assignment_pattern':
+            return patternNames(pattern.childForFieldName('left'), out);
+        case 'pair_pattern':
+            return patternNames(pattern.childForFieldName('value'), out);
+        case 'required_parameter': case 'optional_parameter':
+            return patternNames(pattern.childForFieldName('pattern'), out);
+        case 'object_pattern': case 'array_pattern': case 'rest_pattern': case 'formal_parameters':
+            for (const child of pattern.namedChildren) patternNames(child, out);
+            return out;
+        default:
+            return out;
+    }
+}
 
 /**
  * What names are bound to, as far as declaring tests goes, by the rules of
- * the language's own scopes. A value is the runner's function under any
- * name ({ api }), a module or object its functions are read from
- * ({ namespace }), something that is provably neither ({ other }), or
+ * the language's own scopes, read once for the whole file. A name belongs
+ * to the scope that declares it: `var` and a function declaration to the
+ * function around them wherever they stand in it, `let`, `const` and a
+ * class to their block, a parameter, a caught value and a loop variable to
+ * what they head. Every write to a name counts, wherever it stands: the
+ * declaration, an assignment (in a nested function too), a destructuring
+ * assignment, an update. A name written once holds that value; a name
+ * written more than once holds a value only when every write gives the
+ * same one, else it is not read. A name no scope of the file binds is the
+ * runner's global when it is spelled like one, unless the file writes that
+ * global or hands the global object to something. Inside `with`, and in a
+ * function that calls `eval`, names can be bound at run time: not read.
+ *
+ * A value is the runner's function under any name ({ api }), a module or
+ * object its functions are read from ({ namespace }), something that is
+ * provably neither ({ other }; `calls` says whether it is a function), or
  * something this cannot read ({ unread }): a call through the last two is
- * no test. A name no enclosing scope binds is the runner's global when it
- * is spelled like one. "helpers.exported(module, name)" says what a
- * project module exports under a name.
+ * no test. "helpers.exported(module, name)" says what a project module
+ * exports under a name.
  */
-function createTestBinder(helpers) {
-    let runnerBound = false;
-    let unreadBound = false;
-    const seen = value => {
-        if (value && value.runner && (value.api || value.namespace)) runnerBound = true;
-        if (value && value.unread) unreadBound = true;
-        return value;
-    };
+function createTestBinder(helpers, root) {
     const literal = node => node && node.type === 'string' ? node.text.slice(1, -1) : null;
-    const requiredModule = node => {
+    const scopes = new Map(); // id of the node that opens a scope -> scope
+    // Every call of the file in source order, with the scope it stands in
+    // and the function it stands in; every function, with the one around it.
+    const calls = [];
+    const functions = new Map();
+    const pending = [];
+    const writtenGlobals = new Set();
+    let globalsHandedOver = false;
+    const newScope = parent => ({ parent, names: new Map(), dynamic: false });
+    const bindingIn = (scope, name) => {
+        let binding = scope.names.get(name);
+        if (!binding) {
+            binding = { name, writes: [] };
+            scope.names.set(name, binding);
+        }
+        return binding;
+    };
+    const lookup = (scope, name) => {
+        for (let current = scope; current; current = current.parent) {
+            const binding = current.names.get(name);
+            if (binding) return { binding };
+            if (current.dynamic) return { dynamic: true };
+        }
+        return null;
+    };
+    const top = newScope(null);
+    const fixed = value => ({ kind: 'fixed', value });
+
+    const declarePattern = (target, pattern, value, env) => {
+        if (!pattern) return;
+        if (pattern.type === 'identifier') {
+            const binding = bindingIn(target, pattern.text);
+            if (value) binding.writes.push({ kind: 'value', node: value, env });
+            return;
+        }
+        if (pattern.type !== 'object_pattern') {
+            for (const name of patternNames(pattern)) bindingIn(target, name).writes.push({ kind: 'unknown', node: value, env });
+            return;
+        }
+        for (const property of pattern.namedChildren) {
+            let key = null;
+            let local = null;
+            if (property.type === 'shorthand_property_identifier_pattern') {
+                key = local = property.text;
+            } else if (property.type === 'pair_pattern') {
+                const keyNode = property.childForFieldName('key');
+                const valueNode = property.childForFieldName('value');
+                if (keyNode && keyNode.type !== 'computed_property_name') key = keyNode.text.replace(/^['"]|['"]$/g, '');
+                if (valueNode && valueNode.type === 'identifier') local = valueNode.text;
+            }
+            if (key && local) bindingIn(target, local).writes.push({ kind: 'member', node: value, env, key });
+            else for (const name of patternNames(property)) bindingIn(target, name).writes.push({ kind: 'unknown', node: value, env });
+        }
+    };
+
+    const declareImport = (node, scope) => {
+        // `import type` binds no value.
+        if (node.children.some(child => child.type === 'type')) return;
+        const required = node.namedChildren.find(child => child.type === 'import_require_clause');
+        if (required) {
+            const local = required.namedChildren.find(child => child.type === 'identifier');
+            const from = literal(required.namedChildren.find(child => child.type === 'string'));
+            if (local) bindingIn(scope, local.text).writes.push({ kind: 'import', module: from, imported: null });
+            return;
+        }
+        const moduleName = literal(node.childForFieldName('source'));
+        const clause = node.namedChildren.find(child => child.type === 'import_clause');
+        for (const part of (clause && clause.namedChildren) || []) {
+            if (part.type === 'identifier') {
+                // A default import: the runner module itself where its
+                // default is the declaring function.
+                bindingIn(scope, part.text).writes.push({
+                    kind: 'import', module: moduleName,
+                    imported: TEST_RUNNER_MODULES.has(moduleName) ? null : 'default',
+                });
+            } else if (part.type === 'namespace_import') {
+                const local = part.namedChildren.find(child => child.type === 'identifier');
+                if (local) bindingIn(scope, local.text).writes.push({ kind: 'import', module: moduleName, imported: null });
+            } else if (part.type === 'named_imports') {
+                for (const spec of part.namedChildren) {
+                    const imported = spec.childForFieldName('name');
+                    const alias = spec.childForFieldName('alias');
+                    if (!imported || spec.children.some(child => child.type === 'type')) continue;
+                    bindingIn(scope, (alias || imported).text).writes.push({
+                        kind: 'import', module: moduleName, imported: imported.text,
+                    });
+                }
+            }
+        }
+    };
+
+    const buildFunction = (node, scope, varScope, around) => {
+        const fn = { parent: around };
+        functions.set(node.id, fn);
+        const declaration = node.type === 'function_declaration' || node.type === 'generator_function_declaration';
+        const name = node.childForFieldName('name');
+        let outer = scope;
+        if (declaration && name) {
+            if (scope === varScope || scope.bodyOf === varScope) {
+                // Hoisted: one binding with the function's `var`s.
+                bindingIn(varScope, name.text).writes.push(fixed({ other: true, calls: true }));
+            } else {
+                // In a block: the block's own, and outside it too where
+                // the file is not strict (not decided here).
+                bindingIn(scope, name.text).writes.push(fixed({ other: true, calls: true }));
+                bindingIn(varScope, name.text).writes.push({ kind: 'maybe', outer: varScope.parent });
+            }
+        } else if (name && node.type !== 'method_definition') {
+            // The name of a function expression is its own, inside it.
+            outer = newScope(scope);
+            bindingIn(outer, name.text).writes.push(fixed({ other: true, calls: true }));
+        }
+        const own = newScope(outer);
+        scopes.set(node.id, own);
+        const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
+        for (const parameter of patternNames(parameters)) bindingIn(own, parameter).writes.push({ kind: 'parameter' });
+        if (parameters) for (const child of parameters.namedChildren) build(child, own, own, fn);
+        const body = node.childForFieldName('body');
+        if (body && body.type === 'statement_block') {
+            const inner = newScope(own);
+            inner.bodyOf = own;
+            scopes.set(body.id, inner);
+            for (const child of body.namedChildren) build(child, inner, own, fn);
+        } else if (body) {
+            build(body, own, own, fn);
+        }
+    };
+
+    const build = (node, scope, varScope, fn) => {
+        // A node with nothing inside declares, writes and calls nothing;
+        // most others only hold the ones that do.
+        if (node.namedChildCount === 0) return;
+        const type = node.type;
+        if (!BINDER_NODES.has(type)) {
+            for (const child of node.namedChildren) build(child, scope, varScope, fn);
+            return;
+        }
+        if (AMBIENT_NODES.has(type)) return;
+        if (FUNCTION_NODES.has(type)) {
+            buildFunction(node, scope, varScope, fn);
+            return;
+        }
+        if (CLASS_NODES.has(type)) {
+            const name = node.childForFieldName('name');
+            let inner = scope;
+            if (name && type === 'class') {
+                inner = newScope(scope);
+                scopes.set(node.id, inner);
+                bindingIn(inner, name.text).writes.push(fixed(OTHER));
+            } else if (name) {
+                bindingIn(scope, name.text).writes.push(fixed(OTHER));
+            }
+            for (const child of node.namedChildren) build(child, inner, varScope, fn);
+            return;
+        }
+        if (type === 'class_static_block') {
+            const own = newScope(scope);
+            scopes.set(node.id, own);
+            for (const child of node.namedChildren) build(child, own, own, fn);
+            return;
+        }
+        if (BLOCK_SCOPES.has(type)) {
+            const own = newScope(scope);
+            scopes.set(node.id, own);
+            if (type === 'catch_clause') {
+                for (const name of patternNames(node.childForFieldName('parameter'))) {
+                    bindingIn(own, name).writes.push(fixed(OTHER));
+                }
+            } else if (type === 'for_in_statement') {
+                const left = node.childForFieldName('left');
+                const kind = node.childForFieldName('kind');
+                const names = left && left.type === 'identifier' ? [left.text] : patternNames(left);
+                const from = { kind: 'unknown', node: node.childForFieldName('right'), env: scope };
+                for (const name of names) {
+                    if (!kind) pending.push({ name, scope, write: from });
+                    else bindingIn(kind.text === 'var' ? varScope : own, name).writes.push(from);
+                }
+            }
+            for (const child of node.namedChildren) build(child, own, varScope, fn);
+            return;
+        }
+        if (type === 'with_statement') {
+            // Any name inside may be a property of the object.
+            const own = newScope(scope);
+            own.dynamic = true;
+            scopes.set(node.id, own);
+            for (const child of node.namedChildren) build(child, own, varScope, fn);
+            return;
+        }
+        if (type === 'import_statement') {
+            declareImport(node, scope);
+            return;
+        }
+        if (type === 'lexical_declaration' || type === 'variable_declaration') {
+            const target = type === 'variable_declaration' ? varScope : scope;
+            for (const declarator of node.namedChildren) {
+                if (declarator.type !== 'variable_declarator') continue;
+                const value = declarator.childForFieldName('value');
+                declarePattern(target, declarator.childForFieldName('name'), value, scope);
+                if (value) build(value, scope, varScope, fn);
+            }
+            return;
+        }
+        if (type === 'enum_declaration' || type === 'internal_module' || type === 'module') {
+            const name = node.childForFieldName('name');
+            if (name && name.type === 'identifier') bindingIn(scope, name.text).writes.push(fixed(OTHER));
+        } else if (type === 'assignment_expression' || type === 'augmented_assignment_expression') {
+            const left = node.childForFieldName('left');
+            const right = node.childForFieldName('right');
+            const plain = type === 'assignment_expression';
+            if (left && left.type === 'identifier') {
+                pending.push({
+                    name: left.text, scope,
+                    write: plain ? { kind: 'value', node: right, env: scope } : { kind: 'unknown' },
+                });
+            } else if (left && (left.type === 'member_expression' || left.type === 'subscript_expression')) {
+                // globalThis.it = ...: the global of that name is written.
+                const object = left.childForFieldName('object');
+                const property = left.childForFieldName('property') || left.childForFieldName('index');
+                if (object && object.type === 'identifier' && GLOBAL_OBJECTS.has(object.text)) {
+                    const name = !property ? null : property.type === 'string' ? literal(property)
+                        : left.type === 'member_expression' ? property.text : null;
+                    pending.push({ global: name, object: object.text, scope });
+                }
+            } else if (left) {
+                for (const name of patternNames(left)) {
+                    pending.push({ name, scope, write: { kind: 'unknown', node: right, env: scope } });
+                }
+            }
+        } else if (type === 'update_expression') {
+            const argument = node.childForFieldName('argument');
+            if (argument && argument.type === 'identifier') {
+                pending.push({ name: argument.text, scope, write: { kind: 'unknown' } });
+            }
+        } else if (type === 'call_expression') {
+            calls.push({ node, scope, fn });
+            const callee = node.childForFieldName('function');
+            if (callee && callee.type === 'identifier' && callee.text === 'eval') pending.push({ evalIn: varScope, scope });
+            // Object.assign(globalThis, ...), Object.defineProperty(global,
+            // 'it', ...): the globals they name are written; which ones,
+            // where the names are not written out, is not read. Any other
+            // call handed the global object is taken to leave the
+            // runner's functions alone.
+            const args = node.childForFieldName('arguments');
+            const values = (args && args.namedChildren) || [];
+            const target = values[0];
+            const method = callee && callee.type === 'member_expression' &&
+                /^(Object|Reflect)$/.test(callee.childForFieldName('object')?.text || '')
+                ? callee.childForFieldName('property')?.text : null;
+            if (method && target && target.type === 'identifier' && GLOBAL_OBJECTS.has(target.text)) {
+                const keysOf = object => object.namedChildren.map(member =>
+                    member.type === 'shorthand_property_identifier' ? member.text
+                        : member.type === 'pair' && member.childForFieldName('key')?.type !== 'computed_property_name'
+                            ? member.childForFieldName('key').text.replace(/^['"]|['"]$/g, '') : null);
+                let names = null;
+                if (method === 'defineProperty' || method === 'set') {
+                    names = [values[1] && values[1].type === 'string' ? literal(values[1]) : null];
+                } else if (method === 'assign' || method === 'defineProperties') {
+                    names = values.slice(1).flatMap(source => source.type === 'object' ? keysOf(source) : [null]);
+                }
+                for (const name of names || []) pending.push({ global: name, object: target.text, scope });
+            }
+        }
+        for (const child of node.namedChildren) build(child, scope, varScope, fn);
+    };
+
+    scopes.set(root.id, top);
+    for (const child of root.namedChildren) build(child, top, top, null);
+    for (const entry of pending) {
+        if (entry.write) {
+            const found = lookup(entry.scope, entry.name);
+            if (found && found.binding) found.binding.writes.push(entry.write);
+            else writtenGlobals.add(entry.name);
+        } else if (entry.evalIn) {
+            if (!lookup(entry.scope, 'eval')) entry.evalIn.dynamic = true;
+        } else if (!lookup(entry.scope, entry.object)) {
+            if (entry.global) writtenGlobals.add(entry.global);
+            else globalsHandedOver = true;
+        }
+    }
+
+    const requiredModule = (node, scope) => {
         if (!node || node.type !== 'call_expression') return null;
         const callee = node.childForFieldName('function');
-        if (!callee || callee.type !== 'identifier' || callee.text !== 'require') return null;
+        if (!callee || callee.type !== 'identifier' || callee.text !== 'require' || lookup(scope, 'require')) return null;
         const args = node.childForFieldName('arguments');
         return args && args.namedChildren.length === 1 ? literal(args.namedChildren[0]) : null;
     };
@@ -5955,38 +6271,92 @@ function createTestBinder(helpers) {
                     ...(TEST_CALLABLE_MODULES.has(moduleName) && { callable: 'test' }),
                 };
             }
-            return isTestApiName(name) ? { api: name, runner: true } : { other: true };
+            return isTestApiName(name) ? { api: name, runner: true } : OTHER;
         }
         if (name == null) return { namespace: true, module: moduleName };
         const exported = helpers.exported ? helpers.exported(moduleName, name) : null;
         if (exported) return exported;
         // A module that is not read: a name spelled like the runner's
         // function may be it, and may not.
-        return isTestApiName(name) ? { unread: true } : { other: true };
+        return isTestApiName(name) ? UNREAD : OTHER;
     };
-    const lookup = (env, name) => {
-        for (let i = env.length - 1; i >= 0; i--) {
-            if (env[i].has(name)) return env[i].get(name);
+    const sameValue = (a, b) => !!a.other === !!b.other && !!a.unread === !!b.unread && a.api === b.api &&
+        !!a.namespace === !!b.namespace && a.module === b.module && !!a.runner === !!b.runner &&
+        a.callable === b.callable && a.calls === b.calls && !!a.global === !!b.global &&
+        (a.modifiers || []).join() === (b.modifiers || []).join();
+    const globalNamed = name => {
+        if (writtenGlobals.has(name) || globalsHandedOver) return UNREAD;
+        return { api: name };
+    };
+    const writeValue = (write, name) => {
+        switch (write.kind) {
+            case 'fixed': return write.value;
+            case 'parameter': return isTestApiName(name) ? UNREAD : OTHER;
+            case 'import': return fromModule(write.module, write.imported);
+            case 'value': return valueOf(write.node, write.env, name);
+            case 'member': {
+                const from = write.node ? resolve(write.node, write.env) : null;
+                if (from && from.namespace && from.module) return fromModule(from.module, write.key);
+                if (from && from.namespace && from.global) return isTestApiName(write.key) ? globalNamed(write.key) : OTHER;
+                if (from && from.namespace) return isTestApiName(write.key) ? { api: write.key, runner: from.runner } : OTHER;
+                if (!write.node || PLAIN_VALUES.has(write.node.type) || (from && (from.api || from.other))) return OTHER;
+                return isTestApiName(write.key) ? UNREAD : OTHER;
+            }
+            case 'maybe': {
+                // A function declared in a block may also be the name
+                // outside it: what that name held before decides.
+                const before = lookup(write.outer, name);
+                const held = before && before.binding ? valueOfBinding(before.binding) : null;
+                if (before && before.dynamic) return UNREAD;
+                if (held) return held.api || held.namespace || held.unread ? UNREAD : OTHER;
+                return isTestApiName(name) ? UNREAD : OTHER;
+            }
+            default:
+                // A value this does not follow (a loop's element, an
+                // update, a pattern): the runner's function only where
+                // the name or what it is taken from says so.
+                return isTestApiName(name) || (write.node && mentionsRunner(write.node, write.env)) ? UNREAD : OTHER;
         }
-        return undefined;
     };
-    const resolve = (node, env, depth = 0) => {
+    const valueOfBinding = binding => {
+        if (binding.value !== undefined) return binding.value;
+        // A write that reads the name itself (x = x.trim()) says nothing
+        // by that: the other writes decide.
+        if (binding.resolving) return OTHER;
+        binding.resolving = true;
+        let value;
+        if (binding.writes.length === 0) {
+            // Declared and never written: undefined.
+            value = { other: true, calls: false };
+        } else {
+            const values = binding.writes.map(write => writeValue(write, binding.name));
+            value = values.every(each => sameValue(each, values[0])) ? values[0]
+                : values.some(each => each.unread || each.api || each.namespace) ? UNREAD : OTHER;
+        }
+        binding.resolving = false;
+        binding.value = value;
+        return value;
+    };
+    /** What an expression stands for, or null when it is none of the forms read. */
+    const resolve = (node, scope, depth = 0) => {
         if (!node || depth > 8) return null;
-        if (WRAPPERS.has(node.type)) return resolve(node.namedChildren[0], env, depth + 1);
-        if (node.type === 'identifier') {
-            const bound = lookup(env, node.text);
-            if (bound !== undefined) return bound.other || bound.unread ? null : bound;
+        if (WRAPPERS.has(node.type)) return resolve(node.namedChildren[0], scope, depth + 1);
+        if (node.type === 'identifier' || node.type === 'shorthand_property_identifier') {
+            const found = lookup(scope, node.text);
+            if (found && found.binding) return valueOfBinding(found.binding);
+            if (found && found.dynamic) return UNREAD;
             if (GLOBAL_OBJECTS.has(node.text)) return { namespace: true, global: true };
-            return isTestApiName(node.text) ? { api: node.text } : null;
+            return isTestApiName(node.text) ? globalNamed(node.text) : null;
         }
         if (node.type === 'call_expression') {
-            const name = requiredModule(node);
+            const name = requiredModule(node, scope);
             return name == null ? null : fromModule(name, null);
         }
         if (node.type === 'member_expression') {
-            const object = resolve(node.childForFieldName('object'), env, depth + 1);
+            const object = resolve(node.childForFieldName('object'), scope, depth + 1);
             const property = node.childForFieldName('property');
-            if (!object || !property) return null;
+            if (!object || !property || object.other) return null;
+            if (object.unread) return UNREAD;
             if (object.api) {
                 if (isTestApiName(property.text)) return { ...object, api: property.text };
                 if (TEST_API_MODIFIERS.has(property.text)) {
@@ -5995,11 +6365,10 @@ function createTestBinder(helpers) {
                 return null;
             }
             if (object.namespace) {
-                if (object.module) {
-                    const given = fromModule(object.module, property.text);
-                    return given.other || given.unread ? null : given;
+                if (object.module) return fromModule(object.module, property.text);
+                if (isTestApiName(property.text)) {
+                    return object.global ? globalNamed(property.text) : { api: property.text, runner: object.runner };
                 }
-                if (isTestApiName(property.text)) return { api: property.text, runner: object.runner };
                 // The callable default of a runner module carries members too.
                 if (object.callable && TEST_API_MODIFIERS.has(property.text)) {
                     return { api: object.callable, runner: object.runner, modifiers: [property.text] };
@@ -6009,159 +6378,53 @@ function createTestBinder(helpers) {
         return null;
     };
     /** Does an expression name the runner's function or module anywhere? */
-    const mentionsRunner = (node, env) => {
+    const mentionsRunner = (node, scope) => {
         if (FUNCTION_NODES.has(node.type)) return false;
         if (node.type === 'identifier' || node.type === 'call_expression' || node.type === 'member_expression') {
-            const value = resolve(node, env);
-            if (value && value.runner && (value.api || value.namespace)) return true;
+            const value = resolve(node, scope);
+            if (value && (value.unread || (value.runner && (value.api || value.namespace)))) return true;
         }
-        return node.namedChildren.some(child => mentionsRunner(child, env));
+        return node.namedChildren.some(child => mentionsRunner(child, scope));
     };
-    /** The binding a callee's own name has in scope, unread ones included. */
-    const boundAt = (node, env) => {
+    /** A value an initializer stands for, or what an unreadable one leaves. */
+    const valueOf = (node, scope, name) => {
+        const resolved = resolve(node, scope);
+        if (resolved) return resolved;
+        if (!node) return { other: true, calls: false };
+        if (node.type !== 'class' && FUNCTION_NODES.has(node.type)) return { other: true, calls: true };
+        if (PLAIN_VALUES.has(node.type)) return { other: true, calls: false };
+        // A value made here is not the runner's function; one that holds
+        // the runner's names can hand them on.
+        if (BUILT_VALUES.has(node.type)) return mentionsRunner(node, scope) ? UNREAD : { other: true, calls: false };
+        return isTestApiName(name) || mentionsRunner(node, scope) ? UNREAD : OTHER;
+    };
+    /** Is the name a callee starts with one this cannot read? */
+    const unreadAt = (node, scope) => {
         let base = node;
         while (base && (base.type === 'member_expression' || base.type === 'call_expression' || WRAPPERS.has(base.type))) {
             base = base.type === 'member_expression' ? base.childForFieldName('object')
                 : base.type === 'call_expression' ? base.childForFieldName('function') : base.namedChildren[0];
         }
-        return base && base.type === 'identifier' ? lookup(env, base.text) : undefined;
-    };
-    /** A value an initializer stands for, or what an unreadable one leaves. */
-    const valueOf = (node, env, name) => {
-        const resolved = resolve(node, env);
-        if (resolved) return resolved;
-        // A value that cannot be a function of the runner is not one. Any
-        // other is not read when it is made from the runner's own names
-        // (a member picked at run time, a wrapper's result) or when the
-        // name it gets is spelled like the runner's function.
-        if (!node || INERT_VALUES.has(node.type)) return { other: true };
-        return isTestApiName(name) || mentionsRunner(node, env) ? { unread: true } : { other: true };
-    };
-    const bindPattern = (scope, pattern, value) => {
-        // Every name a pattern introduces, bound to the same value.
-        if (!pattern) return;
-        if (pattern.type === 'identifier' || pattern.type === 'shorthand_property_identifier_pattern') {
-            scope.set(pattern.text, value);
-            return;
-        }
-        for (const child of pattern.namedChildren) bindPattern(scope, child, value);
-    };
-    const declare = (scope, node, env) => {
-        if (node.type === 'export_statement') {
-            for (const child of node.namedChildren) {
-                if (DECLARING.has(child.type)) declare(scope, child, env);
-            }
-            return;
-        }
-        if (node.type === 'import_statement') {
-            const moduleName = literal(node.childForFieldName('source'));
-            const clause = node.namedChildren.find(child => child.type === 'import_clause');
-            for (const part of (clause && clause.namedChildren) || []) {
-                if (part.type === 'identifier') {
-                    // A default import: the runner module itself where its
-                    // default is the declaring function.
-                    scope.set(part.text, seen(TEST_RUNNER_MODULES.has(moduleName)
-                        ? fromModule(moduleName, null) : fromModule(moduleName, 'default')));
-                } else if (part.type === 'namespace_import') {
-                    const local = part.namedChildren.find(child => child.type === 'identifier');
-                    if (local) scope.set(local.text, seen(fromModule(moduleName, null)));
-                } else if (part.type === 'named_imports') {
-                    for (const spec of part.namedChildren) {
-                        const imported = spec.childForFieldName('name');
-                        const alias = spec.childForFieldName('alias');
-                        if (imported) scope.set((alias || imported).text, seen(fromModule(moduleName, imported.text)));
-                    }
-                }
-            }
-            return;
-        }
-        if (node.type === 'function_declaration' || node.type === 'generator_function_declaration' ||
-            node.type === 'class_declaration') {
-            const name = node.childForFieldName('name');
-            if (name) scope.set(name.text, { other: true });
-            return;
-        }
-        if (node.type !== 'lexical_declaration' && node.type !== 'variable_declaration') return;
-        for (const declarator of node.namedChildren) {
-            if (declarator.type !== 'variable_declarator') continue;
-            const target = declarator.childForFieldName('name');
-            const value = declarator.childForFieldName('value');
-            if (!target) continue;
-            if (target.type === 'identifier') {
-                scope.set(target.text, seen(valueOf(value, env, target.text)));
-                continue;
-            }
-            if (target.type !== 'object_pattern') {
-                bindPattern(scope, target, { other: true });
-                continue;
-            }
-            const from = resolve(value, env);
-            for (const property of target.namedChildren) {
-                let key = null;
-                let local = null;
-                if (property.type === 'shorthand_property_identifier_pattern') {
-                    key = local = property.text;
-                } else if (property.type === 'pair_pattern') {
-                    const keyNode = property.childForFieldName('key');
-                    const valueNode = property.childForFieldName('value');
-                    key = keyNode ? keyNode.text : null;
-                    local = valueNode && valueNode.type === 'identifier' ? valueNode.text : null;
-                    if (!local && valueNode) bindPattern(scope, valueNode, { other: true });
-                } else if (property.type === 'object_assignment_pattern') {
-                    const left = property.childForFieldName('left');
-                    if (left && left.type === 'shorthand_property_identifier_pattern') key = local = left.text;
-                } else {
-                    bindPattern(scope, property, { other: true });
-                }
-                if (!key || !local) continue;
-                let given;
-                if (from && from.namespace && from.module) given = fromModule(from.module, key);
-                else if (from && from.namespace) given = isTestApiName(key) ? { api: key, runner: from.runner } : { other: true };
-                else if (!value || INERT_VALUES.has(value.type) || (from && from.api)) given = { other: true };
-                else given = isTestApiName(key) ? { unread: true } : { other: true };
-                scope.set(local, seen(given));
-            }
-        }
-    };
-    /** The scope a list of statements makes, read twice: a name may alias one bound later. */
-    const scopeOf = (statements, outer) => {
-        const scope = new Map();
-        const env = [...outer, scope];
-        for (let round = 0; round < 2; round++) {
-            for (const statement of statements) {
-                if (DECLARING.has(statement.type)) declare(scope, statement, env);
-            }
-        }
-        return scope;
-    };
-    /** The scope a function's parameters make. */
-    const parameterScope = node => {
-        const scope = new Map();
-        const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
-        const bind = child => {
-            if (child.type === 'identifier' || child.type === 'shorthand_property_identifier_pattern') {
-                scope.set(child.text, { other: true });
-                return;
-            }
-            // The default of a parameter is a value, not a name it binds.
-            const pattern = child.childForFieldName('left') || child.childForFieldName('pattern');
-            if (pattern) {
-                bind(pattern);
-                return;
-            }
-            for (const next of child.namedChildren) bind(next);
-        };
-        if (parameters) bind(parameters);
-        const name = node.type === 'function_expression' || node.type === 'function'
-            ? node.childForFieldName('name') : null;
-        if (name) scope.set(name.text, { other: true });
-        return scope;
+        if (!base || base.type !== 'identifier') return false;
+        const value = resolve(base, scope);
+        return !!value && !!value.unread;
     };
     return {
-        resolve, scopeOf, parameterScope, fromModule, declare, boundAt,
-        runnerBound: () => runnerBound,
-        unreadBound: () => unreadBound,
+        top, resolve, fromModule, unreadAt, calls,
+        /** The record of a function node: `parent` is the function around it. */
+        functionOf: node => functions.get(node.id) || null,
+        /** What a name declared at the top of the file holds, or undefined. */
+        bound: name => top.names.has(name) ? valueOfBinding(top.names.get(name)) : undefined,
     };
+}
+
+/** The file's binder, built once for every question asked of the file. */
+function testBinderOf(helpers, tree) {
+    const cache = helpers.cache;
+    if (cache && cache.has('testBinder')) return cache.get('testBinder');
+    const binder = createTestBinder(helpers, tree.rootNode);
+    if (cache) cache.set('testBinder', binder);
+    return binder;
 }
 
 /** The declaring call a call node is, or null: { kind, table, skip, todo, only, sometimes }. */
@@ -6206,23 +6469,67 @@ function literalTitle(node) {
     return body.replace(/\\(['"\x60\\])/g, '$1');
 }
 
-/** What an options object of a declaring call says: 'skip', 'sometimes' or null. */
+/** Whether a literal is truthy: true, false, or null when it is no literal. */
+function literalTruth(node) {
+    if (!node) return null;
+    switch (node.type) {
+        case 'true': return true;
+        case 'false': case 'null': case 'undefined': return false;
+        case 'string': return node.text.length > 2;
+        case 'template_string':
+            return node.namedChildren.some(child => child.type === 'template_substitution') ? null : node.text.length > 2;
+        case 'number': {
+            const value = Number(node.text.replace(/_/g, '').replace(/n$/, ''));
+            return Number.isNaN(value) ? null : value !== 0;
+        }
+        case 'parenthesized_expression': return literalTruth(node.namedChildren[0]);
+        default: return null;
+    }
+}
+
+/**
+ * What an options object of a declaring call says: 'skip' (a skip or todo
+ * whose value is a truthy literal), 'sometimes' (one whose value is not a
+ * literal, a shorthand, a spread, a computed key that is not a string) or
+ * null (none, or a falsy literal: an empty reason does not skip).
+ */
 function declaredSkip(values, hasCallback) {
     const options = values.find(value => value.type === 'object');
     if (!options) return null;
     let answer = null;
+    const weaker = () => {
+        if (answer !== 'skip') answer = 'sometimes';
+    };
     for (const pair of options.namedChildren) {
+        if (pair.type === 'spread_element') {
+            weaker();
+            continue;
+        }
+        if (pair.type === 'shorthand_property_identifier') {
+            if (pair.text === 'skip' || (pair.text === 'todo' && !hasCallback)) weaker();
+            continue;
+        }
         if (pair.type !== 'pair') continue;
         const key = pair.childForFieldName('key');
         const value = pair.childForFieldName('value');
         if (!key || !value) continue;
-        const name = key.text.replace(/^['"]|['"]$/g, '');
+        let name;
+        if (key.type === 'computed_property_name') {
+            const inner = key.namedChildren[0];
+            if (!inner || inner.type !== 'string') {
+                weaker();
+                continue;
+            }
+            name = inner.text.slice(1, -1);
+        } else {
+            name = key.text.replace(/^['"]|['"]$/g, '');
+        }
         if (name !== 'skip' && name !== 'todo') continue;
-        if (value.type === 'false') continue;
         // A todo with a body still runs it.
         if (name === 'todo' && hasCallback) continue;
-        if (value.type === 'true' || value.type === 'string') answer = 'skip';
-        else if (answer !== 'skip') answer = 'sometimes';
+        const truth = literalTruth(value);
+        if (truth === true) answer = 'skip';
+        else if (truth == null) weaker();
     }
     return answer;
 }
@@ -6230,122 +6537,119 @@ function declaredSkip(values, hasCallback) {
 /**
  * The tests a JavaScript or TypeScript file declares: calls of the
  * runners' declaring functions, found by what the callee is bound to at
- * the call (the language's scopes: a parameter, a local, an import from a
- * module that is not the runner's are not the runner's function), named by
- * their literal titles and by the suites whose callbacks hold them. A
- * title that is not a literal, a table of cases and a declaration inside a
- * function that is not a suite's callback are tests whose runtime names
- * are not the written ones; the last exist only where that function is
- * called. A test marked skip (or inside a skipped suite) is declared and
- * not executed. "only" is the mark as written; "parent" is the index of
- * the suite a unit stands in (-1: the file), so each runner's own rule for
- * focus can be applied. "open" says the file calls through a name that may
- * be the runner's function and is not read (made from the runner's names
- * at run time, or taken from a module that is not read), and no test was
- * read: it holds tests this did not see.
+ * the call (see createTestBinder), named by their literal titles and by
+ * the suites whose callbacks hold them. A title that is not a literal, a
+ * table of cases and a declaration inside a function that is not a
+ * suite's callback are tests whose runtime names are not the written
+ * ones; the last exist only where that function is called.
+ *
+ * The body of a test is whatever is passed for it: a function written in
+ * place, or any other expression (a named function, a member, the result
+ * of a call), which is taken to be a function unless the name is bound in
+ * the file to something that is none. A test given no body at all has
+ * nothing to execute. A test marked skip (or inside a skipped suite) is
+ * declared and not executed; options that are not written out as an
+ * object in the call may skip it. "only" is the mark as written; "parent"
+ * is the index of the suite a unit stands in (-1: the file), so each
+ * runner's own rule for focus can be applied. "open" says the file calls
+ * through a name that may be the runner's function and is not read, and
+ * no test was read: it holds tests this did not see.
  */
 function testUnits(fileEntry, helpers) {
     const tree = helpers.tree();
     if (!tree) return null;
-    const binder = createTestBinder(helpers);
+    const binder = testBinderOf(helpers, tree);
     const units = [];
     // A call through a name that may be the runner's function and is not
     // read: a test this does not see.
     let unreadCall = false;
-    const inFunction = (node, ctx, indirect) => {
-        // A function: its parameters, then its body's own declarations.
-        const body = node.childForFieldName('body');
-        const parameters = binder.parameterScope(node);
-        if (body && body.type === 'statement_block') {
-            const env = [...ctx.env, parameters];
-            const inner = { ...ctx, env: [...env, binder.scopeOf(body.namedChildren, env)], indirect };
-            for (const child of body.namedChildren) walk(child, inner);
-        } else if (body) {
-            walk(body, { ...ctx, env: [...ctx.env, parameters], indirect });
-        }
+    /** What an argument after the title is: a body, options, or neither. */
+    const argumentKind = (value, scope) => {
+        if (FUNCTION_NODES.has(value.type)) return 'function';
+        if (value.type === 'object') return 'options';
+        if (PLAIN_VALUES.has(value.type) || value.type === 'array') return 'value';
+        if (value.type === 'spread_element') return 'expression';
+        const held = binder.resolve(value, scope);
+        if (held && held.other && held.calls === false) return 'held';
+        return 'expression';
     };
-    const walk = (node, ctx) => {
-        if (FUNCTION_NODES.has(node.type)) {
-            inFunction(node, ctx, true);
-            return;
-        }
-        if (SCOPE_BLOCKS.has(node.type)) {
-            // A block: what it declares itself (a loop's or a catch's own
-            // names included) is seen before anything further out.
-            const head = node.type === 'statement_block' ? node.namedChildren
-                : node.namedChildren.filter(child => DECLARING.has(child.type));
-            const scope = binder.scopeOf(head, ctx.env);
-            // The name a catch or a for-in/of loop introduces is its own.
-            const introduced = node.type === 'catch_clause' ? node.childForFieldName('parameter')
-                : node.type === 'for_in_statement' ? node.childForFieldName('left') : null;
-            if (introduced) {
-                const names = child => {
-                    if (child.type === 'identifier' || child.type === 'shorthand_property_identifier_pattern') {
-                        scope.set(child.text, { other: true });
-                        return;
-                    }
-                    for (const next of child.namedChildren) names(next);
-                };
-                names(introduced);
-            }
-            const inner = { ...ctx, env: [...ctx.env, scope] };
-            for (const child of node.namedChildren) walk(child, inner);
-            return;
-        }
-        if (node.type === 'call_expression') {
-            const api = testApiCall(node, callee => binder.resolve(callee, ctx.env));
-            if (api) {
-                const args = node.childForFieldName('arguments');
-                const values = args ? args.namedChildren : [];
-                const title = literalTitle(values[0]);
-                const callback = values.slice(1).reverse().find(value => FUNCTION_NODES.has(value.type)) || null;
-                const dynamic = title == null ? 'name-not-literal'
-                    : api.table ? 'generated-cases'
-                    : ctx.indirect || ctx.inTest ? 'declared-indirectly' : null;
-                const option = declaredSkip(values.slice(1), !!callback);
-                // A test with no body has nothing to execute (pending, todo).
-                const skipped = api.skip || (api.kind === 'test' && !callback) || option === 'skip' ||
-                    ctx.suites.some(suite => suite.skipped);
-                const sometimes = api.sometimes || option === 'sometimes' || ctx.indirect || ctx.inTest ||
-                    ctx.suites.some(suite => suite.sometimes);
-                const index = units.length;
-                const outer = ctx.suites[ctx.suites.length - 1];
-                units.push({
-                    kind: api.kind, name: title, titled: true, suite: ctx.suites.map(suite => suite.name),
-                    line: node.startPosition.row + 1, startLine: node.startPosition.row + 1,
-                    endLine: node.endPosition.row + 1,
-                    parent: outer ? outer.index : -1,
-                    ...(api.only && { only: true }),
-                    ...(skipped && { skipped: true }),
-                    ...(sometimes && { conditional: true }),
-                    ...((dynamic || ctx.suites.some(suite => suite.dynamic)) && {
-                        dynamic: dynamic || 'suite-name-not-literal',
-                    }),
-                });
-                for (const value of values) {
-                    if (callback && sameNode(value, callback)) {
-                        // The callback's body is where the suite's own
-                        // declarations are written, not a function apart.
-                        const suites = api.kind === 'suite'
-                            ? [...ctx.suites, { name: title == null ? '' : title, dynamic: !!dynamic, skipped, sometimes, index }]
-                            : ctx.suites;
-                        inFunction(value, { ...ctx, suites, inTest: ctx.inTest || api.kind === 'test' }, ctx.indirect);
-                    } else {
-                        walk(value, ctx);
-                    }
+    // Where a call stands: under the suites whose callbacks hold it, inside
+    // a test, or inside a function that is no declaring call's callback
+    // (then what it declares exists only where that function is called).
+    const TOP = { suites: [], inTest: false, indirect: false };
+    const owners = new Map(); // function record -> the declaring call whose callback it is
+    const contexts = new Map();
+    const contextOf = fn => {
+        if (!fn) return TOP;
+        if (!contexts.has(fn)) {
+            const owner = owners.get(fn);
+            contexts.set(fn, owner
+                ? {
+                    suites: owner.suite ? [...owner.context.suites, owner.suite] : owner.context.suites,
+                    inTest: owner.context.inTest || owner.kind === 'test',
+                    indirect: owner.context.indirect,
                 }
-                const callee = node.childForFieldName('function');
-                if (callee && callee.type === 'call_expression') walk(callee, ctx);
-                return;
-            }
-            const bound = binder.boundAt(node.childForFieldName('function'), ctx.env);
-            if (bound && bound.unread) unreadCall = true;
+                : { ...contextOf(fn.parent), indirect: true });
         }
-        for (const child of node.namedChildren) walk(child, ctx);
+        return contexts.get(fn);
     };
-    const top = binder.scopeOf(tree.rootNode.namedChildren, []);
-    const ctx = { env: [top], suites: [], indirect: false, inTest: false };
-    for (const statement of tree.rootNode.namedChildren) walk(statement, ctx);
+    for (const call of binder.calls) {
+        const node = call.node;
+        const api = testApiCall(node, callee => binder.resolve(callee, call.scope));
+        if (!api) {
+            if (binder.unreadAt(node.childForFieldName('function'), call.scope)) unreadCall = true;
+            continue;
+        }
+        const ctx = contextOf(call.fn);
+        const args = node.childForFieldName('arguments');
+        const values = args ? args.namedChildren : [];
+        const title = literalTitle(values[0]);
+        // The first argument is the title, unless a body, options
+        // or a spread stands there (node: test(fn), test(options, fn)).
+        const rest = values[0] && (FUNCTION_NODES.has(values[0].type) || values[0].type === 'object' ||
+            values[0].type === 'spread_element') ? values : values.slice(1);
+        const kinds = rest.map(value => argumentKind(value, call.scope));
+        const callback = rest.filter((value, i) => kinds[i] === 'function').pop() || null;
+        const given = kinds.filter(kind => kind === 'expression').length;
+        const hasBody = !!callback || given > 0;
+        const dynamic = title == null ? 'name-not-literal'
+            : api.table ? 'generated-cases'
+            : ctx.indirect || ctx.inTest ? 'declared-indirectly' : null;
+        const option = declaredSkip(rest, hasBody);
+        // Options that are not written out here: a name bound to
+        // something that is no function, or an expression beside
+        // the one that is the body.
+        const optionsUnread = hasBody && (kinds.includes('held') || given > (callback ? 0 : 1));
+        // A test with no body has nothing to execute (pending, todo).
+        const skipped = api.skip || (api.kind === 'test' && !hasBody) || option === 'skip' ||
+            ctx.suites.some(suite => suite.skipped);
+        const sometimes = api.sometimes || option === 'sometimes' || (optionsUnread && !skipped) ||
+            ctx.indirect || ctx.inTest || ctx.suites.some(suite => suite.sometimes);
+        const index = units.length;
+        const outer = ctx.suites[ctx.suites.length - 1];
+        units.push({
+            kind: api.kind, name: title, titled: true, suite: ctx.suites.map(suite => suite.name),
+            line: node.startPosition.row + 1, startLine: node.startPosition.row + 1,
+            endLine: node.endPosition.row + 1,
+            parent: outer ? outer.index : -1,
+            ...(api.only && { only: true }),
+            ...(skipped && { skipped: true }),
+            ...(sometimes && { conditional: true }),
+            ...((dynamic || ctx.suites.some(suite => suite.dynamic)) && {
+                dynamic: dynamic || 'suite-name-not-literal',
+            }),
+        });
+        // The callback's body is where the suite's own declarations
+        // are written, not a function apart.
+        const held = callback ? binder.functionOf(callback) : null;
+        if (held) {
+            owners.set(held, {
+                context: ctx, kind: api.kind,
+                suite: api.kind === 'suite'
+                    ? { name: title == null ? '' : title, dynamic: !!dynamic, skipped, sometimes, index } : null,
+            });
+        }
+    }
     return {
         units,
         open: unreadCall && !units.some(unit => unit.kind === 'test'),
@@ -6361,13 +6665,14 @@ function testUnits(fileEntry, helpers) {
 function testExport(fileEntry, helpers, name) {
     const tree = helpers.tree();
     if (!tree) return null;
-    const binder = createTestBinder(helpers);
-    const env = [binder.scopeOf(tree.rootNode.namedChildren, [])];
+    const binder = testBinderOf(helpers, tree);
+    const top = binder.top;
     const settle = value => value && !value.unread ? value : null;
     const valueOf = node => {
-        const resolved = binder.resolve(node, env);
+        const resolved = binder.resolve(node, top);
         if (resolved) return resolved;
-        return node && INERT_VALUES.has(node.type) ? { other: true } : null;
+        return node && (PLAIN_VALUES.has(node.type) || BUILT_VALUES.has(node.type) || FUNCTION_NODES.has(node.type))
+            ? OTHER : null;
     };
     const literal = node => node && node.type === 'string' ? node.text.slice(1, -1) : null;
     let found = null;
@@ -6384,9 +6689,7 @@ function testExport(fileEntry, helpers, name) {
                 if (right.type === 'object') {
                     for (const property of right.namedChildren) {
                         if (property.type === 'shorthand_property_identifier' && property.text === name) {
-                            found = valueOf(property) || binder.resolve(property, env);
-                            const bound = env[0].get(name);
-                            if (!found && bound) found = bound;
+                            found = valueOf(property);
                         } else if (property.type === 'pair') {
                             const key = property.childForFieldName('key');
                             if (key && key.text.replace(/^['"]|['"]$/g, '') === name) {
@@ -6395,10 +6698,10 @@ function testExport(fileEntry, helpers, name) {
                         }
                     }
                 } else {
-                    const whole = binder.resolve(right, env);
+                    const whole = binder.resolve(right, top);
                     if (whole && whole.namespace) {
                         found = whole.module ? binder.fromModule(whole.module, name)
-                            : isTestApiName(name) ? { api: name, runner: whole.runner } : { other: true };
+                            : isTestApiName(name) ? { api: name, runner: whole.runner } : OTHER;
                     } else if (whole && whole.api && name === 'default') {
                         found = whole;
                     }
@@ -6417,14 +6720,14 @@ function testExport(fileEntry, helpers, name) {
                 const alias = spec.childForFieldName('alias');
                 if (!local || (alias || local).text !== name) continue;
                 found = source != null ? binder.fromModule(source, local.text)
-                    : (env[0].get(local.text) || valueOf(local));
+                    : (binder.bound(local.text) || valueOf(local));
             }
-        } else if (source != null && /^export\s*\*/.test(statement.text)) {
+        } else if (source != null && statement.children.some(child => child.type === '*')) {
             // export * from 'm': the name is whatever that module gives.
             const given = binder.fromModule(source, name);
             if (given && !given.other && !given.unread) found = given;
         } else {
-            const declared = env[0].get(name);
+            const declared = binder.bound(name);
             const declares = statement.namedChildren.some(child => DECLARING.has(child.type));
             if (declares && declared) found = declared;
         }

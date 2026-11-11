@@ -12,7 +12,11 @@
  * command that runs one unit, or one file) is built only for a runner whose
  * selection syntax is modeled here and only when everything the command
  * depends on is known; otherwise the unit is reported without a command and
- * with the reason. Nothing here executes anything.
+ * with the reason. The runner's own configuration is part of that: what
+ * is data is read (pytest's options and naming rules, jest's roots and
+ * path patterns, vitest's directory, the options a mocha or node script
+ * passes), and a configuration that can change what a command selects and
+ * is not read withholds the command. Nothing here executes anything.
  *
  * A test-path file is SUPPORT when it declares no unit, declares no class
  * that could inherit one, and is not named the way the runner names test
@@ -334,13 +338,13 @@ function jsRunner(model, fileEntry) {
     const script = manifest && manifest.scripts && typeof manifest.scripts.test === 'string'
         ? manifest.scripts.test : null;
     if (fromFile) {
-        return { id: fromFile, dir: dir || '', evidence: 'test-file-import', script };
+        return { id: fromFile, dir: dir || '', evidence: 'test-file-import', script, scripts: manifest ? manifest.scripts : null };
     }
     if (!manifest) return { id: null, reason: 'no-runner-evidence' };
     const named = [...new Set(scriptRunners(script).filter(name => !name.startsWith('?')))];
     if (named.length === 1) {
         if (!MODELED_JS.has(named[0])) return { id: null, reason: 'runner-not-modeled', runner: named[0] };
-        return { id: named[0], dir, evidence: 'package-script', script };
+        return { id: named[0], dir, evidence: 'package-script', script, scripts: manifest.scripts };
     }
     if (named.length > 1) return { id: null, reason: 'ambiguous-runner' };
     const declared = new Set();
@@ -352,7 +356,7 @@ function jsRunner(model, fileEntry) {
     if (declared.size === 1) {
         const only = [...declared][0];
         if (!MODELED_JS.has(only)) return { id: null, reason: 'runner-not-modeled', runner: only };
-        return { id: only, dir, evidence: 'package-dependency', script };
+        return { id: only, dir, evidence: 'package-dependency', script, scripts: manifest.scripts };
     }
     return { id: null, reason: declared.size > 1 ? 'ambiguous-runner' : 'no-runner-evidence' };
 }
@@ -398,6 +402,7 @@ function pythonRunner(model, fileEntry) {
                     files: configWords(config.table, 'python_files'),
                     classes: configWords(config.table, 'python_classes'),
                     functions: configWords(config.table, 'python_functions'),
+                    options: pytestOptions(configArguments(config, 'addopts')),
                 },
             };
         }
@@ -470,6 +475,581 @@ function dotnetRunner(model, fileEntry) {
     return { id: null, reason: 'no-runner-evidence' };
 }
 
+// ---------------------------------------------------------------------------
+// What the runner's own configuration changes
+// ---------------------------------------------------------------------------
+
+/** Words of a shell-like option string: quotes group, a backslash escapes. */
+function shellSplit(text) {
+    const words = [];
+    let current = null;
+    let quote = null;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (quote) {
+            if (ch === quote) quote = null;
+            else if (ch === '\\' && quote === '"' && i + 1 < text.length) current += text[++i];
+            else current += ch;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+            if (current == null) current = '';
+        } else if (/\s/.test(ch)) {
+            if (current != null) words.push(current);
+            current = null;
+        } else if (ch === '\\' && i + 1 < text.length) {
+            current = (current == null ? '' : current) + text[++i];
+        } else {
+            current = (current == null ? '' : current) + ch;
+        }
+    }
+    if (current != null) words.push(current);
+    return words;
+}
+
+/** A TOML line without its comment. */
+function withoutTomlComment(line) {
+    let quote = null;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (quote) {
+            if (ch === '\\' && quote === '"') i++;
+            else if (ch === quote) quote = null;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === '#') {
+            return line.slice(0, i);
+        }
+    }
+    return line;
+}
+
+/**
+ * The arguments a pytest configuration gives for `key` (addopts): a TOML
+ * array holds one argument per string; a string, and an INI value with its
+ * continuation lines, is split the way a shell would. [] when the key is
+ * not set, null when its value is not read.
+ */
+function configArguments(config, key) {
+    if (!config || config.table == null) return [];
+    const lines = config.table.split('\n');
+    const toml = config.file === 'pyproject.toml';
+    for (let i = 0; i < lines.length; i++) {
+        const match = new RegExp(`^${key}\\s*[=:]\\s*(.*)$`).exec(lines[i]);
+        if (!match) continue;
+        if (!toml) {
+            let value = match[1];
+            for (let j = i + 1; j < lines.length && /^\s+\S/.test(lines[j]); j++) value += ' ' + lines[j].trim();
+            return shellSplit(value);
+        }
+        let value = withoutTomlComment(match[1]);
+        if (/"""|'''/.test(value)) return null;
+        const strings = text => [...text.matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)]
+            .map(found => found[1] != null ? found[1].replace(/\\(.)/g, '$1') : found[2]);
+        if (value.trimStart().startsWith('[')) {
+            for (let j = i + 1; !/\]\s*$/.test(value) && j < lines.length; j++) value += '\n' + withoutTomlComment(lines[j]);
+            return /\]\s*$/.test(value) ? strings(value) : null;
+        }
+        const whole = strings(value);
+        return whole.length === 1 ? shellSplit(whole[0]) : null;
+    }
+    return [];
+}
+
+// pytest options that change neither what is collected nor what a command
+// that names a test runs. --ignore leaves a path out of a whole run only:
+// a path given to the command is still collected (measured).
+const PYTEST_INERT_FLAGS = new Set(['-v', '-vv', '-vvv', '--verbose', '-q', '-qq', '--quiet', '-s', '-l',
+    '--showlocals', '-x', '--exitfirst', '--strict-markers', '--strict-config', '--strict', '--no-header',
+    '--no-summary', '--disable-warnings', '--disable-pytest-warnings', '--ff', '--failed-first', '--nf',
+    '--new-first', '--cache-clear', '--full-trace', '--runxfail', '--no-cov-on-fail', '--cov-branch',
+    '--cov-append', '--no-cov', '--cov']);
+const PYTEST_INERT_VALUED = new Set(['--tb', '--color', '--durations', '--durations-min', '--maxfail',
+    '--capture', '-W', '--pythonwarnings', '--cov', '--cov-report', '--cov-config', '--cov-fail-under',
+    '--cov-context', '--junitxml', '--junit-xml', '--junit-prefix', '--log-level', '--log-cli-level',
+    '--log-format', '--log-date-format', '--log-file', '--log-file-level', '--basetemp', '--import-mode',
+    '--timeout', '--timeout-method', '-n', '--numprocesses', '--dist', '--maxprocesses', '--reruns',
+    '--reruns-delay', '--show-capture', '--code-highlight', '--verbosity', '--asyncio-mode', '--ignore',
+    '--ignore-glob', '-r']);
+// pytest's own plugins that decide what is collected, selected or skipped:
+// switching one of these off changes which tests run. Any other plugin
+// switched off (-p no:name) changes none of that; one switched ON is code
+// that is not read.
+const PYTEST_SELECTING_PLUGINS = new Set(['python', 'unittest', 'mark', 'skipping', 'main', 'runner', 'fixtures',
+    'stepwise', 'setuponly', 'setupplan', 'nose']);
+
+/**
+ * What pytest's configured options do to selection: `markExpr` (-m) and
+ * `deselect` (--deselect) are applied to the units; `unread` says an
+ * option is there that may select, add or leave out tests and is not
+ * modeled (-k, a path, a plugin, an override): no command is exact then.
+ */
+function pytestOptions(words) {
+    const out = { markExpr: null, deselect: [], unread: false };
+    if (words == null) return { ...out, unread: true };
+    for (let i = 0; i < words.length; i++) {
+        const word = words[i];
+        const cut = word.startsWith('--') ? word.indexOf('=') : -1;
+        const name = cut > 0 ? word.slice(0, cut) : word;
+        const inline = cut > 0 ? word.slice(cut + 1) : null;
+        const value = () => (inline != null ? inline : words[++i]);
+        if (name === '-m') {
+            const expression = value();
+            if (expression == null) out.unread = true;
+            else out.markExpr = expression;
+        } else if (name === '--deselect') {
+            const id = value();
+            if (id) out.deselect.push(id);
+            else out.unread = true;
+        } else if (name === '-p') {
+            const plugin = String(value() || '');
+            if (!plugin.startsWith('no:') || PYTEST_SELECTING_PLUGINS.has(plugin.slice(3))) out.unread = true;
+        } else if (/^-r[A-Za-z]+$/.test(word) || /^-W\S+$/.test(word) || /^-n\S+$/.test(word)) {
+            // -ra, -Werror, -n4: the value is in the word.
+        } else if (inline != null ? PYTEST_INERT_VALUED.has(name) : PYTEST_INERT_FLAGS.has(name) && !PYTEST_INERT_VALUED.has(name)) {
+            // nothing
+        } else if (inline == null && name === '--cov') {
+            // --cov takes an optional value: a word after it that is no
+            // option would be read as a path otherwise.
+            if (i + 1 < words.length && !words[i + 1].startsWith('-')) i++;
+        } else if (inline == null && PYTEST_INERT_VALUED.has(name)) {
+            i++;
+        } else {
+            out.unread = true;
+        }
+    }
+    return out;
+}
+
+/**
+ * Does pytest's mark expression select a test with these marks: true,
+ * false, or null when it cannot be said (`open`: the test may carry marks
+ * that are not read; an expression in a form not modeled).
+ */
+function markSelects(expression, marks, open) {
+    const tokens = String(expression).match(/\(|\)|[^\s()]+/g) || [];
+    let at = 0;
+    const not = value => (value == null ? null : !value);
+    const primary = () => {
+        const token = tokens[at++];
+        if (token === 'not') return not(primary());
+        if (token === '(') {
+            const inner = either();
+            if (tokens[at++] !== ')') throw new Error('unbalanced');
+            return inner;
+        }
+        if (token == null || token === ')' || token === 'and' || token === 'or') throw new Error('unexpected');
+        // name(arg=value): a mark with arguments, not modeled.
+        if (tokens[at] === '(') throw new Error('arguments');
+        return marks.has(token) ? true : open ? null : false;
+    };
+    const both = () => {
+        let value = primary();
+        while (tokens[at] === 'and') {
+            at++;
+            const next = primary();
+            value = value === false || next === false ? false : value == null || next == null ? null : true;
+        }
+        return value;
+    };
+    const either = () => {
+        let value = both();
+        while (tokens[at] === 'or') {
+            at++;
+            const next = both();
+            value = value === true || next === true ? true : value == null || next == null ? null : false;
+        }
+        return value;
+    };
+    try {
+        const value = either();
+        return at === tokens.length ? value : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/** A path glob as a regular expression: `**`, `*`, `?`, `{a,b}`, `[...]`. */
+function pathGlob(glob) {
+    const text = String(glob).replace(/^\.\//, '');
+    let source = '';
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '*' && text[i + 1] === '*') {
+            i++;
+            if (text[i + 1] === '/') {
+                i++;
+                source += '(?:.*/)?';
+            } else {
+                source += '.*';
+            }
+        } else if (ch === '*') {
+            source += '[^/]*';
+        } else if (ch === '?') {
+            source += '[^/]';
+        } else if (ch === '{' || ch === '[') {
+            const end = text.indexOf(ch === '{' ? '}' : ']', i);
+            if (end < 0) return null;
+            source += ch === '[' ? text.slice(i, end + 1)
+                : `(?:${text.slice(i + 1, end).split(',').map(part => part.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')).join('|')})`;
+            i = end;
+        } else {
+            source += ch.replace(/[.+^$()|\\]/, '\\$&');
+        }
+    }
+    try {
+        return new RegExp(`^${source}$`);
+    } catch (e) {
+        return null;
+    }
+}
+
+// The files `node --test` runs when it is given none (node's own list).
+const NODE_DEFAULT_TEST_FILES = [/(^|\/)[^/]*[._-]test\.[cm]?js$/, /(^|\/)test-[^/]*\.[cm]?js$/,
+    /(^|\/)test\.[cm]?js$/, /(^|\/)test\/.*\.[cm]?js$/];
+
+/**
+ * The paths a script that is one `node ... --test ...` command names, as
+ * written (a glob stays a glob). Null when the script is anything else.
+ */
+function nodeTestPaths(script) {
+    if (nodeTestOptions(script) == null) return null;
+    const words = script.trim().split(/\s+/).filter(Boolean);
+    const paths = [];
+    for (let i = 1; i < words.length; i++) {
+        const word = words[i];
+        if (word.startsWith('-')) {
+            if (NODE_VALUE_OPTIONS.has(word)) i++;
+            continue;
+        }
+        paths.push(word.replace(/^(['"])(.*)\1$/, '$2'));
+    }
+    return paths;
+}
+
+/**
+ * Does node run a file as a test under the project's own script: one of
+ * the paths the script names, or, when it names none, one node looks for
+ * by itself (every file under a `test` directory among them). node runs a
+ * file that declares no test as one test. Null: the script does not say.
+ */
+function nodeRunsFile(runner, file) {
+    const paths = nodeTestPaths(runner.script);
+    if (paths == null || file == null) return null;
+    if (paths.length === 0) return !/(^|\/)node_modules\//.test(file) && NODE_DEFAULT_TEST_FILES.some(pattern => pattern.test(file));
+    return paths.some(written => {
+        const target = written.replace(/^\.\//, '');
+        if (target === file) return true;
+        if (!/[*?{[]/.test(target)) return false;
+        const pattern = pathGlob(target);
+        return !!pattern && pattern.test(file);
+    });
+}
+
+/**
+ * The words a project's test script passes to a runner: those of the
+ * `test` script and of the scripts it names, after the runner's own name.
+ * [] when the script does not call the runner by name.
+ */
+function runnerScriptWords(runner, name) {
+    const scripts = runner.scripts && typeof runner.scripts === 'object' ? runner.scripts : {};
+    const texts = [];
+    if (typeof runner.script === 'string') {
+        texts.push(runner.script);
+        for (const word of runner.script.split(/[\s"'&|;]+/)) {
+            if (word !== 'test' && typeof scripts[word] === 'string') texts.push(scripts[word]);
+        }
+    }
+    const out = [];
+    for (const text of texts) {
+        for (const segment of text.split(/&&|\|\||;|\|/)) {
+            const words = segment.trim().split(/\s+/).filter(Boolean);
+            const at = words.findIndex(word => word.split('/').pop() === name || word.split('/').pop() === `_${name}`);
+            if (at >= 0) out.push(...words.slice(at + 1));
+        }
+    }
+    return out;
+}
+
+// Options of a runner's command line that point it at another
+// configuration or select files: a script that passes one runs something
+// a command built here does not.
+const SCRIPT_CONFIG_FLAGS = /^(--config|-c|--rootDir|--roots|--projects|--selectProjects|--project|--workspace|--root|--dir|--testMatch|--testRegex|--testPathPattern|--testPathPatterns|--package|--opts)(=|$)/;
+// Options of a mocha command line that decide how a test file loads.
+const MOCHA_LOADING_OPTIONS = new Set(['--require', '-r', '--loader', '--import', '--ui', '-u', '--file', '--node-option', '-n']);
+const MOCHA_VALUE_OPTIONS = new Set([...MOCHA_LOADING_OPTIONS, '--reporter', '-R', '--reporter-option', '--reporter-options',
+    '-O', '--timeout', '-t', '--timeouts', '--slow', '-s', '--retries', '--grep', '-g', '--fgrep', '-f', '--ignore',
+    '--exclude', '--spec', '--jobs', '-j', '--watch-files', '--watch-ignore', '--extension', '--config', '--package']);
+
+/**
+ * The options of the project's mocha script that a command for one file
+ * needs to load it the same way (--require, --ui, --loader, --file).
+ */
+function mochaLoadingOptions(runner) {
+    const words = runnerScriptWords(runner, 'mocha');
+    const kept = [];
+    for (let i = 0; i < words.length; i++) {
+        const word = words[i].replace(/^(['"])(.*)\1$/, '$2');
+        const cut = word.startsWith('--') ? word.indexOf('=') : -1;
+        const name = cut > 0 ? word.slice(0, cut) : word;
+        if (MOCHA_LOADING_OPTIONS.has(name)) {
+            kept.push(word);
+            if (cut < 0 && i + 1 < words.length) kept.push(words[++i].replace(/^(['"])(.*)\1$/, '$2'));
+        } else if (cut < 0 && MOCHA_VALUE_OPTIONS.has(name)) {
+            i++;
+        }
+    }
+    return kept;
+}
+
+// Configuration files of the JavaScript runners, and the keys in them
+// that change which tests a command runs.
+const JS_CONFIG_NAMES = {
+    jest: new Set(['jest.config.js', 'jest.config.cjs', 'jest.config.mjs', 'jest.config.ts', 'jest.config.cts',
+        'jest.config.mts', 'jest.config.json']),
+    vitest: new Set(['vitest.config.js', 'vitest.config.cjs', 'vitest.config.mjs', 'vitest.config.ts',
+        'vitest.config.cts', 'vitest.config.mts', 'vite.config.js', 'vite.config.cjs', 'vite.config.mjs',
+        'vite.config.ts', 'vite.config.cts', 'vite.config.mts', 'vitest.workspace.js', 'vitest.workspace.mjs',
+        'vitest.workspace.ts', 'vitest.workspace.mts', 'vitest.workspace.json', 'vitest.projects.js',
+        'vitest.projects.ts', 'vitest.projects.json']),
+    mocha: new Set(['.mocharc', '.mocharc.js', '.mocharc.cjs', '.mocharc.mjs', '.mocharc.json', '.mocharc.jsonc',
+        '.mocharc.yaml', '.mocharc.yml']),
+};
+const JS_CONFIG_PACKAGE_KEY = { jest: 'jest', mocha: 'mocha' };
+const JS_SELECTING_KEYS = {
+    jest: new Set(['testMatch', 'testRegex', 'testPathIgnorePatterns', 'roots', 'rootDir', 'projects', 'preset',
+        'modulePathIgnorePatterns', 'moduleFileExtensions', 'haste', 'runner', 'testRunner', 'injectGlobals']),
+    vitest: new Set(['include', 'exclude', 'includeSource', 'dir', 'root', 'projects', 'workspace', 'extends',
+        'testNamePattern', 'allowOnly', 'browser', 'shard', 'related', 'changed']),
+    mocha: new Set(['spec', 'file', 'ignore', 'exclude', 'grep', 'fgrep', 'invert', 'extension', 'ui', 'dry-run',
+        'dryRun', 'forbid-only', 'forbidOnly', 'config', 'package', 'opts']),
+};
+const CONFIG_WRAPPERS = new Set(['parenthesized_expression', 'as_expression', 'satisfies_expression',
+    'type_assertion', 'non_null_expression']);
+
+/** The value of a string literal node (no substitutions), or null. */
+function stringLiteralValue(node) {
+    if (!node || (node.type !== 'string' && node.type !== 'template_string')) return null;
+    if (node.namedChildren.some(child => child.type === 'template_substitution')) return null;
+    const escapes = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', v: '\v', 0: '\0' };
+    return node.text.slice(1, -1).replace(/\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g, (whole, escape) => {
+        if (escape[0] === 'u' || escape[0] === 'x') {
+            const code = parseInt(escape.replace(/^[ux]\{?|\}$/g, ''), 16);
+            return Number.isNaN(code) ? whole : String.fromCodePoint(code);
+        }
+        return Object.prototype.hasOwnProperty.call(escapes, escape) ? escapes[escape] : escape;
+    });
+}
+
+/**
+ * The keys a configuration file sets, each with a reader of its value as
+ * strings (null when the value is not a string or a list of strings
+ * written out). Null when the file's configuration object is not read.
+ */
+function configKeysOfJson(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const keys = new Map();
+    for (const [key, held] of Object.entries(value)) {
+        keys.set(key, {
+            strings: () => typeof held === 'string' ? [held]
+                : Array.isArray(held) && held.every(item => typeof item === 'string') ? held : null,
+            object: () => configKeysOfJson(held),
+        });
+    }
+    return keys;
+}
+
+function configKeysOf(model, dir, name) {
+    const text = model.manifests.read(dir, name);
+    if (text == null) return null;
+    const fromJson = configKeysOfJson;
+    if (/\.(json|jsonc)$/.test(name)) {
+        try {
+            return fromJson(JSON.parse(text));
+        } catch (e) {
+            // Comments are allowed in these files.
+            try {
+                return fromJson(JSON.parse(text.replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')));
+            } catch (e2) {
+                return null;
+            }
+        }
+    }
+    if (/\.(yaml|yml)$/.test(name)) {
+        // The top-level keys of a mapping; their values are not read.
+        const keys = new Map();
+        for (const line of text.split('\n')) {
+            const found = /^(['"]?)([A-Za-z][\w-]*)\1\s*:/.exec(line);
+            if (found) keys.set(found[2], { strings: () => null, object: () => null });
+        }
+        return keys;
+    }
+    if (!/\.[cm]?[jt]s$/.test(name)) return null;
+    const tree = safeParse(getParser(/\.[cm]?ts$/.test(name) ? 'typescript' : 'javascript'), text);
+    if (!tree) return null;
+    const root = tree.rootNode;
+    const declared = identifier => {
+        const found = [];
+        for (const statement of root.namedChildren) {
+            const declaration = statement.type === 'export_statement'
+                ? statement.namedChildren.find(child => /_declaration$/.test(child.type)) : statement;
+            if (!declaration || (declaration.type !== 'lexical_declaration' && declaration.type !== 'variable_declaration')) continue;
+            for (const declarator of declaration.namedChildren) {
+                const target = declarator.childForFieldName && declarator.childForFieldName('name');
+                if (target && target.type === 'identifier' && target.text === identifier) found.push(declarator.childForFieldName('value'));
+            }
+        }
+        return found.length === 1 ? found[0] : null;
+    };
+    const objectOf = (node, depth = 0) => {
+        if (!node || depth > 6) return null;
+        if (CONFIG_WRAPPERS.has(node.type)) return objectOf(node.namedChildren[0], depth + 1);
+        if (node.type === 'object') return node;
+        if (node.type === 'identifier') return objectOf(declared(node.text), depth + 1);
+        if (node.type === 'call_expression') {
+            // defineConfig({...}) hands its argument back.
+            const callee = node.childForFieldName('function');
+            const args = node.childForFieldName('arguments');
+            if (callee && callee.type === 'identifier' && /^define(Config|Project)$/.test(callee.text) &&
+                args && args.namedChildren.length === 1) return objectOf(args.namedChildren[0], depth + 1);
+        }
+        return null;
+    };
+    const fromObject = node => {
+        const object = objectOf(node);
+        if (!object) return null;
+        const keys = new Map();
+        for (const member of object.namedChildren) {
+            if (member.type === 'comment') continue;
+            if (member.type !== 'pair') return null;
+            const key = member.childForFieldName('key');
+            const value = member.childForFieldName('value');
+            const written = !key ? null : key.type === 'property_identifier' ? key.text : stringLiteralValue(key);
+            if (written == null) return null;
+            keys.set(written, {
+                strings: () => {
+                    const one = stringLiteralValue(value);
+                    if (one != null) return [one];
+                    if (!value || value.type !== 'array') return null;
+                    const all = value.namedChildren.filter(item => item.type !== 'comment').map(stringLiteralValue);
+                    return all.every(item => item != null) ? all : null;
+                },
+                object: () => fromObject(value),
+            });
+        }
+        return keys;
+    };
+    let exported = null;
+    let count = 0;
+    for (const statement of root.namedChildren) {
+        if (statement.type === 'expression_statement') {
+            const assignment = statement.namedChildren[0];
+            if (assignment && assignment.type === 'assignment_expression' &&
+                assignment.childForFieldName('left')?.text.replace(/\s+/g, '') === 'module.exports') {
+                exported = assignment.childForFieldName('right');
+                count++;
+            }
+        } else if (statement.type === 'export_statement' && statement.children.some(child => child.type === 'default')) {
+            exported = statement.childForFieldName('value');
+            count++;
+        }
+    }
+    return count === 1 ? fromObject(exported) : null;
+}
+
+/**
+ * What a JavaScript runner's configuration does to a command that names a
+ * test file: `inert` (nothing the command depends on is set), `modeled`
+ * (`accepts(file)` says whether the configuration leaves the file in;
+ * `ownPattern`: it replaces the runner's default file pattern), or
+ * `unread` (a key that selects files or tests is set and not modeled, the
+ * configuration is code that is not written out as an object, or one
+ * stands above the runner's directory).
+ */
+function jsRunnerConfig(model, runner) {
+    const memoKey = `${runner.id}\0${runner.dir || ''}`;
+    if (model.jsConfigs.has(memoKey)) return model.jsConfigs.get(memoKey);
+    const answer = (() => {
+        // The project's own script points the runner somewhere else.
+        if (runnerScriptWords(runner, runner.id).some(word => SCRIPT_CONFIG_FLAGS.test(word))) return { state: 'unread' };
+        const names = JS_CONFIG_NAMES[runner.id];
+        const packageKey = JS_CONFIG_PACKAGE_KEY[runner.id];
+        const here = runner.dir || '';
+        for (const dir of ancestorDirs(here ? `${here}/x` : 'x').slice(1)) {
+            if (model.manifests.list(dir).some(name => names.has(name))) return { state: 'unread' };
+            const above = packageKey ? model.manifests.json(dir, 'package.json') : null;
+            if (above && above[packageKey] != null) return { state: 'unread' };
+        }
+        let files = model.manifests.list(here).filter(name => names.has(name));
+        if (runner.id === 'vitest') {
+            if (files.some(name => /^vitest\.(workspace|projects)\./.test(name))) return { state: 'unread' };
+            // vitest's own file is the one read when both are there.
+            if (files.some(name => /^vitest\.config\./.test(name))) files = files.filter(name => /^vitest\.config\./.test(name));
+        }
+        const sources = files.map(name => configKeysOf(model, here, name));
+        const manifest = packageKey ? model.manifests.json(here, 'package.json') : null;
+        if (manifest && manifest[packageKey] != null) {
+            const held = manifest[packageKey];
+            sources.push(configKeysOfJson(held));
+        }
+        if (sources.length === 0) return { state: 'inert' };
+        if (sources.some(source => source == null) || (runner.id !== 'mocha' && sources.length > 1)) return { state: 'unread' };
+        let keys = new Map();
+        for (const source of sources) for (const [key, reader] of source) keys.set(key, reader);
+        if (runner.id === 'vitest') {
+            // The runner's part of a vite configuration is its `test` key.
+            const root = keys.get('root');
+            const test = keys.get('test');
+            if (root) return { state: 'unread' };
+            if (!test) return { state: 'inert' };
+            keys = test.object();
+            if (!keys) return { state: 'unread' };
+        }
+        const selecting = [...keys.keys()].filter(key => JS_SELECTING_KEYS[runner.id].has(key));
+        if (selecting.length === 0) return { state: 'inert', keys: new Set(keys.keys()) };
+        const absolute = file => path.posix.join(String(model.root).replace(/\\/g, '/'), here, file);
+        if (runner.id === 'jest' && selecting.every(key => ['roots', 'testRegex', 'testPathIgnorePatterns'].includes(key))) {
+            const read = key => keys.has(key) ? keys.get(key).strings() : undefined;
+            const roots = read('roots');
+            const regex = read('testRegex');
+            const ignored = read('testPathIgnorePatterns');
+            if (roots === null || regex === null || ignored === null) return { state: 'unread' };
+            let patterns;
+            let ignores;
+            const base = absolute('').replace(/\/$/, '');
+            // jest puts the root directory where a pattern says <rootDir>.
+            const pattern = source => new RegExp(source.replace(/<rootDir>/g, base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+            try {
+                patterns = regex ? regex.map(pattern) : null;
+                ignores = (ignored || ['/node_modules/']).map(pattern);
+            } catch (e) {
+                return { state: 'unread' };
+            }
+            const rootDirs = roots ? roots.map(root => path.posix.join(base, root.replace(/^<rootDir>\/?/, ''))) : null;
+            if (roots && roots.some(root => path.posix.isAbsolute(root.replace(/^<rootDir>/, '')) && !root.startsWith('<rootDir>'))) {
+                return { state: 'unread' };
+            }
+            return {
+                state: 'modeled', ownPattern: !!patterns,
+                accepts: file => {
+                    const full = absolute(file);
+                    if (rootDirs && !rootDirs.some(dir => full.startsWith(dir.replace(/\/$/, '') + '/'))) return false;
+                    if (ignores.some(pattern => pattern.test(full))) return false;
+                    return !patterns || patterns.some(pattern => pattern.test(full));
+                },
+            };
+        }
+        if (runner.id === 'vitest' && selecting.length === 1 && selecting[0] === 'dir') {
+            const dir = keys.get('dir').strings();
+            if (!dir || dir.length !== 1 || path.posix.isAbsolute(dir[0]) || dir[0].includes('..')) return { state: 'unread' };
+            const under = dir[0].replace(/^\.\//, '').replace(/\/$/, '');
+            return { state: 'modeled', ownPattern: false, accepts: file => !under || file.startsWith(`${under}/`) };
+        }
+        return { state: 'unread' };
+    })();
+    model.jsConfigs.set(memoKey, answer);
+    return answer;
+}
+
 const RUNNER_OF_FAMILY = {
     javascript: jsRunner,
     python: pythonRunner,
@@ -517,6 +1097,11 @@ const SELECTORS = {
     'pytest'(model, runner, fileEntry, unit) {
         const file = relativeTo(runner.dir, fileEntry.relativePath);
         if (file == null) return withheld('outside-runner-root');
+        // An option of the project's that selects, adds or leaves out
+        // tests and is not modeled: no command is known to be exact.
+        const options = runner.collection && runner.collection.options;
+        if (options && options.unread) return withheld('runner-options-not-read');
+        if (unit && unit.deselected) return withheld('deselected-by-options');
         if (!unit) return command(runner, ['pytest', shellWord(file)]);
         return command(runner, ['pytest', shellWord([file, ...unit.suite, unit.name].join('::'))]);
     },
@@ -549,26 +1134,48 @@ const SELECTORS = {
     'jest'(model, runner, fileEntry, unit) {
         const file = relativeTo(runner.dir, fileEntry.relativePath);
         if (file == null) return withheld('outside-runner-root');
-        if (!lookedFor('jest', file)) return withheld('runner-config-not-read');
+        // jest holds a path it is given to its configuration: the file
+        // pattern, the roots, the ignored paths (measured).
+        const config = jsRunnerConfig(model, runner);
+        if (config.state === 'unread') return withheld('runner-config-not-read');
+        if (config.state === 'modeled' && !config.accepts(file)) return withheld('outside-runner-config');
+        if (!(config.state === 'modeled' && config.ownPattern) && !lookedFor('jest', file)) {
+            return withheld('runner-config-not-read');
+        }
         // A bare path is a pattern jest tries on every test file's path.
         const words = ['npx', 'jest', '--runTestsByPath', shellWord(file)];
         if (unit) words.push('-t', shellWord(titlePattern(unit)));
         return command(runner, words);
     },
-    'vitest'(model, runner, fileEntry, unit) {
+    'vitest'(model, runner, fileEntry, unit, filePath) {
         const file = relativeTo(runner.dir, fileEntry.relativePath);
         if (file == null) return withheld('outside-runner-root');
+        const config = jsRunnerConfig(model, runner);
+        if (config.state === 'unread') return withheld('runner-config-not-read');
+        if (config.state === 'modeled' && !config.accepts(file)) return withheld('outside-runner-config');
         if (!lookedFor('vitest', file)) return withheld('runner-config-not-read');
         // vitest runs every file whose path contains the one given.
         if (model.pathsContaining(runner.dir, file) > 1) return withheld('path-not-unique');
-        const words = ['npx', 'vitest', 'run', shellWord(file)];
+        // vitest refuses a focused test where CI is set unless told to
+        // allow it (measured).
+        const focus = model.declared(filePath)?.focus ? ['--allowOnly'] : [];
+        const words = ['npx', 'vitest', 'run', ...focus, shellWord(file)];
         if (unit) words.push('-t', shellWord(titlePattern(unit)));
         return command(runner, words);
     },
     'mocha'(model, runner, fileEntry, unit) {
         const file = relativeTo(runner.dir, fileEntry.relativePath);
         if (file == null) return withheld('outside-runner-root');
-        const words = ['npx', 'mocha', shellWord(file)];
+        // mocha adds the files its configuration names to the one given,
+        // and applies its grep and ignore to it (measured).
+        const config = jsRunnerConfig(model, runner);
+        if (config.state !== 'inert') return withheld('runner-config-not-read');
+        const loading = mochaLoadingOptions(runner);
+        // A typed file loads only with what the project's own command or
+        // configuration registers.
+        const registers = loading.length > 0 || ['require', 'loader', 'import', 'node-option'].some(key => config.keys && config.keys.has(key));
+        if (/\.[cm]?tsx?$/.test(file) && !registers) return withheld('loader-unknown');
+        const words = ['npx', 'mocha', ...loading.map(shellWord), shellWord(file)];
         if (unit) words.push('--grep', shellWord(titlePattern(unit)));
         return command(runner, words);
     },
@@ -590,7 +1197,7 @@ const SELECTORS = {
             if (located.segs.length > 0) words.push('--', shellWord(`${located.segs.join('::')}::`));
             return command(runner, words);
         }
-        if (unit.conditional) return withheld('conditional-compilation');
+        if (unit.notInEveryBuild) return withheld('conditional-compilation');
         words.push('--', shellWord([...located.segs, unit.name].join('::')), '--exact');
         if (unit.ignored) words.push('--include-ignored');
         return command(runner, words);
@@ -643,6 +1250,10 @@ function createTestModel(index) {
         rawByFile: new Map(),
         exports: new Map(),
         runners: new Map(),
+        jsConfigs: new Map(),
+        gates: new Map(),
+        readerCaches: new Map(),
+        root: index.root,
         relPaths: null,
     };
 
@@ -748,6 +1359,17 @@ function createTestModel(index) {
                 return out.sort((a, b) => a.startLine - b.startLine ||
                     (b.endLine ?? b.startLine) - (a.endLine ?? a.startLine));
             },
+            /**
+             * The annotations a type of the project carries itself, when
+             * one type of that name is declared: what an annotation of
+             * the project stands for. Null otherwise.
+             */
+            metaAnnotations(name) {
+                const defs = (index.symbols.get(String(name).split('.').pop()) || [])
+                    .filter(def => CONTAINER_KINDS.has(def.type));
+                if (defs.length !== 1) return null;
+                return (defs[0].annotationsWithArgs || []).map(annotation => String(annotation.name).split('.').pop());
+            },
             isContainer: symbol => CONTAINER_KINDS.has(symbol.type),
             isCallable: symbol => CALLABLE_KINDS.has(symbol.type),
             /** Names of the types a class derives from, through the project. */
@@ -756,8 +1378,12 @@ function createTestModel(index) {
                 const queue = [className];
                 while (queue.length > 0 && seen.size < 64) {
                     const parents = index.extendsGraph?.get(queue.shift()) || [];
-                    for (const parent of parents) {
-                        const name = typeof parent === 'string' ? parent : parent?.name;
+                    // One entry per declaration of the name, each with
+                    // the bases it writes.
+                    const names = parents.flatMap(parent => typeof parent === 'string' ? [parent]
+                        : Array.isArray(parent?.parents) ? parent.parents : parent?.name ? [parent.name] : []);
+                    for (const written of names) {
+                        const name = String(written).replace(/[<[(].*$/, '').trim();
                         if (!name || seen.has(name)) continue;
                         seen.add(name);
                         queue.push(name);
@@ -787,9 +1413,28 @@ function createTestModel(index) {
                 }
                 return lines;
             },
-            collection: (model.runnerOf(filePath) || {}).collection || {},
+            collection: collectionFor(filePath, fileEntry),
             glob: globMatches,
+            // What a reader keeps between two questions about one file.
+            cache: (() => {
+                if (!model.readerCaches.has(filePath)) model.readerCaches.set(filePath, new Map());
+                return model.readerCaches.get(filePath);
+            })(),
         };
+    };
+
+    /**
+     * What the runner's configuration says about collecting a file: its
+     * naming rules, its options, and whether the runner collects a module
+     * of this name at all (pytest: python_files, by the file's own name).
+     */
+    const collectionFor = (filePath, fileEntry) => {
+        const runner = model.runnerOf(filePath) || {};
+        const collection = runner.collection || {};
+        if (runner.id !== 'pytest') return collection;
+        const base = path.posix.basename(fileEntry.relativePath);
+        const patterns = collection.files && collection.files.length > 0 ? collection.files : ['test_*.py', '*_test.py'];
+        return { ...collection, collected: patterns.some(glob => globMatches(glob, base)) };
     };
 
     /** What the language's reader finds in a file; null when not modeled. */
@@ -834,7 +1479,7 @@ function createTestModel(index) {
         return hits.length === 1 ? hits[0] : null;
     };
 
-    const nodeKey = node => node.opaque ? `?${node.name}` : `${node.filePath}\0${node.cls.startLine}`;
+    const nodeKey = node => node.opaque ? `?${node.name}` : `${node.filePath}\0${node.cls.startLine}\0${node.cls.name}`;
     const linearMemo = new Map();
 
     /**
@@ -846,10 +1491,16 @@ function createTestModel(index) {
      * language's reader knows it brings neither a test nor a constructor.
      */
     const linearize = (filePath, cls, mode, trail = new Set()) => {
-        const key = `${filePath}\0${cls.startLine}`;
+        const key = `${filePath}\0${cls.startLine}\0${cls.name}`;
         if (linearMemo.has(key)) return linearMemo.get(key);
         const self = { filePath, cls };
         if (trail.has(key)) return [self];
+        if (cls.imported) {
+            // A class bound by an import is the class it names.
+            const order = [self, ...linearize(cls.imported.filePath, cls.imported.cls, mode, trail)];
+            linearMemo.set(key, order);
+            return order;
+        }
         trail.add(key);
         const parents = cls.bases.map(written => {
             const base = baseClass(filePath, written);
@@ -945,6 +1596,48 @@ function createTestModel(index) {
     };
 
     /**
+     * Is there code beside a test file that the runner lets decide which
+     * tests run (the language's `testGate`): a conftest.py above it whose
+     * hooks can change what is collected or run, a TestMain in its Go
+     * package that may not run the tests.
+     */
+    const gatedAtRunTime = (filePath, runner) => {
+        const relativePath = index.files.get(filePath).relativePath;
+        const decides = candidate => {
+            if (!model.gates.has(candidate)) {
+                const entry = index.files.get(candidate);
+                const gate = entry && langTraits(entry.language)?.testGate;
+                let answer = false;
+                if (typeof gate === 'function') {
+                    try {
+                        answer = !!gate(entry, helpersFor(candidate, entry));
+                    } catch (e) {
+                        answer = true;
+                    }
+                }
+                model.gates.set(candidate, answer);
+            }
+            return model.gates.get(candidate);
+        };
+        if (runner.id === 'pytest') {
+            return ancestorDirs(relativePath).some(dir => decides(path.join(index.root, dir, 'conftest.py')));
+        }
+        if (runner.id === 'go-test') {
+            if (!model.goTestFiles) {
+                model.goTestFiles = new Map();
+                for (const [candidate, entry] of index.files) {
+                    if (!/_test\.go$/.test(entry.relativePath)) continue;
+                    const dir = posixDir(entry.relativePath);
+                    if (!model.goTestFiles.has(dir)) model.goTestFiles.set(dir, []);
+                    model.goTestFiles.get(dir).push(candidate);
+                }
+            }
+            return (model.goTestFiles.get(posixDir(relativePath)) || []).some(decides);
+        }
+        return false;
+    };
+
+    /**
      * A file's units: the tests and suites it declares, by line, and the
      * tests its runnable classes inherit (placed at the class). `modeled`
      * is false when the language's units are not read.
@@ -955,22 +1648,51 @@ function createTestModel(index) {
         let facts;
         if (!found) {
             facts = { modeled: false, units: [], tests: 0, inheriting: false };
+        } else if (found.notCollected) {
+            // A module its runner does not collect declares no test.
+            facts = { modeled: true, units: [], tests: 0, inheriting: false };
         } else {
             // A class its runner refuses holds no test, whatever it declares.
-            const refusedClasses = (found.classes || []).filter(cls => cls.runnable && refusal(filePath, cls).refused);
+            const relativePath = index.files.get(filePath).relativePath;
+            const runner = model.runnerOf(filePath) || {};
+            const naming = runner.collection || {};
+            const named = (patterns, fallback, name) => (patterns && patterns.length > 0 ? patterns : fallback)
+                .some(pattern => /[*?[]/.test(pattern) ? globMatches(pattern, name) : name.startsWith(pattern));
+            // Names the module takes from other modules of the project:
+            // a test class or function among them is collected here too.
+            const taken = [];
+            const classesHere = [...(found.classes || [])];
+            for (const entry of found.imports || []) {
+                const from = (index.files.get(filePath).moduleResolved || {})[entry.module];
+                const target = from ? path.join(index.root, from) : null;
+                const there = target && target !== filePath && index.files.has(target) ? model.declared(target) : null;
+                if (!there) continue;
+                const cls = (there.classes || []).find(other => other.name === entry.original && other.suite.length === 0);
+                if (cls && (cls.unittest || named(naming.classes, ['Test'], entry.name))) {
+                    classesHere.push({
+                        name: entry.name, suite: [], bases: [], runnable: true, imported: { filePath: target, cls },
+                        ...(cls.refusedIfDeclares && { refusedIfDeclares: cls.refusedIfDeclares }),
+                        line: entry.line, startLine: entry.line, endLine: entry.line,
+                        members: [], tests: [], marks: [], marksOpen: false,
+                    });
+                }
+                const fn = (there.functions || []).find(other => other.name === entry.original);
+                if (fn && named(naming.functions, ['test'], entry.name)) taken.push({ entry, fn, target });
+            }
+            const refusedClasses = classesHere.filter(cls => cls.runnable && refusal(filePath, cls).refused);
             // Whether the runner takes a class that derives from one the
             // project does not declare cannot be read here: its tests are
             // listed as collected only sometimes, with no command.
-            const unsettled = (found.classes || []).filter(cls => cls.runnable && cls.refusedIfDeclares &&
+            const unsettled = classesHere.filter(cls => cls.runnable && cls.refusedIfDeclares &&
                 !refusedClasses.includes(cls) && refusal(filePath, cls).unknown);
             const within = (unit, cls) => unit.startLine >= cls.startLine && unit.endLine <= cls.endLine;
             // A focus leaves other tests of the file declared and not
             // executed, by the rule of the runner that runs the file.
             const left = found.focus ? focusedOut(found.units, model.runnerOf(filePath).id) : new Set();
-            const units = found.units.filter(unit => !refusedClasses.some(cls => within(unit, cls)))
+            let units = found.units.filter(unit => !refusedClasses.some(cls => !cls.imported && within(unit, cls)))
                 .map(unit => {
                     let out = unit;
-                    if (unit.kind === 'test' && unsettled.some(cls => within(unit, cls))) {
+                    if (unit.kind === 'test' && unsettled.some(cls => !cls.imported && within(unit, cls))) {
                         out = { ...out, conditional: true, dynamic: unit.dynamic || 'base-not-resolved' };
                     }
                     if (left.has(unit)) out = { ...out, skipped: true };
@@ -979,8 +1701,8 @@ function createTestModel(index) {
             // `open`: the file binds its runner's declaring function and
             // no declaration was read.
             let inheriting = !!found.inheriting || !!found.open;
-            for (const cls of found.classes || []) {
-                if (!cls.runnable || cls.bases.length === 0 || refusedClasses.includes(cls)) continue;
+            for (const cls of classesHere) {
+                if (!cls.runnable || (cls.bases.length === 0 && !cls.imported) || refusedClasses.includes(cls)) continue;
                 const inherited = inheritedBy(filePath, cls);
                 const own = units.some(unit => unit.kind === 'test' && within(unit, cls));
                 if (inherited.withheld || (inherited.open && !own && inherited.tests.length === 0)) inheriting = true;
@@ -990,14 +1712,20 @@ function createTestModel(index) {
                         line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
                     });
                 }
-                const sometimes = cls.unsettled || unsettled.includes(cls);
+                // Whether the class or the test exists at all is not
+                // settled: no command names it. A condition on running
+                // it leaves the command.
+                const identity = cls.unsettled ? 'collection-switch'
+                    : unsettled.includes(cls) ? 'base-not-resolved' : null;
                 for (const { test, base } of inherited.tests) {
                     units.push({
                         kind: 'test', name: test.name, suite: [...cls.suite, cls.name],
                         ...(cls.namespace && { namespace: cls.namespace }),
                         line: cls.line, startLine: cls.line, endLine: cls.line,
                         ...((test.skipped || cls.skipped) && { skipped: true }),
-                        ...(sometimes && { conditional: true, dynamic: cls.unsettled ? 'collection-switch' : 'base-not-resolved' }),
+                        ...((identity || cls.sometimes || test.conditional) && { conditional: true }),
+                        ...((identity || test.dynamic) && { dynamic: identity || test.dynamic }),
+                        ...(test.marks && { marks: test.marks, marksOpen: !!test.marksOpen }),
                         inherited: {
                             file: index.files.get(base.filePath).relativePath,
                             filePath: base.filePath, owner: base.cls.name,
@@ -1006,6 +1734,65 @@ function createTestModel(index) {
                         },
                     });
                 }
+            }
+            for (const { entry, fn, target } of taken) {
+                units.push({
+                    kind: 'test', name: entry.name, suite: [],
+                    line: entry.line, startLine: entry.line, endLine: entry.line,
+                    ...(fn.skipped && { skipped: true }),
+                    ...(fn.conditional && { conditional: true }),
+                    ...(fn.dynamic && { dynamic: fn.dynamic }),
+                    ...(fn.marks && { marks: fn.marks, marksOpen: !!fn.marksOpen }),
+                    inherited: {
+                        file: index.files.get(target).relativePath, filePath: target, owner: null, ownerLine: 0,
+                        line: fn.line, startLine: fn.startLine, endLine: fn.endLine,
+                    },
+                });
+            }
+            // The runner's configured options: a mark expression and
+            // tests left out by name apply to a test however it is named
+            // on the command line (measured).
+            const options = naming.options;
+            if (options && (options.markExpr || options.deselect.length > 0)) {
+                const file = relativeTo(runner.dir, relativePath);
+                units = units.map(unit => {
+                    if (unit.kind !== 'test' || unit.skipped) return unit;
+                    const id = [file, ...unit.suite, unit.name].join('::');
+                    let selected = file != null && options.deselect.some(prefix => id.startsWith(prefix)) ? false : true;
+                    if (selected && options.markExpr) {
+                        const marks = new Set([...(unit.marks || []), ...(found.marks || [])]);
+                        let open = !!unit.marksOpen || !!found.marksOpen;
+                        // Marks of the classes around the test, and of
+                        // every class those derive from.
+                        const around = unit.inherited
+                            ? classesHere.filter(cls => cls.line === unit.line && cls.name === unit.suite[unit.suite.length - 1])
+                            : classesHere.filter(cls => !cls.imported && within(unit, cls));
+                        const holders = new Set(around);
+                        for (const cls of around) {
+                            for (const outer of classesHere) {
+                                if (!outer.imported && outer !== cls && outer.startLine <= cls.startLine && outer.endLine >= cls.endLine) holders.add(outer);
+                            }
+                        }
+                        for (const cls of holders) {
+                            for (const node of orderOf(filePath, cls)) {
+                                if (node.opaque) {
+                                    if (!node.safe) open = true;
+                                    continue;
+                                }
+                                for (const mark of node.cls.marks || []) marks.add(mark);
+                                if (node.cls.marksOpen) open = true;
+                            }
+                        }
+                        selected = markSelects(options.markExpr, marks, open);
+                    }
+                    if (selected === false) return { ...unit, skipped: true, deselected: true };
+                    return selected == null ? { ...unit, conditional: true } : unit;
+                });
+            }
+            // Code the runner hands the decision to: what it does is not
+            // read, so a test under it runs only sometimes.
+            if (gatedAtRunTime(filePath, runner)) {
+                units = units.map(unit => unit.kind === 'test' && !unit.skipped ? { ...unit, conditional: true } : unit);
             }
             units.sort((a, b) => a.startLine - b.startLine || (b.endLine - a.endLine) ||
                 codeUnitCompare(a.name || '', b.name || ''));
@@ -1055,12 +1842,26 @@ function createTestModel(index) {
             .filter(cls => cls.startLine <= line && cls.endLine >= line)
             .sort((a, b) => b.startLine - a.startLine)[0];
         const template = holder && holder.tests.find(test => test.startLine <= line && test.endLine >= line);
+        const importers = [...(index.exportGraph?.get(filePath) || [])];
         if (template) {
-            for (const file of [...descendantFiles(holder.name), filePath].sort(codeUnitCompare)) {
+            for (const file of [...new Set([...descendantFiles(holder.name), ...importers, filePath])].sort(codeUnitCompare)) {
                 for (const candidate of model.unitsOf(file).units) {
                     const from = candidate.inherited;
                     if (from && from.filePath === filePath && from.ownerLine === holder.startLine &&
                         candidate.name === template.name) out.push({ filePath: file, unit: candidate });
+                }
+            }
+        }
+        // A function another module imports under a test's name runs there.
+        const fn = holder ? null : (model.declared(filePath)?.functions || [])
+            .find(other => other.startLine <= line && other.endLine >= line);
+        if (fn) {
+            for (const file of importers.sort(codeUnitCompare)) {
+                for (const candidate of model.unitsOf(file).units) {
+                    const from = candidate.inherited;
+                    if (from && from.filePath === filePath && from.owner == null && from.startLine === fn.startLine) {
+                        out.push({ filePath: file, unit: candidate });
+                    }
                 }
             }
         }
@@ -1099,8 +1900,12 @@ function createTestModel(index) {
         if (!facts.modeled) return 'unmodeled';
         if (facts.tests > 0 || facts.units.length > 0 || facts.inheriting) return 'tests';
         // A language whose tests are all declarations: none read, none there.
-        if (model.declared(filePath)?.complete) return 'support';
+        if (model.declared(filePath)?.complete || model.declared(filePath)?.notCollected) return 'support';
         const fileEntry = index.files.get(filePath);
+        // node runs every file it is told to, or looks for, as a test: a
+        // script that declares none is one.
+        const runner = model.runnerOf(filePath) || {};
+        if (runner.id === 'node-test' && nodeRunsFile(runner, relativeTo(runner.dir, fileEntry.relativePath))) return 'tests';
         const named = langTraits(fileEntry.language)?.testFileNames || [];
         const base = path.posix.basename(fileEntry.relativePath);
         const collection = (model.runnerOf(filePath) || {}).collection || {};
@@ -1169,7 +1974,9 @@ function createTestModel(index) {
                 : tests.length > 0 && tests.every(unit => unit.dynamic === 'declared-indirectly')
                     ? withheld('declared-indirectly')
                     : tests.length > 0 && tests.every(unit => unit.notInEveryBuild)
-                        ? withheld('conditional-tests') : model.selectorOf(filePath, null);
+                        ? withheld('conditional-tests')
+                        : tests.length > 0 && tests.every(unit => unit.deselected)
+                            ? withheld('deselected-by-options') : model.selectorOf(filePath, null);
             if (selector) out.run = selector;
             else out.runWithheld = reason;
         }
@@ -1335,6 +2142,9 @@ function linkFiles(model, index, linesByFile) {
 
 // Runners whose file command ends in the path and takes several of them.
 const TAKES_MANY = new Set(['pytest', 'node-test', 'jest', 'vitest', 'mocha', 'go-test']);
+// Runners in which a focus in one file holds for every file of the run:
+// such a file is run by itself, or the others' tests would not run.
+const FOCUS_SPANS_THE_RUN = new Set(['mocha']);
 
 /**
  * The commands that run a set of test files, files of one runner and one
@@ -1352,7 +2162,8 @@ function commandsFor(model, filePaths) {
         const runner = model.runnerOf(filePath);
         const cut = selector.command.lastIndexOf(' ');
         const last = selector.command.slice(cut + 1);
-        if (!TAKES_MANY.has(runner.id) || cut < 0 || /['"\\]/.test(last)) {
+        if (!TAKES_MANY.has(runner.id) || cut < 0 || /['"\\]/.test(last) ||
+            (FOCUS_SPANS_THE_RUN.has(runner.id) && model.declared(filePath)?.focus)) {
             if (!single.includes(selectorText(selector))) single.push(selectorText(selector));
             continue;
         }
@@ -1393,4 +2204,6 @@ module.exports = {
     addTestCaseRows, linkFile, linkFiles, commandsFor,
     // Exposed for tests.
     scriptRunners, nodeTestOptions, configWords, tableText, namesRequirement, focusedOut,
+    shellSplit, configArguments, pytestOptions, markSelects, pathGlob, nodeTestPaths, nodeRunsFile,
+    mochaLoadingOptions, runnerScriptWords,
 };

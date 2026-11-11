@@ -54,6 +54,17 @@ const ANALYSIS_METADATA = Object.freeze([
     'compile_commands.json', 'CMakeLists.txt', 'Makefile',
     'composer.json', 'Gemfile', 'Podfile', 'Cartfile', 'mix.exs', 'rebar.config',
     'Directory.Build.props', 'Directory.Build.targets',
+    // Configuration of the test runners (core/test-units.js).
+    'jest.config.js', 'jest.config.cjs', 'jest.config.mjs', 'jest.config.ts', 'jest.config.cts', 'jest.config.mts',
+    'jest.config.json',
+    'vitest.config.js', 'vitest.config.cjs', 'vitest.config.mjs', 'vitest.config.ts', 'vitest.config.cts',
+    'vitest.config.mts', 'vite.config.js', 'vite.config.cjs', 'vite.config.mjs', 'vite.config.ts',
+    'vite.config.cts', 'vite.config.mts', 'vitest.workspace.js', 'vitest.workspace.mjs', 'vitest.workspace.ts',
+    'vitest.workspace.mts', 'vitest.workspace.json', 'vitest.projects.js', 'vitest.projects.ts',
+    'vitest.projects.json',
+    '.mocharc', '.mocharc.js', '.mocharc.cjs', '.mocharc.mjs', '.mocharc.json', '.mocharc.jsonc', '.mocharc.yaml',
+    '.mocharc.yml',
+    'conftest.py',
 ]);
 // Project files named after the project.
 const ANALYSIS_METADATA_SUFFIXES = Object.freeze(['.csproj', '.sln']);

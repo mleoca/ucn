@@ -35,6 +35,15 @@
     "  T extra > gated_module [conditional] => (withheld: conditional-compilation)",
     "all: cargo test --lib"
   ],
+  "cargo-ignored-on-a-condition": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  S tests",
+    "  T tests > always => cargo test --lib -- tests::always --exact",
+    "  T tests > ignored_here [conditional] => (withheld: conditional-compilation)",
+    "  T tests > ignored_elsewhere [conditional] => (withheld: conditional-compilation)",
+    "  T tests > ignored_with_a_reason [skipped] => cargo test --lib -- tests::ignored_with_a_reason --exact --include-ignored",
+    "all: cargo test --lib"
+  ],
   "cargo-integration-tests": [
     "tests/api.rs [tests] cargo-test  run: cargo test --test api",
     "  T adds => cargo test --test api -- adds --exact",
@@ -104,6 +113,10 @@
     "  T Fixture > Runs => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.Runs",
     "  T Fixture > Ignored [skipped] => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.Ignored",
     "  T Fixture > StaticTest => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.StaticTest",
+    "  T Fixture > IgnoredCase [skipped] => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.IgnoredCase",
+    "  T Fixture > IgnoredForNow [conditional] => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.IgnoredForNow",
+    "  T Fixture > OnlyWhenAsked [conditional] => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.OnlyWhenAsked",
+    "  T Fixture > UnderPlainAttributes => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.UnderPlainAttributes",
     "all: dotnet test --filter 'FullyQualifiedName~Quiet.Tests.Fixture.|FullyQualifiedName~Quiet.Tests.Fixture+'"
   ],
   "dotnet-xunit": [
@@ -118,6 +131,23 @@
     "  S Concrete",
     "  T Concrete > Inherited (from FooTests.cs:35) => dotnet test --filter FullyQualifiedName=My.App.Tests.Concrete.Inherited",
     "all: dotnet test --filter 'FullyQualifiedName~My.App.Tests.Concrete.|FullyQualifiedName~My.App.Tests.Concrete+|FullyQualifiedName~My.App.Tests.FooTests.|FullyQualifiedName~My.App.Tests.FooTests+|FullyQualifiedName~My.App.Tests.FooTestsMore.|FullyQualifiedName~My.App.Tests.FooTestsMore+'"
+  ],
+  "dotnet-xunit-skip-is-a-value": [
+    "SkipValues.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Values.Tests.SkipValues.|FullyQualifiedName~Values.Tests.SkipValues+'",
+    "  S SkipValues",
+    "  T SkipValues > NullRuns => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.NullRuns",
+    "  T SkipValues > CastNullRuns => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.CastNullRuns",
+    "  T SkipValues > DefaultRuns => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.DefaultRuns",
+    "  T SkipValues > NullConstantRuns => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.NullConstantRuns",
+    "  T SkipValues > LiteralSkips [skipped] => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.LiteralSkips",
+    "  T SkipValues > LocalConstantSkips [skipped] => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.LocalConstantSkips",
+    "  T SkipValues > ConstantSkips [skipped] => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.ConstantSkips",
+    "  T SkipValues > NameofSkips [skipped] => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.NameofSkips",
+    "  T SkipValues > JoinedSkips [skipped] => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.JoinedSkips",
+    "  T SkipValues > ConstantElsewhere [conditional] => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.ConstantElsewhere",
+    "  T SkipValues > EmptyReason => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.EmptyReason",
+    "  T SkipValues > UnderAnAttributeOfTheProject [conditional] => dotnet test --filter FullyQualifiedName=Values.Tests.SkipValues.UnderAnAttributeOfTheProject",
+    "all: dotnet test --filter 'FullyQualifiedName~Values.Tests.SkipValues.|FullyQualifiedName~Values.Tests.SkipValues+'"
   ],
   "dotnet-xunit-skip-is-an-argument": [
     "Named.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Named.Tests.Named.|FullyQualifiedName~Named.Tests.Named+'",
@@ -168,6 +198,17 @@
     "  T TestElsewhere [conditional] => (withheld: build-constraint)",
     "all: go test ."
   ],
+  "go-test-main-decides": [
+    "free_test.go [tests] go-test  run: go test .",
+    "  T TestFree => go test . -run '^TestFree$'",
+    "gated/gated_test.go [tests] go-test  run: go test ./gated",
+    "  T TestBehindMain [conditional] => go test ./gated -run '^TestBehindMain$'",
+    "gated/main_test.go [support] go-test",
+    "plain/main_test.go [support] go-test",
+    "plain/plain_test.go [tests] go-test  run: go test ./plain",
+    "  T TestAfterSetup => go test ./plain -run '^TestAfterSetup$'",
+    "all: go test . ./gated ./plain"
+  ],
   "go-what-is-a-test": [
     "a_test.go [tests] go-test  run: go test .",
     "  T TestA => go test . -run '^TestA$'",
@@ -183,6 +224,28 @@
     "src/test/java/com/x/FooTest.java [tests] no runner: runner-not-modeled  run: (withheld: runner-not-modeled)",
     "  S FooTest",
     "  T FooTest > adds => (withheld: runner-not-modeled)"
+  ],
+  "jest-config-chooses-files": [
+    "test/a.spec.js [tests] jest  run: (withheld: runner-config-not-read)",
+    "  T chosen => (withheld: runner-config-not-read)",
+    "test/b.test.js [tests] jest  run: (withheld: runner-config-not-read)",
+    "  T left out by the config => (withheld: runner-config-not-read)"
+  ],
+  "jest-config-roots-and-pattern": [
+    "src/d.test.js [tests] jest  run: (withheld: outside-runner-config)",
+    "  T outside the roots => (withheld: outside-runner-config)",
+    "test/a.test.js [tests] jest  run: npx jest --runTestsByPath test/a.test.js",
+    "  T in the root => npx jest --runTestsByPath test/a.test.js -t '^in the root$'",
+    "test/skipped/c.test.js [tests] jest  run: (withheld: outside-runner-config)",
+    "  T ignored path => (withheld: outside-runner-config)",
+    "test/sub/b.test.js [tests] jest  run: npx jest --runTestsByPath test/sub/b.test.js",
+    "  T deeper => npx jest --runTestsByPath test/sub/b.test.js -t '^deeper$'",
+    "all: npx jest --runTestsByPath test/a.test.js test/sub/b.test.js"
+  ],
+  "jest-config-that-selects-nothing": [
+    "test/a.test.js [tests] jest  run: npx jest --runTestsByPath test/a.test.js",
+    "  T plain => npx jest --runTestsByPath test/a.test.js -t '^plain$'",
+    "all: npx jest --runTestsByPath test/a.test.js"
   ],
   "jest-file-the-default-pattern-leaves-out": [
     "test/named.test.js [tests] jest  run: npx jest --runTestsByPath test/named.test.js",
@@ -202,6 +265,14 @@
     "src/plain.test.js [tests] jest  run: npx jest --runTestsByPath src/plain.test.js",
     "  T other file => npx jest --runTestsByPath src/plain.test.js -t '^other file$'",
     "all: npx jest --runTestsByPath src/focus.test.js src/plain.test.js"
+  ],
+  "jest-joined-with-a-focused-file": [
+    "test/focus.test.js [tests] jest  run: npx jest --runTestsByPath test/focus.test.js",
+    "  T focused => npx jest --runTestsByPath test/focus.test.js -t '^focused$'",
+    "  T left out [skipped] => npx jest --runTestsByPath test/focus.test.js -t '^left out$'",
+    "test/plain.test.js [tests] jest  run: npx jest --runTestsByPath test/plain.test.js",
+    "  T other file => npx jest --runTestsByPath test/plain.test.js -t '^other file$'",
+    "all: npx jest --runTestsByPath test/focus.test.js test/plain.test.js"
   ],
   "jest-local-function-named-test": [
     "src/t.test.js [tests] jest  run: npx jest --runTestsByPath src/t.test.js",
@@ -262,6 +333,12 @@
     "test/setup.js [support] jest",
     "all: npx jest --runTestsByPath src/sum.test.js"
   ],
+  "jest-script-names-its-configuration": [
+    "test/a.unit.js [tests] jest  run: (withheld: runner-config-not-read)",
+    "  T under the configuration the script names => (withheld: runner-config-not-read)",
+    "test/b.test.js [tests] jest  run: (withheld: runner-config-not-read)",
+    "  T under the default pattern => (withheld: runner-config-not-read)"
+  ],
   "js-runner-not-modeled": [
     "test/a.test.js [tests] no runner: runner-not-modeled  run: (withheld: runner-not-modeled)",
     "  T b => (withheld: runner-not-modeled)"
@@ -298,6 +375,18 @@
     "all: mvn test -Dtest=com.x.FooTest",
     "all: mvn test -Dtest=com.x.OtherTest"
   ],
+  "maven-junit5-conditions": [
+    "src/test/java/com/x/ConditionsTest.java [tests] maven  run: mvn test -Dtest=com.x.ConditionsTest",
+    "  S ConditionsTest",
+    "  T ConditionsTest > onlyOnWindows [conditional] => mvn test '-Dtest=com.x.ConditionsTest#onlyOnWindows'",
+    "  T ConditionsTest > notOnWindows [conditional] => mvn test '-Dtest=com.x.ConditionsTest#notOnWindows'",
+    "  T ConditionsTest > underAnAnnotationOfTheProject [skipped] => mvn test '-Dtest=com.x.ConditionsTest#underAnAnnotationOfTheProject'",
+    "  T ConditionsTest > underJUnitsOwn => mvn test '-Dtest=com.x.ConditionsTest#underJUnitsOwn'",
+    "  T ConditionsTest > declaredByAnAnnotationOfTheProject => mvn test '-Dtest=com.x.ConditionsTest#declaredByAnAnnotationOfTheProject'",
+    "src/test/java/com/x/Flaky.java [support] maven",
+    "src/test/java/com/x/Quick.java [support] maven",
+    "all: mvn test -Dtest=com.x.ConditionsTest"
+  ],
   "maven-junit5-what-is-not-run": [
     "src/test/java/com/x/RulesTest.java [tests] maven  run: mvn test -Dtest=com.x.RulesTest",
     "  S RulesTest",
@@ -317,13 +406,33 @@
     "  T OuterTest > Deep > Deeper > bottom => mvn test '-Dtest=com.x.OuterTest$Deep$Deeper#bottom'",
     "all: mvn test -Dtest=com.x.OuterTest"
   ],
+  "mocha-config-adds-files": [
+    "test/a.test.js [tests] mocha  run: (withheld: runner-config-not-read)",
+    "  T first => (withheld: runner-config-not-read)",
+    "test/deep/b.test.js [tests] mocha  run: (withheld: runner-config-not-read)",
+    "  T second => (withheld: runner-config-not-read)"
+  ],
+  "mocha-config-in-code": [
+    "test/a.test.js [tests] mocha  run: (withheld: runner-config-not-read)",
+    "  T first => (withheld: runner-config-not-read)",
+    "test/b.test.js [tests] mocha  run: (withheld: runner-config-not-read)",
+    "  T second => (withheld: runner-config-not-read)"
+  ],
+  "mocha-config-that-selects-nothing": [
+    "test/a.test.js [tests] mocha  run: npx mocha test/a.test.js",
+    "  T first => npx mocha test/a.test.js --grep '^first$'",
+    "test/b.test.js [tests] mocha  run: npx mocha test/b.test.js",
+    "  T second => npx mocha test/b.test.js --grep '^second$'",
+    "all: npx mocha test/a.test.js test/b.test.js"
+  ],
   "mocha-focused-tests": [
     "test/focus.test.js [tests] mocha  run: npx mocha test/focus.test.js",
     "  T focused => npx mocha test/focus.test.js --grep '^focused$'",
     "  T left out [skipped] => npx mocha test/focus.test.js --grep '^left out$'",
     "test/plain.test.js [tests] mocha  run: npx mocha test/plain.test.js",
     "  T other file => npx mocha test/plain.test.js --grep '^other file$'",
-    "all: npx mocha test/focus.test.js test/plain.test.js"
+    "all: npx mocha test/plain.test.js",
+    "all: npx mocha test/focus.test.js"
   ],
   "mocha-nested-focus": [
     "test/nested.test.js [tests] mocha  run: npx mocha test/nested.test.js",
@@ -352,6 +461,13 @@
     "  T stack > pushes => npx mocha test/a.test.js --grep '^stack pushes$'",
     "test/support/build.js [support] mocha",
     "all: npx mocha test/a.test.js"
+  ],
+  "mocha-script-loads-what-the-tests-need": [
+    "test/a.test.js [tests] mocha  run: npx mocha --require ./support/setup.js test/a.test.js",
+    "  T needs the setup => npx mocha --require ./support/setup.js test/a.test.js --grep '^needs the setup$'",
+    "test/b.test.js [tests] mocha  run: npx mocha --require ./support/setup.js test/b.test.js",
+    "  T needs it too => npx mocha --require ./support/setup.js test/b.test.js --grep '^needs it too$'",
+    "all: npx mocha --require ./support/setup.js test/a.test.js test/b.test.js"
   ],
   "mocha-shared-behaviour": [
     "test/fifo.test.js [tests] mocha  run: npx mocha test/fifo.test.js",
@@ -384,8 +500,20 @@
   ],
   "node-test-binding-not-followed": [
     "test/computed.js [tests] node-test  run: node --test test/computed.js",
-    "test/hooks-only.js [support] node-test",
-    "all: node --test test/computed.js"
+    "test/hooks-only.js [tests] node-test  run: node --test test/hooks-only.js",
+    "all: node --test test/computed.js test/hooks-only.js"
+  ],
+  "node-test-body-given-as-an-expression": [
+    "test/b.test.js [tests] node-test  run: node --test test/b.test.js",
+    "  T named callback => node --test --test-name-pattern='^named callback$' test/b.test.js",
+    "  T named callback with options => node --test --test-name-pattern='^named callback with options$' test/b.test.js",
+    "  T member callback => node --test --test-name-pattern='^member callback$' test/b.test.js",
+    "  T wrapped callback => node --test --test-name-pattern='^wrapped callback$' test/b.test.js",
+    "  T options only [skipped] => node --test --test-name-pattern='^options only$' test/b.test.js",
+    "  T undefined body [skipped] => node --test --test-name-pattern='^undefined body$' test/b.test.js",
+    "  T no callback [skipped] => node --test --test-name-pattern='^no callback$' test/b.test.js",
+    "  T (computed name) => (withheld: name-not-literal)",
+    "all: node --test test/b.test.js"
   ],
   "node-test-by-import-only": [
     "test/c.test.js [tests] node-test  run: node --test test/c.test.js",
@@ -404,6 +532,19 @@
     "  T on default > member => node --test --test-name-pattern='^on default member$' test/esm.mjs",
     "all: node --test test/esm.mjs"
   ],
+  "node-test-files-node-looks-for": [
+    "test/a.test.js [tests] node-test  run: node --test test/a.test.js",
+    "  T declared => node --test --test-name-pattern='^declared$' test/a.test.js",
+    "test/tools/setup.js [tests] node-test  run: node --test test/tools/setup.js",
+    "all: node --test test/a.test.js test/tools/setup.js"
+  ],
+  "node-test-files-the-script-names": [
+    "test/a.test.js [tests] node-test  run: node --test test/a.test.js",
+    "  T declared => node --test --test-name-pattern='^declared$' test/a.test.js",
+    "test/helpers/util.js [support] node-test",
+    "test/smoke.js [tests] node-test  run: node --test test/smoke.js",
+    "all: node --test test/a.test.js test/smoke.js"
+  ],
   "node-test-name-read-two-ways": [
     "test/n.test.js [tests] node-test  run: node --test test/n.test.js",
     "  T adds => (withheld: name-not-unique)",
@@ -413,6 +554,11 @@
     "  S math adds",
     "  T math adds > x => node --test --test-name-pattern='^math adds x$' test/n.test.js",
     "all: node --test test/n.test.js"
+  ],
+  "node-test-names-no-scope-settles": [
+    "test/w.test.js [tests] node-test  run: node --test test/w.test.js",
+    "  T real => node --test --test-name-pattern='^real$' test/w.test.js",
+    "all: node --test test/w.test.js"
   ],
   "node-test-names-not-written": [
     "test/e.test.js [tests] node-test  run: node --test test/e.test.js",
@@ -431,6 +577,15 @@
     "  T after them all => node --test --test-name-pattern='^after them all$' test/scopes.test.js",
     "  T and the other name => node --test --test-name-pattern='^and the other name$' test/scopes.test.js",
     "all: node --test test/scopes.test.js"
+  ],
+  "node-test-names-written-again": [
+    "test/block.test.js [tests] node-test  run: node --test test/block.test.js",
+    "  T real beside a block => node --test --test-name-pattern='^real beside a block$' test/block.test.js",
+    "test/once.test.js [tests] node-test  run: node --test test/once.test.js",
+    "  T assigned once => node --test --test-name-pattern='^assigned once$' test/once.test.js",
+    "test/r.test.js [tests] node-test  run: node --test test/r.test.js",
+    "  T real => node --test --test-name-pattern='^real$' test/r.test.js",
+    "all: node --test test/block.test.js test/once.test.js test/r.test.js"
   ],
   "node-test-only-is-inert-without-its-flag": [
     "test/focus.test.js [tests] node-test  run: node --test test/focus.test.js",
@@ -475,13 +630,27 @@
     "  T text > adds => node --test --test-name-pattern='^text adds$' test/a.test.js",
     "  T text > escapes (a+b) [x]? => node --test --test-name-pattern='^text escapes \\(a\\+b\\) \\[x\\]\\?$' test/a.test.js",
     "  T text > it's quoted => node --test --test-name-pattern='^text it'\\''s quoted$' test/a.test.js",
-    "test/helpers.js [support] node-test",
-    "all: node --test test/a.test.js"
+    "test/helpers.js [tests] node-test  run: node --test test/helpers.js",
+    "all: node --test test/a.test.js test/helpers.js"
   ],
   "node-test-script-loader": [
     "test/b.test.js [tests] node-test  run: node --test --import ./setup.mjs test/b.test.js",
     "  T needs setup => node --test --import ./setup.mjs --test-name-pattern='^needs setup$' test/b.test.js",
     "all: node --test --import ./setup.mjs test/b.test.js"
+  ],
+  "node-test-skip-option-values": [
+    "test/o.test.js [tests] node-test  run: node --test test/o.test.js",
+    "  T empty reason runs => node --test --test-name-pattern='^empty reason runs$' test/o.test.js",
+    "  T zero runs => node --test --test-name-pattern='^zero runs$' test/o.test.js",
+    "  T null runs => node --test --test-name-pattern='^null runs$' test/o.test.js",
+    "  T undefined runs => node --test --test-name-pattern='^undefined runs$' test/o.test.js",
+    "  T reason skips [skipped] => node --test --test-name-pattern='^reason skips$' test/o.test.js",
+    "  T one skips [skipped] => node --test --test-name-pattern='^one skips$' test/o.test.js",
+    "  T shorthand [conditional] => node --test --test-name-pattern='^shorthand$' test/o.test.js",
+    "  T spread options [conditional] => node --test --test-name-pattern='^spread options$' test/o.test.js",
+    "  T named options [conditional] => node --test --test-name-pattern='^named options$' test/o.test.js",
+    "  T computed key [skipped] => node --test --test-name-pattern='^computed key$' test/o.test.js",
+    "all: node --test test/o.test.js"
   ],
   "node-test-skipped-and-unregistered": [
     "test/skips.test.js [tests] node-test  run: node --test test/skips.test.js",
@@ -512,6 +681,34 @@
     "test/d.test.ts [tests] node-test  run: (withheld: loader-unknown)",
     "  T typed => (withheld: loader-unknown)"
   ],
+  "pytest-a-later-write-decides": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_class_and_function.py [tests] pytest  run: pytest tests/test_class_and_function.py",
+    "  S TestComputed",
+    "  T TestComputed > test_actual [conditional] => (withheld: collection-switch)",
+    "  S TestBackOn",
+    "  T TestBackOn > test_on => pytest tests/test_class_and_function.py::TestBackOn::test_on",
+    "  T test_function [conditional] => (withheld: collection-switch)",
+    "  T test_function_back_on => pytest tests/test_class_and_function.py::test_function_back_on",
+    "tests/test_marks.py [tests] pytest  run: pytest tests/test_marks.py",
+    "  T test_mark_replaced => pytest tests/test_marks.py::test_mark_replaced",
+    "tests/test_marks_branch.py [tests] pytest  run: pytest tests/test_marks_branch.py",
+    "  T test_mark_in_branch [conditional] => pytest tests/test_marks_branch.py::test_mark_in_branch",
+    "tests/test_marks_grown.py [tests] pytest  run: pytest tests/test_marks_grown.py",
+    "  T test_mark_added [conditional] => pytest tests/test_marks_grown.py::test_mark_added",
+    "tests/test_module_branch.py [tests] pytest  run: pytest tests/test_module_branch.py",
+    "  T test_actual [conditional] => (withheld: collection-switch)",
+    "tests/test_module_computed.py [tests] pytest  run: pytest tests/test_module_computed.py",
+    "  T test_actual [conditional] => (withheld: collection-switch)",
+    "tests/test_rebound.py [tests] pytest  run: pytest tests/test_rebound.py",
+    "  T test_kept => pytest tests/test_rebound.py::test_kept",
+    "  T test_never [conditional] => (withheld: defined-conditionally)",
+    "  T test_else [conditional] => (withheld: defined-conditionally)",
+    "  S TestBody",
+    "  T TestBody > test_m => pytest tests/test_rebound.py::TestBody::test_m",
+    "  T TestBody > test_in_branch [conditional] => (withheld: defined-conditionally)",
+    "all: pytest tests/test_class_and_function.py tests/test_marks.py tests/test_marks_branch.py tests/test_marks_grown.py tests/test_module_branch.py tests/test_module_computed.py tests/test_rebound.py"
+  ],
   "pytest-base-from-outside-the-project": [
     "tests/test_o.py [tests] pytest  run: pytest tests/test_o.py",
     "  S TestOnDict",
@@ -532,30 +729,71 @@
     "  T verify_two => pytest tests/check_a.py::verify_two",
     "  S MathSuite",
     "  T MathSuite > check_three => pytest tests/check_a.py::MathSuite::check_three",
-    "tests/test_plain.py [tests] pytest  run: pytest tests/test_plain.py",
-    "  T check_five => pytest tests/test_plain.py::check_five",
-    "all: pytest tests/check_a.py tests/test_plain.py"
+    "tests/test_plain.py [support] pytest",
+    "all: pytest tests/check_a.py"
+  ],
+  "pytest-decorators-and-module-skips": [
+    "tests/__init__.py [support] pytest",
+    "tests/deco.py [support] pytest",
+    "tests/test_deco.py [tests] pytest  run: pytest tests/test_deco.py",
+    "  T test_needs_db [conditional] => pytest tests/test_deco.py::test_needs_db",
+    "  T test_passed_through [conditional] => pytest tests/test_deco.py::test_passed_through",
+    "  T test_never_started [skipped] => pytest tests/test_deco.py::test_never_started",
+    "  T test_expected_to_fail => pytest tests/test_deco.py::test_expected_to_fail",
+    "  T test_patched => pytest tests/test_deco.py::test_patched",
+    "  T test_with_fixture => pytest tests/test_deco.py::test_with_fixture",
+    "tests/test_module_skip.py [tests] pytest  run: pytest tests/test_module_skip.py",
+    "  T test_unreached [conditional] => pytest tests/test_module_skip.py::test_unreached",
+    "tests/test_needs_module.py [tests] pytest  run: pytest tests/test_needs_module.py",
+    "  T test_needs_it [conditional] => pytest tests/test_needs_module.py::test_needs_it",
+    "all: pytest tests/test_deco.py tests/test_module_skip.py tests/test_needs_module.py"
+  ],
+  "pytest-hooks-decide-at-run-time": [
+    "other/test_free.py [tests] pytest  run: pytest other/test_free.py",
+    "  T test_no_hook_above => pytest other/test_free.py::test_no_hook_above",
+    "tests/__init__.py [support] pytest",
+    "tests/conftest.py [support] pytest",
+    "tests/test_h.py [tests] pytest  run: pytest tests/test_h.py",
+    "  T test_left_out [conditional] => pytest tests/test_h.py::test_left_out",
+    "  T test_kept [conditional] => pytest tests/test_h.py::test_kept",
+    "all: pytest other/test_free.py tests/test_h.py"
+  ],
+  "pytest-imported-tests-run-where-imported": [
+    "tests/__init__.py [support] pytest",
+    "tests/base.py [support] pytest",
+    "tests/test_child.py [tests] pytest  run: pytest tests/test_child.py",
+    "  S TestBase",
+    "  T CaseBase > test_case_shared (from tests/base.py:14) => pytest tests/test_child.py::CaseBase::test_case_shared",
+    "  T TestBase > test_shared (from tests/base.py:10) => pytest tests/test_child.py::TestBase::test_shared",
+    "  T test_function_elsewhere (from tests/base.py:21) => pytest tests/test_child.py::test_function_elsewhere",
+    "  S TestPlain",
+    "  T TestPlain > test_under_another_name (from tests/base.py:18) => pytest tests/test_child.py::TestPlain::test_under_another_name",
+    "  S TestChild",
+    "  T TestChild > test_shared (from tests/base.py:10) => pytest tests/test_child.py::TestChild::test_shared",
+    "  S ChildCase",
+    "  T ChildCase > test_case_shared (from tests/base.py:14) => pytest tests/test_child.py::ChildCase::test_case_shared",
+    "all: pytest tests/test_child.py"
   ],
   "pytest-inherited-tests": [
     "tests/__init__.py [support] pytest",
-    "tests/base.py [tests] pytest  run: pytest tests/base.py",
-    "  S TestBase",
-    "  T TestBase > test_twice => pytest tests/base.py::TestBase::test_twice",
+    "tests/base.py [support] pytest",
     "tests/test_child.py [tests] pytest  run: pytest tests/test_child.py",
+    "  S TestBase",
+    "  T TestBase > test_twice (from tests/base.py:19) => pytest tests/test_child.py::TestBase::test_twice",
     "  S TestChild",
-    "  T TestChild > test_shared (from tests/base.py:11) => pytest tests/test_child.py::TestChild::test_shared",
+    "  T TestChild > test_shared (from tests/base.py:12) => pytest tests/test_child.py::TestChild::test_shared",
     "  T TestChild > test_hidden => pytest tests/test_child.py::TestChild::test_hidden",
     "  S TestGrandChild",
     "  T TestGrandChild > test_hidden (from tests/test_child.py:5) => pytest tests/test_child.py::TestGrandChild::test_hidden",
-    "  T TestGrandChild > test_shared (from tests/base.py:11) => pytest tests/test_child.py::TestGrandChild::test_shared",
+    "  T TestGrandChild > test_shared (from tests/base.py:12) => pytest tests/test_child.py::TestGrandChild::test_shared",
     "  T TestGrandChild > test_own => pytest tests/test_child.py::TestGrandChild::test_own",
     "  S TestAgain",
-    "  T TestAgain > test_twice (from tests/base.py:18) => pytest tests/test_child.py::TestAgain::test_twice",
+    "  T TestAgain > test_twice (from tests/base.py:19) => pytest tests/test_child.py::TestAgain::test_twice",
     "  S Elsewhere",
-    "  T Elsewhere > test_hidden (from tests/base.py:14) => pytest tests/test_child.py::Elsewhere::test_hidden",
-    "  T Elsewhere > test_shared (from tests/base.py:11) => pytest tests/test_child.py::Elsewhere::test_shared",
+    "  T Elsewhere > test_hidden (from tests/base.py:15) => pytest tests/test_child.py::Elsewhere::test_hidden",
+    "  T Elsewhere > test_shared (from tests/base.py:12) => pytest tests/test_child.py::Elsewhere::test_shared",
     "tests/test_outside.py [tests] pytest  run: pytest tests/test_outside.py",
-    "all: pytest tests/base.py tests/test_child.py tests/test_outside.py"
+    "all: pytest tests/test_child.py tests/test_outside.py"
   ],
   "pytest-method-resolution-order": [
     "tests/__init__.py [support] pytest",
@@ -578,6 +816,33 @@
     "  S TestK",
     "  T TestK > test_y => (cd services/api && pytest tests/test_c.py::TestK::test_y)",
     "all: (cd services/api && pytest tests/test_c.py)"
+  ],
+  "pytest-options-deselect": [
+    "tests/__init__.py [support] pytest",
+    "tests/deco.py [support] pytest",
+    "tests/test_marked.py [tests] pytest  run: pytest tests/test_marked.py",
+    "  T test_marked [skipped] => (withheld: deselected-by-options)",
+    "  T test_marked_through_a_name [skipped] => (withheld: deselected-by-options)",
+    "  S TestMarkedClass",
+    "  T TestMarkedClass > test_inside [skipped] => (withheld: deselected-by-options)",
+    "  S TestMarkInBody",
+    "  T TestMarkInBody > test_under_body_mark [skipped] => (withheld: deselected-by-options)",
+    "  S TestDerived",
+    "  T TestDerived > test_under_body_mark [skipped] (from tests/test_marked.py:25) => (withheld: deselected-by-options)",
+    "  T TestDerived > test_own [skipped] => (withheld: deselected-by-options)",
+    "  T test_decorated_elsewhere [conditional] => pytest tests/test_marked.py::test_decorated_elsewhere",
+    "  T test_deselected_by_id [skipped] => (withheld: deselected-by-options)",
+    "  T test_some_cases [conditional] => pytest tests/test_marked.py::test_some_cases",
+    "  T test_plain => pytest tests/test_marked.py::test_plain",
+    "tests/test_module_marked.py [tests] pytest  run: (withheld: deselected-by-options)",
+    "  T test_under_module_mark [skipped] => (withheld: deselected-by-options)",
+    "all: pytest tests/test_marked.py"
+  ],
+  "pytest-options-not-read": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_k.py [tests] pytest  run: (withheld: runner-options-not-read)",
+    "  T test_thing => (withheld: runner-options-not-read)",
+    "  T test_other => (withheld: runner-options-not-read)"
   ],
   "pytest-proved-by-conftest": [
     "tests/unit/test_b.py [tests] pytest  run: pytest tests/unit/test_b.py",
@@ -636,7 +901,7 @@
     "tests/test_a.py [tests] pytest  run: pytest tests/test_a.py",
     "  T test_a => pytest tests/test_a.py::test_a",
     "  T testb => pytest tests/test_a.py::testb",
-    "  T test_cond => pytest tests/test_a.py::test_cond",
+    "  T test_cond [conditional] => (withheld: defined-conditionally)",
     "  S TestX",
     "  T TestX > test_m => pytest tests/test_a.py::TestX::test_m",
     "  T TestX > test_static => pytest tests/test_a.py::TestX::test_static",
@@ -672,6 +937,19 @@
     "  T T > test_x => (withheld: no-runner-evidence)",
     "tests/util.py [support] no runner: no-runner-evidence"
   ],
+  "vitest-config-chooses-files": [
+    "test/a.spec.js [tests] vitest  run: (withheld: runner-config-not-read)",
+    "  T chosen => (withheld: runner-config-not-read)",
+    "test/b.test.js [tests] vitest  run: (withheld: runner-config-not-read)",
+    "  T left out by the config => (withheld: runner-config-not-read)"
+  ],
+  "vitest-config-directory": [
+    "src/b.test.js [tests] vitest  run: (withheld: outside-runner-config)",
+    "  T outside the directory => (withheld: outside-runner-config)",
+    "tests/a.test.js [tests] vitest  run: npx vitest run tests/a.test.js",
+    "  T in the directory => npx vitest run tests/a.test.js -t '^in the directory$'",
+    "all: npx vitest run tests/a.test.js"
+  ],
   "vitest-dependency": [
     "src/sum.test.ts [tests] vitest  run: npx vitest run src/sum.test.ts",
     "  S sum",
@@ -692,35 +970,45 @@
     "all: npx vitest run test/named.test.js"
   ],
   "vitest-focused-tests": [
-    "src/focus.test.js [tests] vitest  run: npx vitest run src/focus.test.js",
-    "  T focused => npx vitest run src/focus.test.js -t '^focused$'",
-    "  T left out [skipped] => npx vitest run src/focus.test.js -t '^left out$'",
+    "src/focus.test.js [tests] vitest  run: npx vitest run --allowOnly src/focus.test.js",
+    "  T focused => npx vitest run --allowOnly src/focus.test.js -t '^focused$'",
+    "  T left out [skipped] => npx vitest run --allowOnly src/focus.test.js -t '^left out$'",
     "  S group",
-    "  T group > inside [skipped] => npx vitest run src/focus.test.js -t '^group inside$'",
+    "  T group > inside [skipped] => npx vitest run --allowOnly src/focus.test.js -t '^group inside$'",
     "src/plain.test.js [tests] vitest  run: npx vitest run src/plain.test.js",
     "  T other file => npx vitest run src/plain.test.js -t '^other file$'",
-    "all: npx vitest run src/focus.test.js src/plain.test.js"
+    "all: npx vitest run --allowOnly src/focus.test.js",
+    "all: npx vitest run src/plain.test.js"
   ],
   "vitest-import-beats-manifest": [
     "src/v.test.js [tests] vitest  run: npx vitest run src/v.test.js",
     "  T runs => npx vitest run src/v.test.js -t '^runs$'",
     "all: npx vitest run src/v.test.js"
   ],
+  "vitest-joined-with-a-focused-file": [
+    "test/focus.test.js [tests] vitest  run: npx vitest run --allowOnly test/focus.test.js",
+    "  T focused => npx vitest run --allowOnly test/focus.test.js -t '^focused$'",
+    "  T left out [skipped] => npx vitest run --allowOnly test/focus.test.js -t '^left out$'",
+    "test/plain.test.js [tests] vitest  run: npx vitest run test/plain.test.js",
+    "  T other file => npx vitest run test/plain.test.js -t '^other file$'",
+    "all: npx vitest run --allowOnly test/focus.test.js",
+    "all: npx vitest run test/plain.test.js"
+  ],
   "vitest-nested-focus": [
-    "src/nested.test.js [tests] vitest  run: npx vitest run src/nested.test.js",
+    "src/nested.test.js [tests] vitest  run: npx vitest run --allowOnly src/nested.test.js",
     "  S outer",
-    "  T outer > one => npx vitest run src/nested.test.js -t '^outer one$'",
-    "  T outer > two => npx vitest run src/nested.test.js -t '^outer two$'",
+    "  T outer > one => npx vitest run --allowOnly src/nested.test.js -t '^outer one$'",
+    "  T outer > two => npx vitest run --allowOnly src/nested.test.js -t '^outer two$'",
     "  S outer > inner",
-    "  T outer > inner > three => npx vitest run src/nested.test.js -t '^outer inner three$'",
+    "  T outer > inner > three => npx vitest run --allowOnly src/nested.test.js -t '^outer inner three$'",
     "  S plain",
-    "  T plain > direct => npx vitest run src/nested.test.js -t '^plain direct$'",
+    "  T plain > direct => npx vitest run --allowOnly src/nested.test.js -t '^plain direct$'",
     "  S plain > nested focus",
-    "  T plain > nested focus > in nested focus => npx vitest run src/nested.test.js -t '^plain nested focus in nested focus$'",
+    "  T plain > nested focus > in nested focus => npx vitest run --allowOnly src/nested.test.js -t '^plain nested focus in nested focus$'",
     "  S plain > nested plain",
-    "  T plain > nested plain > in nested plain [skipped] => npx vitest run src/nested.test.js -t '^plain nested plain in nested plain$'",
-    "  T outside [skipped] => npx vitest run src/nested.test.js -t '^outside$'",
-    "all: npx vitest run src/nested.test.js"
+    "  T plain > nested plain > in nested plain [skipped] => npx vitest run --allowOnly src/nested.test.js -t '^plain nested plain in nested plain$'",
+    "  T outside [skipped] => npx vitest run --allowOnly src/nested.test.js -t '^outside$'",
+    "all: npx vitest run --allowOnly src/nested.test.js"
   ],
   "vitest-path-that-names-two-files": [
     "src/checksum.test.js [tests] vitest  run: npx vitest run src/checksum.test.js",
