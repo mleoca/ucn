@@ -16,7 +16,10 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
 
+const fs = require('fs');
 const { tmp, rm, idx } = require('./helpers');
+const { ProjectIndex } = require('../core/project');
+const { CASES, materialize, deleteTarget } = require('../eval/deletion-matrix-cases');
 const { execute } = require('../core/execute');
 const { deadcode } = require('../core/deadcode');
 const { assessDeletion, projectKind, downstreamExposureBlocks } = require('../core/deletion');
@@ -374,10 +377,21 @@ describe('deletion: a member a project contract requires is withheld', () => {
             // A Rust trait implementation was already withheld (the language
             // adapter treats trait methods as entry points); it stays so.
             assert.strictEqual(implementation('rust_slot', 'tr.rs').verdict, 'review');
+            // The other direction: a trait member is held by the impl that
+            // is written against the trait by name, required or defaulted.
+            // With it gone, `impl Contract for Impl { fn rust_slot }` is a
+            // method that is not a member of the trait.
+            for (const name of ['rust_slot', 'defaulted']) {
+                const requirement = (index.symbols.get(name) || []).find(def =>
+                    def.relativePath === 'tr.rs' && def.className === 'Contract');
+                const answer = assessDeletion(index, requirement);
+                assert.deepStrictEqual([answer.verdict, answer.reason], ['review', 'required-slot'], name);
+            }
             const listed = claimed(index);
-            assert.ok(!listed.some(row => /:(area|slot|goSlot|rust_slot)$/.test(row) &&
-                !/shape\.ts:1:|base\.py:6:|contract\.go:4:|tr\.rs:2:/.test(row)), listed.join(' '));
-            assert.strictEqual(deadcode(index, {}).excludedRequiredSlot, 3);
+            assert.ok(!listed.some(row => /:(area|slot|goSlot|rust_slot|defaulted)$/.test(row) &&
+                !/shape\.ts:1:|base\.py:6:|contract\.go:4:/.test(row)), listed.join(' '));
+            // Three implementations and the two trait members.
+            assert.strictEqual(deadcode(index, {}).excludedRequiredSlot, 5);
         } finally { rm(dir); }
     });
 
@@ -456,6 +470,245 @@ describe('deletion: a declaration the index no longer holds', () => {
     });
 });
 
+describe('deletion: members held in place by a contract nothing names', () => {
+    // eval/deletion-matrix-cases.js: one declaration per case that no call
+    // and no reference names. `expect` is what the language's own toolchain
+    // says about deleting it (judged by eval/run-deletion-matrix.js, not
+    // here); `answer` is the engine's. Each case is asked three ways: in
+    // place, after the declaration is deleted with the file facts of the
+    // revision it came from, and from the saved record alone.
+    const answerOf = assessment => `${assessment.verdict}/${assessment.reason}`;
+    for (const testCase of CASES) {
+        it(`${testCase.id}: ${testCase.answer}`, () => {
+            const dir = tmp({});
+            try {
+                const target = materialize(testCase, dir);
+                const before = idx(dir);
+                const definitions = (before.symbols.get(testCase.name) || []).filter(definition =>
+                    definition.relativePath === target.file &&
+                    definition.startLine >= target.from && definition.startLine <= target.to);
+                assert.strictEqual(definitions.length, 1, 'the marked lines hold one declaration');
+                const inPlace = assessDeletion(before, definitions[0]);
+                const record = JSON.parse(JSON.stringify(definitions[0]));
+                const fileEntry = before.files.get(definitions[0].file);
+
+                deleteTarget(dir, target);
+                const after = idx(dir);
+                const remaining = (after.symbols.get(testCase.name) || []).length;
+                const deleted = assessDeletion(after, record, { fileEntry });
+                const recordOnly = assessDeletion(after, record);
+
+                assert.strictEqual(answerOf(inPlace), testCase.answer, 'in place');
+                // A declaration that is gone is asked about as if it still
+                // stood in its owner: the answer may not change because the
+                // text did.
+                assert.strictEqual(answerOf(deleted), testCase.answer, 'deleted, with its file facts');
+                assert.strictEqual(answerOf(recordOnly), testCase.answer, 'deleted, from the record alone');
+                assert.strictEqual(deleted.indexed, false);
+                // Standing it back in its owner is temporary: the index
+                // holds what it held before the question.
+                assert.strictEqual((after.symbols.get(testCase.name) || []).length, remaining);
+            } finally { rm(dir); }
+        });
+    }
+
+    it('never clears a deletion the toolchain rejects', () => {
+        const rejected = CASES.filter(testCase => testCase.expect === 'break');
+        assert.ok(rejected.length >= 40, `${rejected.length} rejected deletions on the board`);
+        for (const testCase of rejected) {
+            assert.ok(!testCase.answer.startsWith('no-static-dependents/'), testCase.id);
+        }
+        // Every language has both a deletion its toolchain rejects and one
+        // it accepts and the engine clears: withholding everything would
+        // pass the first half of this test and fail the second.
+        for (const lang of new Set(CASES.map(testCase => testCase.lang))) {
+            const ofLang = CASES.filter(testCase => testCase.lang === lang);
+            assert.ok(ofLang.some(testCase => testCase.expect === 'break'), `${lang}: a rejected deletion`);
+            assert.ok(ofLang.some(testCase => testCase.expect === 'clean' &&
+                testCase.answer === 'no-static-dependents/claimed'), `${lang}: a cleared deletion`);
+        }
+    });
+
+    it('a deleted member with two candidate owners is not guessed at', () => {
+        const dir = tmp({
+            'package.json': '{"name":"two-owners"}',
+            '.ucn.json': '{"kind":"application"}',
+            'a.ts': [
+                'namespace One { export class Box { slot() { return 1; } } }',
+                'namespace Two { export class Box { other() { return 2; } } }',
+            ].join('\n'),
+        });
+        try {
+            const before = idx(dir);
+            const slot = (before.symbols.get('slot') || [])[0];
+            assert.ok(slot && slot.className === 'Box');
+            const record = JSON.parse(JSON.stringify(slot));
+            fs.writeFileSync(`${dir}/a.ts`, [
+                'namespace One { export class Box { } }',
+                'namespace Two { export class Box { other() { return 2; } } }',
+            ].join('\n'));
+            const answer = assessDeletion(idx(dir), record);
+            assert.deepStrictEqual([answer.verdict, answer.reason], ['review', 'owner-ambiguous']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('deletion: the requirement fact is read from syntax', () => {
+    // `requiredMember`: a member a subtype or a structural satisfier must
+    // supply. Never inferred from the text of the declaration: an object
+    // type in a signature has braces, an optional member has none.
+    const files = {
+        'package.json': '{"name":"requirement-facts"}',
+        'a.ts': [
+            'interface Contract {',
+            '    slot(): { value: number };',
+            '    opt?(): void;',
+            '    prop: () => void;',
+            '    note?: string;',
+            '}',
+            'abstract class Base {',
+            '    abstract run(): void;',
+            '    plain() {}',
+            '}',
+            'type Alias = { aliased(): void; maybe?(): void };',
+        ].join('\n'),
+        'A.java': [
+            'interface Contract {',
+            '    void slot();',
+            '    default void dflt() {}',
+            '    static void stat() {}',
+            '}',
+            'abstract class Base {',
+            '    abstract void run();',
+            '    void plain() {}',
+            '}',
+        ].join('\n'),
+        'a.cs': [
+            'interface IContract {',
+            '    void Slot();',
+            '    void Dflt() { }',
+            '    int Value { get; }',
+            '    int Calc => 1;',
+            '}',
+            'abstract class Base {',
+            '    public abstract void Run();',
+            '    public virtual void Virt() { }',
+            '}',
+        ].join('\n'),
+        'a.rs': [
+            'trait Contract {',
+            '    fn slot(&self);',
+            '    fn provided(&self) {}',
+            '}',
+        ].join('\n'),
+        'a.go': [
+            'package facts',
+            '',
+            'type contract interface {',
+            '\tgoSlot()',
+            '}',
+            '',
+            'type impl struct{}',
+            '',
+            'func (impl) goSlot() {}',
+        ].join('\n'),
+        'a.py': [
+            'from abc import ABC, abstractmethod',
+            'from typing import Protocol',
+            'import typing',
+            'from typing import Protocol as Shape',
+            'class Greeter(Protocol):',
+            '    def greet(self) -> str: ...',
+            '',
+            'class Generic(typing.Protocol[int]):',
+            '    def hello(self) -> str:',
+            '        return "x"',
+            '',
+            'class Base(ABC):',
+            '    @abstractmethod',
+            '    def run(self): ...',
+            '    def plain(self): pass',
+            '',
+            'class English(Greeter):',
+            '    def greet(self) -> str:',
+            '        return "hi"',
+            '',
+            'class Aliased(Shape):',
+            '    def shaped(self) -> str: ...',
+        ].join('\n'),
+        'a.cpp': [
+            'struct Shape {',
+            '    virtual double area() const = 0;',
+            '    virtual void draw();',
+            '    virtual ~Shape() = 0;',
+            '    void plain() {}',
+            '    int count = 0;',
+            '};',
+        ].join('\n'),
+    };
+    const REQUIRED = [
+        'A.java:2:slot', 'A.java:7:run',
+        'a.cpp:2:area',
+        'a.cs:2:Slot', 'a.cs:4:Value', 'a.cs:8:Run',
+        'a.go:4:goSlot',
+        'a.py:13:run', 'a.py:22:shaped', 'a.py:6:greet', 'a.py:9:hello',
+        'a.rs:2:slot',
+        'a.ts:11:aliased', 'a.ts:2:slot', 'a.ts:4:prop', 'a.ts:8:run',
+    ];
+    const requiredIn = index => {
+        const rows = [];
+        for (const definitions of index.symbols.values()) {
+            for (const definition of definitions) {
+                if (definition.requiredMember) {
+                    rows.push(`${definition.relativePath}:${definition.startLine}:${definition.name}`);
+                }
+            }
+        }
+        return rows.sort();
+    };
+
+    it('marks requirements and nothing else, in every language', () => {
+        const dir = tmp(files);
+        try {
+            // Not marked: optional signatures, default-bodied interface and
+            // trait members, static interface methods, concrete members of
+            // an abstract class, a method that implements a protocol, a
+            // virtual that is not pure, a destructor, a data member.
+            assert.deepStrictEqual(requiredIn(idx(dir)), REQUIRED);
+        } finally { rm(dir); }
+    });
+
+    it('a Python protocol class is known as one, an implementation of it is not', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const protocols = [...index.symbols.values()].flat()
+                .filter(definition => definition.protocolClass).map(definition => definition.name).sort();
+            // `Aliased(Shape)`: Shape is `Protocol` under an import alias.
+            // `English(Greeter)` inherits from a protocol and is a class.
+            assert.deepStrictEqual(protocols, ['Aliased', 'Generic', 'Greeter']);
+        } finally { rm(dir); }
+    });
+
+    it('survives a parallel build and a cache round trip', () => {
+        const dir = tmp(files);
+        try {
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.strictEqual(parallel.lastBuildParallelEligible, true);
+            assert.deepStrictEqual(requiredIn(parallel), REQUIRED);
+            const protocols = index => [...index.symbols.values()].flat()
+                .filter(definition => definition.protocolClass).map(definition => definition.name).sort();
+            assert.deepStrictEqual(protocols(parallel), ['Aliased', 'Generic', 'Greeter']);
+            parallel.saveCache();
+            const reloaded = new ProjectIndex(dir);
+            assert.ok(reloaded.loadCache(), 'cache should load');
+            assert.deepStrictEqual(requiredIn(reloaded), REQUIRED);
+            assert.deepStrictEqual(protocols(reloaded), ['Aliased', 'Generic', 'Greeter']);
+        } finally { rm(dir); }
+    });
+});
+
 describe('deletion: plan --delete', () => {
     it('answers through the public command, in text and JSON', () => {
         const dir = tmp({
@@ -484,6 +737,33 @@ describe('deletion: plan --delete', () => {
             // The handle form pins the declaration.
             const pinned = execute(index, 'plan', { name: 'lib.js:2:unused', delete: true });
             assert.strictEqual(pinned.result.declaration.startLine, 2);
+        } finally { rm(dir); }
+    });
+
+    it('says which declaration a bare name selected, and the others it could mean', () => {
+        const dir = tmp({
+            'package.json': '{"name":"plan-delete-ambiguous"}',
+            'a.js': 'function spare() { return 1; }\nfunction keep() { return 2; }\nkeep();',
+            'b.js': 'export function spare() { return 3; }',
+        });
+        try {
+            const index = idx(dir);
+            const params = { name: 'spare', delete: true };
+            const done = execute(index, 'plan', params);
+            assert.ok(done.ok, done.error);
+            // The verdict is about a.js:1 only. Without the note it reads
+            // as an answer about every `spare`.
+            assert.strictEqual(done.result.declaration.file, 'a.js');
+            assert.strictEqual(done.result.verdict, 'no-static-dependents');
+            assert.strictEqual(done.result.warnings.length, 1);
+            assert.deepStrictEqual(done.result.warnings[0].alternatives, [{ file: 'b.js', line: 1 }]);
+            const text = output.formatPublicText('plan', done.result, params);
+            assert.match(text, /a\.js:1 {2}\(function\)\nNote: Found 2 definitions for "spare"\. Using a\.js:1\. Also in: b\.js:1\. Use file= to disambiguate\.\nVERDICT: /);
+            const json = JSON.parse(output.formatPublicJson('plan', done.result, params, { ...done, surface: 'cli' }));
+            assert.deepStrictEqual(json.data.warnings[0].alternatives, [{ file: 'b.js', line: 1 }]);
+            // A handle that pins one declaration has nothing to disclose.
+            const pinned = execute(index, 'plan', { name: 'a.js:1:spare', delete: true });
+            assert.strictEqual(pinned.result.warnings, undefined);
         } finally { rm(dir); }
     });
 

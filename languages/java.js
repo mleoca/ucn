@@ -972,6 +972,9 @@ function extractClassMembers(classNode, codeOrLines) {
                     memberType,
                     modifiers,
                     isMethod: true,  // Mark as method for context() lookups
+                    // Abstract by keyword or by being a bodiless interface
+                    // method: a concrete subtype must supply it.
+                    ...(modifiers.includes('abstract') && { requiredMember: true }),
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring }),
                     ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),

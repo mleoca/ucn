@@ -1665,6 +1665,18 @@ function extractInterfaceMembers(interfaceNode, code) {
     return extractTypeMembers(bodyNode, code);
 }
 
+/**
+ * A signature in an interface or object type is a member every value of
+ * that type must have, unless it is written optional (`name?`). The `?` is
+ * a token of the signature node, never part of the name or the type.
+ */
+function isOptionalSignature(node) {
+    for (let i = 0; i < node.childCount; i++) {
+        if (node.child(i).type === '?') return true;
+    }
+    return false;
+}
+
 function extractTypeMembers(bodyNode, code) {
     const members = [];
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
@@ -1687,6 +1699,7 @@ function extractTypeMembers(bodyNode, code) {
                     sourceSpan,
                     memberType: 'method',
                     isMethod: true,
+                    ...(!isOptionalSignature(child) && { requiredMember: true }),
                     ...typeAnno
                 });
             }
@@ -1706,6 +1719,7 @@ function extractTypeMembers(bodyNode, code) {
                     endLine,
                     sourceSpan,
                     memberType: 'field',
+                    ...(!isOptionalSignature(child) && { requiredMember: true }),
                     ...(fieldType && { fieldType })
                 });
             }
@@ -1908,6 +1922,9 @@ function extractClassMembers(classNode, codeOrLines) {
                     sourceSpan,
                     memberType: 'abstract',
                     isMethod: true,
+                    // A concrete subclass must supply it (an optional
+                    // abstract member is not a thing the language has).
+                    requiredMember: true,
                     ...typeAnno,
                     ...(docstring && { docstring }),
                     ...(decorators.length > 0 && { decorators })

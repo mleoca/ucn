@@ -84,7 +84,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'annotationType', 'valueShape', 'friendOf', 'templateParams', 'delegateParams',
         'typedefName', 'forwardDeclaration', 'anonymousNamespace', 'specialization',
         'memberConst', 'refQualifier', 'fieldPointers', 'memberPaths', 'instanceAttribute',
-        'ambientAugmentation',
+        'ambientAugmentation', 'requiredMember', 'protocolClass',
     ];
     for (const field of passthrough) {
         if (symbol[field] !== undefined && symbol[field] !== null) {

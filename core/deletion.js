@@ -75,6 +75,8 @@ const REASON_TEXT = Object.freeze({
     'downstream-exposure': 'exported from a library: consumers outside the repository may use it',
     'external-contract': 'implements or overrides something defined outside the project',
     'required-slot': 'required by a contract of the project: removing it breaks the type that implements it',
+    'structural-contract': 'its type has every member a project interface or protocol requires, so it can be used as one without naming it',
+    'owner-ambiguous': 'several types of its owner\'s name share the file, so its contracts cannot be checked',
     'runtime-contract': 'invoked by the language runtime, the compiler or an assignment, not by name',
     'registered': 'decorated or registered with a framework, which may invoke it without naming it',
     'entry-point': 'an entry point the runtime or a test runner invokes',

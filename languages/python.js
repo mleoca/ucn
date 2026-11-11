@@ -390,6 +390,8 @@ function _processClass(node, classes, processedRanges, lines) {
             ...(docstring && { docstring }),
             ...(decorators.length > 0 && { decorators }),
             ...(bases.length > 0 && { extends: bases.join(', ') }),
+            // A protocol class is satisfied by shape: no class has to name it.
+            ...(isProtocolClass(node) && { protocolClass: true }),
             ...(nameLine !== startLine && { nameLine }),
             ...lexicalScope,
         });
@@ -987,6 +989,51 @@ function findFunctions(code, parser) {
  * runtime discards the stub bodies, so pin identity must close over the
  * group and resolution must prefer the implementation.
  */
+/**
+ * A member a subclass or a structural satisfier must supply: decorated
+ * abstract (`@abstractmethod` and its older `abstract*` spellings), or
+ * declared in a class that lists `Protocol` among its bases (a protocol
+ * class; a class that merely inherits from one is an implementation).
+ */
+const PY_ABSTRACT_DECORATORS = new Set(['abstractmethod', 'abstractproperty',
+    'abstractclassmethod', 'abstractstaticmethod']);
+
+// The names a module uses for `Protocol` and for the abstract decorators:
+// the plain spellings, plus what `from m import Protocol as P` binds. A
+// module alias (`import typing as t`) needs nothing: `t.Protocol` ends in
+// the plain spelling.
+const contractSpellingsByTree = new WeakMap();
+function contractSpellings(node) {
+    let spellings = contractSpellingsByTree.get(node.tree);
+    if (spellings) return spellings;
+    spellings = { protocol: new Set(['Protocol']), abstract: new Set(PY_ABSTRACT_DECORATORS) };
+    for (const statement of node.tree.rootNode.descendantsOfType('import_from_statement')) {
+        for (const part of statement.namedChildren) {
+            if (part.type !== 'aliased_import') continue;
+            const imported = part.childForFieldName('name')?.text.split('.').pop();
+            const alias = part.childForFieldName('alias')?.text;
+            if (!alias) continue;
+            if (imported === 'Protocol') spellings.protocol.add(alias);
+            if (PY_ABSTRACT_DECORATORS.has(imported)) spellings.abstract.add(alias);
+        }
+    }
+    contractSpellingsByTree.set(node.tree, spellings);
+    return spellings;
+}
+
+/** Does the class list Protocol among its bases (PEP 544 protocol class)? */
+function isProtocolClass(classNode) {
+    const { protocol } = contractSpellings(classNode);
+    return extractBases(classNode).some(base => protocol.has(String(base).split('.').pop()));
+}
+
+function isRequiredPythonMember(classNode, decorators) {
+    const { abstract } = contractSpellings(classNode);
+    if ((decorators || []).some(decorator =>
+        abstract.has(String(decorator).replace(/\(.*$/s, '').split('.').pop().trim()))) return true;
+    return isProtocolClass(classNode);
+}
+
 function isOverloadDecorated(decorators) {
     return decorators.some(d => {
         const head = d.split('(')[0].trim();
@@ -1271,6 +1318,7 @@ function extractClassMembers(classNode, code) {
                     ...(docstring && { docstring }),
                     ...(memberDecorators.length > 0 && { decorators: memberDecorators }),
                     ...(isOverloadDecorated(memberDecorators) && { isSignature: true }),
+                    ...(isRequiredPythonMember(classNode, memberDecorators) && { requiredMember: true }),
                     ...(nameLine !== startLine && { nameLine })
                 });
             }

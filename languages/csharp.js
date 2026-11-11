@@ -560,6 +560,19 @@ function conversionKind(node) {
     return null;
 }
 
+/**
+ * A member a concrete type must supply: declared `abstract`, or an
+ * interface member written without an implementation (a block or an
+ * expression body anywhere in it is a default implementation).
+ */
+function isRequiredMemberNode(node, modifiers) {
+    if (modifiers.includes('abstract')) return true;
+    let owner = node.parent;
+    while (owner && !TYPE_DECLARATIONS.has(owner.type)) owner = owner.parent;
+    if (!owner || owner.type !== 'interface_declaration') return false;
+    return node.descendantsOfType(['block', 'arrow_expression_clause']).length === 0;
+}
+
 function memberFromNode(node, className, lines) {
     if (!METHOD_LIKE_NODES.has(node.type)) return null;
     const nameNode = node.childForFieldName('name');
@@ -625,6 +638,9 @@ function memberFromNode(node, className, lines) {
         isMethod: true,
         isConstructor,
         className,
+        ...(node.type === 'method_declaration' && isRequiredMemberNode(node, modifiers) && {
+            requiredMember: true,
+        }),
         ...(explicitInterface && { explicitInterface }),
         isAsync: modifiers.includes('async'),
         ...(isCSharpIterator(node) && { isGenerator: true }),
@@ -720,6 +736,7 @@ function propertyMember(node, lines) {
         modifiers: modifiersOf(node),
         memberType: 'property',
         fieldType: typeNode?.text || null,
+        ...(isRequiredMemberNode(node, modifiersOf(node)) && { requiredMember: true }),
         ...(explicitInterface && { explicitInterface }),
     };
 }

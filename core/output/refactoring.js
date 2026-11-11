@@ -83,6 +83,7 @@ function formatDeletion(assessment) {
         `Deletion assessment: ${owner}${d.name}`,
         '═'.repeat(60),
         `${d.file}:${d.startLine}${d.type ? `  (${d.type})` : ''}`,
+        ...(assessment.warnings || []).map(warning => `Note: ${warning.message}`),
         `VERDICT: ${assessment.verdict}`,
         `  basis: ${assessment.basis}`,
     ];

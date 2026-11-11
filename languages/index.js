@@ -315,6 +315,12 @@ const STRUCTURAL_TRAITS = {
     // never names (interfaces satisfied implicitly): name -> parameter
     // count. A zero textual use of one is not evidence that it is unused.
     implicitStandardContracts: null,
+    // Is this project type a contract a value can satisfy WITHOUT naming it
+    // (assigned, passed or returned as the type with no implements clause)?
+    // null: types are satisfied by declaration only, or the language has
+    // its own model (Go's method sets). A type that satisfies such a
+    // contract by its member names keeps the members the contract requires.
+    structuralContract: null,
     // Whether a top-level type is declared in a source file named after it
     // (fix #386): javac requires `public class Widget` in Widget.java, so a
     // type rename renames that file too.
@@ -535,6 +541,12 @@ const NOMINAL_TRAITS = {
     // never names (interfaces satisfied implicitly): name -> parameter
     // count. A zero textual use of one is not evidence that it is unused.
     implicitStandardContracts: null,
+    // Is this project type a contract a value can satisfy WITHOUT naming it
+    // (assigned, passed or returned as the type with no implements clause)?
+    // null: types are satisfied by declaration only, or the language has
+    // its own model (Go's method sets). A type that satisfies such a
+    // contract by its member names keeps the members the contract requires.
+    structuralContract: null,
     // A top-level type lives in a file named after it (fix #386, Java).
     typeNamedSourceFile: false,
     // Compiler-resolved doc references (fix #390, C# crefs).
@@ -623,6 +635,15 @@ const JS_REFLECTION_API = {
     family: 'javascript',
 };
 
+// A TypeScript interface or object type is satisfied by shape: any class or
+// object with its members is one.
+const TS_STRUCTURAL_CONTRACT = typeDef => typeDef.type === 'interface' || typeDef.type === 'type';
+// A Python class that lists Protocol among its bases is a protocol class:
+// type checkers accept any object with its members (PEP 544). A class that
+// only inherits from a protocol is an implementation, not a protocol. The
+// parser records the fact (`protocolClass`), import aliases resolved.
+const PY_STRUCTURAL_CONTRACT = typeDef => typeDef.protocolClass === true;
+
 // Language configurations
 const LANGUAGES = {
     javascript: {
@@ -636,6 +657,7 @@ const LANGUAGES = {
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
+            structuralContract: TS_STRUCTURAL_CONTRACT,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
             lenientCallArity: true,
@@ -654,6 +676,7 @@ const LANGUAGES = {
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
+            structuralContract: TS_STRUCTURAL_CONTRACT,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
@@ -671,6 +694,7 @@ const LANGUAGES = {
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
+            structuralContract: TS_STRUCTURAL_CONTRACT,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
@@ -688,6 +712,7 @@ const LANGUAGES = {
             // `yield` in the body makes the callable a generator.
             callableKindFromBody: ['generator'],
             selfParam: ['self', 'cls'],
+            structuralContract: PY_STRUCTURAL_CONTRACT,
             // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
             // and `self.__class__(..)` in an instance method construct the
             // method's class through its first parameter (fix #434).

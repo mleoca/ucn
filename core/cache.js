@@ -1001,7 +1001,12 @@ function clearAllCaches() {
 // v331: source paths excluded by .ucn.json are recorded one issue per source
 // file (searched as text per name), with `outside-project` and
 // `text-scan-budget` reasons; parse-failed files keep their size and mtime.
-const CACHE_FORMAT_VERSION = 331;
+// v332: members a subtype or a structural satisfier must supply carry
+// `requiredMember` (interface and object-type signatures that are not
+// optional, abstract members, bodiless trait methods, Go interface method
+// elements, Python abstract and Protocol members, C++ pure virtuals); a
+// Python protocol class carries `protocolClass`.
+const CACHE_FORMAT_VERSION = 332;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

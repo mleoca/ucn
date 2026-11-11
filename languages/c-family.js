@@ -3633,6 +3633,17 @@ function memberQualifiers(declarator) {
     return out;
 }
 
+/**
+ * `virtual R f(...) = 0;`: a member function declaration whose initializer
+ * is the literal 0 is pure virtual. A concrete derived class must override
+ * it. (A data member `int x = 0;` has no function declarator and never
+ * reaches the caller.)
+ */
+function isPureVirtual(node) {
+    const value = templatedDeclaration(node).childForFieldName('default_value');
+    return !!value && value.type === 'number_literal' && value.text === '0';
+}
+
 function memberFromNode(node, className, access, lines, mode) {
     const declarator = functionDeclarator(node);
     if (!declarator) return null;
@@ -3662,6 +3673,7 @@ function memberFromNode(node, className, access, lines, mode) {
         memberType: isConstructor ? 'constructor' : 'method',
         isMethod: true,
         isConstructor,
+        ...(mode === 'cpp' && !isConstructor && isPureVirtual(node) && { requiredMember: true }),
         ...(mode === 'cpp' && memberQualifiers(declarator)),
         ...(enclosingNamespace(node) && {
             namespace: enclosingNamespace(node),

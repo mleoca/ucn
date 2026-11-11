@@ -303,7 +303,7 @@ function formatDeadcode(results, options = {}) {
         lines.push(`\n${results.excludedDynamicDispatch} registry member(s) hidden because a matching computed dispatch (registry[key]()) may invoke them.`);
     }
     if (results.excludedRequiredSlot > 0) {
-        lines.push(`\n${results.excludedRequiredSlot} member(s) withheld: required by an interface, abstract class or trait of the project, or overridden by a descendant that says so. Removing one breaks a type.`);
+        lines.push(`\n${results.excludedRequiredSlot} member(s) withheld: required by an interface, abstract class or trait of the project, overridden by a descendant that says so, or matching a project interface or protocol by shape. Removing one can break a type.`);
     }
     if (results.projectKind === 'application') {
         lines.push('\nProject kind: application (.ucn.json). Exported symbols are audited; contracts, registrations and reflection still withhold.');

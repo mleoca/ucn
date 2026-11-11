@@ -1978,6 +1978,9 @@ function extractTraitMembers(traitNode, codeOrLines) {
                     sourceSpan,
                     memberType: 'method',
                     isMethod: true,
+                    // A trait method without a body is one every impl must
+                    // supply; one with a body is a provided default.
+                    ...(child.type === 'function_signature_item' && { requiredMember: true }),
                     ...(qualifiers.async && { isAsync: true }),
                     modifiers: [...(traitVisibility ? [traitVisibility] : []), ...(qualifiers.async ? ['async'] : [])],
                     ...(futureReturn && { futureReturn }),

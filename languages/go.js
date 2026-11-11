@@ -719,6 +719,9 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
                         endLine,
                         sourceSpan,
                         memberType: 'method',
+                        // An interface method element is a requirement of
+                        // every type used as the interface.
+                        requiredMember: true,
                         ...(paramsText !== null && { params: paramsText }),
                         ...(paramsNode && { paramsStructured: parseStructuredParams(paramsNode, 'go') }),
                         ...(returnType && { returnType })

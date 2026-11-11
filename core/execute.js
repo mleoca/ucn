@@ -2301,7 +2301,12 @@ const HANDLERS = {
             });
             if (!resolved.def) return { ok: false, error: symbolNotFound(index, p.name) };
             const assessment = require('./deletion').assessDeletion(index, resolved.def);
-            return { ok: true, result: { found: true, operation: 'delete', ...assessment } };
+            return { ok: true, result: {
+                found: true, operation: 'delete', ...assessment,
+                // Which declaration a bare name selected, and the others it
+                // could have meant: the verdict is about one of them.
+                ...(resolved.warnings.length > 0 && { warnings: resolved.warnings }),
+            } };
         }
         if (!p.addParam && !p.removeParam && !p.renameTo) {
             return { ok: false, error: 'Plan requires an operation: add_param, remove_param, rename_to, or delete.' };

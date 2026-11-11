@@ -201,7 +201,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'annotationType', 'valueShape', 'friendOf', 'templateParams', 'delegateParams',
         'typedefName', 'forwardDeclaration', 'anonymousNamespace', 'specialization',
         'memberConst', 'refQualifier', 'fieldPointers', 'memberPaths', 'instanceAttribute',
-        'ambientAugmentation',
+        'ambientAugmentation', 'requiredMember', 'protocolClass',
 ]);
 
 function materializeSymbol(fileEntry, item) {

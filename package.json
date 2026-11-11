@@ -21,7 +21,7 @@
     "eval:host-calibration": "node eval/lib/host-calibration.js --pin",
     "eval:consistency": "node eval/run-consistency-eval.js --project .",
     "profile:callers": "node eval/profile-callers.js",
-    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js eval/outcome-policy.js eval/outcome-mutations.js eval/profile-callers.js eval/oracles/*.js",
+    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js eval/outcome-policy.js eval/outcome-mutations.js eval/deletion-matrix-cases.js eval/profile-callers.js eval/oracles/*.js",
     "verify": "npm run lint && npm test",
     "trust:gate:semantic": "node eval/run-oracle-eval.js --release --min-precision 0.98 --max-unscored-ratio 0.10",
     "trust:gate:deadcode": "node eval/run-deadcode-eval.js --release --sample 100 --arm default",
@@ -32,6 +32,7 @@
     "trust:gate:fast": "node --expose-gc eval/run-performance-gate.js --repo preact-signals,httpx --queries 20 && node eval/run-oracle-eval.js --repo preact-signals,httpx --min-precision 0.98 && node eval/run-consistency-eval.js --repo preact-signals,httpx --sample 20 --gate",
     "trust:gate": "npm run trust:gate:performance && npm run trust:gate:semantic && npm run trust:gate:deadcode && npm run trust:gate:consistency && npm run trust:gate:agent",
     "eval:outcome": "node eval/run-outcome-eval.js",
+    "eval:deletion-matrix": "node eval/run-deletion-matrix.js",
     "eval:census": "node eval/run-unverified-census.js"
   },
   "keywords": [

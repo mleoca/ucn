@@ -2007,6 +2007,146 @@ function _defIdentity(def) {
     return `${path.resolve(def.file)}\0${def.startLine}`;
 }
 
+// Descendant types visited when asking who can satisfy a contract by shape;
+// past it the answer is "anything may" (the conservative direction).
+const STRUCTURAL_DESCENDANT_LIMIT = 512;
+
+/** Members declared in one type definition's own body. */
+function _ownMembersOf(index, typeDef) {
+    const end = typeDef.endLine || typeDef.startLine;
+    return (index.files.get(typeDef.file)?.symbols || []).filter(member =>
+        member.className === typeDef.name && member !== typeDef &&
+        member.startLine >= typeDef.startLine && member.startLine <= end);
+}
+
+/**
+ * Member names a type has, its own and those it inherits through declared
+ * project supertypes. `open` when a supertype is not a project type: what it
+ * contributes is unknown, so any name may be there.
+ */
+function _memberNamesOf(index, typeDefs) {
+    const names = new Set();
+    let open = false;
+    const seen = new Set();
+    const queue = [...typeDefs];
+    while (queue.length > 0) {
+        const typeDef = queue.shift();
+        if (seen.has(typeDef)) continue;
+        seen.add(typeDef);
+        for (const member of _ownMembersOf(index, typeDef)) names.add(member.name);
+        for (const raw of declaredSupertypes(typeDef)) {
+            const parents = _projectTypeDefs(index, _bareTypeName(raw), typeDef);
+            if (parents.length === 0) open = true;
+            else queue.push(...parents);
+        }
+    }
+    return { names, open };
+}
+
+/**
+ * What a project type says about a member called `name`, through its own
+ * body and its declared project supertypes: 'required' (some declaration of
+ * it is a requirement), 'optional' (declared, never required), 'unknown'
+ * (not declared, but a supertype is not a project type and may require
+ * it), 'absent'.
+ */
+function requirementIn(index, typeDefs, name) {
+    const seen = new Set();
+    const queue = [...typeDefs];
+    let open = false;
+    let declared = false;
+    while (queue.length > 0) {
+        const typeDef = queue.shift();
+        if (seen.has(typeDef)) continue;
+        seen.add(typeDef);
+        for (const member of _ownMembersOf(index, typeDef)) {
+            if (member.name !== name) continue;
+            if (member.requiredMember) return 'required';
+            declared = true;
+        }
+        for (const raw of declaredSupertypes(typeDef)) {
+            const parents = _projectTypeDefs(index, _bareTypeName(raw), typeDef);
+            if (parents.length === 0) open = true;
+            else queue.push(...parents);
+        }
+    }
+    if (declared) return 'optional';
+    return open ? 'unknown' : 'absent';
+}
+
+/**
+ * Project contracts the owner of `def` satisfies WITHOUT naming them, and
+ * that require a member called `def.name` (trait `structuralContract`: a
+ * TypeScript interface or object type, a Python Protocol class). Such a
+ * type can be passed, assigned or returned as the contract with no
+ * `implements` clause to follow, so the member can be the thing that makes
+ * a conversion compile while nothing in the project names it.
+ *
+ * Satisfaction is decided on member NAMES: the owner (with what it
+ * inherits) has every member the contract's own body requires. That is
+ * wider than the type checker's rule on purpose. It withholds a claim; it
+ * never grants one.
+ */
+function structuralContractsRequiring(index, def) {
+    if (!def?.className) return [];
+    const isContract = langTraits(index.files.get(def.file)?.language)?.structuralContract;
+    if (typeof isContract !== 'function') return [];
+    const owners = ownerClassDefs(index, def);
+    // A member OF a contract is the requirement, not a satisfier of one.
+    if (owners.length === 0 || owners.some(owner => isContract(owner))) return [];
+    const contracts = [];
+    // Who can stand in for a contract through this member: its owner, and
+    // every project type that inherits it. A descendant may be the one that
+    // completes the shape (`Base.greet` plus `English.name`).
+    let satisfiers = null;
+    const satisfiersOf = () => {
+        if (satisfiers) return satisfiers;
+        const sets = [_memberNamesOf(index, owners)];
+        const seen = new Set(owners);
+        const queue = owners.map(owner => owner.name);
+        let visited = 0;
+        while (queue.length > 0) {
+            if (++visited > STRUCTURAL_DESCENDANT_LIMIT) { sets.push({ names: new Set(), open: true }); break; }
+            for (const child of index.extendedByGraph?.get(queue.shift()) || []) {
+                const childName = typeof child === 'string' ? child : child.name;
+                for (const childDef of _projectTypeDefs(index, childName)) {
+                    if (seen.has(childDef) || (child.file && childDef.file !== child.file)) continue;
+                    seen.add(childDef);
+                    sets.push(_memberNamesOf(index, [childDef]));
+                    queue.push(childDef.name);
+                }
+            }
+        }
+        // The member asked about is a member of its owner, and so of every
+        // descendant, whether or not the file's own list holds it (a
+        // declaration that was deleted is asked about as if it still stood
+        // there).
+        for (const set of sets) set.names.add(def.name);
+        satisfiers = sets;
+        return satisfiers;
+    };
+    for (const requirement of index.symbols.get(def.name) || []) {
+        if (!requirement.requiredMember || !requirement.className) continue;
+        const contractKind = langTraits(index.files.get(requirement.file)?.language)?.structuralContract;
+        if (typeof contractKind !== 'function') continue;
+        // The type the requirement is written in: any kind the trait
+        // accepts (an object type alias is not a class kind).
+        const declaring = (index.symbols.get(requirement.className) || []).filter(type =>
+            type !== requirement && type.file === requirement.file &&
+            type.startLine <= requirement.startLine &&
+            (type.endLine || type.startLine) >= requirement.startLine);
+        for (const contract of declaring) {
+            if (!contractKind(contract) || contracts.includes(contract)) continue;
+            const required = _ownMembersOf(index, contract)
+                .filter(member => member.requiredMember).map(member => member.name);
+            if (satisfiersOf().some(set => set.open || required.every(name => set.names.has(name)))) {
+                contracts.push(contract);
+            }
+        }
+    }
+    return contracts;
+}
+
 /**
  * Go rename closure for a method or interface-method definition: the
  * bipartite fixed point between interfaces requiring the name and named
@@ -2461,6 +2601,8 @@ module.exports = {
     typedLiteralContract,
     typedLiteralMembers,
     goContractClosure,
+    structuralContractsRequiring,
+    requirementIn,
     goMethodFingerprint,
     splitGoSignatureList,
     goDeclarationType,

@@ -16,7 +16,8 @@ const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, esca
 const { projectComputedDispatch, projectReflectionSites } = require('./ast-analysis');
 const { reflectionPatternReferences, reflectionLiteralNames } = require('./reflection');
 const { protocolMemberOf, protocolTypeOf, typedLiteralContract, rustProjectTraits,
-    hierarchySlotClosure, goContractClosure } = require('./contract-membership');
+    hierarchySlotClosure, goContractClosure, structuralContractsRequiring,
+    requirementIn, resetContractIndex } = require('./contract-membership');
 const { projectKind, downstreamExposureBlocks } = require('./deletion');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
@@ -248,82 +249,131 @@ function typedLiteralExternalMember(index, symbol) {
 }
 
 /**
- * A member a subtype MUST supply: declared abstract, or a member of an
- * interface or trait written without a body (a default-bodied member is an
- * implementation, not a requirement).
+ * A member a subtype or a structural satisfier MUST supply. A parser fact
+ * (`requiredMember`), read from the declaration's own syntax: an interface
+ * or object-type signature that is not optional, an abstract member, a
+ * trait method without a body, a Go interface method element, a Python
+ * abstract or Protocol member, a C++ pure virtual. A default-bodied
+ * interface or trait member is an implementation, not a requirement.
  */
-function isRequiredDeclaration(index, member) {
-    if (member.type === 'abstract' || (member.modifiers || []).includes('abstract') ||
-        /\babstract\b/.test(member.memberType || '')) return true;
-    if ((member.decorators || []).some(decorator =>
-        String(decorator).replace(/\(.*$/, '').split('.').pop() === 'abstractmethod')) return true;
-    if (!member.className) return false;
-    const enclosing = (index.symbols.get(member.className) || []).find(type =>
-        type.file === member.file && (type.type === 'interface' || type.type === 'trait'));
-    if (!enclosing) return false;
-    try {
-        return !memberText(index, member).includes('{');
-    } catch { return false; }
+function isRequiredDeclaration(member) {
+    return member.requiredMember === true;
 }
 
 /**
- * The member's own text. Its lines can hold more than the member (a
- * one-line `interface Shape { area(): number; }` puts the interface's brace
- * on the member's line), so the recorded span is used when it is addressable
- * by column; whole lines are the fallback.
- */
-function memberText(index, member) {
-    const lines = index._readFile(member.file).split('\n');
-    const span = member.sourceSpan;
-    const ascii = text => { for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0x7f) return false; return true; };
-    if (span && span.startLine != null && span.endLine != null &&
-        span.startColumn != null && span.endColumn != null) {
-        const first = lines[span.startLine - 1];
-        const last = lines[span.endLine - 1];
-        if (first != null && last != null && ascii(first) && ascii(last)) {
-            if (span.startLine === span.endLine) return first.slice(span.startColumn, span.endColumn);
-            return [first.slice(span.startColumn),
-                ...lines.slice(span.startLine, span.endLine - 1),
-                last.slice(0, span.endColumn)].join('\n');
-        }
-    }
-    return lines.slice(member.startLine - 1, member.endLine).join('\n');
-}
-
-/**
- * Is this member held in place by a contract of the PROJECT? Two shapes,
- * both invisible to a name count because a same-name declaration line is a
- * declaration, never a use:
- *   - it is the implementation a type owes to an interface, abstract class
- *     or trait of the project (deleting it leaves the type incomplete), or,
- *     where interfaces are satisfied implicitly, the method that makes a
- *     type satisfy a project interface it is used as;
- *   - a descendant declares that it overrides it (deleting it leaves an
- *     override of nothing).
+ * Is this member held in place by a contract of the PROJECT? Invisible to a
+ * name count, because a same-name declaration line is a declaration, never
+ * a use. Returns the reason, or null:
+ *
+ *   'required-slot'        it is the implementation a type owes to an
+ *                          interface, abstract class or trait it declares
+ *                          (deleting it leaves the type incomplete); or,
+ *                          where interfaces are satisfied implicitly by
+ *                          method set, the method that makes a type satisfy
+ *                          a project interface; or a descendant declares
+ *                          that it overrides it (deleting it leaves an
+ *                          override of nothing);
+ *   'structural-contract'  its type has every member a project interface,
+ *                          object type or protocol requires, so the type
+ *                          can be used as that contract without naming it.
+ *
  * A plain override of a concrete method is neither: with it gone, calls
  * fall back to the inherited one.
  */
 function requiredByProjectContract(index, symbol) {
-    if (!symbol.className) return false;
-    // A member OF an interface or trait is the requirement itself, not an
-    // implementation of one: only a descendant that says it overrides it
-    // (below) holds it in place.
-    const ownerIsContract = (index.symbols.get(symbol.className) || []).some(type =>
-        (type.type === 'interface' || type.type === 'trait') &&
-        path.dirname(type.file) === path.dirname(symbol.file));
-    if (!ownerIsContract) {
-        // Interfaces satisfied implicitly: the closure joins a project
-        // interface when the type satisfies it or is converted to it.
+    if (!symbol.className) {
+        // A member of an object literal declared against a project
+        // interface (`const impl: Contract = { slot() {} }`): the literal
+        // owes the interface that member unless the interface says it is
+        // optional. An out-of-project supertype may require it too.
+        const declaredAs = typedLiteralContract(index, symbol)?.projectInterface;
+        if (!declaredAs) return null;
+        const contracts = (index.symbols.get(declaredAs.name) || []).filter(type =>
+            _CLASS_KINDS.includes(type.type) && (!declaredAs.file || type.file === declaredAs.file));
+        const requirement = requirementIn(index, contracts, symbol.name);
+        return requirement === 'required' || requirement === 'unknown' ? 'required-slot' : null;
+    }
+    // An implementation written against this contract BY NAME holds the
+    // member it implements, required or default-bodied: Rust's
+    // `impl Contract for T { fn slot() }` and C#'s `void IContract.Slot()`
+    // are errors once the contract has no such member. Matched on the
+    // contract's bare name: wider than identity, and only ever withholds.
+    const contractNamedBy = member => {
+        const named = member.traitName || member.explicitInterface;
+        return named ? String(named).replace(/<.*$/s, '').split('::').pop().split('.').pop().trim() : null;
+    };
+    if ((index.symbols.get(symbol.name) || []).some(member =>
+        member !== symbol && contractNamedBy(member) === symbol.className)) return 'required-slot';
+    // A requirement is the contract, not an implementation of one: only a
+    // descendant that says it overrides it (below) holds it in place.
+    const isRequirement = isRequiredDeclaration(symbol) ||
+        (index.symbols.get(symbol.className) || []).some(type =>
+            (type.type === 'interface' || type.type === 'trait') &&
+            path.dirname(type.file) === path.dirname(symbol.file));
+    if (!isRequirement) {
+        // Interfaces satisfied implicitly by method set: the closure joins
+        // a project interface when the type satisfies it or is converted
+        // to it.
         const implicit = goContractClosure(index, symbol);
         const joined = implicit && implicit.interfaceNames;
-        if (joined && (joined.size ?? joined.length ?? 0) > 0) return true;
+        if (joined && (joined.size ?? joined.length ?? 0) > 0) return 'required-slot';
     }
     const closure = hierarchySlotClosure(index, symbol);
-    if (!closure) return false;
-    if ((closure.ancestors || []).some(ancestor =>
-        (ancestor.members || []).some(member => isRequiredDeclaration(index, member)))) return true;
-    return (closure.descendants || []).some(descendant =>
-        (descendant.members || []).some(member => isOverrideMarked(member)));
+    if (closure) {
+        if (!isRequirement && (closure.ancestors || []).some(ancestor =>
+            (ancestor.members || []).some(member => isRequiredDeclaration(member)))) return 'required-slot';
+        if ((closure.descendants || []).some(descendant =>
+            (descendant.members || []).some(member => isOverrideMarked(member)))) return 'required-slot';
+    }
+    if (!isRequirement && structuralContractsRequiring(index, symbol).length > 0) return 'structural-contract';
+    return null;
+}
+
+/**
+ * An absent declaration, placed back in its owner for the questions that
+ * depend on where a member stands (which type owns it, what that type
+ * implements, what overrides it). Its recorded lines describe a revision
+ * the index does not hold; the owner's lines are the index's. Returns the
+ * record itself when it has no owner type, a re-anchored copy when its
+ * owner is the one type of that name in its file, the record unchanged when
+ * the owner is declared elsewhere (a receiver method, an impl block, an
+ * out-of-class definition), and null when several types of that name share
+ * the file and nothing says which one it stood in.
+ */
+function anchoredInOwner(index, symbol) {
+    if (!symbol.className) return symbol;
+    const owners = (index.symbols.get(symbol.className) || []).filter(type =>
+        _CLASS_KINDS.includes(type.type) && type.file === symbol.file);
+    if (owners.length > 1) return null;
+    if (owners.length === 0) return { ...symbol };
+    const line = owners[0].endLine || owners[0].startLine;
+    const anchored = { ...symbol, startLine: line, endLine: line };
+    delete anchored.nameLine;
+    delete anchored.sourceSpan;
+    return anchored;
+}
+
+/**
+ * Run `question` with an absent declaration declared again: the record
+ * joins the name's definitions for the duration, and every index derived
+ * from them (contract closures, class identity) is rebuilt before and
+ * dropped after, so nothing computed with it outlives the call.
+ */
+function withDeclared(index, declared, question) {
+    const { resetClassIdentity } = require('./class-identity');
+    const existing = index.symbols.get(declared.name);
+    if (existing) existing.push(declared);
+    else index.symbols.set(declared.name, [declared]);
+    resetContractIndex(index);
+    resetClassIdentity(index);
+    try {
+        return question(declared);
+    } finally {
+        if (existing) existing.splice(existing.lastIndexOf(declared), 1);
+        else index.symbols.delete(declared.name);
+        resetContractIndex(index);
+        resetClassIdentity(index);
+    }
 }
 
 /**
@@ -841,6 +891,32 @@ function deadcode(index, options = {}) {
         if (!absentByName.has(symbol.name)) absentByName.set(symbol.name, []);
         absentByName.get(symbol.name).push(symbol);
     }
+    // Where a member stands decides what it implements and what overrides
+    // it. An absent declaration answers those questions standing in its
+    // owner again (anchoredInOwner); null means it cannot be placed, and
+    // its contracts cannot be checked.
+    const anchored = new Map();
+    for (const symbol of absent.keys()) anchored.set(symbol, anchoredInOwner(index, symbol));
+    // The three answers that depend on where a member stands. For an
+    // absent declaration they are computed together, under one overlay.
+    const standingFacts = (declared, lang) => ({
+        runtimeContract: protocolMemberOf(index, declared) || protocolTypeOf(index, declared),
+        externalContract: !!(classAuditSet.has(declared.type)
+            ? _heritageReachesExternalBase(index, declared, lang, false)
+            : overridesOutOfTreeBase(index, declared) ||
+                typedLiteralExternalMember(index, declared) ||
+                implicitStandardContract(declared, lang)),
+        projectContract: requiredByProjectContract(index, declared),
+    });
+    const absentFacts = new Map();
+    const standing = (symbol, lang) => {
+        if (!absent.has(symbol)) return null;
+        if (!absentFacts.has(symbol)) {
+            absentFacts.set(symbol, withDeclared(index, anchored.get(symbol),
+                declared => standingFacts(declared, lang)));
+        }
+        return absentFacts.get(symbol);
+    };
     const symbolsOf = name => (absentByName.has(name)
         ? [...(index.symbols.get(name) || []), ...absentByName.get(name)]
         : index.symbols.get(name) || []);
@@ -1518,7 +1594,15 @@ function deadcode(index, options = {}) {
             // languageProtocolMember): Java serialization callbacks on
             // Serializable types, Python Enum hooks on Enum subclasses, C#
             // pattern-bound members, JS toJSON/then/[Symbol.*] (fix #363).
-            if (protocolMemberOf(index, symbol) || protocolTypeOf(index, symbol)) {
+            // An absent member that cannot be placed in one owner type
+            // cannot have its contracts checked: no claim, and no guess.
+            if (absent.has(symbol) && anchored.get(symbol) === null) {
+                withhold(symbol, 'owner-ambiguous');
+                continue;
+            }
+            if (standing(symbol, lang)
+                ? standing(symbol, lang).runtimeContract
+                : protocolMemberOf(index, symbol) || protocolTypeOf(index, symbol)) {
                 excludedRuntimeContract++;
                 withhold(symbol, 'runtime-contract');
                 continue;
@@ -1684,11 +1768,13 @@ function deadcode(index, options = {}) {
                 // such subclasses non-textually (django `Command(BaseCommand)`
                 // by module path, pytest plugins by registration) — zero
                 // in-project references is not evidence of deadness there.
-                const isExternalContract = classAuditSet.has(symbol.type)
-                    ? _heritageReachesExternalBase(index, symbol, lang, false)
-                    : overridesOutOfTreeBase(index, symbol) ||
-                        typedLiteralExternalMember(index, symbol) ||
-                        implicitStandardContract(symbol, lang);
+                const isExternalContract = standing(symbol, lang)
+                    ? standing(symbol, lang).externalContract
+                    : (classAuditSet.has(symbol.type)
+                        ? _heritageReachesExternalBase(index, symbol, lang, false)
+                        : overridesOutOfTreeBase(index, symbol) ||
+                            typedLiteralExternalMember(index, symbol) ||
+                            implicitStandardContract(symbol, lang));
                 if (isExternalContract && !options.includeExported) {
                     excludedExternalContract++;
                     withhold(symbol, 'external-contract');
@@ -1696,11 +1782,16 @@ function deadcode(index, options = {}) {
                 }
                 // Held in place by a contract of the project itself: the
                 // implementation a type owes to an interface, abstract class
-                // or trait, or a member a descendant declares it overrides.
-                // A fact about the declaration, so no flag reveals it.
-                if (requiredByProjectContract(index, symbol)) {
+                // or trait, a member a descendant declares it overrides, or
+                // a member that lets its type stand in for a project
+                // interface or protocol by shape. A fact about the
+                // declaration, so no flag reveals it.
+                const projectContract = standing(symbol, lang)
+                    ? standing(symbol, lang).projectContract
+                    : requiredByProjectContract(index, symbol);
+                if (projectContract) {
                     excludedRequiredSlot++;
-                    withhold(symbol, 'required-slot');
+                    withhold(symbol, projectContract);
                     continue;
                 }
                 // Collect decorators/annotations for hint display
