@@ -24,7 +24,7 @@ const { tmp, rm, idx } = require('./helpers');
 const { execute } = require('../core/execute');
 const output = require('../core/output');
 const {
-    createTestModel, selectorText, unitLabel, linkFile, commandsFor,
+    createTestModel, selectorText, unitLabel, linkFile, linkFiles, commandsFor,
     scriptRunners, nodeTestOptions, configWords, tableText,
 } = require('../core/test-units');
 const { CASES } = require('../eval/test-unit-matrix-cases');
@@ -260,18 +260,108 @@ describe('test units: inherited tests run where the deriving class is', () => {
             try {
                 const model = createTestModel(index);
                 const base = path.join(index.root, 'tests/base.py');
+                const child = path.join(index.root, 'tests/test_child.py');
                 const runs = model.runsAt(base, 5);
                 assert.deepStrictEqual(runs.map(run => `${index.files.get(run.filePath).relativePath}::${unitLabel(run.unit)}`),
                     ['tests/test_child.py::TestChild > test_shared']);
-                const linked = linkFile(model, index, base, [5]);
-                assert.strictEqual(linked.role, 'support');
-                assert.strictEqual(linked.tests, 1);
-                assert.strictEqual(linked.units[0].file, 'tests/test_child.py');
-                assert.strictEqual(selectorText(linked.units[0].selector), 'pytest tests/test_child.py::TestChild::test_shared');
-                assert.strictEqual(linkFile(model, index, base, [8]).tests, 0, 'a helper of a class nothing collects is file-level support code');
+                // The base file is support: it holds no test and has no
+                // command. The test is handed to the file that runs it.
+                const own = linkFile(model, index, base, [5]);
+                assert.strictEqual(own.role, 'support');
+                assert.strictEqual(own.tests, 0);
+                assert.deepStrictEqual(own.units, []);
+                assert.strictEqual(own.carried.length, 1);
+                const linked = linkFiles(model, index, new Map([[base, [5]]]));
+                assert.deepStrictEqual([...linked.keys()], [base, child]);
+                const carried = linked.get(child);
+                assert.strictEqual(carried.role, 'tests');
+                assert.strictEqual(carried.tests, 1);
+                assert.deepStrictEqual(carried.from, ['tests/base.py']);
+                assert.strictEqual(carried.units[0].inheritedFrom, 'tests/base.py:4');
+                assert.strictEqual(selectorText(carried.units[0].selector), 'pytest tests/test_child.py::TestChild::test_shared');
+                assert.strictEqual(selectorText(carried.run), 'pytest tests/test_child.py');
+                assert.strictEqual(linkFiles(model, index, new Map([[base, [8]]])).size, 1,
+                    'a helper of a class nothing collects is file-level support code');
             } finally {
                 index._endOp();
             }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('tests, the affected-test selection and check all name the file that runs an inherited test', () => {
+        const dir = projectOf(FILES);
+        try {
+            git(dir, 'init', '-q');
+            git(dir, 'add', '-A');
+            git(dir, 'commit', '-q', '-m', 'base');
+            fs.writeFileSync(path.join(dir, 'app.py'), 'def target():\n    return 1 + 0\n');
+            const index = idx(dir);
+
+            const direct = execute(index, 'tests', { name: 'target' }).result;
+            const byFile = new Map(direct.map(row => [row.file, row]));
+            assert.strictEqual(byFile.get('tests/base.py').role, 'support');
+            const child = byFile.get('tests/test_child.py');
+            assert.strictEqual(child.role, 'tests');
+            assert.strictEqual(child.tests, 1);
+            assert.deepStrictEqual(child.matches.map(match => `${match.line}:${match.matchType}:${match.name}:${match.from}`),
+                ['3:inherited-test:test_shared:tests/base.py:4']);
+            const text = output.formatTests(direct, 'target');
+            assert.match(text, /tests\/test_child\.py {2}\(1 test\)\n {2}3: \[inherited\] class TestChild\(Checks\): {2}test_shared \(from tests\/base\.py:4\)\n {2}run: pytest tests\/test_child\.py/);
+
+            const affected = index.affectedTests('target', { depth: 2 });
+            const rows = new Map(affected.testFiles.map(row => [row.file, row]));
+            assert.strictEqual(rows.get('tests/base.py').role, 'support');
+            assert.strictEqual(rows.get('tests/test_child.py').testCount, 1);
+            assert.deepStrictEqual(rows.get('tests/test_child.py').linkedFunctions, ['target']);
+            assert.strictEqual(affected.summary.totalTests, 1);
+            assert.deepStrictEqual(affected.commands, ['pytest tests/test_child.py']);
+
+            const checked = execute(index, 'check', {});
+            assert.ok(checked.ok, checked.error);
+            assert.strictEqual(checked.result.totalTests, 1);
+            assert.deepStrictEqual(checked.result.testFiles.map(row => row.file), ['tests/test_child.py']);
+            assert.deepStrictEqual(checked.result.supportFiles.map(row => row.file), ['tests/base.py']);
+            assert.deepStrictEqual(checked.result.actions.find(row => row.kind === 'tests_to_run').commands,
+                ['pytest tests/test_child.py']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('an inherited test is the body Python looks up, not the first one a depth-first walk meets', () => {
+        const dir = projectOf({
+            'pytest.ini': '[pytest]\n',
+            'app.py': 'def target():\n    return 1\n\ndef other():\n    return 2\n',
+            'tests/__init__.py': '',
+            'tests/base.py': [
+                'from app import target, other',
+                '',
+                'class Root:',
+                '    def test_shared(self):',
+                '        assert target() == 1',
+                '',
+                'class Left(Root):',
+                '    pass',
+                '',
+                'class Right(Root):',
+                '    def test_shared(self):',
+                '        assert other() == 2',
+                '',
+            ].join('\n'),
+            'tests/test_leaf.py': 'from tests.base import Left, Right\n\nclass TestLeaf(Left, Right):\n    pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const rootBody = index.affectedTests('target', { depth: 2 });
+            assert.strictEqual(rootBody.summary.totalTests, 0, 'the body that calls target is not the one TestLeaf runs');
+            assert.deepStrictEqual(rootBody.commands, []);
+            const rightBody = index.affectedTests('other', { depth: 2 });
+            assert.strictEqual(rightBody.summary.totalTests, 1);
+            const leaf = rightBody.testFiles.find(row => row.file === 'tests/test_leaf.py');
+            assert.strictEqual(leaf.units[0].inheritedFrom, 'tests/base.py:11');
+            assert.deepStrictEqual(rightBody.commands, ['pytest tests/test_leaf.py']);
         } finally {
             rm(dir);
         }
@@ -477,6 +567,252 @@ describe('test units: verify reads "in a test" from the same model', () => {
             const flagged = new Map(result.validDetails.map(site => [site.line, site.patterns.inTestCase]));
             assert.strictEqual(flagged.get(3), true);
             assert.strictEqual(flagged.get(24), false);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('test units: a runner bound under another name is still the runner', () => {
+    const LIB = 'function target() { return 1; }\nmodule.exports = { target };\n';
+    const MANIFEST = '{ "name": "x", "scripts": { "test": "node --test" } }\n';
+
+    for (const [form, source] of [
+        ['an aliased member', "const { test: caseIt } = require('node:test');\nconst { target } = require('../lib');\ncaseIt('aliased', () => { target(); });\n"],
+        ['the module itself', "const runner = require('node:test');\nconst { target } = require('../lib');\nrunner.test('namespaced', () => { target(); });\n"],
+        ['a second name for an alias', "const { it: spec } = require('node:test');\nconst again = spec;\nconst { target } = require('../lib');\nagain('twice removed', () => { target(); });\n"],
+    ]) {
+        it(`${form} declares a test: the file is not support`, () => {
+            const dir = projectOf({ 'package.json': MANIFEST, 'lib.js': LIB, 'test/names.js': source });
+            try {
+                const index = idx(dir);
+                const rows = rowsOf(index, 'test/names.js');
+                assert.strictEqual(rows.facts.role, 'tests');
+                assert.strictEqual(rows.facts.tests, 1);
+                const affected = index.affectedTests('target', { depth: 2 });
+                assert.strictEqual(affected.summary.totalTests, 1);
+                assert.deepStrictEqual(affected.commands, ['node --test test/names.js']);
+            } finally {
+                rm(dir);
+            }
+        });
+    }
+
+    it('a name the file gives to something else is not the runner; one bound inside a function says nothing of the file', () => {
+        const dir = projectOf({
+            'package.json': MANIFEST,
+            'test/own.test.js': "const { describe, it } = require('node:test');\nfunction test(value) { return value; }\ndescribe('group', () => {\n    it('real', () => { test('not a title', () => {}); });\n});\n",
+            'test/inner.test.js': "const { test } = require('node:test');\nfunction helper() { const test = { a: 1 }; return test; }\ntest('still a test', () => { helper(); });\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(rowsOf(index, 'test/own.test.js').units.filter(unit => unit.kind === 'test').map(unit => unit.label),
+                ['group > real']);
+            assert.deepStrictEqual(rowsOf(index, 'test/inner.test.js').units.map(unit => unit.label), ['still a test']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a file that binds the runner and declares nothing readable is a test file with a command, never support', () => {
+        const dir = projectOf({
+            'package.json': MANIFEST,
+            'test/computed.js': "const runner = require('node:test');\nconst pick = runner[process.env.NAME || 'test'];\npick('at run time', () => {});\n",
+            'test/hooks.js': "const { beforeEach } = require('node:test');\nmodule.exports = () => beforeEach(() => {});\n",
+        });
+        try {
+            const index = idx(dir);
+            const computed = rowsOf(index, 'test/computed.js').facts;
+            assert.strictEqual(computed.role, 'tests');
+            assert.strictEqual(computed.tests, 0);
+            assert.strictEqual(selectorText(computed.run), 'node --test test/computed.js');
+            assert.strictEqual(rowsOf(index, 'test/hooks.js').facts.role, 'support');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('test units: one declaration is one test', () => {
+    it('two tests of one name are two tests, and neither has a command of its own', () => {
+        const dir = projectOf({
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'lib.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
+            'test/twice.test.js': "const { test } = require('node:test');\nconst { target } = require('../lib');\ntest('same', () => { target(); });\ntest('same', () => { target(); });\ntest('alone', () => { target(); });\n",
+        });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                const model = createTestModel(index);
+                const filePath = path.join(index.root, 'test/twice.test.js');
+                const linked = linkFile(model, index, filePath, [3, 4, 5]);
+                assert.strictEqual(linked.tests, 3);
+                assert.deepStrictEqual(linked.units.map(unit => `${unit.line}:${unit.name}:${unit.selectorWithheld || 'command'}`),
+                    ['3:same:name-not-unique', '4:same:name-not-unique', '5:alone:command']);
+                assert.strictEqual(selectorText(linked.run), 'node --test test/twice.test.js');
+            } finally {
+                index._endOp();
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('of two Python definitions of one name the last is the test', () => {
+        const dir = projectOf({
+            'pytest.ini': '[pytest]\n',
+            'tests/test_d.py': 'def test_a():\n    pass\n\ndef test_a():\n    pass\n',
+        });
+        try {
+            const rows = rowsOf(idx(dir), 'tests/test_d.py');
+            assert.deepStrictEqual(rows.units.map(unit => `${unit.line}:${unit.label}`), ['4:test_a']);
+            assert.strictEqual(selectorText(rows.units[0].selector), 'pytest tests/test_d.py::test_a');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a test that is declared and not executed is listed, marked, and not counted', () => {
+        const dir = projectOf({
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'lib.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
+            'test/s.test.js': "const { test, describe, it } = require('node:test');\nconst { target } = require('../lib');\ntest.skip('off', () => { target(); });\ndescribe.skip('group', () => {\n    it('inside', () => { target(); });\n});\ntest('on', () => { target(); });\n",
+        });
+        try {
+            const index = idx(dir);
+            const rows = rowsOf(index, 'test/s.test.js');
+            assert.strictEqual(rows.facts.tests, 1);
+            assert.deepStrictEqual(rows.units.filter(unit => unit.kind === 'test').map(unit => `${unit.label}:${!!unit.skipped}`),
+                ['off:true', 'group > inside:true', 'on:false']);
+            assert.strictEqual(index.affectedTests('target', { depth: 1 }).summary.totalTests, 1);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('test units: what pytest does not collect is not a test', () => {
+    for (const [form, source, units] of [
+        ['a module switched off', 'from app import target\n__test__ = False\n\ndef test_hidden():\n    target()\n', 0],
+        ['a class with __new__', 'from app import target\nclass TestNew:\n    def __new__(cls):\n        return object.__new__(cls)\n    def test_hidden(self):\n        target()\n', 0],
+        ['a class that inherits __new__', 'from app import target\nclass Built:\n    def __new__(cls):\n        return object.__new__(cls)\nclass TestNew(Built):\n    def test_hidden(self):\n        target()\n', 0],
+        ['a function switched off', 'from app import target\ndef test_hidden():\n    target()\ntest_hidden.__test__ = False\n', 0],
+        ['a module switched on (the control)', 'from app import target\n__test__ = True\n\ndef test_shown():\n    target()\n', 1],
+    ]) {
+        it(form, () => {
+            const dir = projectOf({
+                'pytest.ini': '[pytest]\n', 'app.py': 'def target():\n    return 1\n',
+                'tests/__init__.py': '', 'tests/test_f.py': source,
+            });
+            try {
+                const index = idx(dir);
+                const rows = rowsOf(index, 'tests/test_f.py');
+                assert.strictEqual(rows.facts.tests, units);
+                assert.strictEqual(rows.units.filter(unit => unit.kind === 'test').length, units);
+                assert.strictEqual(index.affectedTests('target', { depth: 2 }).summary.totalTests, units);
+            } finally {
+                rm(dir);
+            }
+        });
+    }
+
+    it('a module that is switched off has no command; a switch that is not read leaves units without one', () => {
+        const dir = projectOf({
+            'pytest.ini': '[pytest]\n',
+            'tests/test_off.py': '__test__ = False\n\ndef test_hidden():\n    pass\n',
+            'tests/test_maybe.py': 'def nottest(f):\n    f.__test__ = False\n    return f\n\n@nottest\ndef test_a():\n    pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const off = rowsOf(index, 'tests/test_off.py').facts;
+            assert.strictEqual(off.run, undefined);
+            assert.strictEqual(off.runWithheld, 'collection-switched-off');
+            const maybe = rowsOf(index, 'tests/test_maybe.py');
+            assert.deepStrictEqual(maybe.units.map(unit => `${unit.label}:${unit.selectorWithheld}:${!!unit.conditional}`),
+                ['test_a:collection-switch:true']);
+            assert.strictEqual(selectorText(maybe.facts.run), 'pytest tests/test_maybe.py');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('test units: a command the file answer withholds is not offered anywhere else', () => {
+    it('a test declared inside a function nothing calls gives no command, alone or joined', () => {
+        const dir = projectOf({
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'lib.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
+            'test/indirect.test.js': "const { test } = require('node:test');\nconst { target } = require('../lib');\nfunction register() {\n    test('never registered', () => { target(); });\n}\n",
+            'test/direct.test.js': "const { test } = require('node:test');\nconst { target } = require('../lib');\ntest('registered', () => { target(); });\n",
+        });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                const model = createTestModel(index);
+                const indirect = path.join(index.root, 'test/indirect.test.js');
+                const direct = path.join(index.root, 'test/direct.test.js');
+                assert.strictEqual(model.fileFacts(indirect).runWithheld, 'declared-indirectly');
+                assert.deepStrictEqual(commandsFor(model, [indirect]), []);
+                assert.deepStrictEqual(commandsFor(model, [indirect, direct]), ['node --test test/direct.test.js']);
+            } finally {
+                index._endOp();
+            }
+            assert.deepStrictEqual(index.affectedTests('target', { depth: 2 }).commands, ['node --test test/direct.test.js']);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('test units: a focused test and the rest of its file', () => {
+    const SOURCE = "it.only('focused', () => {});\nit('left out', () => {});\n";
+
+    it('under jest the others are declared and not executed; under node the mark does nothing by itself', () => {
+        const jest = projectOf({
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'src/f.test.js': SOURCE,
+        });
+        const node = projectOf({
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'src/f.test.js': "const { it } = require('node:test');\n" + SOURCE,
+        });
+        try {
+            const underJest = rowsOf(idx(jest), 'src/f.test.js');
+            assert.deepStrictEqual(underJest.units.map(unit => `${unit.label}:${!!unit.skipped}`),
+                ['focused:false', 'left out:true']);
+            assert.strictEqual(underJest.facts.tests, 1);
+            const underNode = rowsOf(idx(node), 'src/f.test.js');
+            assert.deepStrictEqual(underNode.units.map(unit => `${unit.label}:${!!unit.skipped}`),
+                ['focused:false', 'left out:false']);
+            assert.strictEqual(underNode.facts.tests, 2);
+        } finally {
+            rm(jest);
+            rm(node);
+        }
+    });
+});
+
+describe('test units: check names nothing to run that would not run', () => {
+    it('with no runner proven, a file whose tests are declared inside functions is not suggested', () => {
+        const dir = projectOf({
+            'lib.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
+            'src/indirect.test.js': "const { target } = require('../lib');\nfunction register() {\n    it('never registered', () => { target(); });\n}\nmodule.exports = { register };\n",
+            'src/direct.test.js': "const { target } = require('../lib');\nit('registered', () => { target(); });\n",
+        });
+        try {
+            git(dir, 'init', '-q');
+            git(dir, 'add', '-A');
+            git(dir, 'commit', '-q', '-m', 'base');
+            fs.writeFileSync(path.join(dir, 'lib.js'), 'function target() { return 1 + 0; }\nmodule.exports = { target };\n');
+            const result = execute(idx(dir), 'check', {});
+            assert.ok(result.ok, result.error);
+            const action = result.result.actions.find(row => row.kind === 'tests_to_run');
+            assert.strictEqual(action.message, 'Run tests: src/direct.test.js');
+            assert.strictEqual(action.commands, undefined);
+            const text = output.formatAffectedTests(idx(dir).affectedTests('target', { depth: 2 }));
+            assert.match(text, /src\/indirect\.test\.js \(links: [^)]*\) · 1 test · no command: declared-indirectly/);
         } finally {
             rm(dir);
         }

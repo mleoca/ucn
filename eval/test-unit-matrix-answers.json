@@ -1,4 +1,12 @@
 {
+  "cargo-attribute-macros": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  S tests",
+    "  T tests > waits => cargo test --lib -- tests::waits --exact",
+    "  T tests > rows => (withheld: generated-cases)",
+    "  T tests > plain => cargo test --lib -- tests::plain --exact",
+    "all: cargo test --lib"
+  ],
   "cargo-binary-and-library": [
     "src/cli.rs [tests] cargo-test  run: cargo test --bin case_binlib -- cli::",
     "  S tests",
@@ -8,7 +16,10 @@
     "  T tests > in_bin => cargo test --bin case_binlib -- tests::in_bin --exact",
     "src/shared.rs [tests] cargo-test  run: cargo test --lib -- shared::",
     "  S tests",
-    "  T tests > in_lib => cargo test --lib -- shared::tests::in_lib --exact"
+    "  T tests > in_lib => cargo test --lib -- shared::tests::in_lib --exact",
+    "all: cargo test --bin case_binlib -- cli::",
+    "all: cargo test --bin case_binlib",
+    "all: cargo test --lib -- shared::"
   ],
   "cargo-custom-targets": [
     "source/entry.rs [tests] cargo-test  run: (withheld: custom-targets)",
@@ -21,7 +32,8 @@
     "  T tests > always => cargo test --lib -- tests::always --exact",
     "  T tests > gated [conditional] => (withheld: conditional-compilation)",
     "  S extra",
-    "  T extra > gated_module [conditional] => (withheld: conditional-compilation)"
+    "  T extra > gated_module [conditional] => (withheld: conditional-compilation)",
+    "all: cargo test --lib"
   ],
   "cargo-integration-tests": [
     "tests/api.rs [tests] cargo-test  run: cargo test --test api",
@@ -32,43 +44,67 @@
     "tests/suite/main.rs [tests] cargo-test  run: cargo test --test suite",
     "  T whole => cargo test --test suite -- whole --exact",
     "tests/suite/part.rs [tests] cargo-test  run: cargo test --test suite -- part::",
-    "  T piece => cargo test --test suite -- part::piece --exact"
+    "  T piece => cargo test --test suite -- part::piece --exact",
+    "all: cargo test --test api",
+    "all: cargo test --test suite",
+    "all: cargo test --test suite -- part::"
   ],
   "cargo-library": [
     "src/lib.rs [tests] cargo-test  run: cargo test --lib",
     "  S tests",
     "  T tests > adds => cargo test --lib -- tests::adds --exact",
-    "  T tests > slow => cargo test --lib -- tests::slow --exact --include-ignored",
+    "  T tests > slow [skipped] => cargo test --lib -- tests::slow --exact --include-ignored",
     "  S tests > inner",
     "  T tests > inner > adds => cargo test --lib -- tests::inner::adds --exact",
     "  T at_root => cargo test --lib -- at_root --exact",
     "src/util.rs [tests] cargo-test  run: cargo test --lib -- util::",
     "  S tests",
     "  T tests > adds => cargo test --lib -- util::tests::adds --exact",
-    "  T tests > adds_more => cargo test --lib -- util::tests::adds_more --exact"
+    "  T tests > adds_more => cargo test --lib -- util::tests::adds_more --exact",
+    "all: cargo test --lib",
+    "all: cargo test --lib -- util::"
   ],
   "cargo-workspace-member": [
     "crates/one/src/lib.rs [tests] cargo-test  run: (cd crates/one && cargo test --lib)",
     "  S tests",
-    "  T tests > member => (cd crates/one && cargo test --lib -- tests::member --exact)"
+    "  T tests > member => (cd crates/one && cargo test --lib -- tests::member --exact)",
+    "all: (cd crates/one && cargo test --lib)"
   ],
   "dotnet-file-scoped-namespace": [
     "DeepTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Deep.Space.DeepTests.|FullyQualifiedName~Deep.Space.DeepTests+'",
     "  S DeepTests",
-    "  T DeepTests > Lands => dotnet test --filter FullyQualifiedName=Deep.Space.DeepTests.Lands"
+    "  T DeepTests > Lands => dotnet test --filter FullyQualifiedName=Deep.Space.DeepTests.Lands",
+    "all: dotnet test --filter 'FullyQualifiedName~Deep.Space.DeepTests.|FullyQualifiedName~Deep.Space.DeepTests+'"
   ],
   "dotnet-mstest": [
     "CalcTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Calc.Tests.CalcTests.|FullyQualifiedName~Calc.Tests.CalcTests+'",
     "  S CalcTests",
     "  T CalcTests > Adds => dotnet test --filter FullyQualifiedName=Calc.Tests.CalcTests.Adds",
-    "  T CalcTests > Rows => dotnet test --filter FullyQualifiedName=Calc.Tests.CalcTests.Rows"
+    "  T CalcTests > Rows => dotnet test --filter FullyQualifiedName=Calc.Tests.CalcTests.Rows",
+    "all: dotnet test --filter 'FullyQualifiedName~Calc.Tests.CalcTests.|FullyQualifiedName~Calc.Tests.CalcTests+'"
+  ],
+  "dotnet-mstest-what-is-not-discovered": [
+    "Loose.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Loose.Tests.Marked.|FullyQualifiedName~Loose.Tests.Marked+'",
+    "  S Marked",
+    "  T Marked > Runs => dotnet test --filter FullyQualifiedName=Loose.Tests.Marked.Runs",
+    "  T Marked > Ignored [skipped] => dotnet test --filter FullyQualifiedName=Loose.Tests.Marked.Ignored",
+    "all: dotnet test --filter 'FullyQualifiedName~Loose.Tests.Marked.|FullyQualifiedName~Loose.Tests.Marked+'"
   ],
   "dotnet-nunit": [
     "QueueTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Queue.Tests.QueueTests.|FullyQualifiedName~Queue.Tests.QueueTests+'",
     "  S QueueTests",
     "  T QueueTests > Pushes => dotnet test --filter FullyQualifiedName=Queue.Tests.QueueTests.Pushes",
     "  T QueueTests > Rows => dotnet test --filter FullyQualifiedName=Queue.Tests.QueueTests.Rows",
-    "  T QueueTests > PushesMore => dotnet test --filter FullyQualifiedName=Queue.Tests.QueueTests.PushesMore"
+    "  T QueueTests > PushesMore => dotnet test --filter FullyQualifiedName=Queue.Tests.QueueTests.PushesMore",
+    "all: dotnet test --filter 'FullyQualifiedName~Queue.Tests.QueueTests.|FullyQualifiedName~Queue.Tests.QueueTests+'"
+  ],
+  "dotnet-nunit-what-is-not-discovered": [
+    "Quiet.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Quiet.Tests.Fixture.|FullyQualifiedName~Quiet.Tests.Fixture+'",
+    "  S Fixture",
+    "  T Fixture > Runs => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.Runs",
+    "  T Fixture > Ignored [skipped] => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.Ignored",
+    "  T Fixture > StaticTest => dotnet test --filter FullyQualifiedName=Quiet.Tests.Fixture.StaticTest",
+    "all: dotnet test --filter 'FullyQualifiedName~Quiet.Tests.Fixture.|FullyQualifiedName~Quiet.Tests.Fixture+'"
   ],
   "dotnet-xunit": [
     "FooTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~My.App.Tests.Concrete.|FullyQualifiedName~My.App.Tests.Concrete+|FullyQualifiedName~My.App.Tests.FooTests.|FullyQualifiedName~My.App.Tests.FooTests+|FullyQualifiedName~My.App.Tests.FooTestsMore.|FullyQualifiedName~My.App.Tests.FooTestsMore+'",
@@ -80,14 +116,25 @@
     "  S FooTestsMore",
     "  T FooTestsMore > Adds => dotnet test --filter FullyQualifiedName=My.App.Tests.FooTestsMore.Adds",
     "  S Concrete",
-    "  T Concrete > Inherited (from FooTests.cs:35) => dotnet test --filter FullyQualifiedName=My.App.Tests.Concrete.Inherited"
+    "  T Concrete > Inherited (from FooTests.cs:35) => dotnet test --filter FullyQualifiedName=My.App.Tests.Concrete.Inherited",
+    "all: dotnet test --filter 'FullyQualifiedName~My.App.Tests.Concrete.|FullyQualifiedName~My.App.Tests.Concrete+|FullyQualifiedName~My.App.Tests.FooTests.|FullyQualifiedName~My.App.Tests.FooTests+|FullyQualifiedName~My.App.Tests.FooTestsMore.|FullyQualifiedName~My.App.Tests.FooTestsMore+'"
+  ],
+  "dotnet-xunit-what-is-not-discovered": [
+    "Hidden.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Hid.Tests.Shown.|FullyQualifiedName~Hid.Tests.Shown+'",
+    "  S Shown",
+    "  T Shown > Runs => dotnet test --filter FullyQualifiedName=Hid.Tests.Shown.Runs",
+    "  T Shown > PrivateFact => dotnet test --filter FullyQualifiedName=Hid.Tests.Shown.PrivateFact",
+    "  T Shown > StaticFact => dotnet test --filter FullyQualifiedName=Hid.Tests.Shown.StaticFact",
+    "  T Shown > Skipped [skipped] => dotnet test --filter FullyQualifiedName=Hid.Tests.Shown.Skipped",
+    "all: dotnet test --filter 'FullyQualifiedName~Hid.Tests.Shown.|FullyQualifiedName~Hid.Tests.Shown+'"
   ],
   "go-build-constraint": [
     "a_test.go [tests] go-test  run: go test .",
     "  T TestAlways => go test . -run '^TestAlways$'",
     "mark_test.go [tests] go-test  run: go test .",
     "slow_test.go [tests] go-test  run: (withheld: conditional-tests)",
-    "  T TestSlow [conditional] => (withheld: build-constraint)"
+    "  T TestSlow [conditional] => (withheld: build-constraint)",
+    "all: go test ."
   ],
   "go-nested-module-and-packages": [
     "svc/a/a_test.go [tests] go-test  run: (cd svc && go test ./a)",
@@ -96,14 +143,16 @@
     "svc/b/b_test.go [tests] go-test  run: (cd svc && go test ./b)",
     "  T TestSame => (cd svc && go test ./b -run '^TestSame$')",
     "  T TestSameMore => (cd svc && go test ./b -run '^TestSameMore$')",
-    "svc/b/mark_test.go [tests] go-test  run: (cd svc && go test ./b)"
+    "svc/b/mark_test.go [tests] go-test  run: (cd svc && go test ./b)",
+    "all: (cd svc && go test ./a ./b)"
   ],
   "go-platform-file-and-external-package": [
     "ext_test.go [tests] go-test  run: go test .",
     "  T TestOutside => go test . -run '^TestOutside$'",
     "mark_test.go [tests] go-test  run: go test .",
     "only_plan9_test.go [tests] go-test  run: (withheld: conditional-tests)",
-    "  T TestElsewhere [conditional] => (withheld: build-constraint)"
+    "  T TestElsewhere [conditional] => (withheld: build-constraint)",
+    "all: go test ."
   ],
   "go-what-is-a-test": [
     "a_test.go [tests] go-test  run: go test .",
@@ -113,17 +162,31 @@
     "  T Test1 => go test . -run '^Test1$'",
     "  T FuzzY => go test . -run '^FuzzY$'",
     "  T ExampleAdd => go test . -run '^ExampleAdd$'",
-    "mark_test.go [tests] go-test  run: go test ."
+    "mark_test.go [tests] go-test  run: go test .",
+    "all: go test ."
   ],
   "java-gradle-not-modeled": [
     "src/test/java/com/x/FooTest.java [tests] no runner: runner-not-modeled  run: (withheld: runner-not-modeled)",
     "  S FooTest",
     "  T FooTest > adds => (withheld: runner-not-modeled)"
   ],
+  "jest-focused-tests": [
+    "src/focus.test.js [tests] jest  run: npx jest --runTestsByPath src/focus.test.js",
+    "  T focused => npx jest --runTestsByPath src/focus.test.js -t '^focused$'",
+    "  T left out [skipped] => npx jest --runTestsByPath src/focus.test.js -t '^left out$'",
+    "  S group",
+    "  T group > inside [skipped] => npx jest --runTestsByPath src/focus.test.js -t '^group inside$'",
+    "  S focused group",
+    "  T focused group > inside focus => npx jest --runTestsByPath src/focus.test.js -t '^focused group inside focus$'",
+    "src/plain.test.js [tests] jest  run: npx jest --runTestsByPath src/plain.test.js",
+    "  T other file => npx jest --runTestsByPath src/plain.test.js -t '^other file$'",
+    "all: npx jest --runTestsByPath src/focus.test.js src/plain.test.js"
+  ],
   "jest-local-function-named-test": [
     "src/t.test.js [tests] jest  run: npx jest --runTestsByPath src/t.test.js",
     "  S uses a local test()",
-    "  T uses a local test() > calls it => npx jest --runTestsByPath src/t.test.js -t '^uses a local test\\(\\) calls it$'"
+    "  T uses a local test() > calls it => npx jest --runTestsByPath src/t.test.js -t '^uses a local test\\(\\) calls it$'",
+    "all: npx jest --runTestsByPath src/t.test.js"
   ],
   "jest-path-that-names-two-files": [
     "src/checksum.test.js [tests] jest  run: npx jest --runTestsByPath src/checksum.test.js",
@@ -131,7 +194,20 @@
     "src/sum.test.js [tests] jest  run: npx jest --runTestsByPath src/sum.test.js",
     "  T adds => npx jest --runTestsByPath src/sum.test.js -t '^adds$'",
     "src/sum.test.jsx [tests] jest  run: npx jest --runTestsByPath src/sum.test.jsx",
-    "  T adds => npx jest --runTestsByPath src/sum.test.jsx -t '^adds$'"
+    "  T adds => npx jest --runTestsByPath src/sum.test.jsx -t '^adds$'",
+    "all: npx jest --runTestsByPath src/checksum.test.js src/sum.test.js src/sum.test.jsx"
+  ],
+  "jest-same-name-twice-and-skips": [
+    "src/twice.test.js [tests] jest  run: npx jest --runTestsByPath src/twice.test.js",
+    "  T same => (withheld: name-not-unique)",
+    "  T same => (withheld: name-not-unique)",
+    "  T alone => npx jest --runTestsByPath src/twice.test.js -t '^alone$'",
+    "  T crossed out [skipped] => npx jest --runTestsByPath src/twice.test.js -t '^crossed out$'",
+    "  T skipped [skipped] => npx jest --runTestsByPath src/twice.test.js -t '^skipped$'",
+    "  S group",
+    "  T group > inside [skipped] => npx jest --runTestsByPath src/twice.test.js -t '^group inside$'",
+    "  T global under another name => npx jest --runTestsByPath src/twice.test.js -t '^global under another name$'",
+    "all: npx jest --runTestsByPath src/twice.test.js"
   ],
   "jest-script": [
     "__tests__/helpers.js [support] jest",
@@ -146,7 +222,8 @@
     "  T other > adds => npx jest --runTestsByPath src/sum.test.js -t '^other adds$'",
     "  T bare => npx jest --runTestsByPath src/sum.test.js -t '^bare$'",
     "  T row %i => (withheld: generated-cases)",
-    "test/setup.js [support] jest"
+    "test/setup.js [support] jest",
+    "all: npx jest --runTestsByPath src/sum.test.js"
   ],
   "js-runner-not-modeled": [
     "test/a.test.js [tests] no runner: runner-not-modeled  run: (withheld: runner-not-modeled)",
@@ -163,9 +240,12 @@
     "  S ChildTest",
     "  T ChildTest > shared (from src/test/java/com/x/BaseChecks.java:9) => mvn test '-Dtest=com.x.ChildTest#shared'",
     "  T ChildTest > own => mvn test '-Dtest=com.x.ChildTest#own'",
+    "  T ChildTest > ignored [skipped] => mvn test '-Dtest=com.x.ChildTest#ignored'",
     "src/test/java/com/x/OnlyInheritsTest.java [tests] maven  run: mvn test -Dtest=com.x.OnlyInheritsTest",
     "  S OnlyInheritsTest",
-    "  T OnlyInheritsTest > shared (from src/test/java/com/x/BaseChecks.java:9) => mvn test '-Dtest=com.x.OnlyInheritsTest#shared'"
+    "  T OnlyInheritsTest > shared (from src/test/java/com/x/BaseChecks.java:9) => mvn test '-Dtest=com.x.OnlyInheritsTest#shared'",
+    "all: mvn test -Dtest=com.x.ChildTest",
+    "all: mvn test -Dtest=com.x.OnlyInheritsTest"
   ],
   "maven-junit5": [
     "src/test/java/com/x/Fixtures.java [support] maven",
@@ -177,7 +257,17 @@
     "  T FooTest > Inner > adds => mvn test '-Dtest=com.x.FooTest$Inner#adds'",
     "src/test/java/com/x/OtherTest.java [tests] maven  run: mvn test -Dtest=com.x.OtherTest",
     "  S OtherTest",
-    "  T OtherTest > adds => mvn test '-Dtest=com.x.OtherTest#adds'"
+    "  T OtherTest > adds => mvn test '-Dtest=com.x.OtherTest#adds'",
+    "all: mvn test -Dtest=com.x.FooTest",
+    "all: mvn test -Dtest=com.x.OtherTest"
+  ],
+  "maven-junit5-what-is-not-run": [
+    "src/test/java/com/x/RulesTest.java [tests] maven  run: mvn test -Dtest=com.x.RulesTest",
+    "  S RulesTest",
+    "  T RulesTest > runs => mvn test '-Dtest=com.x.RulesTest#runs'",
+    "  T RulesTest > disabled [skipped] => mvn test '-Dtest=com.x.RulesTest#disabled'",
+    "  T RulesTest > overloaded => mvn test '-Dtest=com.x.RulesTest#overloaded'",
+    "all: mvn test -Dtest=com.x.RulesTest"
   ],
   "maven-nested-classes": [
     "src/test/java/com/x/OuterTest.java [tests] maven  run: mvn test -Dtest=com.x.OuterTest",
@@ -187,7 +277,16 @@
     "  T OuterTest > Plain > inStatic [conditional] => mvn test '-Dtest=com.x.OuterTest$Plain#inStatic'",
     "  S OuterTest > Deep",
     "  S OuterTest > Deep > Deeper",
-    "  T OuterTest > Deep > Deeper > bottom => mvn test '-Dtest=com.x.OuterTest$Deep$Deeper#bottom'"
+    "  T OuterTest > Deep > Deeper > bottom => mvn test '-Dtest=com.x.OuterTest$Deep$Deeper#bottom'",
+    "all: mvn test -Dtest=com.x.OuterTest"
+  ],
+  "mocha-focused-tests": [
+    "test/focus.test.js [tests] mocha  run: npx mocha test/focus.test.js",
+    "  T focused => npx mocha test/focus.test.js --grep '^focused$'",
+    "  T left out [skipped] => npx mocha test/focus.test.js --grep '^left out$'",
+    "test/plain.test.js [tests] mocha  run: npx mocha test/plain.test.js",
+    "  T other file => npx mocha test/plain.test.js --grep '^other file$'",
+    "all: npx mocha test/focus.test.js test/plain.test.js"
   ],
   "mocha-script": [
     "test/a.test.js [tests] mocha  run: npx mocha test/a.test.js",
@@ -198,19 +297,37 @@
     "  T queue > when empty > pushes => npx mocha test/a.test.js --grep '^queue when empty pushes$'",
     "  S stack",
     "  T stack > pushes => npx mocha test/a.test.js --grep '^stack pushes$'",
-    "test/support/build.js [support] mocha"
+    "test/support/build.js [support] mocha",
+    "all: npx mocha test/a.test.js"
   ],
   "mocha-shared-behaviour": [
     "test/fifo.test.js [tests] mocha  run: npx mocha test/fifo.test.js",
     "  S fifo",
     "test/shared.js [tests] mocha  run: (withheld: declared-indirectly)",
-    "  T pushes => (withheld: declared-indirectly)"
+    "  T pushes [conditional] => (withheld: declared-indirectly)",
+    "all: npx mocha test/fifo.test.js"
+  ],
+  "node-test-binding-not-followed": [
+    "test/computed.js [tests] node-test  run: node --test test/computed.js",
+    "test/hooks-only.js [support] node-test",
+    "all: node --test test/computed.js"
   ],
   "node-test-by-import-only": [
     "test/c.test.js [tests] node-test  run: node --test test/c.test.js",
     "  T alone => node --test --test-name-pattern='^alone$' test/c.test.js",
     "  S group",
-    "  T group > inner => node --test --test-name-pattern='^group inner$' test/c.test.js"
+    "  T group > inner => node --test --test-name-pattern='^group inner$' test/c.test.js",
+    "all: node --test test/c.test.js"
+  ],
+  "node-test-esm-bindings": [
+    "test/esm.mjs [tests] node-test  run: node --test test/esm.mjs",
+    "  T aliased => node --test --test-name-pattern='^aliased$' test/esm.mjs",
+    "  S ns",
+    "  T ns > deep => node --test --test-name-pattern='^ns deep$' test/esm.mjs",
+    "  T default import => node --test --test-name-pattern='^default import$' test/esm.mjs",
+    "  S on default",
+    "  T on default > member => node --test --test-name-pattern='^on default member$' test/esm.mjs",
+    "all: node --test test/esm.mjs"
   ],
   "node-test-name-read-two-ways": [
     "test/n.test.js [tests] node-test  run: node --test test/n.test.js",
@@ -219,16 +336,50 @@
     "  T math > adds => (withheld: name-not-unique)",
     "  T math > subtracts => node --test --test-name-pattern='^math subtracts$' test/n.test.js",
     "  S math adds",
-    "  T math adds > x => node --test --test-name-pattern='^math adds x$' test/n.test.js"
+    "  T math adds > x => node --test --test-name-pattern='^math adds x$' test/n.test.js",
+    "all: node --test test/n.test.js"
   ],
   "node-test-names-not-written": [
     "test/e.test.js [tests] node-test  run: node --test test/e.test.js",
     "  T (computed name) => (withheld: name-not-literal)",
     "  T plain template => node --test --test-name-pattern='^plain template$' test/e.test.js",
     "  T (computed name) => (withheld: name-not-literal)",
-    "  T from helper => (withheld: declared-indirectly)",
+    "  T from helper [conditional] => (withheld: declared-indirectly)",
     "  S uses helper",
-    "  T in callback => (withheld: declared-indirectly)"
+    "  T in callback [conditional] => (withheld: declared-indirectly)",
+    "all: node --test test/e.test.js"
+  ],
+  "node-test-only-is-inert-without-its-flag": [
+    "test/focus.test.js [tests] node-test  run: node --test test/focus.test.js",
+    "  T focused => node --test --test-name-pattern='^focused$' test/focus.test.js",
+    "  T not left out => node --test --test-name-pattern='^not left out$' test/focus.test.js",
+    "all: node --test test/focus.test.js"
+  ],
+  "node-test-runner-under-other-names": [
+    "test/names.js [tests] node-test  run: node --test test/names.js",
+    "  T aliased => node --test --test-name-pattern='^aliased$' test/names.js",
+    "  S grouped",
+    "  T grouped > inner => node --test --test-name-pattern='^grouped inner$' test/names.js",
+    "  T namespaced => node --test --test-name-pattern='^namespaced$' test/names.js",
+    "  S ns",
+    "  T ns > deep => node --test --test-name-pattern='^ns deep$' test/names.js",
+    "  T local alias => node --test --test-name-pattern='^local alias$' test/names.js",
+    "  T from the namespace => node --test --test-name-pattern='^from the namespace$' test/names.js",
+    "  T member alias => node --test --test-name-pattern='^member alias$' test/names.js",
+    "  T required member => node --test --test-name-pattern='^required member$' test/names.js",
+    "all: node --test test/names.js"
+  ],
+  "node-test-same-name-twice": [
+    "test/twice.test.js [tests] node-test  run: node --test test/twice.test.js",
+    "  T same => (withheld: name-not-unique)",
+    "  T same => (withheld: name-not-unique)",
+    "  T alone => node --test --test-name-pattern='^alone$' test/twice.test.js",
+    "  S group",
+    "  T group > inside => (withheld: name-not-unique)",
+    "  S group",
+    "  T group > inside => (withheld: name-not-unique)",
+    "  T group > other => node --test --test-name-pattern='^group other$' test/twice.test.js",
+    "all: node --test test/twice.test.js"
   ],
   "node-test-script": [
     "test/a.test.js [tests] node-test  run: node --test test/a.test.js",
@@ -241,17 +392,31 @@
     "  T text > adds => node --test --test-name-pattern='^text adds$' test/a.test.js",
     "  T text > escapes (a+b) [x]? => node --test --test-name-pattern='^text escapes \\(a\\+b\\) \\[x\\]\\?$' test/a.test.js",
     "  T text > it's quoted => node --test --test-name-pattern='^text it'\\''s quoted$' test/a.test.js",
-    "test/helpers.js [support] node-test"
+    "test/helpers.js [support] node-test",
+    "all: node --test test/a.test.js"
   ],
   "node-test-script-loader": [
     "test/b.test.js [tests] node-test  run: node --test --import ./setup.mjs test/b.test.js",
-    "  T needs setup => node --test --import ./setup.mjs --test-name-pattern='^needs setup$' test/b.test.js"
+    "  T needs setup => node --test --import ./setup.mjs --test-name-pattern='^needs setup$' test/b.test.js",
+    "all: node --test --import ./setup.mjs test/b.test.js"
+  ],
+  "node-test-skipped-and-unregistered": [
+    "test/skips.test.js [tests] node-test  run: node --test test/skips.test.js",
+    "  T runs => node --test --test-name-pattern='^runs$' test/skips.test.js",
+    "  T skipped [skipped] => node --test --test-name-pattern='^skipped$' test/skips.test.js",
+    "  T later => node --test --test-name-pattern='^later$' test/skips.test.js",
+    "  S whole group",
+    "  T whole group > inside a skipped group [skipped] => node --test --test-name-pattern='^whole group inside a skipped group$' test/skips.test.js",
+    "test/unregistered.test.js [tests] node-test  run: (withheld: declared-indirectly)",
+    "  T never registered [conditional] => (withheld: declared-indirectly)",
+    "all: node --test test/skips.test.js"
   ],
   "node-test-typescript-by-script-option": [
     "test/typed.test.ts [tests] node-test  run: node --test --experimental-strip-types test/typed.test.ts",
     "  T typed top => node --test --experimental-strip-types --test-name-pattern='^typed top$' test/typed.test.ts",
     "  S typed group",
-    "  T typed group > inner => node --test --experimental-strip-types --test-name-pattern='^typed group inner$' test/typed.test.ts"
+    "  T typed group > inner => node --test --experimental-strip-types --test-name-pattern='^typed group inner$' test/typed.test.ts",
+    "all: node --test --experimental-strip-types test/typed.test.ts"
   ],
   "node-test-typescript-no-loader": [
     "test/d.test.ts [tests] node-test  run: (withheld: loader-unknown)",
@@ -262,12 +427,14 @@
     "  S TestOnDict",
     "  T TestOnDict > test_never [conditional] => (withheld: base-not-resolved)",
     "  S TestOnAbc",
-    "  T TestOnAbc > test_runs => pytest tests/test_o.py::TestOnAbc::test_runs"
+    "  T TestOnAbc > test_runs => pytest tests/test_o.py::TestOnAbc::test_runs",
+    "all: pytest tests/test_o.py"
   ],
   "pytest-classes-pytest-refuses": [
     "tests/test_k.py [tests] pytest  run: pytest tests/test_k.py",
     "  S TestPlain",
-    "  T TestPlain > test_on => pytest tests/test_k.py::TestPlain::test_on"
+    "  T TestPlain > test_on => pytest tests/test_k.py::TestPlain::test_on",
+    "all: pytest tests/test_k.py"
   ],
   "pytest-configured-names": [
     "tests/check_a.py [tests] pytest  run: pytest tests/check_a.py",
@@ -276,7 +443,8 @@
     "  S MathSuite",
     "  T MathSuite > check_three => pytest tests/check_a.py::MathSuite::check_three",
     "tests/test_plain.py [tests] pytest  run: pytest tests/test_plain.py",
-    "  T check_five => pytest tests/test_plain.py::check_five"
+    "  T check_five => pytest tests/test_plain.py::check_five",
+    "all: pytest tests/check_a.py tests/test_plain.py"
   ],
   "pytest-inherited-tests": [
     "tests/__init__.py [support] pytest",
@@ -296,34 +464,56 @@
     "  S Elsewhere",
     "  T Elsewhere > test_hidden (from tests/base.py:14) => pytest tests/test_child.py::Elsewhere::test_hidden",
     "  T Elsewhere > test_shared (from tests/base.py:11) => pytest tests/test_child.py::Elsewhere::test_shared",
-    "tests/test_outside.py [tests] pytest  run: pytest tests/test_outside.py"
+    "tests/test_outside.py [tests] pytest  run: pytest tests/test_outside.py",
+    "all: pytest tests/base.py tests/test_child.py tests/test_outside.py"
+  ],
+  "pytest-method-resolution-order": [
+    "tests/__init__.py [support] pytest",
+    "tests/base.py [support] pytest",
+    "tests/test_leaf.py [tests] pytest  run: pytest tests/test_leaf.py",
+    "  S KnownByName",
+    "  T KnownByName > test_root_only (from tests/base.py:15) => pytest tests/test_leaf.py::KnownByName::test_root_only",
+    "  T KnownByName > test_shared (from tests/base.py:23) => pytest tests/test_leaf.py::KnownByName::test_shared",
+    "  S TestLeaf",
+    "  T TestLeaf > test_root_only (from tests/base.py:15) => pytest tests/test_leaf.py::TestLeaf::test_root_only",
+    "  T TestLeaf > test_shared (from tests/base.py:23) => pytest tests/test_leaf.py::TestLeaf::test_shared",
+    "  S Known",
+    "  T Known > test_root_only (from tests/base.py:15) => pytest tests/test_leaf.py::Known::test_root_only",
+    "  T Known > test_shared (from tests/base.py:23) => pytest tests/test_leaf.py::Known::test_shared",
+    "all: pytest tests/test_leaf.py"
   ],
   "pytest-nested-project": [
     "services/api/tests/test_c.py [tests] pytest  run: (cd services/api && pytest tests/test_c.py)",
     "  T test_x => (cd services/api && pytest tests/test_c.py::test_x)",
     "  S TestK",
-    "  T TestK > test_y => (cd services/api && pytest tests/test_c.py::TestK::test_y)"
+    "  T TestK > test_y => (cd services/api && pytest tests/test_c.py::TestK::test_y)",
+    "all: (cd services/api && pytest tests/test_c.py)"
   ],
   "pytest-proved-by-conftest": [
     "tests/unit/test_b.py [tests] pytest  run: pytest tests/unit/test_b.py",
-    "  T test_x => pytest tests/unit/test_b.py::test_x"
+    "  T test_x => pytest tests/unit/test_b.py::test_x",
+    "all: pytest tests/unit/test_b.py"
   ],
   "pytest-proved-by-import": [
     "test_c.py [tests] pytest  run: pytest test_c.py",
-    "  T test_x => pytest test_c.py::test_x"
+    "  T test_x => pytest test_c.py::test_x",
+    "all: pytest test_c.py"
   ],
   "pytest-proved-by-requirements": [
     "tests/test_r.py [tests] pytest  run: pytest tests/test_r.py",
-    "  T test_x => pytest tests/test_r.py::test_x"
+    "  T test_x => pytest tests/test_r.py::test_x",
+    "all: pytest tests/test_r.py"
   ],
   "pytest-setup-cfg-and-tox": [
     "tests/test_s.py [tests] pytest  run: pytest tests/test_s.py",
-    "  T test_x => pytest tests/test_s.py::test_x"
+    "  T test_x => pytest tests/test_s.py::test_x",
+    "all: pytest tests/test_s.py"
   ],
   "pytest-toml-array-names": [
     "test_s.py [tests] pytest  run: pytest test_s.py",
     "  T spec_one => pytest test_s.py::spec_one",
-    "  T test_two => pytest test_s.py::test_two"
+    "  T test_two => pytest test_s.py::test_two",
+    "all: pytest test_s.py"
   ],
   "pytest-what-is-collected": [
     "tests/conftest.py [support] pytest",
@@ -340,7 +530,26 @@
     "  T TestX > TestInner > test_z => pytest tests/test_a.py::TestX::TestInner::test_z",
     "  S Foo",
     "  T Foo > test_u => pytest tests/test_a.py::Foo::test_u",
-    "  T test_p => pytest tests/test_a.py::test_p"
+    "  T test_p => pytest tests/test_a.py::test_p",
+    "all: pytest tests/test_a.py"
+  ],
+  "pytest-what-is-not-collected": [
+    "tests/test_forms.py [tests] pytest  run: pytest tests/test_forms.py",
+    "  T test_twice => pytest tests/test_forms.py::test_twice",
+    "  T test_skip_marked [skipped] => pytest tests/test_forms.py::test_skip_marked",
+    "  S Aliased",
+    "  T Aliased > test_alias_base => pytest tests/test_forms.py::Aliased::test_alias_base",
+    "  S TestTwiceInClass",
+    "  T TestTwiceInClass > test_m => pytest tests/test_forms.py::TestTwiceInClass::test_m",
+    "  S TestOn",
+    "  T TestOn > test_on => pytest tests/test_forms.py::TestOn::test_on",
+    "tests/test_marked.py [tests] pytest  run: pytest tests/test_marked.py",
+    "  T test_under_module_mark [skipped] => pytest tests/test_marked.py::test_under_module_mark",
+    "tests/test_module_off.py [tests] pytest  run: (withheld: collection-switched-off)",
+    "tests/test_switch_elsewhere.py [tests] pytest  run: pytest tests/test_switch_elsewhere.py",
+    "  T test_decorated_off [conditional] => (withheld: collection-switch)",
+    "  T test_plain [conditional] => (withheld: collection-switch)",
+    "all: pytest tests/test_forms.py tests/test_marked.py tests/test_switch_elsewhere.py"
   ],
   "python-no-runner-named": [
     "tests/test_u.py [tests] no runner: no-runner-evidence  run: (withheld: no-runner-evidence)",
@@ -356,12 +565,24 @@
     "  T sum > edge > adds => npx vitest run src/sum.test.ts -t '^sum edge adds$'",
     "  S other",
     "  T other > adds => npx vitest run src/sum.test.ts -t '^other adds$'",
-    "  T other > conditional => npx vitest run src/sum.test.ts -t '^other conditional$'",
-    "  T bare (x) => npx vitest run src/sum.test.ts -t '^bare \\(x\\)$'"
+    "  T other > conditional [conditional] => npx vitest run src/sum.test.ts -t '^other conditional$'",
+    "  T bare (x) => npx vitest run src/sum.test.ts -t '^bare \\(x\\)$'",
+    "all: npx vitest run src/sum.test.ts"
+  ],
+  "vitest-focused-tests": [
+    "src/focus.test.js [tests] vitest  run: npx vitest run src/focus.test.js",
+    "  T focused => npx vitest run src/focus.test.js -t '^focused$'",
+    "  T left out [skipped] => npx vitest run src/focus.test.js -t '^left out$'",
+    "  S group",
+    "  T group > inside [skipped] => npx vitest run src/focus.test.js -t '^group inside$'",
+    "src/plain.test.js [tests] vitest  run: npx vitest run src/plain.test.js",
+    "  T other file => npx vitest run src/plain.test.js -t '^other file$'",
+    "all: npx vitest run src/focus.test.js src/plain.test.js"
   ],
   "vitest-import-beats-manifest": [
     "src/v.test.js [tests] vitest  run: npx vitest run src/v.test.js",
-    "  T runs => npx vitest run src/v.test.js -t '^runs$'"
+    "  T runs => npx vitest run src/v.test.js -t '^runs$'",
+    "all: npx vitest run src/v.test.js"
   ],
   "vitest-path-that-names-two-files": [
     "src/checksum.test.js [tests] vitest  run: npx vitest run src/checksum.test.js",
@@ -369,6 +590,14 @@
     "src/sum.test.js [tests] vitest  run: (withheld: path-not-unique)",
     "  T adds => (withheld: path-not-unique)",
     "src/sum.test.jsx [tests] vitest  run: npx vitest run src/sum.test.jsx",
-    "  T adds => npx vitest run src/sum.test.jsx -t '^adds$'"
+    "  T adds => npx vitest run src/sum.test.jsx -t '^adds$'",
+    "all: npx vitest run src/checksum.test.js src/sum.test.jsx"
+  ],
+  "vitest-runner-under-other-names": [
+    "src/names.test.js [tests] vitest  run: npx vitest run src/names.test.js",
+    "  S grouped",
+    "  T grouped > inner => npx vitest run src/names.test.js -t '^grouped inner$'",
+    "  T namespaced => npx vitest run src/names.test.js -t '^namespaced$'",
+    "all: npx vitest run src/names.test.js"
   ]
 }

@@ -291,6 +291,155 @@ class TestOnAbc(abc.ABC):
         },
     },
     {
+        id: 'pytest-what-is-not-collected', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/test_forms.py': `${PY}import pytest
+import unittest
+from unittest import TestCase as Base
+
+def test_twice():
+    mark("tests/test_forms.py::test_twice first")
+
+def test_twice():
+    mark("tests/test_forms.py::test_twice last")
+
+def test_switched():
+    mark("tests/test_forms.py::test_switched")
+
+test_switched.__test__ = False
+
+@pytest.mark.skip(reason="not now")
+def test_skip_marked():
+    mark("tests/test_forms.py::test_skip_marked")
+
+class TestNew:
+    def __new__(cls):
+        return object.__new__(cls)
+
+    def test_in_new(self):
+        mark("tests/test_forms.py::TestNew > test_in_new")
+
+class HasNew:
+    def __new__(cls):
+        return object.__new__(cls)
+
+class TestInheritsNew(HasNew):
+    def test_inherits_new(self):
+        mark("tests/test_forms.py::TestInheritsNew > test_inherits_new")
+
+class Aliased(Base):
+    def test_alias_base(self):
+        mark("tests/test_forms.py::Aliased > test_alias_base")
+
+class TestTwiceInClass:
+    def test_m(self):
+        mark("tests/test_forms.py::TestTwiceInClass > test_m first")
+
+    def test_m(self):
+        mark("tests/test_forms.py::TestTwiceInClass > test_m last")
+
+class TestOn:
+    __test__ = True
+
+    def test_on(self):
+        mark("tests/test_forms.py::TestOn > test_on")
+
+class TestSwitchedLater:
+    def test_late(self):
+        mark("tests/test_forms.py::TestSwitchedLater > test_late")
+
+TestSwitchedLater.__test__ = False
+`,
+            'tests/test_marked.py': `${PY}import pytest
+
+pytestmark = pytest.mark.skip(reason="whole module")
+
+def test_under_module_mark():
+    mark("tests/test_marked.py::test_under_module_mark")
+`,
+            'tests/test_module_off.py': `${PY}__test__ = False
+
+def test_hidden():
+    mark("tests/test_module_off.py::test_hidden")
+
+class TestHidden:
+    __test__ = True
+
+    def test_inner(self):
+        mark("tests/test_module_off.py::TestHidden > test_inner")
+`,
+            'tests/test_switch_elsewhere.py': `${PY}
+def nottest(function):
+    function.__test__ = False
+    return function
+
+@nottest
+def test_decorated_off():
+    mark("tests/test_switch_elsewhere.py::test_decorated_off")
+
+def test_plain():
+    mark("tests/test_switch_elsewhere.py::test_plain")
+`,
+        },
+    },
+    {
+        id: 'pytest-method-resolution-order', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/base.py': `${PY}import inspect
+
+def ran(self, name):
+    cls = type(self)
+    mark(os.path.relpath(inspect.getfile(cls)).replace(os.sep, "/") + "::" + cls.__name__ + " > " + name)
+
+class Root:
+    def test_shared(self):
+        ran(self, "test_shared")
+        mark("tests/base.py::the body in Root")
+
+    def test_root_only(self):
+        ran(self, "test_root_only")
+        mark("tests/base.py::the only body")
+
+class Left(Root):
+    pass
+
+class Right(Root):
+    def test_shared(self):
+        ran(self, "test_shared")
+        mark("tests/base.py::the body in Right")
+`,
+            'tests/test_leaf.py': `import contextlib
+import unittest
+from unittest import TestCase
+from tests.base import Left, Right, Root, ran
+from tests.base import Right as Other
+
+class KnownByName(TestCase, Other):
+    pass
+
+class TestLeaf(Left, Right):
+    pass
+
+class Known(unittest.TestCase, Right):
+    pass
+
+class TestBehindUnknown(contextlib.AbstractContextManager, Right):
+    def __exit__(self, *args):
+        return None
+`,
+        },
+        // A base the project does not declare stands before the class that
+        // declares the tests: which body runs is not settled, so the
+        // engine lists none of them.
+        undeclared: [
+            'tests/test_leaf.py::TestBehindUnknown > test_root_only',
+            'tests/test_leaf.py::TestBehindUnknown > test_shared',
+        ],
+    },
+    {
         id: 'python-no-runner-named', runner: 'pytest', judge: false,
         files: {
             'tests/test_u.py': 'import unittest\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n',
@@ -336,6 +485,111 @@ describe('math', () => {
 describe('math adds', () => {
     it('x', () => { mark('test/n.test.js::math adds > x'); });
 });
+`,
+        },
+    },
+    {
+        id: 'node-test-runner-under-other-names', runner: 'node-test', full: 'node --test test/names.js',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/names.js': `${CJS}const { test: caseIt, describe: group } = require('node:test');
+const runner = require('node:test');
+caseIt('aliased', () => { mark('test/names.js::aliased'); });
+group('grouped', () => {
+    caseIt('inner', () => { mark('test/names.js::grouped > inner'); });
+});
+runner.test('namespaced', () => { mark('test/names.js::namespaced'); });
+runner.describe('ns', () => {
+    runner.it('deep', () => { mark('test/names.js::ns > deep'); });
+});
+const again = caseIt;
+again('local alias', () => { mark('test/names.js::local alias'); });
+const { it: spec } = runner;
+spec('from the namespace', () => { mark('test/names.js::from the namespace'); });
+const member = runner.test;
+member('member alias', () => { mark('test/names.js::member alias'); });
+const direct = require('node:test').test;
+direct('required member', () => { mark('test/names.js::required member'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-esm-bindings', runner: 'node-test', full: 'node --test test/esm.mjs',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/esm.mjs': `${ESM}import { test as caseIt } from 'node:test';
+import * as runner from 'node:test';
+import nodeTest from 'node:test';
+caseIt('aliased', () => { mark('test/esm.mjs::aliased'); });
+runner.describe('ns', () => {
+    runner.it('deep', () => { mark('test/esm.mjs::ns > deep'); });
+});
+nodeTest('default import', () => { mark('test/esm.mjs::default import'); });
+nodeTest.describe('on default', () => {
+    nodeTest.it('member', () => { mark('test/esm.mjs::on default > member'); });
+});
+`,
+        },
+    },
+    {
+        id: 'node-test-binding-not-followed', runner: 'node-test', full: 'node --test test/computed.js',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/computed.js': `${CJS}const runner = require('node:test');
+const pick = runner[process.env.UCN_NO_SUCH_NAME || 'test'];
+pick('picked at run time', () => { mark('test/computed.js::picked at run time'); });
+`,
+            'test/hooks-only.js': "const { beforeEach } = require('node:test');\nmodule.exports = { install() { beforeEach(() => {}); } };\n",
+        },
+        // The declaring function is chosen at run time: the file is a test
+        // file with a command, and its one test is not listed.
+        undeclared: ['test/computed.js:4'],
+    },
+    {
+        id: 'node-test-same-name-twice', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/twice.test.js': `${CJS}const { test, describe, it } = require('node:test');
+test('same', () => { mark('test/twice.test.js::same first'); });
+test('same', () => { mark('test/twice.test.js::same second'); });
+test('alone', () => { mark('test/twice.test.js::alone'); });
+describe('group', () => {
+    it('inside', () => { mark('test/twice.test.js::group > inside first'); });
+});
+describe('group', () => {
+    it('inside', () => { mark('test/twice.test.js::group > inside second'); });
+    it('other', () => { mark('test/twice.test.js::group > other'); });
+});
+`,
+        },
+    },
+    {
+        id: 'node-test-skipped-and-unregistered', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/skips.test.js': `${CJS}const { test, describe, it } = require('node:test');
+test('runs', () => { mark('test/skips.test.js::runs'); });
+test.skip('skipped', () => { mark('test/skips.test.js::skipped'); });
+test.todo('later', () => { mark('test/skips.test.js::later'); });
+describe.skip('whole group', () => {
+    it('inside a skipped group', () => { mark('test/skips.test.js::whole group > inside a skipped group'); });
+});
+`,
+            'test/unregistered.test.js': `${CJS}const { test } = require('node:test');
+function register() {
+    test('never registered', () => { mark('test/unregistered.test.js::never registered'); });
+}
+module.exports = { register };
+`,
+        },
+    },
+    {
+        id: 'node-test-only-is-inert-without-its-flag', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/focus.test.js': `${CJS}const { test } = require('node:test');
+test.only('focused', () => { mark('test/focus.test.js::focused'); });
+test('not left out', () => { mark('test/focus.test.js::not left out'); });
 `,
         },
     },
@@ -458,6 +712,43 @@ describe('uses a local test()', () => {
         },
     },
 
+    {
+        id: 'jest-same-name-twice-and-skips', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'src/twice.test.js': `${CJS}
+it('same', () => { mark('src/twice.test.js::same first'); });
+it('same', () => { mark('src/twice.test.js::same second'); });
+it('alone', () => { mark('src/twice.test.js::alone'); });
+xit('crossed out', () => { mark('src/twice.test.js::crossed out'); });
+it.skip('skipped', () => { mark('src/twice.test.js::skipped'); });
+describe.skip('group', () => {
+    it('inside', () => { mark('src/twice.test.js::group > inside'); });
+});
+const spec = it;
+spec('global under another name', () => { mark('src/twice.test.js::global under another name'); });
+`,
+        },
+    },
+
+    {
+        id: 'jest-focused-tests', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'src/focus.test.js': `${CJS}
+it.only('focused', () => { mark('src/focus.test.js::focused'); });
+it('left out', () => { mark('src/focus.test.js::left out'); });
+describe('group', () => {
+    it('inside', () => { mark('src/focus.test.js::group > inside'); });
+});
+describe.only('focused group', () => {
+    it('inside focus', () => { mark('src/focus.test.js::focused group > inside focus'); });
+});
+`,
+            'src/plain.test.js': `${CJS}it('other file', () => { mark('src/plain.test.js::other file'); });\n`,
+        },
+    },
+
     // ------------------------------------------------------------------ vitest
     {
         id: 'vitest-dependency', runner: 'vitest',
@@ -497,6 +788,20 @@ test('bare (x)', () => { mark('src/sum.test.ts::bare (x)'); });
         },
     },
 
+    {
+        id: 'vitest-runner-under-other-names', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "devDependencies": { "vitest": "^3" } }\n',
+            'src/names.test.js': `${ESM}import { it as spec, describe as group } from 'vitest';
+import * as vt from 'vitest';
+group('grouped', () => {
+    spec('inner', () => { mark('src/names.test.js::grouped > inner'); });
+});
+vt.test('namespaced', () => { mark('src/names.test.js::namespaced'); });
+`,
+        },
+    },
+
     // ------------------------------------------------------------------- mocha
     {
         id: 'mocha-script', runner: 'mocha',
@@ -532,6 +837,35 @@ describe('fifo', function () {
     behavesLikeAQueue('fifo');
 });
 `,
+        },
+    },
+
+    {
+        id: 'mocha-focused-tests', runner: 'mocha',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha --recursive" } }\n',
+            'test/focus.test.js': `${CJS}
+it.only('focused', function () { mark('test/focus.test.js::focused'); });
+it('left out', function () { mark('test/focus.test.js::left out'); });
+`,
+            'test/plain.test.js': `${CJS}it('other file', function () { mark('test/plain.test.js::other file'); });\n`,
+        },
+        // mocha's focus holds for the whole run: a file without one runs
+        // when it is the only file given.
+        notRunByDefault: ['test/plain.test.js::other file'],
+    },
+    {
+        id: 'vitest-focused-tests', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "devDependencies": { "vitest": "^3" } }\n',
+            'src/focus.test.js': `${ESM}import { it, describe } from 'vitest';
+it.only('focused', () => { mark('src/focus.test.js::focused'); });
+it('left out', () => { mark('src/focus.test.js::left out'); });
+describe('group', () => {
+    it('inside', () => { mark('src/focus.test.js::group > inside'); });
+});
+`,
+            'src/plain.test.js': `${ESM}import { it } from 'vitest';\nit('other file', () => { mark('src/plain.test.js::other file'); });\n`,
         },
     },
 
@@ -731,6 +1065,30 @@ mod extra {
         },
     },
     {
+        id: 'cargo-attribute-macros', runner: 'cargo-test',
+        files: {
+            'Cargo.toml': `${CARGO('case_macros')}\n[dev-dependencies]\ntokio = { version = "1", features = ["macros", "rt"] }\nrstest = "0.23"\n`,
+            'src/lib.rs': `${RS}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[tokio::test]
+    async fn waits() { mark("src/lib.rs::tests > waits"); }
+
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    fn rows(#[case] n: i32) { let _ = n; mark("src/lib.rs::tests > rows"); }
+
+    #[test]
+    fn plain() { mark("src/lib.rs::tests > plain"); }
+}
+`,
+        },
+    },
+    {
         id: 'cargo-custom-targets', runner: 'cargo-test',
         files: {
             'Cargo.toml': `${CARGO('case_custom')}\n[lib]\npath = "source/entry.rs"\n`,
@@ -807,6 +1165,93 @@ public class DeepTests
 {
     [Fact]
     public void Lands() { Rec.Mark("DeepTests.cs::DeepTests > Lands"); }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-xunit-what-is-not-discovered', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Hidden.cs': `using Xunit;
+
+namespace Hid.Tests
+{
+${CS}
+    public class Shown
+    {
+        [Fact]
+        public void Runs() { Rec.Mark("Hidden.cs::Shown > Runs"); }
+
+        [Fact]
+        void PrivateFact() { Rec.Mark("Hidden.cs::Shown > PrivateFact"); }
+
+        [Fact]
+        public static void StaticFact() { Rec.Mark("Hidden.cs::Shown > StaticFact"); }
+
+        [Fact(Skip = "not now")]
+        public void Skipped() { Rec.Mark("Hidden.cs::Shown > Skipped"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-mstest-what-is-not-discovered', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ([['Microsoft.NET.Test.Sdk', '17.12.0'], ['MSTest.TestAdapter', '1.2.1'], ['MSTest.TestFramework', '1.2.1']]),
+            'Loose.cs': `using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace Loose.Tests
+{
+${CS}
+    [TestClass]
+    public class Marked
+    {
+        [TestMethod]
+        public void Runs() { Rec.Mark("Loose.cs::Marked > Runs"); }
+
+        [TestMethod]
+        void PrivateMethod() { Rec.Mark("Loose.cs::Marked > PrivateMethod"); }
+
+        [TestMethod]
+        [Ignore]
+        public void Ignored() { Rec.Mark("Loose.cs::Marked > Ignored"); }
+    }
+
+    public class Unmarked
+    {
+        [TestMethod]
+        public void NeverFound() { Rec.Mark("Loose.cs::Unmarked > NeverFound"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-what-is-not-discovered', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ([['Microsoft.NET.Test.Sdk', '17.12.0'], ['NUnit', '3.12.0'], ['NUnit3TestAdapter', '4.6.0']]),
+            'Quiet.cs': `using NUnit.Framework;
+
+namespace Quiet.Tests
+{
+${CS}
+    public class Fixture
+    {
+        [Test]
+        public void Runs() { Rec.Mark("Quiet.cs::Fixture > Runs"); }
+
+        [Test]
+        [Ignore("not now")]
+        public void Ignored() { Rec.Mark("Quiet.cs::Fixture > Ignored"); }
+
+        [Test]
+        public static void StaticTest() { Rec.Mark("Quiet.cs::Fixture > StaticTest"); }
+
+        [Test]
+        void PrivateTest() { Rec.Mark("Quiet.cs::Fixture > PrivateTest"); }
+    }
 }
 `,
         },
@@ -932,6 +1377,10 @@ import org.junit.Test;
 public class ChildTest extends BaseChecks {
     @Test
     public void own() { mark("src/test/java/com/x/ChildTest.java::ChildTest > own"); }
+
+    @Test
+    @org.junit.Ignore("not now")
+    public void ignored() { mark("src/test/java/com/x/ChildTest.java::ChildTest > ignored"); }
 }
 `,
             'src/test/java/com/x/OnlyInheritsTest.java': 'package com.x;\n\npublic class OnlyInheritsTest extends BaseChecks {\n}\n',
@@ -964,6 +1413,36 @@ ${JAVA}
             void bottom() { mark("src/test/java/com/x/OuterTest.java::OuterTest > Deep > Deeper > bottom"); }
         }
     }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-junit5-what-is-not-run', runner: 'maven',
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/RulesTest.java': `package com.x;
+
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+
+class RulesTest {
+${JAVA}
+    @Test
+    void runs() { mark("src/test/java/com/x/RulesTest.java::RulesTest > runs"); }
+
+    @Test
+    private void hidden() { mark("src/test/java/com/x/RulesTest.java::RulesTest > hidden"); }
+
+    @Test
+    static void onTheClass() { mark("src/test/java/com/x/RulesTest.java::RulesTest > onTheClass"); }
+
+    @Test
+    @Disabled("not now")
+    void disabled() { mark("src/test/java/com/x/RulesTest.java::RulesTest > disabled"); }
+
+    @Test
+    void overloaded() { mark("src/test/java/com/x/RulesTest.java::RulesTest > overloaded"); }
 }
 `,
         },

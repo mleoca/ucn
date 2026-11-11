@@ -24,7 +24,7 @@ const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDisp
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
 const { getLanguageAdapter } = require('../languages');
-const { createTestModel, addTestCaseRows, linkFile, commandsFor } = require('./test-units');
+const { createTestModel, addTestCaseRows, linkFiles, commandsFor } = require('./test-units');
 
 /**
  * Contract-mode caller expansion for the tree commands. Memoizes the full
@@ -1310,22 +1310,57 @@ function affectedTests(index, name, options = {}) {
         // how many tests that is.
         for (const [absFile, entry] of frontierTestHits) absoluteOf.set(entry.rel, absFile);
         const confirmedTests = new Set();
-        const describeFile = (row, confirmed) => {
-            const absFile = absoluteOf.get(row.file);
-            if (!absFile) return;
-            const linked = linkFile(model, index, absFile, row.matches
-                .filter(match => match.matchType === 'call' || match.matchType === 'test-case')
-                .map(match => match.line));
-            row.role = linked.role;
-            if (linked.runner) row.runner = linked.runner;
-            row.testCount = linked.tests;
-            if (linked.units.length > 0) row.units = linked.units;
-            if (linked.run) row.run = linked.run;
-            else if (linked.runWithheld) row.runWithheld = linked.runWithheld;
-            if (confirmed) for (const key of linked.testKeys) confirmedTests.add(key);
+        const describeBand = (rows, confirmed) => {
+            const linesByFile = new Map();
+            for (const row of rows) {
+                const absFile = absoluteOf.get(row.file);
+                if (!absFile) continue;
+                linesByFile.set(absFile, row.matches
+                    .filter(match => match.matchType === 'call' || match.matchType === 'test-case')
+                    .map(match => match.line));
+            }
+            const byFile = new Map(rows.map(row => [row.file, row]));
+            for (const [absFile, linked] of linkFiles(model, index, linesByFile)) {
+                const relativePath = index.files.get(absFile).relativePath;
+                let row = byFile.get(relativePath);
+                if (!row) {
+                    // The file of a class that inherits a linked test: the
+                    // test runs there, whatever file its body stands in.
+                    const sources = (linked.from || []).map(from => byFile.get(from)).filter(Boolean);
+                    row = {
+                        file: relativePath,
+                        linkedFunctions: [...new Set(sources.flatMap(source => source.linkedFunctions))]
+                            .sort(codeUnitCompare),
+                        matchCount: 0,
+                        matches: [],
+                    };
+                    byFile.set(relativePath, row);
+                    absoluteOf.set(relativePath, absFile);
+                    rows.push(row);
+                }
+                for (const unit of linked.units) {
+                    if (!unit.inheritedFrom) continue;
+                    row.matches.push({
+                        line: unit.line,
+                        content: (index.getLineContent(absFile, unit.line) || '').trim(),
+                        matchType: 'inherited-test',
+                        functionName: row.linkedFunctions[0] || name,
+                        name: unit.name,
+                        from: unit.inheritedFrom,
+                    });
+                    row.matchCount = row.matches.length;
+                }
+                row.role = linked.role;
+                if (linked.runner) row.runner = linked.runner;
+                row.testCount = linked.tests;
+                if (linked.units.length > 0) row.units = linked.units;
+                if (linked.run) row.run = linked.run;
+                else if (linked.runWithheld) row.runWithheld = linked.runWithheld;
+                if (confirmed) for (const key of linked.testKeys) confirmedTests.add(key);
+            }
         };
-        for (const row of results) describeFile(row, true);
-        for (const row of possibleResults) describeFile(row, false);
+        describeBand(results, true);
+        describeBand(possibleResults, false);
 
         // Sort by linkage breadth then alphabetically
         results.sort((a, b) => b.linkedFunctions.length - a.linkedFunctions.length || codeUnitCompare(a.file, b.file));

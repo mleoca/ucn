@@ -570,13 +570,15 @@ function formatAffectedTests(result, options = {}) {
         lines.push('');
         for (const tf of displayFiles) {
             const count = tf.testCount > 0 ? ` · ${tf.testCount} test${tf.testCount === 1 ? '' : 's'}` : '';
-            lines.push(`  ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})${count}`);
+            const refusal = tf.runWithheld ? ` · no command: ${tf.runWithheld}` : '';
+            lines.push(`  ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})${count}${refusal}`);
             // Show up to 5 key matches per file
             const keyMatches = tf.matches
-                .filter(m => m.matchType === 'call' || m.matchType === 'test-case')
+                .filter(m => m.matchType === 'call' || m.matchType === 'test-case' || m.matchType === 'inherited-test')
                 .slice(0, 5);
             for (const m of keyMatches) {
-                lines.push(`    L${m.line}: ${m.content}  [${m.matchType}]`);
+                const origin = m.matchType === 'inherited-test' ? `  ${m.name} (from ${m.from})` : '';
+                lines.push(`    L${m.line}: ${m.content}${origin}  [${m.matchType}]`);
             }
         }
         if (truncatedFiles > 0) {

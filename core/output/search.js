@@ -429,10 +429,14 @@ function formatTests(tests, name) {
                     match.matchType === 'call' ? '[call]' :
                     match.matchType === 'unverified-call' ? '[unverified-call]' :
                     match.matchType === 'unverified-reference' ? '[unverified-ref]' :
+                    match.matchType === 'inherited-test' ? '[inherited]' :
                     match.matchType === 'string-ref' ? '[string]' : '[ref]';
-                lines.push(`  ${match.line}: ${typeLabel} ${match.content}`);
+                // A test the class inherits: its name, and where its body is.
+                const origin = match.matchType === 'inherited-test' ? `  ${match.name} (from ${match.from})` : '';
+                lines.push(`  ${match.line}: ${typeLabel} ${match.content}${origin}`);
             }
             if (testFile.run) lines.push(`  run: ${selectorText(testFile.run)}`);
+            else if (testFile.role === 'tests' && testFile.runWithheld) lines.push(`  no command: ${testFile.runWithheld}`);
             lines.push('');
         }
     }

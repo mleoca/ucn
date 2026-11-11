@@ -2895,6 +2895,9 @@ function testUnits(fileEntry, helpers) {
     const testsIn = new Map();
     const declared = new Map();
     const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract');
+    // @Disabled (JUnit 5) and @Ignore (JUnit 4): declared, not executed.
+    const disabled = symbol => (symbol.annotationsWithArgs || [])
+        .some(annotation => /^(Disabled|Ignore)$/.test(String(annotation.name).split('.').pop()));
     const legacyMemo = new Map();
     const legacy = cls => {
         if (!legacyMemo.has(cls)) {
@@ -2912,9 +2915,13 @@ function testUnits(fileEntry, helpers) {
             .some(annotation => JAVA_TEST_ANNOTATIONS.has(String(annotation.name).split('.').pop()));
         if (!annotated && !(legacy(owner) && /^test/.test(symbol.name) &&
             (symbol.modifiers || []).includes('public'))) continue;
+        // JUnit runs neither a private nor a static method as a test.
+        if ((symbol.modifiers || []).includes('private') || (symbol.modifiers || []).includes('static')) continue;
+        const off = [symbol, ...chain].some(disabled);
         const row = {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+            ...(off && { skipped: true }),
         };
         if (!declared.has(owner)) declared.set(owner, []);
         declared.get(owner).push(row);
@@ -2929,7 +2936,7 @@ function testUnits(fileEntry, helpers) {
         units.push({
             kind: 'test', suite: chain.map(cls => cls.name), ...row,
             ...(symbol.namespace && { namespace: symbol.namespace }),
-            ...(unmarked.length > 0 && { conditional: true }),
+            ...(unmarked.length > 0 && { conditional: true, notInEveryBuild: true }),
         });
     }
     const classes = [];
@@ -2942,6 +2949,7 @@ function testUnits(fileEntry, helpers) {
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases,
             runnable: [...chain, cls].every(concrete),
+            ...([...chain, cls].some(disabled) && { skipped: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
             members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&

@@ -3884,7 +3884,7 @@ function testUnits(fileEntry, helpers) {
         units.push({
             kind: 'test', name: symbol.name, suite: [], form,
             // A file under a build constraint is compiled only sometimes.
-            ...((fileEntry.buildConstraint || platform) && { conditional: true }),
+            ...((fileEntry.buildConstraint || platform) && { conditional: true, notInEveryBuild: true }),
             line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
             endLine: symbol.endLine ?? symbol.startLine,
         });

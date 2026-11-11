@@ -167,15 +167,6 @@ function configWords(table, key) {
 // Runners
 // ---------------------------------------------------------------------------
 
-// Modules whose import in a test file says which runner executes it.
-const JS_RUNNER_MODULES = new Map([
-    ['node:test', 'node-test'], ['test', 'node-test'],
-    ['vitest', 'vitest'],
-    ['@jest/globals', 'jest'],
-    ['mocha', 'mocha'],
-    ['bun:test', 'bun'], ['@playwright/test', 'playwright'], ['ava', 'ava'], ['tap', 'tap'],
-    ['uvu', 'uvu'], ['@japa/runner', 'japa'], ['cypress', 'cypress'],
-]);
 // Package and command names of JavaScript runners; `true` marks the ones
 // whose selection syntax is modeled.
 const JS_RUNNER_PACKAGES = new Map([
@@ -187,6 +178,9 @@ const JS_RUNNER_PACKAGES = new Map([
     ['react-scripts', 'react-scripts'], ['ng', 'angular'], ['nx', 'nx'], ['turbo', 'turbo'], ['lerna', 'lerna'],
 ]);
 const MODELED_JS = new Set(['node-test', 'jest', 'vitest', 'mocha']);
+// Runners in which a focused test (`.only`) keeps the other tests of its
+// file from running. node:test honours the mark only under --test-only.
+const FOCUS_RUNNERS = new Set(['jest', 'vitest', 'mocha']);
 // Node options that take the next word as their value.
 const NODE_VALUE_OPTIONS = new Set(['--import', '--require', '-r', '--loader', '--experimental-loader',
     '--conditions', '-C', '--env-file', '--test-reporter', '--test-reporter-destination',
@@ -250,9 +244,10 @@ function nodeTestOptions(script) {
 
 function jsRunner(model, fileEntry) {
     // 1. The file's own imports.
+    const modules = langTraits(fileEntry.language)?.testRunnerModules?.() || new Map();
     const imported = new Set();
     for (const mod of fileEntry.imports || []) {
-        const runner = JS_RUNNER_MODULES.get(mod);
+        const runner = modules.get(mod);
         if (runner) imported.add(runner);
     }
     if (imported.size > 1) return { id: null, reason: 'ambiguous-runner' };
@@ -484,7 +479,7 @@ const SELECTORS = {
     'go-test'(model, runner, fileEntry, unit) {
         const file = relativeTo(runner.dir, fileEntry.relativePath);
         if (file == null) return withheld('outside-runner-root');
-        if (fileEntry.buildConstraint || (unit && unit.conditional)) return withheld('build-constraint');
+        if (fileEntry.buildConstraint || (unit && unit.notInEveryBuild)) return withheld('build-constraint');
         const dir = posixDir(file);
         const pkg = dir ? `./${dir}` : '.';
         if (!unit) return command(runner, ['go', 'test', shellWord(pkg)]);
@@ -717,74 +712,113 @@ function createTestModel(index) {
         return hits.length === 1 ? hits[0] : null;
     };
 
+    const nodeKey = node => node.opaque ? `?${node.name}` : `${node.filePath}\0${node.cls.startLine}`;
+    const linearMemo = new Map();
+
     /**
-     * Tests a runnable class runs without declaring them: the test-shaped
-     * methods of the classes it derives from, nearest first, unless a
-     * nearer class declares a member of that name. `open` is set when a
-     * base is not a class the project declares once.
+     * The order in which a class's members are looked up: the class, then
+     * the classes it derives from. `c3` is Python's method resolution
+     * order; otherwise depth first in the order written (a superclass
+     * before the interfaces). A base that is not a class the project
+     * declares once stands in the order as an opaque entry, `safe` when the
+     * language's reader knows it brings neither a test nor a constructor.
+     */
+    const linearize = (filePath, cls, mode, trail = new Set()) => {
+        const key = `${filePath}\0${cls.startLine}`;
+        if (linearMemo.has(key)) return linearMemo.get(key);
+        const self = { filePath, cls };
+        if (trail.has(key)) return [self];
+        trail.add(key);
+        const parents = cls.bases.map(written => {
+            const base = baseClass(filePath, written);
+            if (base) return base;
+            const name = String(written).replace(/[<[(].*$/, '').split('.').pop().trim();
+            return { opaque: true, name, safe: (cls.plainBases || []).includes(written) };
+        });
+        const below = parent => parent.opaque ? [parent] : linearize(parent.filePath, parent.cls, mode, trail);
+        let order = [self];
+        if (mode === 'c3') {
+            const sequences = [...parents.map(parent => below(parent).slice()), parents.slice()];
+            while (sequences.some(sequence => sequence.length > 0)) {
+                const head = sequences.filter(sequence => sequence.length > 0).map(sequence => sequence[0])
+                    .find(candidate => !sequences.some(other =>
+                        other.slice(1).some(node => nodeKey(node) === nodeKey(candidate))));
+                if (!head) {
+                    // No consistent order: the language rejects the class.
+                    order = [self, { opaque: true, name: '', safe: false }];
+                    break;
+                }
+                order.push(head);
+                for (const sequence of sequences) {
+                    if (sequence.length > 0 && nodeKey(sequence[0]) === nodeKey(head)) sequence.shift();
+                }
+            }
+        } else {
+            const seen = new Set([key]);
+            for (const parent of parents) {
+                for (const node of below(parent)) {
+                    if (seen.has(nodeKey(node))) continue;
+                    seen.add(nodeKey(node));
+                    order.push(node);
+                }
+            }
+        }
+        trail.delete(key);
+        linearMemo.set(key, order);
+        return order;
+    };
+    const orderOf = (filePath, cls) => linearize(filePath, cls, model.declared(filePath)?.linearization || null);
+
+    /**
+     * Tests a runnable class runs without declaring them: for each
+     * test-shaped name, the first class in lookup order that declares a
+     * member of that name. A test found behind a base that is not read is
+     * not attributed (`withheld`): that base may declare the name itself.
      */
     const inheritedBy = (filePath, cls) => {
         const out = [];
         const hidden = new Set(cls.members);
-        const visited = new Set();
-        let open = false;
-        const climb = (fromFile, bases) => {
-            for (const written of bases) {
-                const base = baseClass(fromFile, written);
-                if (!base) { open = true; continue; }
-                const key = `${base.filePath}\0${base.cls.startLine}`;
-                if (visited.has(key)) continue;
-                visited.add(key);
-                for (const test of base.cls.tests) {
-                    if (hidden.has(test.name)) continue;
-                    hidden.add(test.name);
-                    out.push({ test, base });
-                }
-                for (const member of base.cls.members) hidden.add(member);
-                climb(base.filePath, base.cls.bases);
+        let behindUnknown = false;
+        let withheldAny = false;
+        for (const node of orderOf(filePath, cls).slice(1)) {
+            if (node.opaque) {
+                if (!node.safe) behindUnknown = true;
+                continue;
             }
-        };
-        climb(filePath, cls.bases);
-        return { tests: out, open };
+            for (const test of node.cls.tests) {
+                if (hidden.has(test.name)) continue;
+                hidden.add(test.name);
+                if (behindUnknown) withheldAny = true;
+                else out.push({ test, base: node });
+            }
+            for (const member of node.cls.members) hidden.add(member);
+        }
+        return { tests: out, open: behindUnknown, withheld: withheldAny };
     };
 
     /**
      * Does the runner refuse a class its own declarations would let in:
-     * it or a class it derives from declares the member that rules a
-     * class out (`refusedIfDeclares`), or the nearest explicit switch
-     * (`enabled`) along its ancestry says off.
+     * a class it derives from declares a member that rules a class out
+     * (`refusedIfDeclares`), or the nearest explicit switch (`enabled`) in
+     * lookup order says off. `unknown`: a base that is not read could.
      */
-    const refused = (filePath, cls) => refusal(filePath, cls).refused;
-
-    // Bases every class may name without bringing a constructor of its own.
-    const PLAIN_BASES = new Set(['object', 'ABC', 'Generic', 'Protocol']);
-
     const refusal = (filePath, cls) => {
-        const visited = new Set();
+        const rules = cls.refusedIfDeclares ? [].concat(cls.refusedIfDeclares) : [];
         let switchSeen = cls.enabled != null;
         let off = cls.enabled === false;
         let ruledOut = false;
         let unknown = false;
-        const climb = (fromFile, bases) => {
-            for (const written of bases) {
-                const base = baseClass(fromFile, written);
-                if (!base) {
-                    const last = String(written).replace(/[<[(].*$/, '').split('.').pop().trim();
-                    if (cls.refusedIfDeclares && !PLAIN_BASES.has(last)) unknown = true;
-                    continue;
-                }
-                const key = `${base.filePath}\0${base.cls.startLine}`;
-                if (visited.has(key)) continue;
-                visited.add(key);
-                if (cls.refusedIfDeclares && base.cls.members.includes(cls.refusedIfDeclares)) ruledOut = true;
-                if (!switchSeen && base.cls.enabled != null) {
-                    switchSeen = true;
-                    off = base.cls.enabled === false;
-                }
-                climb(base.filePath, base.cls.bases);
+        for (const node of orderOf(filePath, cls).slice(1)) {
+            if (node.opaque) {
+                if (rules.length > 0 && !node.safe) unknown = true;
+                continue;
             }
-        };
-        climb(filePath, cls.bases);
+            if (rules.some(name => node.cls.members.includes(name))) ruledOut = true;
+            if (!switchSeen && node.cls.enabled != null) {
+                switchSeen = true;
+                off = node.cls.enabled === false;
+            }
+        }
         return { refused: ruledOut || off, unknown: !(ruledOut || off) && unknown };
     };
 
@@ -801,39 +835,47 @@ function createTestModel(index) {
             facts = { modeled: false, units: [], tests: 0, inheriting: false };
         } else {
             // A class its runner refuses holds no test, whatever it declares.
-            const refusedClasses = (found.classes || []).filter(cls => cls.runnable && refused(filePath, cls));
+            const refusedClasses = (found.classes || []).filter(cls => cls.runnable && refusal(filePath, cls).refused);
             // Whether the runner takes a class that derives from one the
             // project does not declare cannot be read here: its tests are
             // listed as collected only sometimes, with no command.
             const unsettled = (found.classes || []).filter(cls => cls.runnable && cls.refusedIfDeclares &&
                 !refusedClasses.includes(cls) && refusal(filePath, cls).unknown);
-            const units = found.units.filter(unit => !refusedClasses.some(cls =>
-                unit.startLine >= cls.startLine && unit.endLine <= cls.endLine))
-                .map(unit => unit.kind === 'test' && unsettled.some(cls =>
-                    unit.startLine >= cls.startLine && unit.endLine <= cls.endLine)
-                    ? { ...unit, conditional: true, dynamic: unit.dynamic || 'base-not-resolved' } : unit);
-            let inheriting = !!found.inheriting;
+            const within = (unit, cls) => unit.startLine >= cls.startLine && unit.endLine <= cls.endLine;
+            // A focused test leaves the others of its file declared and
+            // not executed, under the runners that honour the mark.
+            const focus = !!found.focus && FOCUS_RUNNERS.has(model.runnerOf(filePath).id);
+            const units = found.units.filter(unit => !refusedClasses.some(cls => within(unit, cls)))
+                .map(unit => unit.kind === 'test' && unsettled.some(cls => within(unit, cls))
+                    ? { ...unit, conditional: true, dynamic: unit.dynamic || 'base-not-resolved' } : unit)
+                .map(unit => focus && unit.kind === 'test' && !unit.focused ? { ...unit, skipped: true } : unit);
+            // `open`: the file binds its runner's declaring function and
+            // no declaration was read.
+            let inheriting = !!found.inheriting || !!found.open;
             for (const cls of found.classes || []) {
                 if (!cls.runnable || cls.bases.length === 0 || refusedClasses.includes(cls)) continue;
                 const inherited = inheritedBy(filePath, cls);
-                const own = units.some(unit => unit.kind === 'test' &&
-                    unit.startLine >= cls.startLine && unit.endLine <= cls.endLine);
-                if (inherited.open && !own && inherited.tests.length === 0) inheriting = true;
+                const own = units.some(unit => unit.kind === 'test' && within(unit, cls));
+                if (inherited.withheld || (inherited.open && !own && inherited.tests.length === 0)) inheriting = true;
                 if (inherited.tests.length > 0 && !own) {
                     units.push({
                         kind: 'suite', name: cls.name, suite: cls.suite,
                         line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
                     });
                 }
+                const sometimes = cls.unsettled || unsettled.includes(cls);
                 for (const { test, base } of inherited.tests) {
                     units.push({
                         kind: 'test', name: test.name, suite: [...cls.suite, cls.name],
                         ...(cls.namespace && { namespace: cls.namespace }),
                         line: cls.line, startLine: cls.line, endLine: cls.line,
+                        ...((test.skipped || cls.skipped) && { skipped: true }),
+                        ...(sometimes && { conditional: true, dynamic: cls.unsettled ? 'collection-switch' : 'base-not-resolved' }),
                         inherited: {
                             file: index.files.get(base.filePath).relativePath,
                             filePath: base.filePath, owner: base.cls.name,
                             ownerLine: base.cls.startLine, line: test.line,
+                            startLine: test.startLine, endLine: test.endLine,
                         },
                     });
                 }
@@ -843,7 +885,8 @@ function createTestModel(index) {
             facts = {
                 modeled: true,
                 units,
-                tests: units.filter(unit => unit.kind === 'test').length,
+                // A test that is declared and not executed is not counted.
+                tests: units.filter(unit => unit.kind === 'test' && !unit.skipped).length,
                 inheriting,
             };
         }
@@ -947,6 +990,14 @@ function createTestModel(index) {
         if (unit && unit.kind !== 'test') return withheld('not-a-test');
         if (unit && unit.name == null) return withheld('name-not-literal');
         if (unit && unit.dynamic) return withheld(unit.dynamic);
+        // Runners select by name: two declarations of one name in one
+        // suite are one selection.
+        if (unit && model.unitsOf(filePath).units.some(other => other !== unit && other.kind === 'test' &&
+            other.name === unit.name && other.suite.length === unit.suite.length &&
+            other.suite.every((name, i) => name === unit.suite[i]) &&
+            !(other.inherited && unit.inherited && other.startLine !== unit.startLine))) {
+            return withheld('name-not-unique');
+        }
         try {
             return build(model, runner, fileEntry, unit || null, filePath);
         } catch (e) {
@@ -964,6 +1015,7 @@ function createTestModel(index) {
             line: unit.line,
             ...(unit.inherited && { inheritedFrom: `${unit.inherited.file}:${unit.inherited.line}` }),
             ...(unit.conditional && { conditional: true }),
+            ...(unit.skipped && { skipped: true }),
             ...(unit.kind === 'test' && selector && { selector }),
             ...(unit.kind === 'test' && !selector && { selectorWithheld: reason }),
         };
@@ -978,14 +1030,17 @@ function createTestModel(index) {
         if (runner.id) out.runner = runner.id;
         if (role === 'tests') {
             const tests = facts.units.filter(unit => unit.kind === 'test');
-            // A file whose every test is compiled or collected only
-            // sometimes has no command that is known to run it.
-            // So has a file whose tests are all declared inside functions:
-            // they exist only where something calls those functions.
-            const { selector, reason } = tests.length > 0 && tests.every(unit => unit.conditional)
-                ? withheld('conditional-tests')
+            // A module its runner is told not to collect has no command.
+            // A file whose tests are all declared inside functions has
+            // them only where something calls those functions; one whose
+            // every test is left out of some builds has no command that
+            // is known to run it.
+            const { selector, reason } = model.declared(filePath)?.off
+                ? withheld('collection-switched-off')
                 : tests.length > 0 && tests.every(unit => unit.dynamic === 'declared-indirectly')
-                    ? withheld('declared-indirectly') : model.selectorOf(filePath, null);
+                    ? withheld('declared-indirectly')
+                    : tests.length > 0 && tests.every(unit => unit.notInEveryBuild)
+                        ? withheld('conditional-tests') : model.selectorOf(filePath, null);
             if (selector) out.run = selector;
             else out.runWithheld = reason;
         }
@@ -1054,26 +1109,33 @@ function addTestCaseRows(model, index, filePath, term, matches, options) {
     matches.push(...added);
 }
 
+/** One declaration: two tests of one name on two lines are two tests. */
 function testKey(relativePath, unit) {
-    return [relativePath, ...unit.suite, unit.name == null ? `@${unit.startLine}` : unit.name].join('\0');
+    return [relativePath, ...unit.suite, unit.name == null ? '' : unit.name, `@${unit.startLine}`].join('\0');
 }
 
 /**
  * What the lines of a test-path file that reach a symbol amount to: the
- * file's role and runner, the units that execute those lines (here, and
- * in the files of classes that inherit them), how many tests that is, and
- * the command for the file.
+ * file's role and runner, the units of THIS file that execute those lines
+ * (plus `extra`: units of this file that execute lines of another, handed
+ * over by that file's answer), how many tests that is, and the command for
+ * the file. `carried` (not enumerable) holds the units of OTHER files that
+ * execute these lines: a test a class inherits runs where the class is.
  * @returns {{role: string, runner?: string, run?: object, runWithheld?: string,
- *   units: object[], tests: number, testKeys: string[]}}
+ *   units: object[], tests: number, testKeys: string[], carried: Array<{filePath: string, unit: object}>}}
  */
-function linkFile(model, index, filePath, lines) {
+function linkFile(model, index, filePath, lines, extra = []) {
     const facts = model.fileFacts(filePath);
     const relativePath = index.files.get(filePath).relativePath;
     const rows = new Map();
     const tests = new Set();
-    const count = (at, unit) => {
-        const rel = index.files.get(at).relativePath;
-        for (const test of model.testsWithin(at, unit)) tests.add(testKey(rel, test));
+    const carried = [];
+    const take = unit => {
+        const key = `${unit.kind}\0${testKey(relativePath, unit)}`;
+        if (!rows.has(key)) rows.set(key, model.describe(filePath, unit));
+        for (const test of model.testsWithin(filePath, unit)) {
+            if (!test.skipped) tests.add(testKey(relativePath, test));
+        }
     };
     let fileLevel = false;
     for (const line of [...new Set(lines)].sort((a, b) => a - b)) {
@@ -1082,20 +1144,20 @@ function linkFile(model, index, filePath, lines) {
             fileLevel = true;
             continue;
         }
-        for (const { filePath: at, unit } of runs) {
-            const rel = index.files.get(at).relativePath;
-            const key = `${unit.kind}\0${testKey(rel, unit)}`;
-            if (!rows.has(key)) {
-                rows.set(key, { ...model.describe(at, unit), ...(at !== filePath && { file: rel }) });
-            }
-            count(at, unit);
+        for (const run of runs) {
+            if (run.filePath === filePath) take(run.unit);
+            else carried.push(run);
         }
     }
+    for (const unit of extra) take(unit);
     // Code outside every unit runs with the file: all its tests count.
-    if (fileLevel && facts.role === 'tests') count(filePath, null);
-    const units = [...rows.values()].sort((a, b) => codeUnitCompare(a.file || relativePath, b.file || relativePath) ||
-        a.line - b.line || codeUnitCompare(a.name || '', b.name || ''));
-    return {
+    if (fileLevel && facts.role === 'tests') {
+        for (const test of model.testsWithin(filePath, null)) {
+            if (!test.skipped) tests.add(testKey(relativePath, test));
+        }
+    }
+    const units = [...rows.values()].sort((a, b) => a.line - b.line || codeUnitCompare(a.name || '', b.name || ''));
+    const out = {
         role: facts.role,
         ...(facts.runner && { runner: facts.runner }),
         ...(facts.run && { run: facts.run }),
@@ -1104,6 +1166,42 @@ function linkFile(model, index, filePath, lines) {
         tests: tests.size,
         testKeys: [...tests].sort(codeUnitCompare),
     };
+    Object.defineProperty(out, 'carried', { value: carried, enumerable: false });
+    return out;
+}
+
+/**
+ * Link several files at once: each file's own lines, then the units that
+ * other files' lines carried into it. A file that only receives carried
+ * units (its class inherits a test whose body is elsewhere) gets a row of
+ * its own.
+ * @param {Map<string, number[]>} linesByFile - absolute path -> lines
+ * @returns {Map<string, object>} absolute path -> linkFile answer, plus
+ *   `from`: the relative paths whose lines its carried units execute
+ */
+function linkFiles(model, index, linesByFile) {
+    const carriedInto = new Map(); // absolute path -> { units: Map, from: Set }
+    for (const [filePath, lines] of linesByFile) {
+        for (const run of linkFile(model, index, filePath, lines).carried) {
+            let held = carriedInto.get(run.filePath);
+            if (!held) {
+                held = { units: new Map(), from: new Set() };
+                carriedInto.set(run.filePath, held);
+            }
+            held.units.set(testKey('', run.unit), run.unit);
+            held.from.add(index.files.get(filePath).relativePath);
+        }
+    }
+    const out = new Map();
+    const all = new Set([...linesByFile.keys(), ...carriedInto.keys()]);
+    for (const filePath of [...all].sort(codeUnitCompare)) {
+        const held = carriedInto.get(filePath);
+        const linked = linkFile(model, index, filePath, linesByFile.get(filePath) || [],
+            held ? [...held.units.values()] : []);
+        if (held) linked.from = [...held.from].sort(codeUnitCompare);
+        out.set(filePath, linked);
+    }
+    return out;
 }
 
 // Runners whose file command ends in the path and takes several of them.
@@ -1118,8 +1216,9 @@ function commandsFor(model, filePaths) {
     const groups = new Map();
     const single = [];
     for (const filePath of filePaths) {
-        if (model.roleOf(filePath) !== 'tests') continue;
-        const { selector } = model.selectorOf(filePath, null);
+        // The file's own answer decides: a command it withholds is not
+        // offered again here.
+        const selector = model.fileFacts(filePath).run;
         if (!selector) continue;
         const runner = model.runnerOf(filePath);
         const cut = selector.command.lastIndexOf(' ');
@@ -1162,7 +1261,7 @@ function unitLabel(unit) {
 
 module.exports = {
     createTestModel, selectorText, unitLabel, shellWord, globMatches,
-    addTestCaseRows, linkFile, commandsFor,
+    addTestCaseRows, linkFile, linkFiles, commandsFor,
     // Exposed for tests.
     scriptRunners, nodeTestOptions, configWords, tableText,
 };

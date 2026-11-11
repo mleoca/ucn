@@ -17,7 +17,7 @@ const { isAccessorDefinition, findAccessorReferences } = require('./accessors');
 const isSafeRegex = require('safe-regex2');
 const { RE2JS } = require('re2js');
 const { UcnError } = require('./errors');
-const { createTestModel, addTestCaseRows, linkFile } = require('./test-units');
+const { createTestModel, addTestCaseRows, linkFiles } = require('./test-units');
 
 // Keep the established search-input contract for the canonical catastrophic
 // nested-single-atom family even though the RE2-compatible engine could run it
@@ -1842,6 +1842,7 @@ function tests(index, nameOrFile, options = {}) {
     // The tests that hold the matches (core/test-units.js): one row per
     // test, then what the file is to its runner and how to run it.
     const absolute = new Map(testFiles.map(info => [info.entry.relativePath, info.path]));
+    const linesByFile = new Map();
     for (const fileResult of results) {
         const testPath = absolute.get(fileResult.file);
         if (!testPath) continue;
@@ -1850,10 +1851,32 @@ function tests(index, nameOrFile, options = {}) {
             titles: titled.has(fileResult.file),
             titleNeedsMatch: !!className,
         });
-        fileResult.matches.sort((a, b) => (a.line || 0) - (b.line || 0) ||
-            codeUnitCompare(a.matchType || '', b.matchType || ''));
-        const linked = linkFile(model, index, testPath,
+        linesByFile.set(testPath,
             fileResult.matches.filter(match => match.matchType !== 'import').map(match => match.line));
+    }
+    // A test a class inherits runs where the class is: the file of a class
+    // that inherits a linked test is a result of its own, with the test.
+    const byFile = new Map(results.map(fileResult => [fileResult.file, fileResult]));
+    for (const [testPath, linked] of linkFiles(model, index, linesByFile)) {
+        const relativePath = index.files.get(testPath).relativePath;
+        let fileResult = byFile.get(relativePath);
+        if (!fileResult) {
+            fileResult = { file: relativePath, matches: [] };
+            byFile.set(relativePath, fileResult);
+            results.push(fileResult);
+        }
+        for (const unit of linked.units) {
+            if (!unit.inheritedFrom) continue;
+            fileResult.matches.push({
+                line: unit.line,
+                content: (index.getLineContent(testPath, unit.line) || '').trim(),
+                matchType: 'inherited-test',
+                name: unit.name,
+                from: unit.inheritedFrom,
+            });
+        }
+        fileResult.matches.sort((a, b) => (a.line || 0) - (b.line || 0) ||
+            codeUnitCompare(a.matchType || '', b.matchType || '') || codeUnitCompare(a.name || '', b.name || ''));
         fileResult.role = linked.role;
         if (linked.runner) fileResult.runner = linked.runner;
         fileResult.tests = linked.tests;
@@ -1861,6 +1884,7 @@ function tests(index, nameOrFile, options = {}) {
         if (linked.run) fileResult.run = linked.run;
         else if (linked.runWithheld) fileResult.runWithheld = linked.runWithheld;
     }
+    results.sort((a, b) => codeUnitCompare(a.file || '', b.file || ''));
 
     return results;
     } finally { index._endOp(); }

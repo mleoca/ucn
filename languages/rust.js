@@ -6427,8 +6427,9 @@ function testUnits(fileEntry, helpers) {
             kind: 'test', name: symbol.name, suite: chain.map(outer => outer.name),
             line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
             endLine: symbol.endLine ?? symbol.startLine,
-            ...(names.includes('ignore') && { ignored: true }),
-            ...((ownGate || gates > (inTestModule ? 1 : 0)) && { conditional: true }),
+            // Declared, and left out of a run unless asked for.
+            ...(names.includes('ignore') && { ignored: true, skipped: true }),
+            ...((ownGate || gates > (inTestModule ? 1 : 0)) && { conditional: true, notInEveryBuild: true }),
             ...(cases && { dynamic: 'generated-cases' }),
         });
     }

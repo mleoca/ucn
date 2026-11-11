@@ -42,7 +42,9 @@ const { langTraits } = require('../languages');
 const { assessDeletion, definiteDependentsOf, REASON_TEXT } = require('./deletion');
 const { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, HAZARD_TEXT } = require('./capture');
 const { reviewItemsOf } = require('./review-items');
-const { createTestModel, linkFile, commandsFor } = require('./test-units');
+const { createTestModel, linkFiles, commandsFor } = require('./test-units');
+// Reasons a file has no command that are about the file, not the runner.
+const FILE_WOULD_NOT_RUN = new Set(['declared-indirectly', 'collection-switched-off', 'conditional-tests']);
 const { resolveTarget, flaggedPaths } = require('./snapshot');
 const { projectKind, submoduleOf } = require('./deletion');
 
@@ -1082,17 +1084,29 @@ function checkTarget(index, options, repoRoot) {
     for (const [file, entry] of index.files) {
         if (linesByFile.has(entry.relativePath)) absoluteTest.set(entry.relativePath, file);
     }
+    // The lines each file's links stand on; a test a class inherits is
+    // carried to the file of the class that runs it, which may be a file
+    // no link stands in.
+    const linesOf = new Map();
+    for (const [rel, held] of linesByFile) {
+        if (absoluteTest.has(rel)) linesOf.set(absoluteTest.get(rel), [...held.lines]);
+    }
     testFiles = [];
     supportFiles = [];
     const countedTests = new Set();
-    for (const rel of [...linesByFile.keys()].sort()) {
+    const runnable = [];
+    for (const [absFile, linked] of linkFiles(model, index, linesOf)) {
+        const rel = index.files.get(absFile).relativePath;
         const held = linesByFile.get(rel);
-        const linked = linkFile(model, index, absoluteTest.get(rel), [...held.lines]);
+        const names = new Set(held ? held.linked : []);
+        for (const from of linked.from || []) {
+            for (const name of (linesByFile.get(from) || { linked: [] }).linked) names.add(name);
+        }
         const row = {
             file: rel,
             role: linked.role,
             ...(linked.runner && { runner: linked.runner }),
-            linkedFunctions: [...held.linked].sort(),
+            linkedFunctions: [...names].sort(),
             testCount: linked.tests,
             ...(linked.run && { run: linked.run }),
             ...(linked.runWithheld && { runWithheld: linked.runWithheld }),
@@ -1102,10 +1116,13 @@ function checkTarget(index, options, repoRoot) {
             continue;
         }
         testFiles.push(row);
+        runnable.push(absFile);
         for (const key of linked.testKeys) countedTests.add(key);
     }
+    testFiles.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+    supportFiles.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
     testCount = countedTests.size;
-    testCommands = commandsFor(model, testFiles.map(row => absoluteTest.get(row.file)));
+    testCommands = commandsFor(model, runnable.sort());
     } finally { index._endOp(); }
 
     // Action items: one per reason an item is not ready, then what else the
@@ -1245,14 +1262,20 @@ function checkTarget(index, options, repoRoot) {
                 (testCommands.length > shown.length ? ` (+${testCommands.length - shown.length} more command(s))` : ''),
             commands: testCommands,
         });
-    } else if (testFiles.length > 0) {
-        const filesList = testFiles.slice(0, 5).map(t => t.file).join(' ');
-        actions.push({
-            severity: 'info',
-            kind: 'tests_to_run',
-            message: `Run tests: ${filesList}` +
-                (testFiles.length > 5 ? ` (+${testFiles.length - 5} more)` : ''),
-        });
+    } else {
+        // No runner is proven: the files are named, without a command.
+        // A file whose own answer says running it would not run its tests
+        // (declared inside functions, switched off, left out of the
+        // build) is not named.
+        const named = testFiles.filter(row => !FILE_WOULD_NOT_RUN.has(row.runWithheld));
+        if (named.length > 0) {
+            actions.push({
+                severity: 'info',
+                kind: 'tests_to_run',
+                message: `Run tests: ${named.slice(0, 5).map(t => t.file).join(' ')}` +
+                    (named.length > 5 ? ` (+${named.length - 5} more)` : ''),
+            });
+        }
     }
 
     // Counts describe the items whose callers matter: an inert change has

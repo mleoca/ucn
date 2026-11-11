@@ -2994,6 +2994,11 @@ function testUnits(fileEntry, helpers) {
     const units = [];
     const testsIn = new Map();
     const declared = new Map();
+    const attributeNames = symbol => (symbol.decorators || [])
+        .map(name => String(name).split('.').pop().replace(/Attribute$/, ''));
+    // [Ignore] (NUnit, MSTest) and Skip = "..." (xUnit): declared, not executed.
+    const skipped = symbol => attributeNames(symbol).includes('Ignore') ||
+        (symbol.attributesWithArgs || []).some(attribute => /(^|[\s,(])Skip\s*=/.test(String(attribute.args || '')));
     const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract') &&
         !(Array.isArray(cls.generics) ? cls.generics.length > 0 : !!cls.generics) &&
         !(cls.typeParameters && cls.typeParameters.length > 0);
@@ -3004,9 +3009,18 @@ function testUnits(fileEntry, helpers) {
         if (!attributes.some(name => CSHARP_TEST_ATTRIBUTES.has(name))) continue;
         const chain = helpers.enclosing(symbol).filter(outer => outer.type !== 'namespace');
         if (chain.length === 0 || chain.some(outer => !helpers.isContainer(outer))) continue;
+        // xUnit runs a test method of any visibility; NUnit and MSTest
+        // discover public ones only, and MSTest also wants the class marked.
+        const xunit = attributes.some(name => /^(Fact|SkippableFact|SkippableTheory)$/.test(name)) ||
+            (fileEntry.imports || []).some(name => /^Xunit(\.|$)/.test(String(name)));
+        if (!xunit && !(symbol.modifiers || []).includes('public')) continue;
+        if (attributes.some(name => name === 'TestMethod' || name === 'DataTestMethod') &&
+            !attributeNames(chain[chain.length - 1]).includes('TestClass')) continue;
+        const off = [symbol, ...chain].some(skipped);
         const row = {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+            ...(off && { skipped: true }),
         };
         const owner = chain[chain.length - 1];
         if (!declared.has(owner)) declared.set(owner, []);
@@ -3028,6 +3042,7 @@ function testUnits(fileEntry, helpers) {
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases,
             runnable: [...chain, cls].every(concrete),
+            ...([...chain, cls].some(skipped) && { skipped: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
             members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
