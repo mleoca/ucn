@@ -6392,6 +6392,56 @@ function rustMacroNamespaceName(node, parent, attributeNode) {
     return !next || next.type !== '::';
 }
 
+
+// Attribute macros that declare one test per case; the names the harness
+// lists come from the expansion, not from the function.
+const RUST_CASE_ATTRIBUTES = new Set(['rstest', 'test_case', 'test_matrix', 'parameterized', 'test_casing',
+    'apply', 'quickcheck', 'proptest', 'test_resources', 'datatest']);
+
+/**
+ * The tests a Rust file declares, as the test harness lists them: a
+ * function carrying #[test] or an attribute whose path ends in ::test
+ * (tokio::test and the like), named by the modules it sits in. A function
+ * carrying a case-generating attribute is a test whose listed names are
+ * not its own. A test under a cfg other than cfg(test) is compiled only
+ * sometimes.
+ */
+function testUnits(fileEntry, helpers) {
+    const units = [];
+    const holding = new Set();
+    for (const symbol of fileEntry.symbols || []) {
+        if (symbol.type !== 'function') continue;
+        const attributes = symbol.attributesWithArgs || [];
+        const names = attributes.map(attribute => String(attribute.name));
+        const plain = names.some(name => /(^|::)test$/.test(name));
+        const cases = names.some(name => RUST_CASE_ATTRIBUTES.has(name.split('::').pop()));
+        if (!plain && !cases) continue;
+        const chain = helpers.enclosing(symbol);
+        if (chain.some(outer => outer.type !== 'module')) continue;
+        const gates = chain.filter(outer => (outer.modifiers || []).includes('cfg')).length;
+        const ownGate = attributes.some(attribute => /^cfg(_attr)?$/.test(String(attribute.name)) &&
+            String(attribute.args || '').replace(/[\s()]/g, '') !== 'test');
+        const inTestModule = (symbol.modifiers || []).includes('cfg_test_module');
+        for (const outer of chain) holding.add(outer);
+        units.push({
+            kind: 'test', name: symbol.name, suite: chain.map(outer => outer.name),
+            line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
+            endLine: symbol.endLine ?? symbol.startLine,
+            ...(names.includes('ignore') && { ignored: true }),
+            ...((ownGate || gates > (inTestModule ? 1 : 0)) && { conditional: true }),
+            ...(cases && { dynamic: 'generated-cases' }),
+        });
+    }
+    for (const outer of holding) {
+        units.push({
+            kind: 'suite', name: outer.name, suite: helpers.enclosing(outer).map(up => up.name),
+            line: outer.nameLine || outer.startLine, startLine: outer.startLine,
+            endLine: outer.endLine ?? outer.startLine,
+        });
+    }
+    return { units, inheriting: false };
+}
+
 /**
  * Classify a Rust symbol as a runtime entry point of a specific kind.
  * Returns 'test' | 'main' | 'framework' | null.
@@ -6447,5 +6497,6 @@ module.exports = {
     findUsagesInCode,
     isEntryPoint,
     getEntryPointKind,
+    testUnits,
     parse
 };

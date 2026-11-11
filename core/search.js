@@ -17,6 +17,7 @@ const { isAccessorDefinition, findAccessorReferences } = require('./accessors');
 const isSafeRegex = require('safe-regex2');
 const { RE2JS } = require('re2js');
 const { UcnError } = require('./errors');
+const { createTestModel, addTestCaseRows, linkFile } = require('./test-units');
 
 // Keep the established search-input contract for the canonical catastrophic
 // nested-single-atom family even though the RE2-compatible engine could run it
@@ -1313,6 +1314,10 @@ function tests(index, nameOrFile, options = {}) {
     index._beginOp();
     try {
     const results = [];
+    const model = createTestModel(index);
+    // Files where a title that names the term is a link (the term on a test
+    // line is the project's symbol, not the file's own helper).
+    const titled = new Set();
 
     // Check if it's a file path
     const isFilePath = nameOrFile.includes('/') || nameOrFile.includes('\\') ||
@@ -1659,12 +1664,11 @@ function tests(index, nameOrFile, options = {}) {
                 });
             }
 
-            // Language-aware test-case detection. Under a local same-name
-            // shadow the term on a test line is the file's OWN helper —
-            // only anchor test cases to matches that survived the shadow.
+            // Under a local same-name shadow the term in a test's title is
+            // the file's OWN helper: titles link only where a match survived.
             if (!isFilePath && sourceFileLinked &&
                 (!localShadow || matches.some(m => m.matchType !== 'import'))) {
-                _addTestCaseMatches(index, testPath, entry, searchTerm, className, instanceTypeMap, matches);
+                titled.add(entry.relativePath);
             }
 
             // Deduplicate: if a line already has a 'call' or 'import', don't also add 'test-case'
@@ -1833,6 +1837,29 @@ function tests(index, nameOrFile, options = {}) {
             }
         }
         results.sort((a, b) => codeUnitCompare(a.file || '', b.file || ''));
+    }
+
+    // The tests that hold the matches (core/test-units.js): one row per
+    // test, then what the file is to its runner and how to run it.
+    const absolute = new Map(testFiles.map(info => [info.entry.relativePath, info.path]));
+    for (const fileResult of results) {
+        const testPath = absolute.get(fileResult.file);
+        if (!testPath) continue;
+        addTestCaseRows(model, index, testPath, isFilePath ? null : searchTerm, fileResult.matches, {
+            counts: match => match.matchType !== 'import',
+            titles: titled.has(fileResult.file),
+            titleNeedsMatch: !!className,
+        });
+        fileResult.matches.sort((a, b) => (a.line || 0) - (b.line || 0) ||
+            codeUnitCompare(a.matchType || '', b.matchType || ''));
+        const linked = linkFile(model, index, testPath,
+            fileResult.matches.filter(match => match.matchType !== 'import').map(match => match.line));
+        fileResult.role = linked.role;
+        if (linked.runner) fileResult.runner = linked.runner;
+        fileResult.tests = linked.tests;
+        if (linked.units.length > 0) fileResult.units = linked.units;
+        if (linked.run) fileResult.run = linked.run;
+        else if (linked.runWithheld) fileResult.runWithheld = linked.runWithheld;
     }
 
     return results;
@@ -2179,117 +2206,6 @@ function _receiverMatchesClass(usage, dispatchNames, instanceTypeMap, lineConten
         }
     }
     return false;
-}
-
-/**
- * Language-aware test-case detection.
- *
- * JS/TS: describe, it, test, spec calls with searchTerm in the description.
- * Go: TestXxx, BenchmarkXxx, ExampleXxx functions containing a usage of searchTerm.
- * Python: test_ functions or TestCase methods containing a usage of searchTerm.
- * Java: @Test-annotated methods containing a usage of searchTerm.
- * Rust: #[test]-attributed functions containing a usage of searchTerm.
- */
-function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, instanceTypeMap, matches) {
-    const matchLines = new Set(matches.map(m => m.line));
-    const lang = fileEntry.language;
-
-    if (lang === 'javascript' || lang === 'typescript' || lang === 'tsx') {
-        // JS/TS: find describe/it/test/spec calls from getCachedCalls
-        const calls = getCachedCalls(index, filePath);
-        if (!calls) return;
-        const testFrameworkCalls = new Set(['describe', 'it', 'test', 'spec']);
-        // Word-boundary match: `describe("untargeted zone")` is not a test
-        // case for `target` (fix #246 — raw substring matched mid-word).
-        const termPattern = new RegExp('(^|[^\\w$])' + escapeRegExp(searchTerm) + '([^\\w$]|$)');
-        for (const call of calls) {
-            if (!testFrameworkCalls.has(call.name)) continue;
-            const lineContent = index.getLineContent(filePath, call.line);
-            // Check if searchTerm appears in the description string on this line
-            if (termPattern.test(lineContent) && !matchLines.has(call.line)) {
-                // className scoping: only add test-case if the test body has a
-                // class-scoped match (call or class-receiver reference) — not just
-                // any mention of className.
-                if (className) {
-                    const endLine = _estimateTestBlockEnd(index, filePath, call.line);
-                    const hasClassScopedMatch = matches.some(m =>
-                        m.line >= call.line && m.line <= endLine &&
-                        m.matchType !== 'import'
-                    );
-                    if (!hasClassScopedMatch) continue;
-                }
-                matches.push({
-                    line: call.line,
-                    content: lineContent.trim(),
-                    matchType: 'test-case'
-                });
-                matchLines.add(call.line);
-            }
-        }
-    } else {
-        // Go/Python/Java/Rust: check if any AST usage falls within a test function's range
-        if (!fileEntry.symbols) return;
-        try {
-            const langModule = getLanguageAdapter(lang);
-            if (!langModule) return;
-            // Prefer kinded predicate so fn main() and fn init() aren't classified
-            // as test cases (BUG-CX). Fall back to isEntryPoint for compat.
-            const classify = langModule.getEntryPointKind
-                ? (s) => langModule.getEntryPointKind(s) === 'test'
-                : langModule.isEntryPoint;
-            if (!classify) return;
-
-            // Find test symbols
-            for (const symbol of fileEntry.symbols) {
-                if (!classify(symbol)) continue;
-                // Check if any non-import usage of searchTerm falls within this test function
-                const usageInRange = matches.some(m =>
-                    m.line >= symbol.startLine && m.line <= symbol.endLine &&
-                    m.matchType !== 'import'
-                );
-                if (usageInRange && !matchLines.has(symbol.startLine)) {
-                    // className scoping: verify the test body has class-scoped matches
-                    if (className) {
-                        const hasClassScopedMatch = matches.some(m =>
-                            m.line >= symbol.startLine && m.line <= symbol.endLine &&
-                            m.matchType !== 'import'
-                        );
-                        if (!hasClassScopedMatch) continue;
-                    }
-                    const lineContent = index.getLineContent(filePath, symbol.startLine);
-                    matches.push({
-                        line: symbol.startLine,
-                        content: lineContent.trim(),
-                        matchType: 'test-case'
-                    });
-                    matchLines.add(symbol.startLine);
-                }
-            }
-        } catch (e) {
-            // Skip if language module unavailable
-        }
-    }
-}
-
-/**
- * Estimate the end line of a test block (it/test/describe callback) by tracking
- * brace nesting from the start line.
- */
-function _estimateTestBlockEnd(index, filePath, startLine) {
-    const content = index._readFile(filePath);
-    if (!content) return startLine + 5;
-    const lines = content.split('\n');
-    let depth = 0;
-    let started = false;
-    for (let i = startLine - 1; i < lines.length; i++) {
-        const line = lines[i];
-        for (const ch of line) {
-            if (ch === '{' || ch === '(') { depth++; started = true; }
-            else if (ch === '}' || ch === ')') { depth--; }
-        }
-        if (started && depth <= 0) return i + 1; // 1-based
-    }
-    return Math.min(startLine + 10, lines.length);
 }
 
 /**

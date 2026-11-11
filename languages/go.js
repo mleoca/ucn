@@ -3844,6 +3844,54 @@ function selectorReceiverIsLocal(tree, line, column) {
     return !!scope && typeof scope !== 'string';
 }
 
+
+/**
+ * The tests a Go file declares, as "go test" finds them: in a _test.go
+ * file, a function (never a method) named Test or Fuzz followed by nothing
+ * or by a rune that is not lower case; TestMain is the harness, not a
+ * test; an Example runs only when its body ends in an output comment. A
+ * Benchmark runs only when asked for, so it is not one of the tests.
+ */
+const GO_PLATFORM_WORDS = new Set(['aix', 'android', 'darwin', 'dragonfly', 'freebsd', 'hurd', 'illumos', 'ios',
+    'js', 'linux', 'nacl', 'netbsd', 'openbsd', 'plan9', 'solaris', 'wasip1', 'windows', 'zos',
+    '386', 'amd64', 'amd64p32', 'arm', 'armbe', 'arm64', 'arm64be', 'loong64', 'mips', 'mipsle', 'mips64',
+    'mips64le', 'mips64p32', 'mips64p32le', 'ppc', 'ppc64', 'ppc64le', 'riscv', 'riscv64', 's390', 's390x',
+    'sparc', 'sparc64', 'wasm']);
+
+function testUnits(fileEntry, helpers) {
+    if (!/_test\.go$/.test(fileEntry.relativePath)) return { units: [], inheriting: false };
+    // name_GOOS_test.go, name_GOARCH_test.go, name_GOOS_GOARCH_test.go
+    const words = fileEntry.relativePath.split('/').pop().replace(/_test\.go$/, '').split('_').slice(1);
+    const platform = words.length > 0 && GO_PLATFORM_WORDS.has(words[words.length - 1]);
+    const units = [];
+    for (const symbol of fileEntry.symbols || []) {
+        if (symbol.type !== 'function' || symbol.isMethod || symbol.receiver || symbol.className) continue;
+        const match = /^(Test|Fuzz|Example)([\s\S]*)$/.exec(symbol.name);
+        if (!match) continue;
+        const first = match[2] ? String.fromCodePoint(match[2].codePointAt(0)) : '';
+        if (first && first.toLowerCase() === first && first.toUpperCase() !== first) continue;
+        if (symbol.name === 'TestMain' && /testing\s*\.\s*M\b/.test(String(symbol.params || ''))) continue;
+        if (helpers.enclosing(symbol).length > 0) continue;
+        const form = match[1].toLowerCase();
+        if (form === 'example') {
+            const lines = helpers.lines();
+            let printed = false;
+            for (let line = symbol.startLine; line <= (symbol.endLine ?? symbol.startLine); line++) {
+                if (/^\s*\/\/\s*(unordered )?output:/i.test(lines[line - 1] || '')) { printed = true; break; }
+            }
+            if (!printed) continue;
+        }
+        units.push({
+            kind: 'test', name: symbol.name, suite: [], form,
+            // A file under a build constraint is compiled only sometimes.
+            ...((fileEntry.buildConstraint || platform) && { conditional: true }),
+            line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
+            endLine: symbol.endLine ?? symbol.startLine,
+        });
+    }
+    return { units, inheriting: false };
+}
+
 /**
  * Classify a Go symbol as a runtime entry point of a specific kind.
  * Returns 'test' | 'main' | null.
@@ -3905,5 +3953,6 @@ module.exports = {
     isPlatformConcreteType,
     isEntryPoint,
     getEntryPointKind,
+    testUnits,
     parse
 };

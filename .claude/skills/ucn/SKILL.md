@@ -87,6 +87,10 @@ A property/getter/setter target adds `PROPERTY ACCESS SITES` to `impact` (reads 
 
 `tests` distinguishes calls and unverified calls from imports, references, strings and test-case matches. Those other match kinds are discovery hints, not confirmed call edges.
 
+A test is a unit: its file, the suites around it, its name and its line, read from what the language's runner collects. `tests` puts a `[test]` row above the calls a test holds, counts tests per file, and prints the command for the file (`run:`); `--json` carries each unit with its own command (`units[].selector`). A test a class inherits is listed at the class that runs it (`inheritedFrom`). A command is printed only when the runner is proven (the test file imports the runner, or the nearest manifest names it) and its selection syntax is modeled: pytest, node:test, jest, vitest, mocha, go test, cargo test, dotnet test, Maven. Otherwise the unit is listed with `selectorWithheld` and the reason (`no-runner-evidence`, `runner-not-modeled`, `ambiguous-runner`, `name-not-literal`, `generated-cases`, `declared-indirectly`, `name-not-unique`, `path-not-unique`, `build-constraint`, `conditional-compilation`, `custom-targets`, `target-unknown`, `loader-unknown`). The command runs the unit; whether it passes, and anything the project's own configuration adds, is the runner's to say. Test-path files that declare no test (helpers, fixtures, shared setup) are listed as support and are never something to run. C, C++ and HTML tests are not read as units.
+
+`check` selects tests for every changed symbol by its declaration, counts each test once (`Tests potentially affected: N in M files`) and prints the runner's command under `Run tests:`.
+
 Numeric evidence values are ordinal ranking weights, not probabilities. An observed-text zero is not a semantic zero or safe-delete proof.
 
 ## In a shell

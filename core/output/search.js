@@ -3,6 +3,7 @@
  */
 
 const { detectDoubleEscaping, advisoryLine } = require('./shared');
+const { selectorText } = require('../test-units');
 
 /**
  * Format search command output
@@ -419,7 +420,9 @@ function formatTests(tests, name) {
         }
 
         for (const testFile of tests) {
-            lines.push(testFile.file);
+            const facts = testFile.role === 'support' ? '  [support: declares no test]'
+                : testFile.tests > 0 ? `  (${testFile.tests} test${testFile.tests === 1 ? '' : 's'})` : '';
+            lines.push(`${testFile.file}${facts}`);
             for (const match of testFile.matches) {
                 const typeLabel = match.matchType === 'test-case' ? '[test]' :
                     match.matchType === 'import' ? '[import]' :
@@ -429,6 +432,7 @@ function formatTests(tests, name) {
                     match.matchType === 'string-ref' ? '[string]' : '[ref]';
                 lines.push(`  ${match.line}: ${typeLabel} ${match.content}`);
             }
+            if (testFile.run) lines.push(`  run: ${selectorText(testFile.run)}`);
             lines.push('');
         }
     }

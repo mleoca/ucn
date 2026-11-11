@@ -121,7 +121,12 @@ function formatCheck(result) {
     // Tests
     lines.push('');
     if (result.testFiles && result.testFiles.length > 0) {
-        lines.push(`Tests potentially affected: ${result.totalTests || result.testFiles.length} in ${result.testFiles.length} file${result.testFiles.length === 1 ? '' : 's'}`);
+        const files = result.testFiles.length;
+        // A count of tests is printed only when tests were counted: files
+        // whose tests are not read have none to report.
+        lines.push(result.totalTests > 0
+            ? `Tests potentially affected: ${result.totalTests} in ${files} file${files === 1 ? '' : 's'}`
+            : `Test files potentially affected: ${files}`);
         for (const tf of result.testFiles.slice(0, 8)) {
             const cnt = tf.testCount ? ` (${tf.testCount})` : '';
             lines.push(`  ${tf.file}${cnt}`);
@@ -131,6 +136,11 @@ function formatCheck(result) {
         }
     } else {
         lines.push('Tests: none detected for changed functions');
+    }
+    if (result.supportFiles && result.supportFiles.length > 0) {
+        const names = result.supportFiles.slice(0, 5).map(row => row.file).join(', ');
+        const more = result.supportFiles.length > 5 ? `, +${result.supportFiles.length - 5} more` : '';
+        lines.push(`Test support code reached (declares no test, runs with the tests that load it): ${names}${more}`);
     }
 
     // Action items

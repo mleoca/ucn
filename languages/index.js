@@ -393,6 +393,18 @@ const STRUCTURAL_TRAITS = {
     // site is one the toolchain will not show: check lists it and does not
     // block on it.
     checkSuppressedAt: null,
+    // The tests a file declares, as its runner collects them:
+    // `(fileEntry, helpers) => { units, inheriting }` where a unit is
+    // { kind: 'test' | 'suite', name, suite: [names], line, endLine } plus
+    // what a selector needs (core/test-units.js). Null: the language's
+    // tests are not read, and nothing is said about them.
+    testUnits: null,
+    // Which family of runners executes the language's tests; the family's
+    // manifests are the evidence a runner is named on. Null: none modeled.
+    testRunnerFamily: null,
+    // How the language's runners name a test file. A test-path file that
+    // declares no test and is not named like one is support code.
+    testFileNames: [],
     // Is the import of `module` written on a line one the project's judge
     // resolves (an import statement), not a call it never looks into?
     // `(root, line, module) => boolean`; null: every import of the language
@@ -699,6 +711,18 @@ const NOMINAL_TRAITS = {
     // site is one the toolchain will not show: check lists it and does not
     // block on it.
     checkSuppressedAt: null,
+    // The tests a file declares, as its runner collects them:
+    // `(fileEntry, helpers) => { units, inheriting }` where a unit is
+    // { kind: 'test' | 'suite', name, suite: [names], line, endLine } plus
+    // what a selector needs (core/test-units.js). Null: the language's
+    // tests are not read, and nothing is said about them.
+    testUnits: null,
+    // Which family of runners executes the language's tests; the family's
+    // manifests are the evidence a runner is named on. Null: none modeled.
+    testRunnerFamily: null,
+    // How the language's runners name a test file. A test-path file that
+    // declares no test and is not named like one is support code.
+    testFileNames: [],
     // Is the import of `module` written on a line one the project's judge
     // resolves (an import statement), not a call it never looks into?
     // `(root, line, module) => boolean`; null: every import of the language
@@ -840,6 +864,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-javascript'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'javascript',
+            testFileNames: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)(test|spec)\.[cm]?[jt]sx?$/, /[-_]test\.[cm]?[jt]sx?$/, /(^|\/)test-[^/]*\.[cm]?[jt]sx?$/],
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
@@ -864,6 +891,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-typescript').typescript,
         traits: {
             ...STRUCTURAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'javascript',
+            testFileNames: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)(test|spec)\.[cm]?[jt]sx?$/, /[-_]test\.[cm]?[jt]sx?$/, /(^|\/)test-[^/]*\.[cm]?[jt]sx?$/],
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
@@ -892,6 +922,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-typescript').tsx,
         traits: {
             ...STRUCTURAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'javascript',
+            testFileNames: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)(test|spec)\.[cm]?[jt]sx?$/, /[-_]test\.[cm]?[jt]sx?$/, /(^|\/)test-[^/]*\.[cm]?[jt]sx?$/],
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
@@ -920,6 +953,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-python'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./python').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'python',
+            testFileNames: [/^test_[^/]*\.py$/, /_test\.py$/],
             // `yield` in the body makes the callable a generator.
             callableKindFromBody: ['generator'],
             selfParam: ['self', 'cls'],
@@ -1046,6 +1082,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-go'),
         traits: {
             ...NOMINAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./go').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'go',
+            testFileNames: [/_test\.go$/],
             selfParam: null,
             packageScope: 'directory',
             nameReferenceFamily: 'go',
@@ -1077,6 +1116,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-rust'),
         traits: {
             ...NOMINAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./rust').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'rust',
+            testFileNames: [/(^|\/)tests\/[^/]+\.rs$/],
             // `-> impl Trait` hides the type but leaks the value's auto traits.
             inferredReturnForms: ['opaque', 'evaluated'],
             // `async fn` returns an anonymous future whose auto traits
@@ -1159,6 +1201,9 @@ const LANGUAGES = {
         parseRecovery: () => require('./java').recoverTypeAnnotatedVarargs,
         traits: {
             ...NOMINAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./java').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'java',
+            testFileNames: [/^Test[^/]*\.java$/, /Tests?\.java$/, /TestCase\.java$/, /IT\.java$/],
             // A method overrides/implements every supertype's same-signature
             // member, an inherited one included (JLS 8.4.8) (fix #426).
             memberFillsSupertypeSlots: true,
@@ -1371,6 +1416,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c-sharp'),
         traits: {
             ...NOMINAL_TRAITS,
+            testUnits: (fileEntry, helpers) => require('./csharp').testUnits(fileEntry, helpers),
+            testRunnerFamily: 'dotnet',
+            testFileNames: [/Tests?\.cs$/],
             // Interface mapping takes inherited members (C# spec 18.6.5); a
             // `new` member hides the inherited one, starting a slot of its
             // own (fix #426).

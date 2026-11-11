@@ -24,6 +24,7 @@ const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDisp
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
 const { getLanguageAdapter } = require('../languages');
+const { createTestModel, addTestCaseRows, linkFile, commandsFor } = require('./test-units');
 
 /**
  * Contract-mode caller expansion for the tree commands. Memoizes the full
@@ -354,7 +355,9 @@ function blast(index, name, options = {}) {
         if (!def) return null;
 
         const visited = new Set();
-        const callerCache = new Map();
+        // A caller's answer about one definition is the same whichever
+        // root the walk started from: a selection over many roots shares it.
+        const callerCache = options._callerCache || new Map();
         const affectedFunctions = new Set();
         const possiblyAffectedSet = new Set();
         const affectedFiles = new Set();
@@ -855,6 +858,10 @@ function affectedTests(index, name, options = {}) {
             depth: maxDepth,
             file: options.file,
             className: options.className,
+            // A pin on the declaration's line: one of several same-name
+            // definitions in a file.
+            line: options.line,
+            _callerCache: options._callerCache,
             all: true,
             exclude: options.exclude,
             includeMethods: options.includeMethods,
@@ -905,7 +912,7 @@ function affectedTests(index, name, options = {}) {
         // possiblyAffectedTests after the scan (fix #244).
         const frontierTestHits = new Map();
         {
-            const callerCache = new Map();
+            const callerCache = options._callerCache || new Map();
             const possibleVisited = new Set();
             const queue = [];
             const enqueueCaller = (c, depth) => {
@@ -991,6 +998,8 @@ function affectedTests(index, name, options = {}) {
         // Step 3: Scan test files for all affected names using AST
         // Only count call and test-case matches as real coverage — not imports or bare references.
         const className = options.className || null;
+        const model = createTestModel(index);
+        const absoluteOf = new Map(); // relative test path -> absolute
         const results = [];
         const possibleResults = [];
         const scanNames = [...affectedNames, ...possiblyNames];
@@ -1024,6 +1033,12 @@ function affectedTests(index, name, options = {}) {
                     // (depth-limit nodes were never adjudicated — the text
                     // scan remains their best-effort fallback).
                     const engineAdjudicated = expandedNames.has(funcName);
+
+                    // The engine searched this name's callers and confirmed
+                    // none in this file: a call here is not credited (below),
+                    // and an import or a bare reference links nothing by
+                    // itself, so there is nothing a scan could add.
+                    if (engineAdjudicated && !engineFileSites) continue;
 
                     // Fast pre-check
                     if (!content.includes(funcName) && !engineFileSites) continue;
@@ -1172,9 +1187,17 @@ function affectedTests(index, name, options = {}) {
                         }
                     }
 
-                    // Language-aware test-case detection
-                    _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches);
+                    // The tests that hold a call, and the titled ones that
+                    // name the function around one (core/test-units.js).
+                    if (fileMatches.has(funcName)) {
+                        addTestCaseRows(model, index, filePath, funcName, fileMatches.get(funcName), {
+                            counts: match => match.matchType === 'call',
+                            titleNeedsMatch: true,
+                            extra: { functionName: funcName },
+                        });
+                    }
                 }
+                if (fileMatches.size > 0) absoluteOf.set(fileEntry.relativePath, filePath);
 
                 if (fileMatches.size > 0) {
                     const linkedFunctions = [...fileMatches.keys()];
@@ -1283,6 +1306,27 @@ function affectedTests(index, name, options = {}) {
             });
         }
 
+        // What each file is to its runner, which tests hold the links, and
+        // how many tests that is.
+        for (const [absFile, entry] of frontierTestHits) absoluteOf.set(entry.rel, absFile);
+        const confirmedTests = new Set();
+        const describeFile = (row, confirmed) => {
+            const absFile = absoluteOf.get(row.file);
+            if (!absFile) return;
+            const linked = linkFile(model, index, absFile, row.matches
+                .filter(match => match.matchType === 'call' || match.matchType === 'test-case')
+                .map(match => match.line));
+            row.role = linked.role;
+            if (linked.runner) row.runner = linked.runner;
+            row.testCount = linked.tests;
+            if (linked.units.length > 0) row.units = linked.units;
+            if (linked.run) row.run = linked.run;
+            else if (linked.runWithheld) row.runWithheld = linked.runWithheld;
+            if (confirmed) for (const key of linked.testKeys) confirmedTests.add(key);
+        };
+        for (const row of results) describeFile(row, true);
+        for (const row of possibleResults) describeFile(row, false);
+
         // Sort by linkage breadth then alphabetically
         results.sort((a, b) => b.linkedFunctions.length - a.linkedFunctions.length || codeUnitCompare(a.file, b.file));
         possibleResults.sort((a, b) => b.linkedFunctions.length - a.linkedFunctions.length || codeUnitCompare(a.file, b.file));
@@ -1331,11 +1375,17 @@ function affectedTests(index, name, options = {}) {
             possiblyAffected: possiblyProduction,
             testFiles: results,
             possiblyAffectedTests: possibleResults,
+            // The commands that run the confirmed files, where a runner is
+            // proven and its command is known.
+            commands: commandsFor(model, results.filter(row => row.role === 'tests')
+                .map(row => absoluteOf.get(row.file)).filter(Boolean)),
             ...(blastResult.account && { account: blastResult.account }),
             treeAccount: blastResult.treeAccount,
             summary: {
                 totalAffected: namesForCoverage.size,
                 totalTestFiles: results.length,
+                totalTests: confirmedTests.size,
+                supportFiles: results.filter(row => row.role === 'support').length,
                 staticallyLinkedFunctions: linkedSet.size,
                 notStaticallyLinkedCount: notStaticallyLinked.length,
                 possiblyAffected: possiblyProduction.length,
@@ -1346,73 +1396,6 @@ function affectedTests(index, name, options = {}) {
             warnings: blastResult.warnings,
         };
     } finally { index._endOp(); }
-}
-
-/**
- * Add test-case matches for a function name in a test file (language-aware).
- * Only adds test-case when the test body has a call match (not just import/reference).
- */
-function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches) {
-    const lang = fileEntry.language;
-    const existingMatches = fileMatches.get(funcName) || [];
-    const existingLines = new Set(existingMatches.map(m => m.line));
-
-    if (lang === 'javascript' || lang === 'typescript' || lang === 'tsx') {
-        const calls = getCachedCalls(index, filePath);
-        if (!calls) return;
-        const testFrameworkCalls = new Set(['describe', 'it', 'test', 'spec']);
-        // Word-boundary match (fix #246): substring matched mid-word titles.
-        const termPattern = new RegExp('(^|[^\\w$])' + escapeRegExp(funcName) + '([^\\w$]|$)');
-        for (const call of calls) {
-            if (!testFrameworkCalls.has(call.name)) continue;
-            const lineContent = index.getLineContent(filePath, call.line);
-            if (termPattern.test(lineContent) && !existingLines.has(call.line)) {
-                // Only add test-case if a call match exists in the test body
-                const endLine = _estimateTestBlockEndTracing(index, filePath, call.line);
-                const hasCallMatch = existingMatches.some(m =>
-                    m.line >= call.line && m.line <= endLine &&
-                    m.matchType === 'call'
-                );
-                if (!hasCallMatch) continue;
-                if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
-                fileMatches.get(funcName).push({
-                    line: call.line, content: lineContent.trim(),
-                    matchType: 'test-case', functionName: funcName
-                });
-                existingLines.add(call.line);
-            }
-        }
-    } else {
-        if (!fileEntry.symbols) return;
-        try {
-            const langModule = getLanguageAdapter(lang);
-            if (!langModule) return;
-            // Prefer the kinded predicate so we don't mis-tag fn main() / fn init()
-            // (runtime entries) as test cases (BUG-CX). Fall back to isEntryPoint
-            // for backward compat with language modules that haven't been migrated.
-            const classify = langModule.getEntryPointKind
-                ? (s) => langModule.getEntryPointKind(s) === 'test'
-                : langModule.isEntryPoint;
-            if (!classify) return;
-            for (const symbol of fileEntry.symbols) {
-                if (!classify(symbol)) continue;
-                // Only add test-case if a call match exists in the test body
-                const hasCallInRange = existingMatches.some(m =>
-                    m.line >= symbol.startLine && m.line <= symbol.endLine &&
-                    m.matchType === 'call'
-                );
-                if (hasCallInRange && !existingLines.has(symbol.startLine)) {
-                    const lineContent = index.getLineContent(filePath, symbol.startLine);
-                    if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
-                    fileMatches.get(funcName).push({
-                        line: symbol.startLine, content: lineContent.trim(),
-                        matchType: 'test-case', functionName: funcName
-                    });
-                    existingLines.add(symbol.startLine);
-                }
-            }
-        } catch (e) { /* skip */ }
-    }
 }
 
 /**
@@ -1474,26 +1457,6 @@ function _receiverMatchesClassTracing(usage, dispatchNames, instanceTypeMap, lin
         }
     }
     return false;
-}
-
-/**
- * Estimate the end line of a test block by tracking brace/paren nesting.
- */
-function _estimateTestBlockEndTracing(index, filePath, startLine) {
-    const content = index._readFile(filePath);
-    if (!content) return startLine + 5;
-    const lines = content.split('\n');
-    let depth = 0;
-    let started = false;
-    for (let i = startLine - 1; i < lines.length; i++) {
-        const line = lines[i];
-        for (const ch of line) {
-            if (ch === '{' || ch === '(') { depth++; started = true; }
-            else if (ch === '}' || ch === ')') { depth--; }
-        }
-        if (started && depth <= 0) return i + 1;
-    }
-    return Math.min(startLine + 10, lines.length);
 }
 
 function _matchPriority(matchType) {

@@ -5533,6 +5533,111 @@ function extractConstructorName(node) {
     return null;
 }
 
+
+/**
+ * The tests a Python file declares, as pytest collects them (measured on
+ * pytest 9): a module-level function whose name matches python_functions
+ * (prefix "test" by default), in any branch but not inside a function; a
+ * method so named in a class matching python_classes (prefix "Test") that
+ * defines no __init__, static and class methods included, nested classes
+ * through collected classes only; and the "test"-prefixed methods of a
+ * unittest TestCase subclass whatever the class is called. A fixture is not
+ * a test. Names bound by assignment are not declarations. `classes` says,
+ * for every class, what it derives from and which test-shaped methods it
+ * declares, so the tests a collected class inherits can be found.
+ */
+function testUnits(fileEntry, helpers) {
+    const collection = helpers.collection || {};
+    const matches = (patterns, fallback, name) => (patterns && patterns.length > 0 ? patterns : fallback)
+        .some(pattern => /[*?[]/.test(pattern) ? helpers.glob(pattern, name) : name.startsWith(pattern));
+    const symbols = fileEntry.symbols || [];
+    const basesOf = cls => (Array.isArray(cls.extends) ? cls.extends : String(cls.extends || '').split(','))
+        .map(base => String(base).trim()).filter(base => base && base !== 'object');
+    const unittestMemo = new Map();
+    const isUnittest = cls => {
+        if (!unittestMemo.has(cls)) {
+            const names = [...basesOf(cls), ...helpers.ancestors(cls.name)];
+            unittestMemo.set(cls, names.some(name => /TestCase$/.test(name.split('.').pop())));
+        }
+        return unittestMemo.get(cls);
+    };
+    const holds = (cls, symbol) => symbol.className === cls.name && symbol.startLine >= cls.startLine &&
+        (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine);
+    const collectedMemo = new Map();
+    const collected = cls => {
+        if (collectedMemo.has(cls)) return collectedMemo.get(cls);
+        collectedMemo.set(cls, false);
+        const chain = helpers.enclosing(cls);
+        let answer = chain.every(outer => outer.type === 'class' && collected(outer));
+        if (answer && !isUnittest(cls)) {
+            answer = matches(collection.classes, ['Test'], cls.name) &&
+                !symbols.some(symbol => symbol.name === '__init__' && holds(cls, symbol));
+        }
+        collectedMemo.set(cls, answer);
+        return answer;
+    };
+    const units = [];
+    const testsIn = new Map();
+    for (const symbol of symbols) {
+        if (!helpers.isCallable(symbol) || symbol.type === 'constructor') continue;
+        if ((symbol.decorators || []).some(name => /(^|\.)fixture$/.test(String(name).split('(')[0]))) continue;
+        const chain = helpers.enclosing(symbol);
+        if (chain.some(outer => outer.type !== 'class')) continue;
+        const owner = chain[chain.length - 1] || null;
+        if (owner) {
+            if (!collected(owner) || symbol.className !== owner.name) continue;
+            if (isUnittest(owner) ? !symbol.name.startsWith('test')
+                : !matches(collection.functions, ['test'], symbol.name)) continue;
+            for (const cls of chain) testsIn.set(cls, (testsIn.get(cls) || 0) + 1);
+        } else if (!matches(collection.functions, ['test'], symbol.name)) {
+            continue;
+        }
+        units.push({
+            kind: 'test', name: symbol.name, suite: chain.map(cls => cls.name),
+            line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
+            endLine: symbol.endLine ?? symbol.startLine,
+        });
+    }
+    const classes = [];
+    for (const cls of symbols) {
+        if (cls.type !== 'class') continue;
+        const chain = helpers.enclosing(cls);
+        if (chain.some(outer => outer.type !== 'class')) continue;
+        const runnable = collected(cls);
+        const members = symbols.filter(symbol => holds(cls, symbol) && helpers.isCallable(symbol));
+        // `__test__ = False` switches collection off, `= True` back on.
+        const switchLine = symbols.find(symbol => symbol.name === '__test__' && symbol.type !== 'class' &&
+            symbol.className === cls.name && symbol.startLine >= cls.startLine &&
+            symbol.startLine <= (cls.endLine ?? cls.startLine));
+        const switched = switchLine
+            ? /=\s*(True|False)\b/.exec(helpers.lines()[switchLine.startLine - 1] || '') : null;
+        classes.push({
+            name: cls.name, suite: chain.map(outer => outer.name), bases: basesOf(cls), runnable,
+            // pytest does not collect a class that has a constructor, its
+            // own or inherited; unittest's classes are built by unittest.
+            ...(!isUnittest(cls) && { refusedIfDeclares: '__init__' }),
+            ...(switched && { enabled: switched[1] === 'True' }),
+            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
+            members: symbols.filter(symbol => holds(cls, symbol)).map(symbol => symbol.name),
+            tests: members.filter(symbol => symbol.type !== 'constructor' &&
+                !(symbol.decorators || []).some(name => /(^|\.)fixture$/.test(String(name).split('(')[0])) &&
+                (symbol.name.startsWith('test') || matches(collection.functions, ['test'], symbol.name)))
+                .map(symbol => ({
+                    name: symbol.name, line: symbol.nameLine || symbol.startLine,
+                    startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+                })),
+        });
+        if (runnable && testsIn.get(cls) > 0) {
+            units.push({
+                kind: 'suite', name: cls.name, suite: chain.map(outer => outer.name),
+                line: cls.nameLine || cls.startLine, startLine: cls.startLine,
+                endLine: cls.endLine ?? cls.startLine,
+            });
+        }
+    }
+    return { units, classes };
+}
+
 /**
  * Classify a Python symbol as a runtime entry point of a specific kind.
  * Returns 'test' | 'framework' | null.
@@ -6099,5 +6204,6 @@ module.exports = {
     findPytestFunctions,
     isEntryPoint,
     getEntryPointKind,
+    testUnits,
     parse
 };

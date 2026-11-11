@@ -2977,6 +2977,75 @@ function usagesInTree(code, name, parser, tree) {
     return usages;
 }
 
+
+const CSHARP_TEST_ATTRIBUTES = new Set(['Fact', 'Theory', 'Test', 'TestCase', 'TestCaseSource',
+    'TestMethod', 'DataTestMethod', 'SkippableFact', 'SkippableTheory']);
+
+/**
+ * The tests a C# file declares: a method carrying a test attribute of
+ * xUnit, NUnit or MSTest, named by its namespace and the classes around
+ * it. A test of an abstract or generic class is not one by itself: it
+ * runs through the closed types that derive from it. `classes` says, for
+ * every type, what it derives from and which tests it declares, so the
+ * tests a concrete class inherits can be found.
+ */
+function testUnits(fileEntry, helpers) {
+    const symbols = fileEntry.symbols || [];
+    const units = [];
+    const testsIn = new Map();
+    const declared = new Map();
+    const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract') &&
+        !(Array.isArray(cls.generics) ? cls.generics.length > 0 : !!cls.generics) &&
+        !(cls.typeParameters && cls.typeParameters.length > 0);
+    for (const symbol of symbols) {
+        if (!symbol.isMethod || symbol.type === 'constructor') continue;
+        const attributes = (symbol.decorators || [])
+            .map(name => String(name).split('.').pop().replace(/Attribute$/, ''));
+        if (!attributes.some(name => CSHARP_TEST_ATTRIBUTES.has(name))) continue;
+        const chain = helpers.enclosing(symbol).filter(outer => outer.type !== 'namespace');
+        if (chain.length === 0 || chain.some(outer => !helpers.isContainer(outer))) continue;
+        const row = {
+            name: symbol.name, line: symbol.nameLine || symbol.startLine,
+            startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+        };
+        const owner = chain[chain.length - 1];
+        if (!declared.has(owner)) declared.set(owner, []);
+        declared.get(owner).push(row);
+        if (chain.some(cls => !concrete(cls))) continue;
+        for (const cls of chain) testsIn.set(cls, (testsIn.get(cls) || 0) + 1);
+        units.push({
+            kind: 'test', suite: chain.map(cls => cls.name), ...row,
+            ...(symbol.namespace && { namespace: symbol.namespace }),
+        });
+    }
+    const classes = [];
+    for (const cls of symbols) {
+        if (!helpers.isContainer(cls) || cls.type === 'namespace') continue;
+        const chain = helpers.enclosing(cls).filter(outer => outer.type !== 'namespace');
+        if (chain.some(outer => !helpers.isContainer(outer))) continue;
+        const bases = [cls.extends, cls.implements].flat().filter(Boolean)
+            .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
+        classes.push({
+            name: cls.name, suite: chain.map(outer => outer.name), bases,
+            runnable: [...chain, cls].every(concrete),
+            ...(cls.namespace && { namespace: cls.namespace }),
+            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
+            members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
+                symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine))
+                .map(symbol => symbol.name),
+            tests: declared.get(cls) || [],
+        });
+        if (testsIn.get(cls) > 0) {
+            units.push({
+                kind: 'suite', name: cls.name, suite: chain.map(outer => outer.name),
+                line: cls.nameLine || cls.startLine, startLine: cls.startLine,
+                endLine: cls.endLine ?? cls.startLine,
+            });
+        }
+    }
+    return { units, classes };
+}
+
 function getEntryPointKind(symbol) {
     const decorators = new Set(symbol.decorators || []);
     if (symbol.name === 'Main' && symbol.modifiers?.includes('static')) return 'main';
@@ -3181,5 +3250,6 @@ module.exports = {
     isPlatformConcreteCall,
     isEntryPoint,
     getEntryPointKind,
+    testUnits,
     parse,
 };

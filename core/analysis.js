@@ -30,7 +30,6 @@ const { findAccessorReferences } = require('./accessors');
 // JS/TS test framework helpers — calls to these bracket a test case.
 // Used to flag call sites whose enclosing function is an arrow callback
 // passed to one of these (the common pattern in mocha/jest/vitest).
-const _JS_TEST_FRAMEWORK_CALLS = new Set(['describe', 'it', 'test', 'spec', 'context', 'suite']);
 
 /**
  * Give agents the exact indexed definitions behind a same-name ambiguity.
@@ -89,66 +88,31 @@ function buildAmbiguityCandidates(index, name, selected, unverified) {
 }
 
 /**
- * Tag each call site with `inTestCase` based on its enclosing function's
- * entry-point classification. Uses each language's `getEntryPointKind`
- * predicate (kind === 'test') so results match `affectedTests`/etc.
- *
- * For JS/TS/HTML, function-level entry-point classification only covers
- * framework lifecycle methods. Test bodies are framework callbacks
- * (`it('name', () => {...})`), so we additionally tag a site as inTestCase
- * when its file has a `describe`/`it`/`test` framework call that brackets
- * the enclosing function — mirroring `_addAffectedTestCases` in tracing.js.
+ * Tag each call site with `inTestCase`: its enclosing function is one the
+ * language's harness invokes (`getEntryPointKind` says 'test'), or its line
+ * sits in a test or suite the file declares (core/test-units.js, the one
+ * model of what a test is).
  *
  * Mutates each site in place (sets `site.inTestCase = boolean`).
  */
 function tagInTestCase(index, sites) {
     if (!Array.isArray(sites) || sites.length === 0) return;
-    // Per-file cache: language module + JS framework call ranges.
-    const fileMeta = new Map();
-    function getFileMeta(filePath) {
-        if (!filePath) return null;
-        if (fileMeta.has(filePath)) return fileMeta.get(filePath);
-        const fe = index.files.get(filePath);
-        if (!fe) { fileMeta.set(filePath, null); return null; }
-        let langModule = null;
-        try { langModule = getLanguageAdapter(fe.language); } catch (_) { /* ignore */ }
-        const meta = { fileEntry: fe, langModule, language: fe.language, jsTestRanges: null };
-        // For JS-family files, build line ranges of describe/it/test framework calls.
-        if (langModule && isTestFile(fe.relativePath, fe.language) &&
-            (fe.language === 'javascript' || fe.language === 'typescript' ||
-            fe.language === 'tsx' || fe.language === 'html')) {
-            try {
-                const calls = index.getCachedCalls ? index.getCachedCalls(filePath) : null;
-                if (Array.isArray(calls)) {
-                    const ranges = [];
-                    for (const call of calls) {
-                        if (!_JS_TEST_FRAMEWORK_CALLS.has(call.name)) continue;
-                        // Get the enclosing test-block end via existing fn-bound estimate.
-                        // Without a proper bracket scan we use the next-fn-boundary or +200 lines.
-                        let endLine = call.line + 200;
-                        // Try using the enclosing-symbol range as an upper bound when possible.
-                        if (fe.symbols) {
-                            for (const sym of fe.symbols) {
-                                if (sym.startLine <= call.line && (sym.endLine || 0) >= call.line) {
-                                    endLine = Math.min(endLine, sym.endLine || endLine);
-                                }
-                            }
-                        }
-                        ranges.push({ start: call.line, end: endLine });
-                    }
-                    meta.jsTestRanges = ranges;
-                }
-            } catch (_) { /* ignore */ }
-        }
-        fileMeta.set(filePath, meta);
-        return meta;
-    }
+    const model = require('./test-units').createTestModel(index);
+    const kindOf = new Map();
     for (const site of sites) {
         site.inTestCase = false;
-        const meta = getFileMeta(site.callerFile);
-        if (!meta || !meta.langModule) continue;
-        // First: kinded entry-point predicate (Python/Go/Java/Rust + JS lifecycle).
-        const classify = meta.langModule.getEntryPointKind;
+        // A call in a test's own callback has no named function around it:
+        // the site's file is where it is.
+        const sitePath = site.callerFile ||
+            (site.file ? (path.isAbsolute(site.file) ? site.file : path.join(index.root, site.file)) : null);
+        const fileEntry = sitePath ? index.files.get(sitePath) : null;
+        if (!fileEntry) continue;
+        if (!kindOf.has(fileEntry.language)) {
+            let adapter = null;
+            try { adapter = getLanguageAdapter(fileEntry.language); } catch (_) { /* ignore */ }
+            kindOf.set(fileEntry.language, adapter && adapter.getEntryPointKind ? adapter.getEntryPointKind : null);
+        }
+        const classify = kindOf.get(fileEntry.language);
         if (classify && site.callerFile && site.callerStartLine != null) {
             const encl = index.findEnclosingFunction
                 ? index.findEnclosingFunction(site.callerFile, site.line, true)
@@ -158,15 +122,9 @@ function tagInTestCase(index, sites) {
                 continue;
             }
         }
-        // Second: JS/TS framework-call brackets (it/test/describe). The site is
-        // inside a test case when its line falls within a describe/it block.
-        if (meta.jsTestRanges && meta.jsTestRanges.length > 0 && site.line != null) {
-            for (const r of meta.jsTestRanges) {
-                if (site.line >= r.start && site.line <= r.end) {
-                    site.inTestCase = true;
-                    break;
-                }
-            }
+        if (site.line != null && isTestFile(fileEntry.relativePath, fileEntry.language) &&
+            model.unitAt(sitePath, site.line)) {
+            site.inTestCase = true;
         }
     }
 }

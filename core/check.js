@@ -42,6 +42,7 @@ const { langTraits } = require('../languages');
 const { assessDeletion, definiteDependentsOf, REASON_TEXT } = require('./deletion');
 const { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, HAZARD_TEXT } = require('./capture');
 const { reviewItemsOf } = require('./review-items');
+const { createTestModel, linkFile, commandsFor } = require('./test-units');
 const { resolveTarget, flaggedPaths } = require('./snapshot');
 const { projectKind, submoduleOf } = require('./deletion');
 
@@ -1038,20 +1039,74 @@ function checkTarget(index, options, repoRoot) {
 
     items.push(...moduleItems);
 
-    // Affected tests (top-level summary, capped)
-    let testFiles = [];
-    let testCount = 0;
-    for (const fn of changed.slice(0, 10)) {
-        const t = index.affectedTests(fn.name, { depth: 2 });
-        if (t && t.testFiles) {
-            for (const tf of t.testFiles) {
-                if (!testFiles.find(x => x.file === tf.file)) {
-                    testFiles.push(tf);
-                    testCount += tf.testCount || 0;
-                }
+    // Affected tests: every changed symbol, by its own declaration (a name
+    // alone would pick the tests of every namesake). One row per file; the
+    // tests are counted once however many symbols reach them.
+    // One operation for the whole selection: every symbol's question reads
+    // the same test files, and what one read parsed the next reuses.
+    index._beginOp();
+    let testFiles;
+    let supportFiles;
+    let testCount;
+    let testCommands;
+    try {
+    const model = createTestModel(index);
+    const linesByFile = new Map(); // relative test path -> { row, lines }
+    const callerCache = new Map();
+    for (const fn of changed) {
+        let t = null;
+        try {
+            t = index.affectedTests(fn.name, {
+                depth: 2,
+                file: fn.relativePath || fn.file || undefined,
+                line: fn.startLine || undefined,
+                className: fn.className || undefined,
+                _callerCache: callerCache,
+            });
+        } catch (e) {
+            t = null;
+        }
+        for (const tf of (t && t.testFiles) || []) {
+            let held = linesByFile.get(tf.file);
+            if (!held) {
+                held = { row: tf, lines: new Set(), linked: new Set() };
+                linesByFile.set(tf.file, held);
+            }
+            for (const name of tf.linkedFunctions || []) held.linked.add(name);
+            for (const match of tf.matches || []) {
+                if (match.matchType === 'call' || match.matchType === 'test-case') held.lines.add(match.line);
             }
         }
     }
+    const absoluteTest = new Map();
+    for (const [file, entry] of index.files) {
+        if (linesByFile.has(entry.relativePath)) absoluteTest.set(entry.relativePath, file);
+    }
+    testFiles = [];
+    supportFiles = [];
+    const countedTests = new Set();
+    for (const rel of [...linesByFile.keys()].sort()) {
+        const held = linesByFile.get(rel);
+        const linked = linkFile(model, index, absoluteTest.get(rel), [...held.lines]);
+        const row = {
+            file: rel,
+            role: linked.role,
+            ...(linked.runner && { runner: linked.runner }),
+            linkedFunctions: [...held.linked].sort(),
+            testCount: linked.tests,
+            ...(linked.run && { run: linked.run }),
+            ...(linked.runWithheld && { runWithheld: linked.runWithheld }),
+        };
+        if (linked.role === 'support') {
+            supportFiles.push(row);
+            continue;
+        }
+        testFiles.push(row);
+        for (const key of linked.testKeys) countedTests.add(key);
+    }
+    testCount = countedTests.size;
+    testCommands = commandsFor(model, testFiles.map(row => absoluteTest.get(row.file)));
+    } finally { index._endOp(); }
 
     // Action items: one per reason an item is not ready, then what else the
     // evidence about a non-ready item says.
@@ -1180,12 +1235,23 @@ function checkTarget(index, options, repoRoot) {
             message: `${allChanged.length - limit} changed symbol(s) were not checked; rerun without --limit`,
         });
     }
-    if (testFiles.length > 0) {
+    if (testCommands.length > 0) {
+        // The runner's own commands, where a manifest names the runner.
+        const shown = testCommands.slice(0, 3);
+        actions.push({
+            severity: 'info',
+            kind: 'tests_to_run',
+            message: `Run tests: ${shown.join(' ; ')}` +
+                (testCommands.length > shown.length ? ` (+${testCommands.length - shown.length} more command(s))` : ''),
+            commands: testCommands,
+        });
+    } else if (testFiles.length > 0) {
         const filesList = testFiles.slice(0, 5).map(t => t.file).join(' ');
         actions.push({
             severity: 'info',
             kind: 'tests_to_run',
-            message: `Run tests: ${filesList}`,
+            message: `Run tests: ${filesList}` +
+                (testFiles.length > 5 ? ` (+${testFiles.length - 5} more)` : ''),
         });
     }
 
@@ -1208,6 +1274,7 @@ function checkTarget(index, options, repoRoot) {
         totalChanged: allChanged.length + deleted.length + moduleItems.length,
         truncated,
         testFiles,
+        ...(supportFiles.length > 0 && { supportFiles }),
         totalTestFiles: testFiles.length,
         totalTests: testCount,
         actions,

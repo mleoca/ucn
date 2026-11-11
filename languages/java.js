@@ -2877,6 +2877,89 @@ function findUsagesInCode(code, name, parser, tree) {
     return usages;
 }
 
+
+const JAVA_TEST_ANNOTATIONS = new Set(['Test', 'ParameterizedTest', 'RepeatedTest', 'TestFactory', 'TestTemplate']);
+
+/**
+ * The tests a Java file declares: a method annotated as a test (JUnit 4
+ * and 5, TestNG), or a public "test"-prefixed method of a class deriving
+ * from TestCase (JUnit 3), named by its package and the classes around it.
+ * A test of an abstract class or an interface is not one by itself: it
+ * runs through the types that inherit it. `classes` says, for every type,
+ * what it derives from and which tests it declares, so the tests a
+ * concrete class inherits can be found.
+ */
+function testUnits(fileEntry, helpers) {
+    const symbols = fileEntry.symbols || [];
+    const units = [];
+    const testsIn = new Map();
+    const declared = new Map();
+    const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract');
+    const legacyMemo = new Map();
+    const legacy = cls => {
+        if (!legacyMemo.has(cls)) {
+            const names = [...String(cls.extends || '').split(','), ...helpers.ancestors(cls.name)];
+            legacyMemo.set(cls, names.some(name => /(^|\.)TestCase$/.test(String(name).trim().replace(/<.*$/, ''))));
+        }
+        return legacyMemo.get(cls);
+    };
+    for (const symbol of symbols) {
+        if (!symbol.isMethod || symbol.type === 'constructor') continue;
+        const chain = helpers.enclosing(symbol);
+        if (chain.length === 0 || chain.some(outer => !helpers.isContainer(outer))) continue;
+        const owner = chain[chain.length - 1];
+        const annotated = (symbol.annotationsWithArgs || [])
+            .some(annotation => JAVA_TEST_ANNOTATIONS.has(String(annotation.name).split('.').pop()));
+        if (!annotated && !(legacy(owner) && /^test/.test(symbol.name) &&
+            (symbol.modifiers || []).includes('public'))) continue;
+        const row = {
+            name: symbol.name, line: symbol.nameLine || symbol.startLine,
+            startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+        };
+        if (!declared.has(owner)) declared.set(owner, []);
+        declared.get(owner).push(row);
+        if (chain.some(cls => !concrete(cls))) continue;
+        // A class inside another runs with it only when marked @Nested. A
+        // static one is a test class of its own that a build's default
+        // class-name filter leaves out; an inner one is no test class.
+        const unmarked = chain.slice(1).filter(cls => !(cls.annotationsWithArgs || [])
+            .some(annotation => String(annotation.name).split('.').pop() === 'Nested'));
+        if (unmarked.some(cls => !(cls.modifiers || []).includes('static'))) continue;
+        for (const cls of chain) testsIn.set(cls, (testsIn.get(cls) || 0) + 1);
+        units.push({
+            kind: 'test', suite: chain.map(cls => cls.name), ...row,
+            ...(symbol.namespace && { namespace: symbol.namespace }),
+            ...(unmarked.length > 0 && { conditional: true }),
+        });
+    }
+    const classes = [];
+    for (const cls of symbols) {
+        if (!helpers.isContainer(cls)) continue;
+        const chain = helpers.enclosing(cls);
+        if (chain.some(outer => !helpers.isContainer(outer))) continue;
+        const bases = [cls.extends, cls.implements].flat().filter(Boolean)
+            .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
+        classes.push({
+            name: cls.name, suite: chain.map(outer => outer.name), bases,
+            runnable: [...chain, cls].every(concrete),
+            ...(cls.namespace && { namespace: cls.namespace }),
+            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
+            members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
+                symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine))
+                .map(symbol => symbol.name),
+            tests: declared.get(cls) || [],
+        });
+        if (testsIn.get(cls) > 0) {
+            units.push({
+                kind: 'suite', name: cls.name, suite: chain.map(outer => outer.name),
+                line: cls.nameLine || cls.startLine, startLine: cls.startLine,
+                endLine: cls.endLine ?? cls.startLine,
+            });
+        }
+    }
+    return { units, classes };
+}
+
 /**
  * Classify a Java symbol as a runtime entry point of a specific kind.
  * Returns 'test' | 'main' | 'framework' | null.
@@ -2930,5 +3013,6 @@ module.exports = {
     findUsagesInCode,
     isEntryPoint,
     getEntryPointKind,
+    testUnits,
     parse
 };

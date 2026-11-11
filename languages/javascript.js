@@ -5878,6 +5878,129 @@ const _JS_LIFECYCLE_METHODS = new Set([
     'connectedCallback', 'disconnectedCallback', 'attributeChangedCallback', 'adoptedCallback'
 ]);
 
+
+// The functions JavaScript runners declare tests with (mocha, jest, vitest,
+// node:test and the runners that copy them).
+const TEST_SUITE_APIS = new Set(['describe', 'suite', 'context', 'xdescribe', 'fdescribe', 'xcontext']);
+const TEST_CASE_APIS = new Set(['it', 'test', 'specify', 'xit', 'fit', 'xtest', 'xspecify']);
+// Members that keep a call a declaration of the same thing.
+const TEST_API_MODIFIERS = new Set(['only', 'skip', 'todo', 'concurrent', 'sequential', 'serial', 'parallel',
+    'failing', 'fails', 'fixme', 'slow']);
+// Members whose call returns the declaring function: it.each(rows)(title, fn).
+const TEST_API_TABLES = new Set(['each', 'for']);
+const TEST_API_CONDITIONS = new Set(['runIf', 'skipIf', 'if']);
+const FUNCTION_NODES = new Set(['function_declaration', 'function_expression', 'function', 'arrow_function',
+    'generator_function', 'generator_function_declaration', 'method_definition']);
+
+/** The declaring call a call node is, or null: { kind, table }. */
+function testApiCall(node, shadowed) {
+    let callee = node.childForFieldName('function');
+    let table = false;
+    if (callee && callee.type === 'call_expression') {
+        // it.each(rows)(...), it.skipIf(cond)(...)
+        const inner = callee.childForFieldName('function');
+        if (!inner || inner.type !== 'member_expression') return null;
+        const property = inner.childForFieldName('property');
+        if (!property) return null;
+        if (TEST_API_TABLES.has(property.text)) table = true;
+        else if (!TEST_API_CONDITIONS.has(property.text)) return null;
+        callee = inner.childForFieldName('object');
+    }
+    const members = [];
+    while (callee && callee.type === 'member_expression') {
+        const property = callee.childForFieldName('property');
+        if (!property) return null;
+        members.unshift(property.text);
+        callee = callee.childForFieldName('object');
+    }
+    if (!callee || callee.type !== 'identifier') return null;
+    const base = callee.text;
+    if (shadowed.has(base)) return null;
+    let kind = TEST_SUITE_APIS.has(base) ? 'suite' : TEST_CASE_APIS.has(base) ? 'test' : null;
+    if (!kind) return null;
+    for (const member of members) {
+        if (TEST_SUITE_APIS.has(member)) kind = 'suite';
+        else if (TEST_CASE_APIS.has(member)) kind = 'test';
+        else if (!TEST_API_MODIFIERS.has(member)) return null;
+    }
+    return { kind, table };
+}
+
+/** The value of a title written as a literal, or null. */
+function literalTitle(node) {
+    if (!node) return null;
+    if (node.type !== 'string' && node.type !== 'template_string') return null;
+    if (node.namedChildren.some(child => child.type === 'template_substitution')) return null;
+    const body = node.text.slice(1, -1);
+    if (!body.includes('\\')) return body;
+    // Escapes that only quote a character; anything else is not read.
+    if (/\\(?!['"\x60\\])/.test(body)) return null;
+    return body.replace(/\\(['"\x60\\])/g, '$1');
+}
+
+/**
+ * The tests a JavaScript or TypeScript file declares: calls of the
+ * runners' declaring functions, named by their literal titles and by the
+ * suites whose callbacks hold them. A title that is not a literal, a table
+ * of cases and a declaration inside a function that is not a suite's
+ * callback are tests whose runtime names are not the written ones.
+ */
+function testUnits(fileEntry, helpers) {
+    const tree = helpers.tree();
+    if (!tree) return null;
+    // A name the file declares itself is not the runner's function.
+    const shadowed = new Set();
+    for (const symbol of fileEntry.symbols || []) {
+        if (!symbol.className && (TEST_SUITE_APIS.has(symbol.name) || TEST_CASE_APIS.has(symbol.name))) {
+            shadowed.add(symbol.name);
+        }
+    }
+    const units = [];
+    const walk = (node, suites, indirect, inTest) => {
+        if (node.type === 'call_expression') {
+            const api = testApiCall(node, shadowed);
+            if (api) {
+                const args = node.childForFieldName('arguments');
+                const values = args ? args.namedChildren : [];
+                const title = literalTitle(values[0]);
+                const callback = values.slice(1).reverse().find(value => FUNCTION_NODES.has(value.type)) || null;
+                const dynamic = title == null ? 'name-not-literal'
+                    : api.table ? 'generated-cases'
+                    : indirect || inTest ? 'declared-indirectly' : null;
+                const unit = {
+                    kind: api.kind, name: title, titled: true, suite: suites.map(suite => suite.name),
+                    line: node.startPosition.row + 1, startLine: node.startPosition.row + 1,
+                    endLine: node.endPosition.row + 1,
+                    ...((dynamic || suites.some(suite => suite.dynamic)) && {
+                        dynamic: dynamic || 'suite-name-not-literal',
+                    }),
+                };
+                units.push(unit);
+                for (const value of values) {
+                    if (callback && sameNode(value, callback)) {
+                        // The callback's body is where the suite's own
+                        // declarations are written, not a function apart.
+                        const inside = api.kind === 'suite'
+                            ? [...suites, { name: title == null ? '' : title, dynamic: !!dynamic }] : suites;
+                        for (const child of value.namedChildren) {
+                            walk(child, inside, indirect, inTest || api.kind === 'test');
+                        }
+                    } else {
+                        walk(value, suites, indirect, inTest);
+                    }
+                }
+                const callee = node.childForFieldName('function');
+                if (callee && callee.type === 'call_expression') walk(callee, suites, indirect, inTest);
+                return;
+            }
+        }
+        const enters = FUNCTION_NODES.has(node.type);
+        for (const child of node.namedChildren) walk(child, suites, indirect || enters, inTest);
+    };
+    walk(tree.rootNode, [], false, false);
+    return { units, inheriting: false };
+}
+
 /**
  * Classify a JS/TS symbol as a runtime entry point of a specific kind.
  * Returns 'framework' | null.
@@ -6212,5 +6335,6 @@ module.exports = {
     findUsagesInCode,
     isEntryPoint,
     getEntryPointKind,
+    testUnits,
     parse
 };

@@ -24,11 +24,11 @@ const { describeError } = require('./errors');
 // HELPERS
 // ============================================================================
 
+// A state, said once and short: what the absence never means is in the
+// tool description and the usage guide.
 const NO_STATIC_TEST_LINK_NOTE =
-    'No confirmed static test link was found. This is not runtime coverage evidence: ' +
-    'subprocess/black-box tests, reflection, generated code, and external harnesses can still ' +
-    'exercise the target. Inspect the project test runner and search for the defining module/file ' +
-    'before concluding it is untested.';
+    'No static test link found; this is not runtime coverage evidence ' +
+    '(tests that reach the target by subprocess, reflection or generated code are not seen).';
 
 function requireName(name) {
     if (!name || (typeof name === 'string' && !name.trim())) {

@@ -49,7 +49,7 @@ const ANALYSIS_METADATA = Object.freeze([
     'package.json', 'tsconfig.json', 'jsconfig.json',
     'go.mod', 'go.work',
     'Cargo.toml',
-    'pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt',
+    'pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt', 'pytest.ini', 'tox.ini',
     'pom.xml', 'build.gradle', 'build.gradle.kts',
     'compile_commands.json', 'CMakeLists.txt', 'Makefile',
     'composer.json', 'Gemfile', 'Podfile', 'Cartfile', 'mix.exs', 'rebar.config',

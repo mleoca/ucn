@@ -562,12 +562,15 @@ function formatAffectedTests(result, options = {}) {
         lines.push('No confirmed static test links found for any affected function.');
     } else {
         const MAX_TEST_FILES = options.all ? Infinity : 30;
-        const displayFiles = result.testFiles.slice(0, MAX_TEST_FILES);
-        const truncatedFiles = result.testFiles.length - displayFiles.length;
-        lines.push(`Test files to run (${summary.totalTestFiles}):`);
+        const runnable = result.testFiles.filter(tf => tf.role !== 'support');
+        const support = result.testFiles.filter(tf => tf.role === 'support');
+        const displayFiles = runnable.slice(0, MAX_TEST_FILES);
+        const truncatedFiles = runnable.length - displayFiles.length;
+        lines.push(`Test files to run (${runnable.length})${summary.totalTests > 0 ? `, ${summary.totalTests} test${summary.totalTests === 1 ? '' : 's'}` : ''}:`);
         lines.push('');
         for (const tf of displayFiles) {
-            lines.push(`  ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})`);
+            const count = tf.testCount > 0 ? ` · ${tf.testCount} test${tf.testCount === 1 ? '' : 's'}` : '';
+            lines.push(`  ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})${count}`);
             // Show up to 5 key matches per file
             const keyMatches = tf.matches
                 .filter(m => m.matchType === 'call' || m.matchType === 'test-case')
@@ -578,6 +581,23 @@ function formatAffectedTests(result, options = {}) {
         }
         if (truncatedFiles > 0) {
             lines.push(`\n  ... ${truncatedFiles} more test files (use file= and exclude= to narrow scope)`);
+        }
+        if (support.length > 0) {
+            lines.push('');
+            lines.push(`Test support code reached (${support.length}) — declares no test, runs with the tests that load it:`);
+            for (const tf of support.slice(0, options.all ? Infinity : 10)) {
+                lines.push(`  ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})`);
+            }
+        }
+        const commands = result.commands || [];
+        if (commands.length > 0) {
+            lines.push('');
+            lines.push('Run:');
+            const MAX_COMMANDS = options.all ? Infinity : 5;
+            for (const line of commands.slice(0, MAX_COMMANDS)) lines.push(`  ${line}`);
+            if (commands.length > MAX_COMMANDS) {
+                lines.push(`  ... ${commands.length - MAX_COMMANDS} more (${options.allHint || 'use --all'})`);
+            }
         }
     }
 
@@ -614,7 +634,7 @@ function formatAffectedTests(result, options = {}) {
     const pct = summary.totalAffected > 0
         ? Math.round(summary.staticallyLinkedFunctions / summary.totalAffected * 100)
         : 0;
-    let summaryLine = `Summary: ${summary.totalAffected} affected → ${summary.totalTestFiles} statically linked test files, ${summary.staticallyLinkedFunctions}/${summary.totalAffected} functions linked (${pct}%)`;
+    let summaryLine = `Summary: ${summary.totalAffected} affected → ${summary.totalTestFiles} statically linked test files${summary.totalTests > 0 ? ` (${summary.totalTests} tests)` : ''}, ${summary.staticallyLinkedFunctions}/${summary.totalAffected} functions linked (${pct}%)`;
     if (summary.possiblyAffected > 0) {
         summaryLine += ` · ${summary.possiblyAffected} possibly affected (unverified chains)`;
     }

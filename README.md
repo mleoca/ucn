@@ -85,6 +85,9 @@ several hops away. `plan` previews a rename or signature change with source
 locations and review items; it does not edit files. Together these commands
 support code exploration, refactoring, and change review from a terminal or
 an AI agent.
+Each linked test is named by its file, suites and name, and where the test
+runner is proven by the project's own files, `tests` and `check` print the
+command that runs it.
 
 ## What an answer establishes
 
