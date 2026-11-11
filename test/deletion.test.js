@@ -468,6 +468,43 @@ describe('deletion: a declaration the index no longer holds', () => {
             assert.strictEqual(sameLine.verdict, 'has-static-dependents');
         } finally { rm(dir); }
     });
+
+    it('a whole file that is gone: each declaration by what still names it', () => {
+        const dir = tmp({
+            'package.json': '{"name":"gone-file"}',
+            '.ucn.json': '{"kind":"application"}',
+            'gone.ts': [
+                'export interface Contract { slot(): number; }',
+                'export class Impl implements Contract {',
+                '    slot() { return 1; }',
+                '}',
+                'export function helper() { return 2; }',
+                'export function unused() { return 3; }',
+            ].join('\n'),
+            'keep.ts': 'import { helper } from "./gone";\nconsole.log(helper());',
+        });
+        try {
+            const before = idx(dir);
+            const saved = (name, className) => JSON.parse(JSON.stringify(
+                (before.symbols.get(name) || []).find(definition =>
+                    definition.relativePath === 'gone.ts' && (definition.className || null) === className)));
+            const records = { slot: saved('slot', 'Impl'), helper: saved('helper', null), unused: saved('unused', null) };
+            const fileEntry = before.files.get(path.join(dir, 'gone.ts'));
+            // While the file stands, the interface holds the member.
+            assert.strictEqual(assessDeletion(before, records.slot).reason, 'required-slot');
+            fs.rmSync(path.join(dir, 'gone.ts'));
+            const after = idx(dir);
+            // Still imported and called from a file that stayed.
+            const helper = assessDeletion(after, records.helper, { fileEntry });
+            assert.deepStrictEqual([helper.verdict, helper.reason, helper.site],
+                ['has-static-dependents', 'has-callers', { file: 'keep.ts', line: 2 }]);
+            // Named by nothing that stayed.
+            assert.strictEqual(assessDeletion(after, records.unused, { fileEntry }).verdict, 'no-static-dependents');
+            // Its owner type and the interface went with the file: nothing
+            // left in the snapshot can require it.
+            assert.strictEqual(assessDeletion(after, records.slot, { fileEntry }).verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
 });
 
 describe('deletion: members held in place by a contract nothing names', () => {
