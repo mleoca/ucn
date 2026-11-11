@@ -3852,6 +3852,33 @@ function selectorReceiverIsLocal(tree, line, column) {
  * test; an Example runs only when its body ends in an output comment. A
  * Benchmark runs only when asked for, so it is not one of the tests.
  */
+/**
+ * Does an Example function end in an output comment? go runs an example
+ * only then. The comment is a comment of the function's body (vet insists
+ * it is the last one): text inside a string is not one.
+ */
+function exampleHasOutput(tree, symbol) {
+    if (!tree) return false;
+    const line = (symbol.nameLine || symbol.startLine) - 1;
+    const declaration = tree.rootNode.namedChildren.find(node => node.type === 'function_declaration' &&
+        node.startPosition.row <= line && node.endPosition.row >= line &&
+        node.childForFieldName('name')?.text === symbol.name);
+    const body = declaration && declaration.childForFieldName('body');
+    if (!body) return false;
+    let found = false;
+    const scan = node => {
+        if (found) return;
+        if (node.type === 'comment') {
+            const text = node.text.replace(/^\/\/|^\/\*/, '');
+            if (/^\s*(unordered )?output:/i.test(text)) found = true;
+            return;
+        }
+        for (const child of node.namedChildren) scan(child);
+    };
+    scan(body);
+    return found;
+}
+
 const GO_PLATFORM_WORDS = new Set(['aix', 'android', 'darwin', 'dragonfly', 'freebsd', 'hurd', 'illumos', 'ios',
     'js', 'linux', 'nacl', 'netbsd', 'openbsd', 'plan9', 'solaris', 'wasip1', 'windows', 'zos',
     '386', 'amd64', 'amd64p32', 'arm', 'armbe', 'arm64', 'arm64be', 'loong64', 'mips', 'mipsle', 'mips64',
@@ -3859,7 +3886,7 @@ const GO_PLATFORM_WORDS = new Set(['aix', 'android', 'darwin', 'dragonfly', 'fre
     'sparc', 'sparc64', 'wasm']);
 
 function testUnits(fileEntry, helpers) {
-    if (!/_test\.go$/.test(fileEntry.relativePath)) return { units: [], inheriting: false };
+    if (!/_test\.go$/.test(fileEntry.relativePath)) return { units: [], inheriting: false, complete: true };
     // name_GOOS_test.go, name_GOARCH_test.go, name_GOOS_GOARCH_test.go
     const words = fileEntry.relativePath.split('/').pop().replace(/_test\.go$/, '').split('_').slice(1);
     const platform = words.length > 0 && GO_PLATFORM_WORDS.has(words[words.length - 1]);
@@ -3873,14 +3900,7 @@ function testUnits(fileEntry, helpers) {
         if (symbol.name === 'TestMain' && /testing\s*\.\s*M\b/.test(String(symbol.params || ''))) continue;
         if (helpers.enclosing(symbol).length > 0) continue;
         const form = match[1].toLowerCase();
-        if (form === 'example') {
-            const lines = helpers.lines();
-            let printed = false;
-            for (let line = symbol.startLine; line <= (symbol.endLine ?? symbol.startLine); line++) {
-                if (/^\s*\/\/\s*(unordered )?output:/i.test(lines[line - 1] || '')) { printed = true; break; }
-            }
-            if (!printed) continue;
-        }
+        if (form === 'example' && !exampleHasOutput(helpers.tree(), symbol)) continue;
         units.push({
             kind: 'test', name: symbol.name, suite: [], form,
             // A file under a build constraint is compiled only sometimes.
@@ -3889,7 +3909,8 @@ function testUnits(fileEntry, helpers) {
             endLine: symbol.endLine ?? symbol.startLine,
         });
     }
-    return { units, inheriting: false };
+    // Go has no test that is not a declaration: no unit, no test.
+    return { units, inheriting: false, complete: true };
 }
 
 /**

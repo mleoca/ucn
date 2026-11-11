@@ -119,6 +119,13 @@
     "  T Concrete > Inherited (from FooTests.cs:35) => dotnet test --filter FullyQualifiedName=My.App.Tests.Concrete.Inherited",
     "all: dotnet test --filter 'FullyQualifiedName~My.App.Tests.Concrete.|FullyQualifiedName~My.App.Tests.Concrete+|FullyQualifiedName~My.App.Tests.FooTests.|FullyQualifiedName~My.App.Tests.FooTests+|FullyQualifiedName~My.App.Tests.FooTestsMore.|FullyQualifiedName~My.App.Tests.FooTestsMore+'"
   ],
+  "dotnet-xunit-skip-is-an-argument": [
+    "Named.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Named.Tests.Named.|FullyQualifiedName~Named.Tests.Named+'",
+    "  S Named",
+    "  T Named > Runs => dotnet test --filter FullyQualifiedName=Named.Tests.Named.Runs",
+    "  T Named > Skipped [skipped] => dotnet test --filter FullyQualifiedName=Named.Tests.Named.Skipped",
+    "all: dotnet test --filter 'FullyQualifiedName~Named.Tests.Named.|FullyQualifiedName~Named.Tests.Named+'"
+  ],
   "dotnet-xunit-what-is-not-discovered": [
     "Hidden.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Hid.Tests.Shown.|FullyQualifiedName~Hid.Tests.Shown+'",
     "  S Shown",
@@ -131,25 +138,32 @@
   "go-build-constraint": [
     "a_test.go [tests] go-test  run: go test .",
     "  T TestAlways => go test . -run '^TestAlways$'",
-    "mark_test.go [tests] go-test  run: go test .",
+    "mark_test.go [support] go-test",
     "slow_test.go [tests] go-test  run: (withheld: conditional-tests)",
     "  T TestSlow [conditional] => (withheld: build-constraint)",
+    "all: go test ."
+  ],
+  "go-example-output-is-the-last-comment": [
+    "ex_test.go [tests] go-test  run: go test .",
+    "  T ExampleAdd => go test . -run '^ExampleAdd$'",
+    "  T ExampleDiv => go test . -run '^ExampleDiv$'",
+    "mark_test.go [support] go-test",
     "all: go test ."
   ],
   "go-nested-module-and-packages": [
     "svc/a/a_test.go [tests] go-test  run: (cd svc && go test ./a)",
     "  T TestSame => (cd svc && go test ./a -run '^TestSame$')",
-    "svc/a/mark_test.go [tests] go-test  run: (cd svc && go test ./a)",
+    "svc/a/mark_test.go [support] go-test",
     "svc/b/b_test.go [tests] go-test  run: (cd svc && go test ./b)",
     "  T TestSame => (cd svc && go test ./b -run '^TestSame$')",
     "  T TestSameMore => (cd svc && go test ./b -run '^TestSameMore$')",
-    "svc/b/mark_test.go [tests] go-test  run: (cd svc && go test ./b)",
+    "svc/b/mark_test.go [support] go-test",
     "all: (cd svc && go test ./a ./b)"
   ],
   "go-platform-file-and-external-package": [
     "ext_test.go [tests] go-test  run: go test .",
     "  T TestOutside => go test . -run '^TestOutside$'",
-    "mark_test.go [tests] go-test  run: go test .",
+    "mark_test.go [support] go-test",
     "only_plan9_test.go [tests] go-test  run: (withheld: conditional-tests)",
     "  T TestElsewhere [conditional] => (withheld: build-constraint)",
     "all: go test ."
@@ -162,13 +176,20 @@
     "  T Test1 => go test . -run '^Test1$'",
     "  T FuzzY => go test . -run '^FuzzY$'",
     "  T ExampleAdd => go test . -run '^ExampleAdd$'",
-    "mark_test.go [tests] go-test  run: go test .",
+    "mark_test.go [support] go-test",
     "all: go test ."
   ],
   "java-gradle-not-modeled": [
     "src/test/java/com/x/FooTest.java [tests] no runner: runner-not-modeled  run: (withheld: runner-not-modeled)",
     "  S FooTest",
     "  T FooTest > adds => (withheld: runner-not-modeled)"
+  ],
+  "jest-file-the-default-pattern-leaves-out": [
+    "test/named.test.js [tests] jest  run: npx jest --runTestsByPath test/named.test.js",
+    "  T in a file jest looks for => npx jest --runTestsByPath test/named.test.js -t '^in a file jest looks for$'",
+    "test/plain.js [tests] jest  run: (withheld: runner-config-not-read)",
+    "  T in a file jest does not look for => (withheld: runner-config-not-read)",
+    "all: npx jest --runTestsByPath test/named.test.js"
   ],
   "jest-focused-tests": [
     "src/focus.test.js [tests] jest  run: npx jest --runTestsByPath src/focus.test.js",
@@ -187,6 +208,22 @@
     "  S uses a local test()",
     "  T uses a local test() > calls it => npx jest --runTestsByPath src/t.test.js -t '^uses a local test\\(\\) calls it$'",
     "all: npx jest --runTestsByPath src/t.test.js"
+  ],
+  "jest-nested-focus": [
+    "src/nested.test.js [tests] jest  run: npx jest --runTestsByPath src/nested.test.js",
+    "  S outer",
+    "  T outer > one => npx jest --runTestsByPath src/nested.test.js -t '^outer one$'",
+    "  T outer > two [skipped] => npx jest --runTestsByPath src/nested.test.js -t '^outer two$'",
+    "  S outer > inner",
+    "  T outer > inner > three => npx jest --runTestsByPath src/nested.test.js -t '^outer inner three$'",
+    "  S plain",
+    "  T plain > direct => npx jest --runTestsByPath src/nested.test.js -t '^plain direct$'",
+    "  S plain > nested focus",
+    "  T plain > nested focus > in nested focus => npx jest --runTestsByPath src/nested.test.js -t '^plain nested focus in nested focus$'",
+    "  S plain > nested plain",
+    "  T plain > nested plain > in nested plain [skipped] => npx jest --runTestsByPath src/nested.test.js -t '^plain nested plain in nested plain$'",
+    "  T outside [skipped] => npx jest --runTestsByPath src/nested.test.js -t '^outside$'",
+    "all: npx jest --runTestsByPath src/nested.test.js"
   ],
   "jest-path-that-names-two-files": [
     "src/checksum.test.js [tests] jest  run: npx jest --runTestsByPath src/checksum.test.js",
@@ -288,6 +325,22 @@
     "  T other file => npx mocha test/plain.test.js --grep '^other file$'",
     "all: npx mocha test/focus.test.js test/plain.test.js"
   ],
+  "mocha-nested-focus": [
+    "test/nested.test.js [tests] mocha  run: npx mocha test/nested.test.js",
+    "  S outer",
+    "  T outer > one => npx mocha test/nested.test.js --grep '^outer one$'",
+    "  T outer > two [skipped] => npx mocha test/nested.test.js --grep '^outer two$'",
+    "  S outer > inner",
+    "  T outer > inner > three [skipped] => npx mocha test/nested.test.js --grep '^outer inner three$'",
+    "  S plain",
+    "  T plain > direct => npx mocha test/nested.test.js --grep '^plain direct$'",
+    "  S plain > nested focus",
+    "  T plain > nested focus > in nested focus [skipped] => npx mocha test/nested.test.js --grep '^plain nested focus in nested focus$'",
+    "  S plain > nested plain",
+    "  T plain > nested plain > in nested plain [skipped] => npx mocha test/nested.test.js --grep '^plain nested plain in nested plain$'",
+    "  T outside [skipped] => npx mocha test/nested.test.js --grep '^outside$'",
+    "all: npx mocha test/nested.test.js"
+  ],
   "mocha-script": [
     "test/a.test.js [tests] mocha  run: npx mocha test/a.test.js",
     "  S queue",
@@ -306,6 +359,28 @@
     "test/shared.js [tests] mocha  run: (withheld: declared-indirectly)",
     "  T pushes [conditional] => (withheld: declared-indirectly)",
     "all: npx mocha test/fifo.test.js"
+  ],
+  "mocha-skipped-forms": [
+    "test/skips.test.js [tests] mocha  run: npx mocha test/skips.test.js",
+    "  T runs => npx mocha test/skips.test.js --grep '^runs$'",
+    "  T skipped [skipped] => npx mocha test/skips.test.js --grep '^skipped$'",
+    "  T crossed out [skipped] => npx mocha test/skips.test.js --grep '^crossed out$'",
+    "  T pending, no body [skipped] => npx mocha test/skips.test.js --grep '^pending, no body$'",
+    "  S skipped group",
+    "  T skipped group > inside [skipped] => npx mocha test/skips.test.js --grep '^skipped group inside$'",
+    "  S crossed group",
+    "  T crossed group > inside [skipped] => npx mocha test/skips.test.js --grep '^crossed group inside$'",
+    "all: npx mocha test/skips.test.js"
+  ],
+  "node-test-binding-at-the-call": [
+    "test/bound.test.js [tests] node-test  run: node --test test/bound.test.js",
+    "  T real => node --test --test-name-pattern='^real$' test/bound.test.js",
+    "  S suite",
+    "  T suite > inside => node --test --test-name-pattern='^suite inside$' test/bound.test.js",
+    "  S re-exported",
+    "  T re-exported > through a project module => node --test --test-name-pattern='^re-exported through a project module$' test/bound.test.js",
+    "  T after the suite => node --test --test-name-pattern='^after the suite$' test/bound.test.js",
+    "all: node --test test/bound.test.js"
   ],
   "node-test-binding-not-followed": [
     "test/computed.js [tests] node-test  run: node --test test/computed.js",
@@ -348,6 +423,14 @@
     "  S uses helper",
     "  T in callback [conditional] => (withheld: declared-indirectly)",
     "all: node --test test/e.test.js"
+  ],
+  "node-test-names-of-inner-scopes": [
+    "test/scopes.test.js [tests] node-test  run: node --test test/scopes.test.js",
+    "  S declared inside",
+    "  T declared inside > still the runner => node --test --test-name-pattern='^declared inside still the runner$' test/scopes.test.js",
+    "  T after them all => node --test --test-name-pattern='^after them all$' test/scopes.test.js",
+    "  T and the other name => node --test --test-name-pattern='^and the other name$' test/scopes.test.js",
+    "all: node --test test/scopes.test.js"
   ],
   "node-test-only-is-inert-without-its-flag": [
     "test/focus.test.js [tests] node-test  run: node --test test/focus.test.js",
@@ -410,6 +493,13 @@
     "test/unregistered.test.js [tests] node-test  run: (withheld: declared-indirectly)",
     "  T never registered [conditional] => (withheld: declared-indirectly)",
     "all: node --test test/skips.test.js"
+  ],
+  "node-test-through-an-esm-module": [
+    "test/through.test.mjs [tests] node-test  run: node --test test/through.test.mjs",
+    "  S grouped",
+    "  T grouped > renamed on the way out => node --test --test-name-pattern='^grouped renamed on the way out$' test/through.test.mjs",
+    "  T a constant of the module => node --test --test-name-pattern='^a constant of the module$' test/through.test.mjs",
+    "all: node --test test/through.test.mjs"
   ],
   "node-test-typescript-by-script-option": [
     "test/typed.test.ts [tests] node-test  run: node --test --experimental-strip-types test/typed.test.ts",
@@ -509,6 +599,31 @@
     "  T test_x => pytest tests/test_s.py::test_x",
     "all: pytest tests/test_s.py"
   ],
+  "pytest-switches-and-marks-are-syntax": [
+    "tests/test_annotated.py [tests] pytest  run: (withheld: collection-switched-off)",
+    "tests/test_branch.py [tests] pytest  run: pytest tests/test_branch.py",
+    "  T test_under_a_branch [conditional] => (withheld: collection-switch)",
+    "tests/test_decorators.py [tests] pytest  run: pytest tests/test_decorators.py",
+    "  T test_own_decorator_named_skip [conditional] => pytest tests/test_decorators.py::test_own_decorator_named_skip",
+    "  T test_unittest_skip_renamed [skipped] => pytest tests/test_decorators.py::test_unittest_skip_renamed",
+    "  T test_skip_if [conditional] => pytest tests/test_decorators.py::test_skip_if",
+    "  S TestOffByDecorator",
+    "  T TestOffByDecorator > test_in_skipped_class [skipped] => pytest tests/test_decorators.py::TestOffByDecorator::test_in_skipped_class",
+    "tests/test_listed_marks.py [tests] pytest  run: pytest tests/test_listed_marks.py",
+    "  T test_under_a_list [skipped] => pytest tests/test_listed_marks.py::test_under_a_list",
+    "tests/test_reset.py [tests] pytest  run: pytest tests/test_reset.py",
+    "  T test_switched_back_on => pytest tests/test_reset.py::test_switched_back_on",
+    "  S TestReset",
+    "  T TestReset > test_in_class => pytest tests/test_reset.py::TestReset::test_in_class",
+    "  T test_named_reset => pytest tests/test_reset.py::test_named_reset",
+    "tests/test_text.py [tests] pytest  run: pytest tests/test_text.py",
+    "  T test_under_a_string => pytest tests/test_text.py::test_under_a_string",
+    "tests/test_warning.py [tests] pytest  run: pytest tests/test_warning.py",
+    "  T test_under_a_filter => pytest tests/test_warning.py::test_under_a_filter",
+    "  S TestFiltered",
+    "  T TestFiltered > test_in_class => pytest tests/test_warning.py::TestFiltered::test_in_class",
+    "all: pytest tests/test_branch.py tests/test_decorators.py tests/test_listed_marks.py tests/test_reset.py tests/test_text.py tests/test_warning.py"
+  ],
   "pytest-toml-array-names": [
     "test_s.py [tests] pytest  run: pytest test_s.py",
     "  T spec_one => pytest test_s.py::spec_one",
@@ -569,6 +684,13 @@
     "  T bare (x) => npx vitest run src/sum.test.ts -t '^bare \\(x\\)$'",
     "all: npx vitest run src/sum.test.ts"
   ],
+  "vitest-file-the-default-pattern-leaves-out": [
+    "test/named.test.js [tests] vitest  run: npx vitest run test/named.test.js",
+    "  T in a file vitest looks for => npx vitest run test/named.test.js -t '^in a file vitest looks for$'",
+    "test/plain.js [tests] vitest  run: (withheld: runner-config-not-read)",
+    "  T in a file vitest does not look for => (withheld: runner-config-not-read)",
+    "all: npx vitest run test/named.test.js"
+  ],
   "vitest-focused-tests": [
     "src/focus.test.js [tests] vitest  run: npx vitest run src/focus.test.js",
     "  T focused => npx vitest run src/focus.test.js -t '^focused$'",
@@ -583,6 +705,22 @@
     "src/v.test.js [tests] vitest  run: npx vitest run src/v.test.js",
     "  T runs => npx vitest run src/v.test.js -t '^runs$'",
     "all: npx vitest run src/v.test.js"
+  ],
+  "vitest-nested-focus": [
+    "src/nested.test.js [tests] vitest  run: npx vitest run src/nested.test.js",
+    "  S outer",
+    "  T outer > one => npx vitest run src/nested.test.js -t '^outer one$'",
+    "  T outer > two => npx vitest run src/nested.test.js -t '^outer two$'",
+    "  S outer > inner",
+    "  T outer > inner > three => npx vitest run src/nested.test.js -t '^outer inner three$'",
+    "  S plain",
+    "  T plain > direct => npx vitest run src/nested.test.js -t '^plain direct$'",
+    "  S plain > nested focus",
+    "  T plain > nested focus > in nested focus => npx vitest run src/nested.test.js -t '^plain nested focus in nested focus$'",
+    "  S plain > nested plain",
+    "  T plain > nested plain > in nested plain [skipped] => npx vitest run src/nested.test.js -t '^plain nested plain in nested plain$'",
+    "  T outside [skipped] => npx vitest run src/nested.test.js -t '^outside$'",
+    "all: npx vitest run src/nested.test.js"
   ],
   "vitest-path-that-names-two-files": [
     "src/checksum.test.js [tests] vitest  run: npx vitest run src/checksum.test.js",
@@ -599,5 +737,17 @@
     "  T grouped > inner => npx vitest run src/names.test.js -t '^grouped inner$'",
     "  T namespaced => npx vitest run src/names.test.js -t '^namespaced$'",
     "all: npx vitest run src/names.test.js"
+  ],
+  "vitest-skipped-forms": [
+    "src/skips.test.js [tests] vitest  run: npx vitest run src/skips.test.js",
+    "  T runs => npx vitest run src/skips.test.js -t '^runs$'",
+    "  T skipped [skipped] => npx vitest run src/skips.test.js -t '^skipped$'",
+    "  T later [skipped] => npx vitest run src/skips.test.js -t '^later$'",
+    "  T skipped when true [conditional] => npx vitest run src/skips.test.js -t '^skipped when true$'",
+    "  T run when true [conditional] => npx vitest run src/skips.test.js -t '^run when true$'",
+    "  S skipped group",
+    "  T skipped group > inside [skipped] => npx vitest run src/skips.test.js -t '^skipped group inside$'",
+    "  T with options [skipped] => npx vitest run src/skips.test.js -t '^with options$'",
+    "all: npx vitest run src/skips.test.js"
   ]
 }

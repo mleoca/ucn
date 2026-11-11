@@ -13,7 +13,9 @@
  * engine does not list: inherited, generated), `notRunByDefault` (units a
  * whole-project run leaves out and an explicit command runs), `moduleDirs`
  * (where a JavaScript case needs node_modules), `full` (the whole-project
- * command when it is not the runner's default).
+ * command when it is not the runner's default), `sometimes` (units the
+ * engine calls conditional: each must be meant), `emptyTestFiles` (files
+ * the engine calls test files, with a command, from which nothing runs).
  *
  * Two consumers share this data: eval/run-test-unit-matrix.js runs the
  * runners; test/test-units.test.js pins the engine's answer on every case
@@ -200,6 +202,7 @@ class TestOld:
     },
     {
         id: 'pytest-inherited-tests', runner: 'pytest',
+        emptyTestFiles: ['tests/test_outside.py'],
         files: {
             'pytest.ini': '[pytest]\n',
             'tests/base.py': `${PY}import inspect
@@ -275,6 +278,7 @@ class TestPlain:
     },
     {
         id: 'pytest-base-from-outside-the-project', runner: 'pytest',
+        sometimes: ['tests/test_o.py::TestOnDict > test_never'],
         files: {
             'pytest.ini': '[pytest]\n',
             'tests/test_o.py': `${PY}import collections
@@ -292,6 +296,8 @@ class TestOnAbc(abc.ABC):
     },
     {
         id: 'pytest-what-is-not-collected', runner: 'pytest',
+        sometimes: ['tests/test_switch_elsewhere.py::test_decorated_off', 'tests/test_switch_elsewhere.py::test_plain'],
+        emptyTestFiles: ['tests/test_marked.py'],
         files: {
             'pytest.ini': '[pytest]\n',
             'tests/test_forms.py': `${PY}import pytest
@@ -440,6 +446,102 @@ class TestBehindUnknown(contextlib.AbstractContextManager, Right):
         ],
     },
     {
+        id: 'pytest-switches-and-marks-are-syntax', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/test_text.py': `${PY}
+DOC = """
+__test__ = False
+pytestmark = pytest.mark.skip
+"""
+# __test__ = False
+
+def test_under_a_string():
+    mark("tests/test_text.py::test_under_a_string")
+`,
+            'tests/test_reset.py': `${PY}__test__ = False
+__test__ = True
+
+def test_switched_back_on():
+    mark("tests/test_reset.py::test_switched_back_on")
+
+class TestReset:
+    __test__ = False
+    __test__ = True
+
+    def test_in_class(self):
+        mark("tests/test_reset.py::TestReset > test_in_class")
+
+def test_named_reset():
+    mark("tests/test_reset.py::test_named_reset")
+
+test_named_reset.__test__ = False
+test_named_reset.__test__ = True
+`,
+            'tests/test_warning.py': `${PY}import pytest
+
+pytestmark = pytest.mark.filterwarnings("ignore:skip")
+
+def test_under_a_filter():
+    mark("tests/test_warning.py::test_under_a_filter")
+
+class TestFiltered:
+    pytestmark = [pytest.mark.filterwarnings("ignore:skip")]
+
+    def test_in_class(self):
+        mark("tests/test_warning.py::TestFiltered > test_in_class")
+`,
+            'tests/test_listed_marks.py': `${PY}import pytest
+
+pytestmark = [pytest.mark.filterwarnings("ignore"), pytest.mark.skip(reason="whole module")]
+
+def test_under_a_list():
+    mark("tests/test_listed_marks.py::test_under_a_list")
+`,
+            'tests/test_branch.py': `${PY}
+if os.environ.get("UCN_NO_SUCH_SETTING"):
+    __test__ = False
+
+def test_under_a_branch():
+    mark("tests/test_branch.py::test_under_a_branch")
+`,
+            'tests/test_decorators.py': `${PY}import unittest
+from unittest import skip as leave_out
+
+def skip(function):
+    return function
+
+@skip
+def test_own_decorator_named_skip():
+    mark("tests/test_decorators.py::test_own_decorator_named_skip")
+
+@leave_out("not now")
+def test_unittest_skip_renamed():
+    mark("tests/test_decorators.py::test_unittest_skip_renamed")
+
+@unittest.skipIf(False, "never true")
+def test_skip_if():
+    mark("tests/test_decorators.py::test_skip_if")
+
+@unittest.skip("whole class")
+class TestOffByDecorator(unittest.TestCase):
+    def test_in_skipped_class(self):
+        mark("tests/test_decorators.py::TestOffByDecorator > test_in_skipped_class")
+`,
+            'tests/test_annotated.py': `${PY}__test__: bool = False
+
+def test_under_an_annotated_switch():
+    mark("tests/test_annotated.py::test_under_an_annotated_switch")
+`,
+        },
+        sometimes: [
+            'tests/test_branch.py::test_under_a_branch',
+            'tests/test_decorators.py::test_own_decorator_named_skip',
+            'tests/test_decorators.py::test_skip_if',
+        ],
+        emptyTestFiles: ['tests/test_listed_marks.py'],
+    },
+    {
         id: 'python-no-runner-named', runner: 'pytest', judge: false,
         files: {
             'tests/test_u.py': 'import unittest\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n',
@@ -565,6 +667,7 @@ describe('group', () => {
     },
     {
         id: 'node-test-skipped-and-unregistered', runner: 'node-test',
+        sometimes: ['test/unregistered.test.js::never registered'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/skips.test.js': `${CJS}const { test, describe, it } = require('node:test');
@@ -590,6 +693,74 @@ module.exports = { register };
             'test/focus.test.js': `${CJS}const { test } = require('node:test');
 test.only('focused', () => { mark('test/focus.test.js::focused'); });
 test('not left out', () => { mark('test/focus.test.js::not left out'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-binding-at-the-call', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'helper.js': 'function it(name, callback) { return name; }\nmodule.exports = { it };\n',
+            'reexport.js': "const runner = require('node:test');\nmodule.exports = { it: runner.it, group: runner.describe };\n",
+            'test/bound.test.js': `${CJS}const { test, describe, it: real } = require('node:test');
+const { it } = require('../helper');
+const { it: again, group } = require('../reexport');
+it('from a helper that is not the runner', () => { mark('test/bound.test.js::from a helper that is not the runner'); });
+test('real', () => { mark('test/bound.test.js::real'); });
+describe('suite', () => {
+    const real = (name, callback) => name;
+    real('shadowed inside the suite', () => { mark('test/bound.test.js::suite > shadowed inside the suite'); });
+    test('inside', () => { mark('test/bound.test.js::suite > inside'); });
+});
+function register(test) {
+    test('through a parameter', () => { mark('test/bound.test.js::through a parameter'); });
+}
+register((name, callback) => name);
+group('re-exported', () => {
+    again('through a project module', () => { mark('test/bound.test.js::re-exported > through a project module'); });
+});
+real('after the suite', () => { mark('test/bound.test.js::after the suite'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-through-an-esm-module', runner: 'node-test', full: 'node --test test/through.test.mjs',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'harness.mjs': "import { test } from 'node:test';\nexport { it as spec } from 'node:test';\nexport * from 'node:test';\nexport const again = test;\nexport function fake(name, callback) { return name; }\n",
+            'test/through.test.mjs': `${ESM}import { spec, describe, again, fake } from '../harness.mjs';
+describe('grouped', () => {
+    spec('renamed on the way out', () => { mark('test/through.test.mjs::grouped > renamed on the way out'); });
+});
+again('a constant of the module', () => { mark('test/through.test.mjs::a constant of the module'); });
+fake('a function of the module', () => { mark('test/through.test.mjs::a function of the module'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-names-of-inner-scopes', runner: 'node-test',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/scopes.test.js': `${CJS}const { test, describe, it } = require('node:test');
+describe('declared inside', () => {
+    function it(name, callback) { return name; }
+    it('a function of the suite', () => { mark('test/scopes.test.js::declared inside > a function of the suite'); });
+    test('still the runner', () => { mark('test/scopes.test.js::declared inside > still the runner'); });
+});
+{
+    const test = (name, callback) => name;
+    test('a constant of a block', () => { mark('test/scopes.test.js::a constant of a block'); });
+}
+for (const it of [(name, callback) => name]) {
+    it('a loop variable', () => { mark('test/scopes.test.js::a loop variable'); });
+}
+try {
+    throw (name, callback) => name;
+} catch (test) {
+    test('a caught value', () => { mark('test/scopes.test.js::a caught value'); });
+}
+test('after them all', () => { mark('test/scopes.test.js::after them all'); });
+it('and the other name', () => { mark('test/scopes.test.js::and the other name'); });
 `,
         },
     },
@@ -629,6 +800,7 @@ describe('typed group', () => {
     },
     {
         id: 'node-test-names-not-written', runner: 'node-test',
+        sometimes: ['test/e.test.js::from helper', 'test/e.test.js::in callback'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/e.test.js': `${CJS}const { test, describe, it } = require('node:test');
@@ -749,9 +921,46 @@ describe.only('focused group', () => {
         },
     },
 
+    {
+        id: 'jest-nested-focus', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'src/nested.test.js': `${CJS}
+describe.only('outer', () => {
+    it.only('one', () => { mark('src/nested.test.js::outer > one'); });
+    it('two', () => { mark('src/nested.test.js::outer > two'); });
+    describe('inner', () => {
+        it('three', () => { mark('src/nested.test.js::outer > inner > three'); });
+    });
+});
+describe('plain', () => {
+    it.only('direct', () => { mark('src/nested.test.js::plain > direct'); });
+    describe.only('nested focus', () => {
+        it('in nested focus', () => { mark('src/nested.test.js::plain > nested focus > in nested focus'); });
+    });
+    describe('nested plain', () => {
+        it('in nested plain', () => { mark('src/nested.test.js::plain > nested plain > in nested plain'); });
+    });
+});
+it('outside', () => { mark('src/nested.test.js::outside'); });
+`,
+        },
+    },
+
+    {
+        id: 'jest-file-the-default-pattern-leaves-out', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'test/plain.js': `${CJS}it('in a file jest does not look for', () => { mark('test/plain.js::in a file jest does not look for'); });\n`,
+            'test/named.test.js': `${CJS}it('in a file jest looks for', () => { mark('test/named.test.js::in a file jest looks for'); });\n`,
+        },
+        notRunByDefault: ['test/plain.js::in a file jest does not look for'],
+    },
+
     // ------------------------------------------------------------------ vitest
     {
         id: 'vitest-dependency', runner: 'vitest',
+        sometimes: ['src/sum.test.ts::other > conditional'],
         files: {
             'package.json': '{ "name": "x", "type": "module", "devDependencies": { "vitest": "^3" } }\n',
             'src/sum.test.ts': `${ESM}import { describe, it, test } from 'vitest';
@@ -802,6 +1011,61 @@ vt.test('namespaced', () => { mark('src/names.test.js::namespaced'); });
         },
     },
 
+    {
+        id: 'vitest-nested-focus', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "devDependencies": { "vitest": "^3" } }\n',
+            'src/nested.test.js': `${ESM}import { it, describe } from 'vitest';
+describe.only('outer', () => {
+    it.only('one', () => { mark('src/nested.test.js::outer > one'); });
+    it('two', () => { mark('src/nested.test.js::outer > two'); });
+    describe('inner', () => {
+        it('three', () => { mark('src/nested.test.js::outer > inner > three'); });
+    });
+});
+describe('plain', () => {
+    it.only('direct', () => { mark('src/nested.test.js::plain > direct'); });
+    describe.only('nested focus', () => {
+        it('in nested focus', () => { mark('src/nested.test.js::plain > nested focus > in nested focus'); });
+    });
+    describe('nested plain', () => {
+        it('in nested plain', () => { mark('src/nested.test.js::plain > nested plain > in nested plain'); });
+    });
+});
+it('outside', () => { mark('src/nested.test.js::outside'); });
+`,
+        },
+    },
+
+    {
+        id: 'vitest-file-the-default-pattern-leaves-out', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "devDependencies": { "vitest": "^3" } }\n',
+            'test/plain.js': `${ESM}import { it } from 'vitest';\nit('in a file vitest does not look for', () => { mark('test/plain.js::in a file vitest does not look for'); });\n`,
+            'test/named.test.js': `${ESM}import { it } from 'vitest';\nit('in a file vitest looks for', () => { mark('test/named.test.js::in a file vitest looks for'); });\n`,
+        },
+        notRunByDefault: ['test/plain.js::in a file vitest does not look for'],
+    },
+
+    {
+        id: 'vitest-skipped-forms', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "devDependencies": { "vitest": "^3" } }\n',
+            'src/skips.test.js': `${ESM}import { it, describe, test } from 'vitest';
+it('runs', () => { mark('src/skips.test.js::runs'); });
+it.skip('skipped', () => { mark('src/skips.test.js::skipped'); });
+it.todo('later');
+test.skipIf(true)('skipped when true', () => { mark('src/skips.test.js::skipped when true'); });
+test.runIf(true)('run when true', () => { mark('src/skips.test.js::run when true'); });
+describe.skip('skipped group', () => {
+    it('inside', () => { mark('src/skips.test.js::skipped group > inside'); });
+});
+it('with options', { skip: true }, () => { mark('src/skips.test.js::with options'); });
+`,
+        },
+        sometimes: ['src/skips.test.js::run when true', 'src/skips.test.js::skipped when true'],
+    },
+
     // ------------------------------------------------------------------- mocha
     {
         id: 'mocha-script', runner: 'mocha',
@@ -825,6 +1089,7 @@ describe('stack', function () {
 
     {
         id: 'mocha-shared-behaviour', runner: 'mocha',
+        sometimes: ['test/shared.js::pushes'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "mocha --recursive" } }\n',
             'test/shared.js': `${CJS}
@@ -866,6 +1131,51 @@ describe('group', () => {
 });
 `,
             'src/plain.test.js': `${ESM}import { it } from 'vitest';\nit('other file', () => { mark('src/plain.test.js::other file'); });\n`,
+        },
+    },
+
+    {
+        id: 'mocha-nested-focus', runner: 'mocha',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha --recursive" } }\n',
+            'test/nested.test.js': `${CJS}
+describe.only('outer', function () {
+    it.only('one', function () { mark('test/nested.test.js::outer > one'); });
+    it('two', function () { mark('test/nested.test.js::outer > two'); });
+    describe('inner', function () {
+        it('three', function () { mark('test/nested.test.js::outer > inner > three'); });
+    });
+});
+describe('plain', function () {
+    it.only('direct', function () { mark('test/nested.test.js::plain > direct'); });
+    describe.only('nested focus', function () {
+        it('in nested focus', function () { mark('test/nested.test.js::plain > nested focus > in nested focus'); });
+    });
+    describe('nested plain', function () {
+        it('in nested plain', function () { mark('test/nested.test.js::plain > nested plain > in nested plain'); });
+    });
+});
+it('outside', function () { mark('test/nested.test.js::outside'); });
+`,
+        },
+    },
+
+    {
+        id: 'mocha-skipped-forms', runner: 'mocha',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha --recursive" } }\n',
+            'test/skips.test.js': `${CJS}
+it('runs', function () { mark('test/skips.test.js::runs'); });
+it.skip('skipped', function () { mark('test/skips.test.js::skipped'); });
+xit('crossed out', function () { mark('test/skips.test.js::crossed out'); });
+it('pending, no body');
+describe.skip('skipped group', function () {
+    it('inside', function () { mark('test/skips.test.js::skipped group > inside'); });
+});
+xdescribe('crossed group', function () {
+    it('inside', function () { mark('test/skips.test.js::crossed group > inside'); });
+});
+`,
         },
     },
 
@@ -919,6 +1229,7 @@ func helper()                        { mark("a_test.go::helper") }
     },
     {
         id: 'go-build-constraint', runner: 'go-test',
+        sometimes: ['slow_test.go::TestSlow'],
         files: {
             'go.mod': 'module example.com/m\n\ngo 1.21\n',
             'mark_test.go': GO('m'),
@@ -929,12 +1240,47 @@ func helper()                        { mark("a_test.go::helper") }
 
     {
         id: 'go-platform-file-and-external-package', runner: 'go-test',
+        sometimes: ['only_plan9_test.go::TestElsewhere'],
         files: {
             'go.mod': 'module example.com/m\n\ngo 1.21\n',
             'util.go': 'package m\n\nfunc Add(a, b int) int { return a + b }\n',
             'mark_test.go': GO('m_test'),
             'ext_test.go': 'package m_test\n\nimport "testing"\n\nfunc TestOutside(t *testing.T) { mark("ext_test.go::TestOutside") }\n',
             'only_plan9_test.go': 'package m_test\n\nimport "testing"\n\nfunc TestElsewhere(t *testing.T) { mark("only_plan9_test.go::TestElsewhere") }\n',
+        },
+    },
+
+    {
+        id: 'go-example-output-is-the-last-comment', runner: 'go-test',
+        files: {
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'util.go': 'package m\n\nfunc Add(a, b int) int { return a + b }\nfunc Sub(a, b int) int { return a - b }\nfunc Mul(a, b int) int { return a * b }\nfunc Div(a, b int) int { return a / b }\n',
+            'mark_test.go': GO('m'),
+            'ex_test.go': `package m
+
+import "fmt"
+
+func ExampleAdd() {
+	mark("ex_test.go::ExampleAdd")
+	fmt.Println("hi")
+	// Output: hi
+}
+
+func ExampleSub() {
+	mark("ex_test.go::ExampleSub")
+	_ = \`
+// Output: only text in a string
+\`
+}
+
+func ExampleDiv() {
+	mark("ex_test.go::ExampleDiv")
+	fmt.Println("hi")
+	/* Output:
+	hi
+	*/
+}
+`,
         },
     },
 
@@ -1042,6 +1388,7 @@ mod tests {
     },
     {
         id: 'cargo-feature-gated', runner: 'cargo-test',
+        sometimes: ['src/lib.rs::extra > gated_module', 'src/lib.rs::tests > gated'],
         files: {
             'Cargo.toml': `${CARGO('case_gated')}\n[features]\nextra = []\n`,
             'src/lib.rs': `${RS}
@@ -1191,6 +1538,27 @@ ${CS}
 
         [Fact(Skip = "not now")]
         public void Skipped() { Rec.Mark("Hidden.cs::Shown > Skipped"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-xunit-skip-is-an-argument', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Named.cs': `using Xunit;
+
+namespace Named.Tests
+{
+${CS}
+    public class Named
+    {
+        [Fact(DisplayName = "when asked to, Skip = no")]
+        public void Runs() { Rec.Mark("Named.cs::Named > Runs"); }
+
+        [Fact(Skip = "not now")]
+        public void Skipped() { Rec.Mark("Named.cs::Named > Skipped"); }
     }
 }
 `,
@@ -1388,6 +1756,7 @@ public class ChildTest extends BaseChecks {
     },
     {
         id: 'maven-nested-classes', runner: 'maven',
+        sometimes: ['src/test/java/com/x/OuterTest.java::OuterTest > Plain > inStatic'],
         files: {
             'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
             'src/test/java/com/x/OuterTest.java': `package com.x;

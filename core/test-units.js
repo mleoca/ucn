@@ -178,9 +178,79 @@ const JS_RUNNER_PACKAGES = new Map([
     ['react-scripts', 'react-scripts'], ['ng', 'angular'], ['nx', 'nx'], ['turbo', 'turbo'], ['lerna', 'lerna'],
 ]);
 const MODELED_JS = new Set(['node-test', 'jest', 'vitest', 'mocha']);
-// Runners in which a focused test (`.only`) keeps the other tests of its
-// file from running. node:test honours the mark only under --test-only.
-const FOCUS_RUNNERS = new Set(['jest', 'vitest', 'mocha']);
+/**
+ * The tests of a file that a focus (`.only`) keeps from running, by each
+ * runner's own rule (read from the runners and measured). `units` are the
+ * reader's, each with `parent` (the index of the suite it stands in, -1
+ * for the file) and `only` as written.
+ * - vitest: a test runs when it or a suite around it is marked.
+ * - jest: a suite passes its mark down to suites inside it, and to its own
+ *   tests unless one of those is marked itself.
+ * - mocha: a suite with marked tests of its own runs those and nothing
+ *   else of it; otherwise it runs its marked suites (narrowed further when
+ *   they hold marks) and the unmarked ones that hold a mark.
+ * node:test honours the mark only under --test-only: nothing is left out.
+ * @returns {Set<object>} the units that do not run
+ */
+function focusedOut(units, runner) {
+    if (!units.some(unit => unit.only) || !['jest', 'vitest', 'mocha'].includes(runner)) return new Set();
+    const children = new Map();
+    units.forEach((unit, i) => {
+        const parent = unit.parent == null ? -1 : unit.parent;
+        if (!children.has(parent)) children.set(parent, []);
+        children.get(parent).push(i);
+    });
+    const kids = i => children.get(i) || [];
+    const isSuite = i => units[i].kind === 'suite';
+    const runs = new Set();
+    if (runner === 'vitest') {
+        const visit = (parent, included) => {
+            for (const i of kids(parent)) {
+                const include = included || !!units[i].only;
+                if (isSuite(i)) visit(i, include);
+                else if (include) runs.add(i);
+            }
+        };
+        visit(-1, false);
+    } else if (runner === 'jest') {
+        const modes = new Map();
+        const modeOf = i => {
+            if (i === -1) return null;
+            if (!modes.has(i)) modes.set(i, units[i].only ? 'only' : modeOf(units[i].parent == null ? -1 : units[i].parent));
+            return modes.get(i);
+        };
+        units.forEach((unit, i) => {
+            if (unit.kind !== 'test') return;
+            const parent = unit.parent == null ? -1 : unit.parent;
+            const narrowed = modeOf(parent) === 'only' && kids(parent).some(k => !isSuite(k) && units[k].only);
+            if (unit.only || (!narrowed && modeOf(parent) === 'only')) runs.add(i);
+        });
+        // No test ends up focused (an empty marked suite): nothing is left out.
+        if (runs.size === 0) return new Set();
+    } else {
+        const holdsMark = i => kids(i).some(k => units[k].only || (isSuite(k) && holdsMark(k)));
+        const all = i => {
+            for (const k of kids(i)) {
+                if (isSuite(k)) all(k);
+                else runs.add(k);
+            }
+        };
+        const narrow = i => {
+            const own = kids(i).filter(k => !isSuite(k) && units[k].only);
+            if (own.length > 0) {
+                for (const k of own) runs.add(k);
+                return;
+            }
+            for (const k of kids(i)) {
+                if (!isSuite(k)) continue;
+                if (units[k].only && !holdsMark(k)) all(k);
+                else if (units[k].only || holdsMark(k)) narrow(k);
+            }
+        };
+        narrow(-1);
+    }
+    return new Set(units.filter((unit, i) => unit.kind === 'test' && !runs.has(i)));
+}
 // Node options that take the next word as their value.
 const NODE_VALUE_OPTIONS = new Set(['--import', '--require', '-r', '--loader', '--experimental-loader',
     '--conditions', '-C', '--env-file', '--test-reporter', '--test-reporter-destination',
@@ -306,6 +376,17 @@ function pytestConfigIn(model, dir) {
     return null;
 }
 
+/**
+ * Does a requirements file or a manifest name a package as a requirement:
+ * the name where a requirement starts (a line, a list item, a quoted
+ * string, a key), up to a version or the end. A word in a comment or in
+ * another package's name is not one.
+ */
+function namesRequirement(text, name) {
+    const shape = new RegExp(`(^|["'\\s,\\[])${name}(\\[[^\\]]*\\])?\\s*([<>=!~;,"'\\]]|$)`);
+    return String(text).split('\n').some(raw => shape.test(raw.replace(/(^|\s)[#;].*$/, '').trim()));
+}
+
 function pythonRunner(model, fileEntry) {
     const dirs = ancestorDirs(fileEntry.relativePath);
     for (const dir of dirs) {
@@ -331,7 +412,7 @@ function pythonRunner(model, fileEntry) {
     for (const dir of dirs) {
         for (const name of ['pyproject.toml', 'requirements.txt', 'setup.cfg', 'tox.ini']) {
             const text = model.manifests.read(dir, name);
-            if (text != null && /(^|[^\w-])pytest($|[^\w])/m.test(text)) {
+            if (text != null && namesRequirement(text, 'pytest')) {
                 return { id: 'pytest', dir, evidence: name, collection: {} };
             }
         }
@@ -415,6 +496,19 @@ function command(runner, words) {
     };
 }
 
+// The files jest and vitest look for when the project configures nothing.
+// Neither runs a file outside its pattern, even when given the path
+// (measured): for such a file the command depends on a configuration that
+// is not read here.
+const DEFAULT_TEST_FILES = {
+    jest: [/(^|\/)__tests__\/.*\.[jt]sx?$/, /(^|\/)([^/]*\.)?(spec|test)+\.[jt]sx?$/],
+    vitest: [/\.(test|spec)\.[cm]?[jt]sx?$/],
+};
+
+function lookedFor(runnerId, relativePath) {
+    return DEFAULT_TEST_FILES[runnerId].some(pattern => pattern.test(relativePath));
+}
+
 function titlePattern(unit) {
     return `^${regexLiteral([...unit.suite, unit.name].join(' '))}$`;
 }
@@ -455,6 +549,7 @@ const SELECTORS = {
     'jest'(model, runner, fileEntry, unit) {
         const file = relativeTo(runner.dir, fileEntry.relativePath);
         if (file == null) return withheld('outside-runner-root');
+        if (!lookedFor('jest', file)) return withheld('runner-config-not-read');
         // A bare path is a pattern jest tries on every test file's path.
         const words = ['npx', 'jest', '--runTestsByPath', shellWord(file)];
         if (unit) words.push('-t', shellWord(titlePattern(unit)));
@@ -463,6 +558,7 @@ const SELECTORS = {
     'vitest'(model, runner, fileEntry, unit) {
         const file = relativeTo(runner.dir, fileEntry.relativePath);
         if (file == null) return withheld('outside-runner-root');
+        if (!lookedFor('vitest', file)) return withheld('runner-config-not-read');
         // vitest runs every file whose path contains the one given.
         if (model.pathsContaining(runner.dir, file) > 1) return withheld('path-not-unique');
         const words = ['npx', 'vitest', 'run', shellWord(file)];
@@ -545,6 +641,7 @@ function createTestModel(index) {
         manifests: createManifests(index),
         byFile: new Map(),
         rawByFile: new Map(),
+        exports: new Map(),
         runners: new Map(),
         relPaths: null,
     };
@@ -604,10 +701,35 @@ function createTestModel(index) {
         return { target: null, reason: 'target-unknown' };
     };
 
-    const helpersFor = (filePath, fileEntry) => {
+    const helpersFor = (filePath, fileEntry, depth = 0) => {
         const symbols = fileEntry.symbols || [];
         let lines = null;
         return {
+            /**
+             * What a module this file imports exports under a name, when
+             * the module is a file of the project whose language reads
+             * exports: followed a few modules deep, never around a cycle.
+             */
+            exported(moduleName, name) {
+                if (depth >= 4) return null;
+                const relativePath = (fileEntry.moduleResolved || {})[moduleName];
+                if (!relativePath) return null;
+                const target = path.join(index.root, relativePath);
+                const targetEntry = index.files.get(target);
+                const read = targetEntry && langTraits(targetEntry.language)?.testExport;
+                if (typeof read !== 'function') return null;
+                const key = `${target}\0${name}`;
+                if (model.exports.has(key)) return model.exports.get(key);
+                model.exports.set(key, null);
+                let answer;
+                try {
+                    answer = read(targetEntry, helpersFor(target, targetEntry, depth + 1), name);
+                } catch (e) {
+                    answer = null;
+                }
+                model.exports.set(key, answer);
+                return answer;
+            },
             /** Symbols whose range holds this one, outermost first. */
             enclosing(symbol) {
                 const out = [];
@@ -842,13 +964,18 @@ function createTestModel(index) {
             const unsettled = (found.classes || []).filter(cls => cls.runnable && cls.refusedIfDeclares &&
                 !refusedClasses.includes(cls) && refusal(filePath, cls).unknown);
             const within = (unit, cls) => unit.startLine >= cls.startLine && unit.endLine <= cls.endLine;
-            // A focused test leaves the others of its file declared and
-            // not executed, under the runners that honour the mark.
-            const focus = !!found.focus && FOCUS_RUNNERS.has(model.runnerOf(filePath).id);
+            // A focus leaves other tests of the file declared and not
+            // executed, by the rule of the runner that runs the file.
+            const left = found.focus ? focusedOut(found.units, model.runnerOf(filePath).id) : new Set();
             const units = found.units.filter(unit => !refusedClasses.some(cls => within(unit, cls)))
-                .map(unit => unit.kind === 'test' && unsettled.some(cls => within(unit, cls))
-                    ? { ...unit, conditional: true, dynamic: unit.dynamic || 'base-not-resolved' } : unit)
-                .map(unit => focus && unit.kind === 'test' && !unit.focused ? { ...unit, skipped: true } : unit);
+                .map(unit => {
+                    let out = unit;
+                    if (unit.kind === 'test' && unsettled.some(cls => within(unit, cls))) {
+                        out = { ...out, conditional: true, dynamic: unit.dynamic || 'base-not-resolved' };
+                    }
+                    if (left.has(unit)) out = { ...out, skipped: true };
+                    return out;
+                });
             // `open`: the file binds its runner's declaring function and
             // no declaration was read.
             let inheriting = !!found.inheriting || !!found.open;
@@ -971,6 +1098,8 @@ function createTestModel(index) {
         const facts = model.unitsOf(filePath);
         if (!facts.modeled) return 'unmodeled';
         if (facts.tests > 0 || facts.units.length > 0 || facts.inheriting) return 'tests';
+        // A language whose tests are all declarations: none read, none there.
+        if (model.declared(filePath)?.complete) return 'support';
         const fileEntry = index.files.get(filePath);
         const named = langTraits(fileEntry.language)?.testFileNames || [];
         const base = path.posix.basename(fileEntry.relativePath);
@@ -1263,5 +1392,5 @@ module.exports = {
     createTestModel, selectorText, unitLabel, shellWord, globMatches,
     addTestCaseRows, linkFile, linkFiles, commandsFor,
     // Exposed for tests.
-    scriptRunners, nodeTestOptions, configWords, tableText,
+    scriptRunners, nodeTestOptions, configWords, tableText, namesRequirement, focusedOut,
 };

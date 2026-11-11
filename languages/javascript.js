@@ -5915,20 +5915,28 @@ function isTestApiName(name) {
     return TEST_SUITE_APIS.has(name) || TEST_CASE_APIS.has(name);
 }
 
+const SCOPE_BLOCKS = new Set(['statement_block', 'for_statement', 'for_in_statement', 'catch_clause',
+    'switch_body', 'class_static_block']);
+const DECLARING = new Set(['import_statement', 'lexical_declaration', 'variable_declaration',
+    'function_declaration', 'generator_function_declaration', 'class_declaration', 'export_statement']);
+
 /**
- * What the names of a file are bound to, as far as declaring tests goes:
- * the runner's function under any name ({ api }), a module or object its
- * functions are read from ({ namespace }), or something else ({ other }).
- * A name the file never binds is the runner's global when it is spelled
- * like one. "runner" is set when a binding comes from a runner's module.
+ * What names are bound to, as far as declaring tests goes, by the rules of
+ * the language's own scopes. A value is the runner's function under any
+ * name ({ api }), a module or object its functions are read from
+ * ({ namespace }), something that is provably neither ({ other }), or
+ * something this cannot read ({ unread }): a call through the last two is
+ * no test. A name no enclosing scope binds is the runner's global when it
+ * is spelled like one. "helpers.exported(module, name)" says what a
+ * project module exports under a name.
  */
-function testBindings(root) {
-    const bindings = new Map();
+function createTestBinder(helpers) {
     let runnerBound = false;
-    const bind = (name, value) => {
-        if (!name) return;
-        if (value.runner && (value.api || value.namespace)) runnerBound = true;
-        bindings.set(name, value);
+    let unreadBound = false;
+    const seen = value => {
+        if (value && value.runner && (value.api || value.namespace)) runnerBound = true;
+        if (value && value.unread) unreadBound = true;
+        return value;
     };
     const literal = node => node && node.type === 'string' ? node.text.slice(1, -1) : null;
     const requiredModule = node => {
@@ -5938,25 +5946,45 @@ function testBindings(root) {
         const args = node.childForFieldName('arguments');
         return args && args.namedChildren.length === 1 ? literal(args.namedChildren[0]) : null;
     };
-    const moduleValue = name => ({
-        namespace: true, runner: TEST_RUNNER_MODULES.has(name),
-        ...(TEST_CALLABLE_MODULES.has(name) && { callable: 'test' }),
-    });
-    const resolve = (node, depth = 0) => {
+    /** What a module gives: as a whole (name null) or under one name. */
+    const fromModule = (moduleName, name) => {
+        if (TEST_RUNNER_MODULES.has(moduleName)) {
+            if (name == null) {
+                return {
+                    namespace: true, runner: true,
+                    ...(TEST_CALLABLE_MODULES.has(moduleName) && { callable: 'test' }),
+                };
+            }
+            return isTestApiName(name) ? { api: name, runner: true } : { other: true };
+        }
+        if (name == null) return { namespace: true, module: moduleName };
+        const exported = helpers.exported ? helpers.exported(moduleName, name) : null;
+        if (exported) return exported;
+        // A module that is not read: a name spelled like the runner's
+        // function may be it, and may not.
+        return isTestApiName(name) ? { unread: true } : { other: true };
+    };
+    const lookup = (env, name) => {
+        for (let i = env.length - 1; i >= 0; i--) {
+            if (env[i].has(name)) return env[i].get(name);
+        }
+        return undefined;
+    };
+    const resolve = (node, env, depth = 0) => {
         if (!node || depth > 8) return null;
-        if (WRAPPERS.has(node.type)) return resolve(node.namedChildren[0], depth + 1);
+        if (WRAPPERS.has(node.type)) return resolve(node.namedChildren[0], env, depth + 1);
         if (node.type === 'identifier') {
-            const bound = bindings.get(node.text);
-            if (bound) return bound.other ? null : bound;
-            if (GLOBAL_OBJECTS.has(node.text)) return { namespace: true };
+            const bound = lookup(env, node.text);
+            if (bound !== undefined) return bound.other || bound.unread ? null : bound;
+            if (GLOBAL_OBJECTS.has(node.text)) return { namespace: true, global: true };
             return isTestApiName(node.text) ? { api: node.text } : null;
         }
         if (node.type === 'call_expression') {
             const name = requiredModule(node);
-            return name == null ? null : moduleValue(name);
+            return name == null ? null : fromModule(name, null);
         }
         if (node.type === 'member_expression') {
-            const object = resolve(node.childForFieldName('object'), depth + 1);
+            const object = resolve(node.childForFieldName('object'), env, depth + 1);
             const property = node.childForFieldName('property');
             if (!object || !property) return null;
             if (object.api) {
@@ -5967,35 +5995,81 @@ function testBindings(root) {
                 return null;
             }
             if (object.namespace) {
+                if (object.module) {
+                    const given = fromModule(object.module, property.text);
+                    return given.other || given.unread ? null : given;
+                }
                 if (isTestApiName(property.text)) return { api: property.text, runner: object.runner };
                 // The callable default of a runner module carries members too.
                 if (object.callable && TEST_API_MODIFIERS.has(property.text)) {
                     return { api: object.callable, runner: object.runner, modifiers: [property.text] };
                 }
-                return null;
             }
         }
         return null;
     };
-    const declare = node => {
+    /** Does an expression name the runner's function or module anywhere? */
+    const mentionsRunner = (node, env) => {
+        if (FUNCTION_NODES.has(node.type)) return false;
+        if (node.type === 'identifier' || node.type === 'call_expression' || node.type === 'member_expression') {
+            const value = resolve(node, env);
+            if (value && value.runner && (value.api || value.namespace)) return true;
+        }
+        return node.namedChildren.some(child => mentionsRunner(child, env));
+    };
+    /** The binding a callee's own name has in scope, unread ones included. */
+    const boundAt = (node, env) => {
+        let base = node;
+        while (base && (base.type === 'member_expression' || base.type === 'call_expression' || WRAPPERS.has(base.type))) {
+            base = base.type === 'member_expression' ? base.childForFieldName('object')
+                : base.type === 'call_expression' ? base.childForFieldName('function') : base.namedChildren[0];
+        }
+        return base && base.type === 'identifier' ? lookup(env, base.text) : undefined;
+    };
+    /** A value an initializer stands for, or what an unreadable one leaves. */
+    const valueOf = (node, env, name) => {
+        const resolved = resolve(node, env);
+        if (resolved) return resolved;
+        // A value that cannot be a function of the runner is not one. Any
+        // other is not read when it is made from the runner's own names
+        // (a member picked at run time, a wrapper's result) or when the
+        // name it gets is spelled like the runner's function.
+        if (!node || INERT_VALUES.has(node.type)) return { other: true };
+        return isTestApiName(name) || mentionsRunner(node, env) ? { unread: true } : { other: true };
+    };
+    const bindPattern = (scope, pattern, value) => {
+        // Every name a pattern introduces, bound to the same value.
+        if (!pattern) return;
+        if (pattern.type === 'identifier' || pattern.type === 'shorthand_property_identifier_pattern') {
+            scope.set(pattern.text, value);
+            return;
+        }
+        for (const child of pattern.namedChildren) bindPattern(scope, child, value);
+    };
+    const declare = (scope, node, env) => {
+        if (node.type === 'export_statement') {
+            for (const child of node.namedChildren) {
+                if (DECLARING.has(child.type)) declare(scope, child, env);
+            }
+            return;
+        }
         if (node.type === 'import_statement') {
-            const name = literal(node.childForFieldName('source'));
-            const runner = TEST_RUNNER_MODULES.has(name);
+            const moduleName = literal(node.childForFieldName('source'));
             const clause = node.namedChildren.find(child => child.type === 'import_clause');
             for (const part of (clause && clause.namedChildren) || []) {
                 if (part.type === 'identifier') {
-                    bind(part.text, runner ? moduleValue(name)
-                        : isTestApiName(part.text) ? { api: part.text } : { other: true });
+                    // A default import: the runner module itself where its
+                    // default is the declaring function.
+                    scope.set(part.text, seen(TEST_RUNNER_MODULES.has(moduleName)
+                        ? fromModule(moduleName, null) : fromModule(moduleName, 'default')));
                 } else if (part.type === 'namespace_import') {
                     const local = part.namedChildren.find(child => child.type === 'identifier');
-                    bind(local && local.text, { namespace: true, runner });
+                    if (local) scope.set(local.text, seen(fromModule(moduleName, null)));
                 } else if (part.type === 'named_imports') {
                     for (const spec of part.namedChildren) {
                         const imported = spec.childForFieldName('name');
                         const alias = spec.childForFieldName('alias');
-                        if (!imported) continue;
-                        bind((alias || imported).text,
-                            isTestApiName(imported.text) ? { api: imported.text, runner } : { other: true });
+                        if (imported) scope.set((alias || imported).text, seen(fromModule(moduleName, imported.text)));
                     }
                 }
             }
@@ -6004,68 +6078,93 @@ function testBindings(root) {
         if (node.type === 'function_declaration' || node.type === 'generator_function_declaration' ||
             node.type === 'class_declaration') {
             const name = node.childForFieldName('name');
-            if (name && !bindings.has(name.text)) bind(name.text, { other: true });
+            if (name) scope.set(name.text, { other: true });
             return;
         }
-        if (node.type !== 'variable_declarator') return;
-        const target = node.childForFieldName('name');
-        const value = node.childForFieldName('value');
-        if (!target) return;
-        const inert = !value || INERT_VALUES.has(value.type);
-        if (target.type === 'identifier') {
-            const resolved = resolve(value);
-            if (resolved) bind(target.text, resolved);
-            // A value that is not read here may still be the runner's
-            // function (a wrapper's result): the name's spelling decides.
-            else bind(target.text, !inert && isTestApiName(target.text) ? { api: target.text } : { other: true });
-            return;
-        }
-        if (target.type !== 'object_pattern') return;
-        const from = resolve(value);
-        for (const property of target.namedChildren) {
-            let key = null;
-            let local = null;
-            if (property.type === 'shorthand_property_identifier_pattern') {
-                key = local = property.text;
-            } else if (property.type === 'pair_pattern') {
-                const keyNode = property.childForFieldName('key');
-                const valueNode = property.childForFieldName('value');
-                key = keyNode ? keyNode.text : null;
-                local = valueNode && valueNode.type === 'identifier' ? valueNode.text : null;
-            } else if (property.type === 'object_assignment_pattern') {
-                const left = property.childForFieldName('left');
-                if (left && left.type === 'shorthand_property_identifier_pattern') key = local = left.text;
+        if (node.type !== 'lexical_declaration' && node.type !== 'variable_declaration') return;
+        for (const declarator of node.namedChildren) {
+            if (declarator.type !== 'variable_declarator') continue;
+            const target = declarator.childForFieldName('name');
+            const value = declarator.childForFieldName('value');
+            if (!target) continue;
+            if (target.type === 'identifier') {
+                scope.set(target.text, seen(valueOf(value, env, target.text)));
+                continue;
             }
-            if (!key || !local) continue;
-            const usable = !inert && !(from && from.api);
-            bind(local, usable && isTestApiName(key)
-                ? { api: key, runner: !!(from && from.runner) } : { other: true });
+            if (target.type !== 'object_pattern') {
+                bindPattern(scope, target, { other: true });
+                continue;
+            }
+            const from = resolve(value, env);
+            for (const property of target.namedChildren) {
+                let key = null;
+                let local = null;
+                if (property.type === 'shorthand_property_identifier_pattern') {
+                    key = local = property.text;
+                } else if (property.type === 'pair_pattern') {
+                    const keyNode = property.childForFieldName('key');
+                    const valueNode = property.childForFieldName('value');
+                    key = keyNode ? keyNode.text : null;
+                    local = valueNode && valueNode.type === 'identifier' ? valueNode.text : null;
+                    if (!local && valueNode) bindPattern(scope, valueNode, { other: true });
+                } else if (property.type === 'object_assignment_pattern') {
+                    const left = property.childForFieldName('left');
+                    if (left && left.type === 'shorthand_property_identifier_pattern') key = local = left.text;
+                } else {
+                    bindPattern(scope, property, { other: true });
+                }
+                if (!key || !local) continue;
+                let given;
+                if (from && from.namespace && from.module) given = fromModule(from.module, key);
+                else if (from && from.namespace) given = isTestApiName(key) ? { api: key, runner: from.runner } : { other: true };
+                else if (!value || INERT_VALUES.has(value.type) || (from && from.api)) given = { other: true };
+                else given = isTestApiName(key) ? { unread: true } : { other: true };
+                scope.set(local, seen(given));
+            }
         }
     };
-    // The module's own declarations, in source order, twice (a name may
-    // alias one bound later). A name bound inside a function is that
-    // function's: it does not say what the name is in the rest of the file.
-    const declarations = [];
-    const collect = node => {
-        if (node.type === 'import_statement' || node.type === 'variable_declarator' ||
-            node.type === 'function_declaration' || node.type === 'generator_function_declaration' ||
-            node.type === 'class_declaration') {
-            declarations.push(node);
-            return;
+    /** The scope a list of statements makes, read twice: a name may alias one bound later. */
+    const scopeOf = (statements, outer) => {
+        const scope = new Map();
+        const env = [...outer, scope];
+        for (let round = 0; round < 2; round++) {
+            for (const statement of statements) {
+                if (DECLARING.has(statement.type)) declare(scope, statement, env);
+            }
         }
-        if (node.type === 'export_statement' || node.type === 'lexical_declaration' ||
-            node.type === 'variable_declaration') {
-            for (const child of node.namedChildren) collect(child);
-        }
+        return scope;
     };
-    for (const statement of root.namedChildren) collect(statement);
-    for (let round = 0; round < 2; round++) {
-        for (const node of declarations) declare(node);
-    }
-    return { resolve, runnerBound: () => runnerBound };
+    /** The scope a function's parameters make. */
+    const parameterScope = node => {
+        const scope = new Map();
+        const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
+        const bind = child => {
+            if (child.type === 'identifier' || child.type === 'shorthand_property_identifier_pattern') {
+                scope.set(child.text, { other: true });
+                return;
+            }
+            // The default of a parameter is a value, not a name it binds.
+            const pattern = child.childForFieldName('left') || child.childForFieldName('pattern');
+            if (pattern) {
+                bind(pattern);
+                return;
+            }
+            for (const next of child.namedChildren) bind(next);
+        };
+        if (parameters) bind(parameters);
+        const name = node.type === 'function_expression' || node.type === 'function'
+            ? node.childForFieldName('name') : null;
+        if (name) scope.set(name.text, { other: true });
+        return scope;
+    };
+    return {
+        resolve, scopeOf, parameterScope, fromModule, declare, boundAt,
+        runnerBound: () => runnerBound,
+        unreadBound: () => unreadBound,
+    };
 }
 
-/** The declaring call a call node is, or null: { kind, table, skip, todo, sometimes }. */
+/** The declaring call a call node is, or null: { kind, table, skip, todo, only, sometimes }. */
 function testApiCall(node, resolve) {
     let callee = node.childForFieldName('function');
     let table = false;
@@ -6130,25 +6229,71 @@ function declaredSkip(values, hasCallback) {
 
 /**
  * The tests a JavaScript or TypeScript file declares: calls of the
- * runners' declaring functions, whatever name the file binds them to,
- * named by their literal titles and by the suites whose callbacks hold
- * them. A title that is not a literal, a table of cases and a declaration
- * inside a function that is not a suite's callback are tests whose runtime
- * names are not the written ones; the last exist only where that function
- * is called. A test marked skip (or inside a skipped suite) is declared
- * and not executed. A test marked only (or inside such a suite) is
- * focused: what that does to the others is the runner's rule. "open" says
- * the file binds a runner's declaring function and no declaration was
+ * runners' declaring functions, found by what the callee is bound to at
+ * the call (the language's scopes: a parameter, a local, an import from a
+ * module that is not the runner's are not the runner's function), named by
+ * their literal titles and by the suites whose callbacks hold them. A
+ * title that is not a literal, a table of cases and a declaration inside a
+ * function that is not a suite's callback are tests whose runtime names
+ * are not the written ones; the last exist only where that function is
+ * called. A test marked skip (or inside a skipped suite) is declared and
+ * not executed. "only" is the mark as written; "parent" is the index of
+ * the suite a unit stands in (-1: the file), so each runner's own rule for
+ * focus can be applied. "open" says the file calls through a name that may
+ * be the runner's function and is not read (made from the runner's names
+ * at run time, or taken from a module that is not read), and no test was
  * read: it holds tests this did not see.
  */
 function testUnits(fileEntry, helpers) {
     const tree = helpers.tree();
     if (!tree) return null;
-    const bindings = testBindings(tree.rootNode);
+    const binder = createTestBinder(helpers);
     const units = [];
-    const walk = (node, suites, indirect, inTest) => {
+    // A call through a name that may be the runner's function and is not
+    // read: a test this does not see.
+    let unreadCall = false;
+    const inFunction = (node, ctx, indirect) => {
+        // A function: its parameters, then its body's own declarations.
+        const body = node.childForFieldName('body');
+        const parameters = binder.parameterScope(node);
+        if (body && body.type === 'statement_block') {
+            const env = [...ctx.env, parameters];
+            const inner = { ...ctx, env: [...env, binder.scopeOf(body.namedChildren, env)], indirect };
+            for (const child of body.namedChildren) walk(child, inner);
+        } else if (body) {
+            walk(body, { ...ctx, env: [...ctx.env, parameters], indirect });
+        }
+    };
+    const walk = (node, ctx) => {
+        if (FUNCTION_NODES.has(node.type)) {
+            inFunction(node, ctx, true);
+            return;
+        }
+        if (SCOPE_BLOCKS.has(node.type)) {
+            // A block: what it declares itself (a loop's or a catch's own
+            // names included) is seen before anything further out.
+            const head = node.type === 'statement_block' ? node.namedChildren
+                : node.namedChildren.filter(child => DECLARING.has(child.type));
+            const scope = binder.scopeOf(head, ctx.env);
+            // The name a catch or a for-in/of loop introduces is its own.
+            const introduced = node.type === 'catch_clause' ? node.childForFieldName('parameter')
+                : node.type === 'for_in_statement' ? node.childForFieldName('left') : null;
+            if (introduced) {
+                const names = child => {
+                    if (child.type === 'identifier' || child.type === 'shorthand_property_identifier_pattern') {
+                        scope.set(child.text, { other: true });
+                        return;
+                    }
+                    for (const next of child.namedChildren) names(next);
+                };
+                names(introduced);
+            }
+            const inner = { ...ctx, env: [...ctx.env, scope] };
+            for (const child of node.namedChildren) walk(child, inner);
+            return;
+        }
         if (node.type === 'call_expression') {
-            const api = testApiCall(node, bindings.resolve);
+            const api = testApiCall(node, callee => binder.resolve(callee, ctx.env));
             if (api) {
                 const args = node.childForFieldName('arguments');
                 const values = args ? args.namedChildren : [];
@@ -6156,21 +6301,24 @@ function testUnits(fileEntry, helpers) {
                 const callback = values.slice(1).reverse().find(value => FUNCTION_NODES.has(value.type)) || null;
                 const dynamic = title == null ? 'name-not-literal'
                     : api.table ? 'generated-cases'
-                    : indirect || inTest ? 'declared-indirectly' : null;
+                    : ctx.indirect || ctx.inTest ? 'declared-indirectly' : null;
                 const option = declaredSkip(values.slice(1), !!callback);
-                const skipped = api.skip || (api.todo && !callback) || option === 'skip' ||
-                    suites.some(suite => suite.skipped);
-                const sometimes = api.sometimes || option === 'sometimes' || indirect || inTest ||
-                    suites.some(suite => suite.sometimes);
-                const focused = api.only || suites.some(suite => suite.focused);
+                // A test with no body has nothing to execute (pending, todo).
+                const skipped = api.skip || (api.kind === 'test' && !callback) || option === 'skip' ||
+                    ctx.suites.some(suite => suite.skipped);
+                const sometimes = api.sometimes || option === 'sometimes' || ctx.indirect || ctx.inTest ||
+                    ctx.suites.some(suite => suite.sometimes);
+                const index = units.length;
+                const outer = ctx.suites[ctx.suites.length - 1];
                 units.push({
-                    kind: api.kind, name: title, titled: true, suite: suites.map(suite => suite.name),
+                    kind: api.kind, name: title, titled: true, suite: ctx.suites.map(suite => suite.name),
                     line: node.startPosition.row + 1, startLine: node.startPosition.row + 1,
                     endLine: node.endPosition.row + 1,
+                    parent: outer ? outer.index : -1,
+                    ...(api.only && { only: true }),
                     ...(skipped && { skipped: true }),
                     ...(sometimes && { conditional: true }),
-                    ...(focused && { focused: true }),
-                    ...((dynamic || suites.some(suite => suite.dynamic)) && {
+                    ...((dynamic || ctx.suites.some(suite => suite.dynamic)) && {
                         dynamic: dynamic || 'suite-name-not-literal',
                     }),
                 });
@@ -6178,30 +6326,110 @@ function testUnits(fileEntry, helpers) {
                     if (callback && sameNode(value, callback)) {
                         // The callback's body is where the suite's own
                         // declarations are written, not a function apart.
-                        const inside = api.kind === 'suite'
-                            ? [...suites, { name: title == null ? '' : title, dynamic: !!dynamic, skipped, sometimes, focused }]
-                            : suites;
-                        for (const child of value.namedChildren) {
-                            walk(child, inside, indirect, inTest || api.kind === 'test');
-                        }
+                        const suites = api.kind === 'suite'
+                            ? [...ctx.suites, { name: title == null ? '' : title, dynamic: !!dynamic, skipped, sometimes, index }]
+                            : ctx.suites;
+                        inFunction(value, { ...ctx, suites, inTest: ctx.inTest || api.kind === 'test' }, ctx.indirect);
                     } else {
-                        walk(value, suites, indirect, inTest);
+                        walk(value, ctx);
                     }
                 }
                 const callee = node.childForFieldName('function');
-                if (callee && callee.type === 'call_expression') walk(callee, suites, indirect, inTest);
+                if (callee && callee.type === 'call_expression') walk(callee, ctx);
                 return;
             }
+            const bound = binder.boundAt(node.childForFieldName('function'), ctx.env);
+            if (bound && bound.unread) unreadCall = true;
         }
-        const enters = FUNCTION_NODES.has(node.type);
-        for (const child of node.namedChildren) walk(child, suites, indirect || enters, inTest);
+        for (const child of node.namedChildren) walk(child, ctx);
     };
-    walk(tree.rootNode, [], false, false);
+    const top = binder.scopeOf(tree.rootNode.namedChildren, []);
+    const ctx = { env: [top], suites: [], indirect: false, inTest: false };
+    for (const statement of tree.rootNode.namedChildren) walk(statement, ctx);
     return {
         units,
-        open: bindings.runnerBound() && !units.some(unit => unit.kind === 'test'),
-        ...(units.some(unit => unit.focused) && { focus: true }),
+        open: unreadCall && !units.some(unit => unit.kind === 'test'),
+        ...(units.some(unit => unit.only) && { focus: true }),
     };
+}
+
+/**
+ * What a module exports under a name, as far as declaring tests goes: the
+ * runner's function ({ api }), a namespace of it, something else
+ * ({ other }), or null when no export of that name is read here.
+ */
+function testExport(fileEntry, helpers, name) {
+    const tree = helpers.tree();
+    if (!tree) return null;
+    const binder = createTestBinder(helpers);
+    const env = [binder.scopeOf(tree.rootNode.namedChildren, [])];
+    const settle = value => value && !value.unread ? value : null;
+    const valueOf = node => {
+        const resolved = binder.resolve(node, env);
+        if (resolved) return resolved;
+        return node && INERT_VALUES.has(node.type) ? { other: true } : null;
+    };
+    const literal = node => node && node.type === 'string' ? node.text.slice(1, -1) : null;
+    let found = null;
+    for (const statement of tree.rootNode.namedChildren) {
+        if (statement.type === 'expression_statement') {
+            // module.exports = ..., module.exports.x = ..., exports.x = ...
+            const assignment = statement.namedChildren[0];
+            if (!assignment || assignment.type !== 'assignment_expression') continue;
+            const left = assignment.childForFieldName('left');
+            const right = assignment.childForFieldName('right');
+            if (!left || !right) continue;
+            const target = left.text.replace(/\s+/g, '');
+            if (target === 'module.exports' || target === 'exports') {
+                if (right.type === 'object') {
+                    for (const property of right.namedChildren) {
+                        if (property.type === 'shorthand_property_identifier' && property.text === name) {
+                            found = valueOf(property) || binder.resolve(property, env);
+                            const bound = env[0].get(name);
+                            if (!found && bound) found = bound;
+                        } else if (property.type === 'pair') {
+                            const key = property.childForFieldName('key');
+                            if (key && key.text.replace(/^['"]|['"]$/g, '') === name) {
+                                found = valueOf(property.childForFieldName('value'));
+                            }
+                        }
+                    }
+                } else {
+                    const whole = binder.resolve(right, env);
+                    if (whole && whole.namespace) {
+                        found = whole.module ? binder.fromModule(whole.module, name)
+                            : isTestApiName(name) ? { api: name, runner: whole.runner } : { other: true };
+                    } else if (whole && whole.api && name === 'default') {
+                        found = whole;
+                    }
+                }
+            } else if (target === `module.exports.${name}` || target === `exports.${name}`) {
+                found = valueOf(right);
+            }
+            continue;
+        }
+        if (statement.type !== 'export_statement') continue;
+        const source = literal(statement.childForFieldName('source'));
+        const clause = statement.namedChildren.find(child => child.type === 'export_clause');
+        if (clause) {
+            for (const spec of clause.namedChildren) {
+                const local = spec.childForFieldName('name');
+                const alias = spec.childForFieldName('alias');
+                if (!local || (alias || local).text !== name) continue;
+                found = source != null ? binder.fromModule(source, local.text)
+                    : (env[0].get(local.text) || valueOf(local));
+            }
+        } else if (source != null && /^export\s*\*/.test(statement.text)) {
+            // export * from 'm': the name is whatever that module gives.
+            const given = binder.fromModule(source, name);
+            if (given && !given.other && !given.unread) found = given;
+        } else {
+            const declared = env[0].get(name);
+            const declares = statement.namedChildren.some(child => DECLARING.has(child.type));
+            if (declares && declared) found = declared;
+        }
+    }
+    return settle(found);
 }
 
 /**
@@ -6539,6 +6767,7 @@ module.exports = {
     isEntryPoint,
     getEntryPointKind,
     testUnits,
+    testExport,
     TEST_RUNNER_MODULES,
     parse
 };

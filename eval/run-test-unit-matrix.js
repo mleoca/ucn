@@ -21,6 +21,11 @@
  *
  * A unit owns the marks on its own lines, or the run-time identity that
  * carries its label. FALSE-UNIT is a unit the runner never executes.
+ * FALSE-SKIP is a unit called skipped that the runner executes. A claim
+ * that only weakens what is said has to be deliberate: every unit called
+ * conditional (SOMETIMES) and every test file with a command from which
+ * nothing runs (EMPTY-FILE) must be named by its case, and a file's count
+ * must be the number of its listed tests that are not skipped (COUNT).
  * WRONG-SELECTOR is a command that runs nothing, something else, or more
  * than its unit (a second declaration of the same name included).
  * FALSE-SUPPORT is a file called support that the runner executes tests
@@ -135,7 +140,7 @@ function answerOf(dir) {
             const run = facts.run ? selectorText(facts.run) : null;
             lines.push(`${entry.relativePath} [${facts.role}] ${runner.id || `no runner: ${runner.reason}`}` +
                 (facts.role === 'tests' ? `  run: ${run || `(withheld: ${facts.runWithheld})`}` : ''));
-            files.push({ file: entry.relativePath, role: facts.role, run });
+            files.push({ file: entry.relativePath, role: facts.role, run, tests: facts.tests });
             for (const unit of declared.units) {
                 const label = unitLabel(unit);
                 if (unit.kind !== 'test') {
@@ -163,8 +168,9 @@ function answerOf(dir) {
             }
         }
         // The commands for every test file of the project at once.
-        const commands = commandsFor(model, entries.filter(([filePath]) => model.unitsOf(filePath).modeled &&
-            model.roleOf(filePath) === 'tests').map(([filePath]) => filePath));
+        const listed = new Set(files.filter(file => file.role === 'tests').map(file => file.file));
+        const commands = commandsFor(model, entries.filter(([, entry]) => listed.has(entry.relativePath))
+            .map(([filePath]) => filePath));
         for (const line of commands) lines.push(`all: ${line}`);
         return { lines, units, files, commands };
     } finally {
@@ -194,6 +200,75 @@ function runRecorded(commandLine, cwd, env) {
 
 function sameSet(a, b) {
     return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+/**
+ * Is an executed identity a unit's? A unit owns the marks on its own
+ * lines; a test that runs under a class it does not stand in owns its
+ * run-time label, and the marks of the body the engine says it runs:
+ * another body running is another test.
+ */
+function owns(unit, id) {
+    if (id === unit.id) return true;
+    const at = /^(.*):(\d+)$/.exec(id);
+    if (!at) return false;
+    const range = unit.inherited ? unit.origin : unit;
+    return at[1] === range.file && Number(at[2]) >= range.startLine && Number(at[2]) <= range.endLine;
+}
+
+function fileOf(id) {
+    return (/^(.*):(\d+)$/.exec(id) || /^(.*?)::/.exec(id) || [])[1];
+}
+
+function labelOf(unit) {
+    return `${unit.id} (line ${unit.line})`;
+}
+
+/**
+ * What a whole-project run says about an answer, with no command run:
+ * the engine's units and files against the identities that executed.
+ * @param {object} testCase - the case (its named exceptions)
+ * @param {{units: object[], files: object[]}} answer
+ * @param {string[]} ran - identities the whole run executed
+ * @returns {{problems: Array<{kind: string, detail: string}>, undeclared: string[]}}
+ */
+function judgeWholeRun(testCase, answer, ran) {
+    const problems = [];
+    const fail = (kind, detail) => problems.push({ kind, detail });
+    for (const unit of answer.units) {
+        // What is this unit's alone: its label when it runs under a class
+        // it does not stand in (several classes share a body).
+        const executed = ran.some(id => unit.inherited ? id === unit.id : owns(unit, id));
+        if (unit.skipped) {
+            if (executed) fail('FALSE-SKIP', `${labelOf(unit)} is called skipped and the runner executes it`);
+            continue;
+        }
+        if (unit.conditional || (testCase.notRunByDefault || []).includes(unit.id)) continue;
+        if (!ran.some(id => owns(unit, id))) {
+            fail('FALSE-UNIT', `${labelOf(unit)} is listed and the runner never executes it`);
+        }
+    }
+    // A weaker claim is a deliberate one.
+    const sometimes = [...new Set(answer.units.filter(unit => unit.conditional).map(unit => unit.id))].sort();
+    if (!sameSet(sometimes, (testCase.sometimes || []).slice().sort())) {
+        fail('SOMETIMES', `units called conditional [${sometimes.join(', ')}], the case names [${(testCase.sometimes || []).slice().sort().join(', ')}]`);
+    }
+    for (const file of answer.files) {
+        const listed = answer.units.filter(unit => unit.file === file.file && !unit.skipped).length;
+        if (file.role === 'tests' && file.tests !== listed) {
+            fail('COUNT', `${file.file} counts ${file.tests} tests and lists ${listed} that are not skipped`);
+        }
+        const executed = ran.filter(id => fileOf(id) === file.file);
+        if (file.role === 'support' && executed.some(id => answer.units.every(unit => !owns(unit, id)))) {
+            fail('FALSE-SUPPORT', `${file.file} is called support and the runner executes ${executed.join(', ')}`);
+        }
+    }
+    const undeclared = ran.filter(id => !answer.units.some(unit => owns(unit, id)));
+    const allowed = (testCase.undeclared || []).slice().sort();
+    if (!sameSet(undeclared, allowed)) {
+        fail('UNDECLARED', `the runner executes [${undeclared.join(', ')}], the case names [${allowed.join(', ')}]`);
+    }
+    return { problems, undeclared };
 }
 
 function main() {
@@ -250,52 +325,32 @@ function main() {
             delete env.CI;
             const cwd = path.join(dir, testCase.cwd || '');
             const full = runRecorded(testCase.full || spec.full, cwd, env);
-            // A unit owns the marks on its own lines; a test that runs
-            // under a class it does not stand in owns its run-time label.
-            // An inherited test also owns the marks of the body the
-            // engine says it runs: another body running is another test.
-            const owns = (unit, id) => {
-                if (id === unit.id) return true;
-                const at = /^(.*):(\d+)$/.exec(id);
-                if (!at) return false;
-                const range = unit.inherited ? unit.origin : unit;
-                return at[1] === range.file && Number(at[2]) >= range.startLine && Number(at[2]) <= range.endLine;
-            };
-            const fileOf = id => (/^(.*):(\d+)$/.exec(id) || /^(.*?)::/.exec(id) || [])[1];
-            const label = unit => `${unit.id} (line ${unit.line})`;
+            const label = labelOf;
             totals.judged++;
             totals.units += answer.units.length;
             if (full.ran.length === 0 && answer.units.some(unit => !unit.conditional && !unit.skipped)) {
                 fail('RUNNER-RAN-NOTHING', `${testCase.full || spec.full} (exit ${full.status})\n${full.output.slice(-1500)}`);
                 continue;
             }
-            for (const unit of answer.units) {
-                if (unit.conditional || unit.skipped || (testCase.notRunByDefault || []).includes(unit.id)) continue;
-                if (!full.ran.some(id => owns(unit, id))) {
-                    fail('FALSE-UNIT', `${label(unit)} is listed and the runner never executes it`);
-                }
-            }
-            const undeclared = full.ran.filter(id => !answer.units.some(unit => owns(unit, id)));
-            const allowed = (testCase.undeclared || []).slice().sort();
-            if (!sameSet(undeclared, allowed)) {
-                fail('UNDECLARED', `the runner executes [${undeclared.join(', ')}], the case names [${allowed.join(', ')}]`);
-            }
-            totals.undeclared += undeclared.length;
+            const whole = judgeWholeRun(testCase, answer, full.ran);
+            for (const problem of whole.problems) fail(problem.kind, problem.detail);
+            totals.undeclared += whole.undeclared.length;
+            const empty = [];
             for (const file of answer.files) {
-                const executed = full.ran.filter(id => fileOf(id) === file.file);
-                if (file.role === 'support' && executed.some(id => answer.units.every(unit => !owns(unit, id)))) {
-                    fail('FALSE-SUPPORT', `${file.file} is called support and the runner executes ${executed.join(', ')}`);
-                }
                 if (file.role !== 'tests' || !file.run) continue;
                 // What the file's own tests executed in the whole run.
                 const mine = full.ran.filter(id => answer.units.some(unit => unit.file === file.file && owns(unit, id)));
-                if (mine.length === 0) continue;
                 totals.fileCommands++;
                 const got = runRecorded(file.run, dir, env);
+                if (got.ran.length === 0) empty.push(file.file);
                 const lost = mine.filter(id => !got.ran.includes(id));
                 if (lost.length > 0) {
                     fail('WRONG-SELECTOR', `${file.run} does not run ${lost.join(', ')} (exit ${got.status})\n${got.output.slice(-800)}`);
                 }
+            }
+            empty.sort();
+            if (!sameSet(empty, (testCase.emptyTestFiles || []).slice().sort())) {
+                fail('EMPTY-FILE', `test files whose command runs nothing [${empty.join(', ')}], the case names [${(testCase.emptyTestFiles || []).slice().sort().join(', ')}]`);
             }
             // Joined commands run what the files' own commands run, and a
             // file that has no command of its own is in none of them.
@@ -319,7 +374,8 @@ function main() {
                 totals.selectors++;
                 const got = runRecorded(unit.selector, dir, env);
                 const foreign = got.ran.filter(id => !owns(unit, id));
-                const nothing = got.ran.length === 0 && !unit.skipped;
+                // A unit that may not execute (named by its case) may run nothing.
+                const nothing = got.ran.length === 0 && !unit.skipped && !unit.conditional;
                 if (foreign.length > 0 || nothing) {
                     fail('WRONG-SELECTOR', `${unit.selector} ran [${got.ran.join(', ')}], expected only ${label(unit)} (exit ${got.status})\n${got.output.slice(-800)}`);
                 }
@@ -361,4 +417,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { answerOf, materialize, RUNNERS };
+module.exports = { answerOf, materialize, judgeWholeRun, RUNNERS };

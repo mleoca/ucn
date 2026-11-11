@@ -5590,56 +5590,142 @@ function testUnits(fileEntry, helpers) {
     const holds = (cls, symbol) => symbol.className === cls.name && symbol.startLine >= cls.startLine &&
         (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine);
 
-    // __test__ switches. A line that names __test__ and is none of the
-    // three assignments leaves collection unsettled for the file.
-    let moduleOff = false;
+    // What an attribute path or a decorator stands for as a skip mark:
+    // 'skip' (pytest.mark.skip, unittest.skip, under whatever name they
+    // were imported), 'sometimes' (skipif, skipIf, skipUnless, and a name
+    // spelled like a skip whose origin is not one of those: it may skip),
+    // or null.
+    // The mark a path names when it is one of pytest's (pytest.mark.x, or
+    // mark.x with mark imported from pytest), else null.
+    const pytestMark = dotted => {
+        const parts = String(dotted).split('.');
+        const head = imported.get(parts[0]);
+        const via = head && head.module === 'pytest' && (
+            (head.kind !== 'from' && parts.length === 3 && parts[1] === 'mark') ||
+            (head.kind === 'from' && head.name === 'mark' && parts.length === 2));
+        return via ? parts[parts.length - 1] : null;
+    };
+    const markNamed = dotted => {
+        if (!dotted) return null;
+        const parts = String(dotted).split('.');
+        const last = parts[parts.length - 1];
+        const head = imported.get(parts[0]);
+        const viaPytest = pytestMark(dotted) != null;
+        const unittestName = head && head.module === 'unittest'
+            ? (head.kind === 'from' && parts.length === 1 ? head.name : parts.length === 2 && head.kind !== 'from' ? last : null)
+            : null;
+        if (viaPytest) return last === 'skip' ? 'skip' : last === 'skipif' ? 'sometimes' : null;
+        if (unittestName) {
+            return unittestName === 'skip' ? 'skip'
+                : unittestName === 'skipIf' || unittestName === 'skipUnless' ? 'sometimes' : null;
+        }
+        return /^skip/i.test(last) ? 'sometimes' : null;
+    };
+
+    // Collection switches and module or class marks, read from the syntax
+    // tree: an assignment is a statement of a module or class body, the
+    // last one of a name is the one in effect, and text inside a string or
+    // a comment is no statement. A use of __test__ that is none of the
+    // readable assignments (in a branch, with a computed value, inside a
+    // function) leaves what is collected unsettled for the file.
+    let moduleSwitch = null;
+    let moduleMark = null;
     let unsettled = false;
     const switchedNames = new Map();
-    const classSwitch = new Map();
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (!line.includes('__test__')) continue;
-        const own = /^(\s*)__test__\s*=\s*(True|False)\s*(#.*)?$/.exec(line);
-        if (own && own[1] === '') {
-            if (own[2] === 'False') moduleOff = true;
-            continue;
+    const classFacts = []; // { name, line, enabled, mark }
+    if (lines.some(line => line.includes('__test__') || line.includes('pytestmark'))) {
+        const tree = helpers.tree();
+        if (!tree) {
+            unsettled = true;
+        } else {
+            const read = new Set(); // start offsets of the __test__ names read as a switch
+            const dotted = node => {
+                if (!node) return null;
+                if (node.type === 'identifier') return node.text;
+                if (node.type !== 'attribute') return null;
+                const object = dotted(node.childForFieldName('object'));
+                const attribute = node.childForFieldName('attribute');
+                return object && attribute ? `${object}.${attribute.text}` : null;
+            };
+            const markOf = node => {
+                if (!node) return null;
+                if (node.type === 'list' || node.type === 'tuple' || node.type === 'parenthesized_expression') {
+                    const each = node.namedChildren.map(markOf);
+                    return each.includes('skip') ? 'skip' : each.includes('sometimes') ? 'sometimes' : null;
+                }
+                if (node.type === 'call') return markOf(node.childForFieldName('function'));
+                const name = dotted(node);
+                // A value that is not one of pytest's marks written out
+                // (a name from elsewhere, a computed value) may hold any.
+                return name && pytestMark(name) != null ? markNamed(name) : 'sometimes';
+            };
+            const literal = node => node && (node.type === 'true' || node.type === 'false') ? node.type === 'true' : null;
+            const readBody = (statements, facts, isModule) => {
+                for (const statement of statements) {
+                    let node = statement;
+                    if (node.type === 'decorated_definition') node = node.childForFieldName('definition') || node;
+                    if (node.type === 'class_definition') {
+                        const name = node.childForFieldName('name');
+                        const body = node.childForFieldName('body');
+                        const own = { name: name ? name.text : '', line: node.startPosition.row + 1, enabled: null, mark: null };
+                        classFacts.push(own);
+                        readBody(body ? body.namedChildren : [], own, false);
+                        continue;
+                    }
+                    if (node.type !== 'expression_statement') continue;
+                    const assignment = node.namedChildren[0];
+                    if (!assignment || assignment.type !== 'assignment') continue;
+                    const left = assignment.childForFieldName('left');
+                    const right = assignment.childForFieldName('right');
+                    if (!left) continue;
+                    if (left.type === 'identifier' && left.text === '__test__') {
+                        const value = literal(right);
+                        if (value == null) continue;
+                        read.add(left.startIndex);
+                        if (isModule) moduleSwitch = value;
+                        else facts.enabled = value;
+                    } else if (left.type === 'identifier' && left.text === 'pytestmark') {
+                        const mark = markOf(right);
+                        if (isModule) moduleMark = mark;
+                        else facts.mark = mark;
+                    } else if (isModule && left.type === 'attribute') {
+                        const object = left.childForFieldName('object');
+                        const attribute = left.childForFieldName('attribute');
+                        const value = literal(right);
+                        if (attribute && attribute.text === '__test__' && object && object.type === 'identifier' &&
+                            value != null) {
+                            read.add(attribute.startIndex);
+                            switchedNames.set(object.text, value);
+                        }
+                    }
+                }
+            };
+            readBody(tree.rootNode.namedChildren, null, true);
+            const scan = node => {
+                if (node.type === 'identifier' && node.text === '__test__' && !read.has(node.startIndex)) unsettled = true;
+                for (const child of node.namedChildren) scan(child);
+            };
+            scan(tree.rootNode);
         }
-        if (own) {
-            const field = symbols.find(symbol => symbol.name === '__test__' && symbol.className &&
-                symbol.startLine === i + 1);
-            const owner = field && symbols.filter(symbol => symbol.type === 'class' && symbol.name === field.className &&
-                symbol.startLine <= i + 1 && (symbol.endLine ?? symbol.startLine) >= i + 1)
-                .sort((a, b) => b.startLine - a.startLine)[0];
-            if (owner) {
-                classSwitch.set(owner, own[2] === 'True');
-                continue;
-            }
-        }
-        const named = /^(\w+)\.__test__\s*=\s*(True|False)\s*(#.*)?$/.exec(line);
-        if (named) {
-            switchedNames.set(named[1], named[2] === 'True');
-            continue;
-        }
-        unsettled = true;
     }
+    const moduleOff = moduleSwitch === false;
+    const factsOf = cls => classFacts.filter(entry => entry.name === cls.name &&
+        entry.line >= cls.startLine && entry.line <= (cls.endLine ?? cls.startLine))
+        .sort((a, b) => a.line - b.line)[0] || null;
+    const classSwitch = { has: cls => factsOf(cls)?.enabled != null, get: cls => factsOf(cls).enabled };
 
-    // "pytestmark = pytest.mark.skip(...)" marks a whole module or class.
-    const markOf = cls => {
-        const field = symbols.find(symbol => symbol.name === 'pytestmark' &&
-            (cls ? symbol.className === cls.name && symbol.startLine >= cls.startLine &&
-                symbol.startLine <= (cls.endLine ?? cls.startLine) : !symbol.className));
-        if (!field) return null;
-        let text = '';
-        for (let line = field.startLine; line <= (field.endLine ?? field.startLine); line++) text += (lines[line - 1] || '') + '\n';
-        return /\bskip(if|If|Unless)\b/.test(text) ? 'sometimes' : /\bskip\b/.test(text) ? 'skip' : null;
+    const decoratorMark = symbol => {
+        const marks = (symbol.decorators || []).map(name => markNamed(String(name).split('(')[0]));
+        return marks.includes('skip') ? 'skip' : marks.includes('sometimes') ? 'sometimes' : null;
     };
-    const moduleMark = markOf(null);
     const decoratorNames = symbol => (symbol.decorators || []).map(name => String(name).split('(')[0]);
-    const skipMarked = symbol => decoratorNames(symbol).some(name => /(^|\.)skip$/.test(name)) ||
-        (symbol.type === 'class' && markOf(symbol) === 'skip');
-    const skipConditional = symbol => decoratorNames(symbol)
-        .some(name => /(^|\.)(skipif|skipIf|skipUnless)$/.test(name)) ||
-        (symbol.type === 'class' && markOf(symbol) === 'sometimes');
+    const markAt = symbol => {
+        const own = decoratorMark(symbol);
+        const body = symbol.type === 'class' ? factsOf(symbol)?.mark || null : null;
+        return own === 'skip' || body === 'skip' ? 'skip' : own || body;
+    };
+    const skipMarked = symbol => markAt(symbol) === 'skip';
+    const skipConditional = symbol => markAt(symbol) === 'sometimes';
 
     const collectedMemo = new Map();
     const collected = cls => {
@@ -5708,8 +5794,8 @@ function testUnits(fileEntry, helpers) {
         // A base is looked up by the name it was declared under.
         const written = basesOf(cls).map(base => ({ base, from: origin(base) }));
         const bases = written.map(entry => entry.from.name);
-        const enabled = classSwitch.has(cls) ? classSwitch.get(cls)
-            : switchedNames.has(cls.name) && chain.length === 0 ? switchedNames.get(cls.name) : null;
+        const enabled = switchedNames.has(cls.name) && chain.length === 0 ? switchedNames.get(cls.name)
+            : classSwitch.has(cls) ? classSwitch.get(cls) : null;
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases, runnable,
             // Bases that are known to bring neither a constructor nor a

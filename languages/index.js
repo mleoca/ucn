@@ -405,6 +405,11 @@ const STRUCTURAL_TRAITS = {
     // Modules whose import in a test file names its runner: `() => Map` of
     // module name to runner id; null where an import says nothing of it.
     testRunnerModules: null,
+    // What a module of the language exports under a name, as far as
+    // declaring tests goes: `(fileEntry, helpers, name) => binding | null`.
+    // A test file that takes its runner through a project module is read
+    // through it. Null: imports are not followed.
+    testExport: null,
     // How the language's runners name a test file. A test-path file that
     // declares no test and is not named like one is support code.
     testFileNames: [],
@@ -726,6 +731,11 @@ const NOMINAL_TRAITS = {
     // Modules whose import in a test file names its runner: `() => Map` of
     // module name to runner id; null where an import says nothing of it.
     testRunnerModules: null,
+    // What a module of the language exports under a name, as far as
+    // declaring tests goes: `(fileEntry, helpers, name) => binding | null`.
+    // A test file that takes its runner through a project module is read
+    // through it. Null: imports are not followed.
+    testExport: null,
     // How the language's runners name a test file. A test-path file that
     // declares no test and is not named like one is support code.
     testFileNames: [],
@@ -872,6 +882,7 @@ const LANGUAGES = {
             ...STRUCTURAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
+            testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',
             testFileNames: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)(test|spec)\.[cm]?[jt]sx?$/, /[-_]test\.[cm]?[jt]sx?$/, /(^|\/)test-[^/]*\.[cm]?[jt]sx?$/],
             selfParam: ['this'],
@@ -900,6 +911,7 @@ const LANGUAGES = {
             ...STRUCTURAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
+            testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',
             testFileNames: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)(test|spec)\.[cm]?[jt]sx?$/, /[-_]test\.[cm]?[jt]sx?$/, /(^|\/)test-[^/]*\.[cm]?[jt]sx?$/],
             selfParam: ['this'],
@@ -932,6 +944,7 @@ const LANGUAGES = {
             ...STRUCTURAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
+            testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',
             testFileNames: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)(test|spec)\.[cm]?[jt]sx?$/, /[-_]test\.[cm]?[jt]sx?$/, /(^|\/)test-[^/]*\.[cm]?[jt]sx?$/],
             selfParam: ['this'],

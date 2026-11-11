@@ -2997,8 +2997,10 @@ function testUnits(fileEntry, helpers) {
     const attributeNames = symbol => (symbol.decorators || [])
         .map(name => String(name).split('.').pop().replace(/Attribute$/, ''));
     // [Ignore] (NUnit, MSTest) and Skip = "..." (xUnit): declared, not executed.
+    const withoutStrings = text => String(text || '')
+        .replace(/@"(?:[^"]|"")*"/g, '""').replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'(?:[^'\\]|\\.)*'/g, "''");
     const skipped = symbol => attributeNames(symbol).includes('Ignore') ||
-        (symbol.attributesWithArgs || []).some(attribute => /(^|[\s,(])Skip\s*=/.test(String(attribute.args || '')));
+        (symbol.attributesWithArgs || []).some(attribute => /(^|[\s,(])Skip\s*=/.test(withoutStrings(attribute.args)));
     const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract') &&
         !(Array.isArray(cls.generics) ? cls.generics.length > 0 : !!cls.generics) &&
         !(cls.typeParameters && cls.typeParameters.length > 0);
