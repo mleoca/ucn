@@ -1215,7 +1215,7 @@ const GIT_REF_FORMAT = /^[a-zA-Z0-9._\-~\/^@{}:]+$/;  // eslint-disable-line no-
  */
 let baseReadSerial = 0;
 
-function startBaseRead(file, base) {
+function startBaseRead(file, base, repoFile = file) {
     if (process.platform === 'win32' || !file || !GIT_REF_FORMAT.test(base)) return null;
     const out = path.join(os.tmpdir(),
         `ucn-base-${process.pid}-${++baseReadSerial}-${Math.random().toString(36).slice(2, 10)}`);
@@ -1225,8 +1225,8 @@ function startBaseRead(file, base) {
         // marks a revision that does not hold the file.
         child = spawn('/bin/sh', ['-c',
             'git show "$1" > "$2.part" 2>/dev/null && mv "$2.part" "$2" || { rm -f "$2.part"; : > "$2.none"; }',
-            'ucn-base', `${base}:./${path.basename(file)}`, out],
-        { cwd: path.dirname(file), stdio: 'ignore' });
+            'ucn-base', `${base}:./${path.basename(repoFile)}`, out],
+        { cwd: path.dirname(repoFile), stdio: 'ignore' });
     } catch {
         child = null;
     }
@@ -1299,8 +1299,11 @@ function baseDeclarationChanges(index, name, def, base = 'HEAD', baseRead = null
         if (baseContent === null) continue;
         if (baseContent === undefined) {
             try {
-                baseContent = execFileSync('git', ['show', `${base}:./${path.basename(file)}`], {
-                    cwd: path.dirname(file), encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024,
+                // The repository's copy of the file (a snapshot exported
+                // from the git index is not a repository).
+                const repoFile = index.repoPathOf ? index.repoPathOf(file) : file;
+                baseContent = execFileSync('git', ['show', `${base}:./${path.basename(repoFile)}`], {
+                    cwd: path.dirname(repoFile), encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024,
                     stdio: ['ignore', 'pipe', 'ignore'],
                 });
             } catch {
@@ -2199,8 +2202,9 @@ function verify(index, name, options = {}) {
     // A base the user names must be a commit: a misspelled ref would read as
     // a file absent at base and check nothing against the old declaration
     // (the target-less check already resolved its base through the diff).
-    if (options.base && options.checkBaseRef) assertGitCommit(def.file, baseRef);
-    const baseRead = startBaseRead(def.file, baseRef);
+    const repoFile = index.repoPathOf ? index.repoPathOf(def.file) : def.file;
+    if (options.base && options.checkBaseRef) assertGitCommit(repoFile, baseRef);
+    const baseRead = startBaseRead(def.file, baseRef, repoFile);
     let sweep;
     try {
         sweep = contractedCallerSweep(index, name, def, {

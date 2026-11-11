@@ -77,11 +77,9 @@ function resultExitCode(command, result) {
     if (result && result.ok === false) return 2;
     if (command !== 'check' || !result) return 0;
     if (result.trust) {
-        // Target-less pre-commit check distinguishes advisory review from a
-        // blocking validation failure. Export/reference review remains
-        // machine-readable in trust.status but does not make every ordinary
-        // body edit fail CI; incomplete accounts and signature drift do.
-        return result.trust.status === 'BLOCKED' ? 1 : 0;
+        // Target-less pre-commit check: a definite break fails, something
+        // to look at does not, unless the caller asked for --strict.
+        return result.trust.passes === false ? 1 : 0;
     }
     // Symbol-mode check (verify): a mismatch or unresolved call-site tier is
     // review-required and must fail a CI gate.
@@ -335,6 +333,7 @@ function parseFlags(tokens) {
         defaultValue: getValueFlag('--default-value') ?? getValueFlag('--default'),
         base: getValueFlag('--base'),
         staged: tokens.includes('--staged') || undefined,
+        strict: tokens.includes('--strict') || undefined,
         deep: tokens.includes('--deep') || undefined,
         compact: tokens.includes('--no-compact')
             ? false
@@ -963,7 +962,7 @@ Common flags:
   --file=PATH --exclude=a,b --in=PATH --depth=N --top=N --limit=N
   --all --compact --no-compact --json --include-tests --class-name=X --line=N
   --range=N-M (source <file> --range=N-M, or --file=PATH)
-  --base=REF --staged --no-cache --clear-cache [--all] --max-files=N --workers=N
+  --base=REF --staged --strict --no-cache --clear-cache [--all] --max-files=N --workers=N
   --max-chars=N (text characters, not UTF-8 bytes; default 10K targeted / 3K broad, ceiling 100K)
            JSON is uncapped; meta.maxChars is "not-applied", even with an explicit budget.
   --lines  find/usages/search/show/impact: grep -n shape, one path:line:text

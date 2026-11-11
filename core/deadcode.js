@@ -330,6 +330,30 @@ function requiredByProjectContract(index, symbol) {
 }
 
 /**
+ * What holds a declaration in place whatever names it: facts about the
+ * declaration itself, the same for an audit, a deletion and an addition.
+ *   runtimeContract   the language runtime or the compiler invokes it;
+ *   externalContract  it implements or overrides something defined outside
+ *                     the project;
+ *   projectContract   a contract of the project requires it (the reason:
+ *                     'required-slot' or 'structural-contract'), or null;
+ *   registered        a decorator or a framework registration may invoke
+ *                     it without naming it.
+ */
+function contractFactsOf(index, declared, lang) {
+    return {
+        runtimeContract: !!(protocolMemberOf(index, declared) || protocolTypeOf(index, declared)),
+        externalContract: !!(CLASS_AUDIT_KINDS.includes(declared.type)
+            ? _heritageReachesExternalBase(index, declared, lang, false)
+            : overridesOutOfTreeBase(index, declared) ||
+                typedLiteralExternalMember(index, declared) ||
+                implicitStandardContract(declared, lang)),
+        projectContract: requiredByProjectContract(index, declared),
+        registered: !!(isFrameworkEntrypoint(declared, index) || hasUnknownRegistrationDecorator(declared)),
+    };
+}
+
+/**
  * An absent declaration, placed back in its owner for the questions that
  * depend on where a member stands (which type owns it, what that type
  * implements, what overrides it). Its recorded lines describe a revision
@@ -897,17 +921,9 @@ function deadcode(index, options = {}) {
     // its contracts cannot be checked.
     const anchored = new Map();
     for (const symbol of absent.keys()) anchored.set(symbol, anchoredInOwner(index, symbol));
-    // The three answers that depend on where a member stands. For an
-    // absent declaration they are computed together, under one overlay.
-    const standingFacts = (declared, lang) => ({
-        runtimeContract: protocolMemberOf(index, declared) || protocolTypeOf(index, declared),
-        externalContract: !!(classAuditSet.has(declared.type)
-            ? _heritageReachesExternalBase(index, declared, lang, false)
-            : overridesOutOfTreeBase(index, declared) ||
-                typedLiteralExternalMember(index, declared) ||
-                implicitStandardContract(declared, lang)),
-        projectContract: requiredByProjectContract(index, declared),
-    });
+    // The answers that depend on where a member stands. For an absent
+    // declaration they are computed together, under one overlay.
+    const standingFacts = (declared, lang) => contractFactsOf(index, declared, lang);
     const absentFacts = new Map();
     const standing = (symbol, lang) => {
         if (!absent.has(symbol)) return null;
@@ -1955,4 +1971,4 @@ function deadcode(index, options = {}) {
     } finally { index._endOp(); }
 }
 
-module.exports = { buildUsageIndex, deadcode, nameOnlySelfRecursive, DEF_NAME_LINE_KINDS };
+module.exports = { buildUsageIndex, deadcode, nameOnlySelfRecursive, contractFactsOf, DEF_NAME_LINE_KINDS };

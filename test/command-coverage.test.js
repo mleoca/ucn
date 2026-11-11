@@ -1185,7 +1185,7 @@ describe('check command', () => {
         } finally { rm(dir); }
     });
 
-    it('blocks a deleted symbol because the current index cannot prove deletion safety', () => {
+    it('a deleted exported symbol is review: nothing observed breaks, consumers outside may use it', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'function doomed() { return 1; }\nmodule.exports = doomed;',
@@ -1200,11 +1200,14 @@ describe('check command', () => {
             const { ok, result } = execute(index, 'check', { base: 'HEAD' });
             assert.ok(ok);
             assert.strictEqual(result.empty, undefined);
-            assert.strictEqual(result.trust.status, 'BLOCKED');
-            assert.ok(result.trust.incompleteAccounts > 0);
-            assert.ok(result.actions.some(a => a.kind === 'incomplete_account'));
+            assert.strictEqual(result.trust.status, 'REVIEW_REQUIRED');
+            assert.strictEqual(result.trust.passes, true);
             const deleted = result.changed.find(c => c.kind === 'deleted');
             assert.ok(deleted);
+            // The base revision's declaration decides: `module.exports =
+            // doomed` made it public surface of a library.
+            assert.deepStrictEqual([deleted.verdict, deleted.reasons], ['review', ['downstream-exposure']]);
+            assert.ok(result.actions.some(a => a.kind === 'deleted_review'));
             assert.strictEqual(deleted.account.available, false);
             assert.strictEqual(deleted.account.safeToDelete, false);
         } finally { rm(dir); }

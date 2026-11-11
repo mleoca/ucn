@@ -2617,24 +2617,52 @@ describe('formatCheck trust gate', () => {
             base: 'HEAD',
             staged: false,
             changed: [{
-                name: 'removedFn', file: 'src/a.js', line: 5, kind: 'deleted',
+                name: 'widened', file: 'src/a.js', line: 5, kind: 'modified', change: 'contract',
+                verdict: 'blocked', reasons: ['signature-mismatch', 'header'],
+                callerCount: 4, unverifiedCallerCount: 0, signatureMismatches: 4,
+                mismatches: [1, 2, 3, 4].map(n => ({
+                    file: 'src/use.js', line: n * 10, expression: `widened(${n})`, expected: '2 arg(s)', actual: 1,
+                })),
+                account: { available: true, textComplete: false, safeToDelete: false },
+            }, {
+                name: 'removedFn', file: 'src/a.js', line: 9, kind: 'deleted',
+                verdict: 'blocked', reasons: ['still-referenced'],
+                sites: [{ file: 'src/use.js', line: 1, kind: 'import' }],
                 callerCount: 0, unverifiedCallerCount: 0, signatureMismatches: 0,
                 account: { available: false, textComplete: false, safeToDelete: false },
+            }, {
+                name: 'tidy', file: 'src/a.js', line: 20, kind: 'modified', change: 'inert',
+                verdict: 'ready', reasons: [],
+                callerCount: 7, unverifiedCallerCount: 3, signatureMismatches: 0,
+                account: { available: true, textComplete: false, safeToDelete: false },
             }],
-            totalChanged: 1,
+            totalChanged: 3,
             testFiles: [],
-            actions: [{ severity: 'error', kind: 'incomplete_account', message: 'removedFn: inspect manually' }],
+            actions: [{ severity: 'error', kind: 'signature_drift', message: 'widened: 4 call site(s) no longer fit the signature' }],
             trust: {
-                status: 'BLOCKED', accountsChecked: 0, incompleteAccounts: 1,
-                unverifiedCallSites: 0, signatureMismatches: 0, filteredEdges: 0,
+                status: 'BLOCKED', passes: false, blocked: 2, review: 0, ready: 1,
+                accountsChecked: 2, incompleteAccounts: 1,
+                unverifiedCallSites: 0, signatureMismatches: 4, filteredEdges: 0,
                 usageReviewSymbols: 0, semanticComplete: false, safeToDelete: false,
                 requiresCompilerAndTests: true,
             },
         };
         const text = output.formatCheck(result);
         assert.ok(text.includes('TRUST: BLOCKED'));
-        assert.ok(text.includes('ACCOUNT-INCOMPLETE'));
+        assert.ok(text.includes('2 blocked · 1 ready · 4 signature mismatch(es)'));
         assert.ok(text.includes('compiler and tests are required'));
+        // Worst first, and every site of a break: four call sites to fix
+        // are four lines.
+        assert.ok(text.indexOf('BLOCKED (2)') < text.indexOf('READY (1)'));
+        for (const n of [1, 2, 3, 4]) {
+            assert.ok(text.includes(`↳ src/use.js:${n * 10}  widened(${n})  expected 2 arg(s), got 1`), `site ${n}`);
+        }
+        assert.ok(text.includes('↳ src/use.js:1  import'));
+        // Caller evidence is flagged where the callers matter: on the
+        // changed contract, never on the inert edit or the deletion.
+        assert.match(text, /widened \(src\/a\.js:5\) \[MODIFIED, header, SIG-DRIFT\(4\), ACCOUNT-INCOMPLETE\]/);
+        assert.match(text, /tidy \(src\/a\.js:20\) \[MODIFIED, contract unchanged\] {2}7 callers \(\+3 unverified\)/);
+        assert.match(text, /removedFn \(src\/a\.js:9\) \[DELETED, still-referenced\]/);
 
         const json = JSON.parse(output.formatCheckJson(result));
         assert.strictEqual(json.trust.semanticComplete, false);

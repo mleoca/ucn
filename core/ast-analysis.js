@@ -437,6 +437,8 @@ function projectReflectionSites(index) {
 }
 
 module.exports = {
+    CALLABLE_NODES,
+    COMMENT_NODES,
     declarationSnapshots,
     computeAstComplexity,
     computedDispatchSites,

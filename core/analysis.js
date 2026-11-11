@@ -24,6 +24,7 @@ const symbolKey = (file, line) => entrypoints().symbolKey(file, line);
 const { getLanguageAdapter } = require('../languages');
 const { parseOpenCallShape } = require('../languages/rust-value-flow');
 const { projectComputedDispatch, declarationSnapshots } = require('./ast-analysis');
+const { callableContract, classifyChange, baseCounterpart, parseRevision, moduleChange } = require('./change-kinds');
 const { findAccessorReferences } = require('./accessors');
 
 // JS/TS test framework helpers — calls to these bracket a test case.
@@ -2065,6 +2066,10 @@ function diffImpact(index, options = {}) {
     index._beginOp();
     try {
     const { base = 'HEAD', staged = false, file } = options;
+    // Where git commands run. The index's own root, except for a snapshot
+    // exported from the git index (core/snapshot.js): its files stand in
+    // for the repository's, and the repository is elsewhere.
+    const repoRoot = options.repoRoot || index.repoRoot || index.root;
 
     // Validate base ref format to prevent argument injection
     if (base && !/^[a-zA-Z0-9._\-~\/^@{}:]+$/.test(base)) {  // eslint-disable-line no-useless-escape
@@ -2074,7 +2079,7 @@ function diffImpact(index, options = {}) {
     // Verify git repo
     let gitRoot;
     try {
-        gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: index.root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: repoRoot, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch (e) {
         throw new UcnError('Not a git repository. impact without a symbol requires git.', { cause: e });
     }
@@ -2096,7 +2101,7 @@ function diffImpact(index, options = {}) {
         // "fatal: ambiguous argument" straight to the terminal AND repeat it
         // inside the error message.
         diffText = execFileSync('git', diffArgs, {
-            cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
+            cwd: repoRoot, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
             stdio: ['ignore', 'pipe', 'pipe'],
         });
     } catch (e) {
@@ -2115,7 +2120,7 @@ function diffImpact(index, options = {}) {
     // Normalize both through realpath to handle macOS /var → /private/var symlinks.
     let realGitRoot, realProjectRoot;
     try { realGitRoot = fs.realpathSync(gitRoot); } catch (_) { realGitRoot = gitRoot; }
-    try { realProjectRoot = fs.realpathSync(index.root); } catch (_) { realProjectRoot = index.root; }
+    try { realProjectRoot = fs.realpathSync(repoRoot); } catch (_) { realProjectRoot = repoRoot; }
     const projectPrefix = realGitRoot === realProjectRoot
         ? ''
         : path.relative(realGitRoot, realProjectRoot);
@@ -2143,7 +2148,7 @@ function diffImpact(index, options = {}) {
         let untrackedText = '';
         try {
             untrackedText = execFileSync('git', lsArgs, {
-                cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
+                cwd: repoRoot, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
                 stdio: ['ignore', 'pipe', 'ignore'],
             });
         } catch (_) { untrackedText = ''; }
@@ -2192,6 +2197,9 @@ function diffImpact(index, options = {}) {
 
     const functions = [];
     const moduleLevelChanges = [];
+    // What each changed file did outside its declarations: names it no
+    // longer provides to importers, import statements, loose module code.
+    const moduleChanges = [];
     const newFunctions = [];
     const deletedFunctions = [];
     const symbolChanges = { symbols: [], newSymbols: [], deletedSymbols: [] };
@@ -2219,17 +2227,18 @@ function diffImpact(index, options = {}) {
                 try {
                     const oldContent = execFileSync(
                         'git', ['show', `${ref}:${change.gitRelativePath}`],
-                        { cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
+                        { cwd: repoRoot, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
                     );
                     const oldParsed = parse(oldContent, lang);
                     collectNonCallableChanges(index, change, oldParsed, [], symbolChanges);
+                    const baseEntry = index.fileEntryForContent(change.filePath, oldContent);
                     for (const oldFn of extractCallableSymbols(oldParsed)) {
-                        deletedFunctions.push({
+                        deletedFunctions.push(withBaseDeclaration({
                             name: oldFn.name,
                             filePath: change.filePath,
                             relativePath: change.relativePath,
                             startLine: oldFn.startLine
-                        });
+                        }, baseEntry, oldFn));
                     }
                 } catch (e) {
                     // git show failed — skip
@@ -2255,7 +2264,7 @@ function diffImpact(index, options = {}) {
             try {
                 const oldContent = execFileSync(
                     'git', ['show', `${ref}:${change.gitRelativePath}`],
-                    { cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
+                    { cwd: repoRoot, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
                 );
                 const fileLang = index.languageOf(change.filePath);
                 if (fileLang) {
@@ -2274,6 +2283,32 @@ function diffImpact(index, options = {}) {
         }
 
         collectNonCallableChanges(index, change, oldParsed, fileEntry.symbols, symbolChanges, oldLines);
+
+        // The base revision read with the index's own eyes, and both
+        // revisions' syntax trees: what a changed callable's contract was
+        // and is (core/change-kinds.js). Built on first use.
+        let baseEntry;
+        const baseEntryOf = () => {
+            if (baseEntry === undefined) baseEntry = oldText != null ? index.fileEntryForContent(change.filePath, oldText) : null;
+            return baseEntry;
+        };
+        let baseRoot;
+        let currentRoot;
+        const contractChange = symbol => {
+            if (change.untracked || oldText == null) return { kind: 'unknown', reasons: ['contract-unreadable'] };
+            const fileLang = fileEntry.language;
+            if (baseRoot === undefined) baseRoot = parseRevision(oldText, fileLang);
+            if (currentRoot === undefined) {
+                let content;
+                try { content = index._readFile(change.filePath); } catch { content = null; }
+                currentRoot = content == null ? null
+                    : (index._getParsedTree(change.filePath, content, fileLang)?.rootNode || parseRevision(content, fileLang));
+            }
+            const base = baseCounterpart(baseEntryOf()?.symbols, symbol, isDiffCallable);
+            return classifyChange(
+                base ? callableContract(baseRoot, fileLang, base) : null,
+                callableContract(currentRoot, fileLang, symbol), fileLang);
+        };
 
         // Several callables can share a changed line (`class Box {
         // constructor(v) {..} get w() {..} }`, fix #434): the line belongs
@@ -2474,7 +2509,10 @@ function diffImpact(index, options = {}) {
                     relativePath: change.relativePath,
                     startLine: symbol.startLine,
                     endLine: symbol.endLine,
-                    signature: index.formatSignature(symbol)
+                    signature: index.formatSignature(symbol),
+                    ...(symbol.className && { className: symbol.className }),
+                    // Nothing in a file the base does not have existed before.
+                    ...((change.untracked || change.isNew) && { newFile: true }),
                 });
                 affectedSymbols.delete(key);
             }
@@ -2505,13 +2543,53 @@ function diffImpact(index, options = {}) {
                     // Report the extra ones (by startLine descending — later ones more likely deleted)
                     const toReport = matching.slice(curCount);
                     for (const oldFn of toReport) {
-                        deletedFunctions.push({
+                        deletedFunctions.push(withBaseDeclaration({
                             name: oldFn.name,
                             filePath: change.filePath,
                             relativePath: change.relativePath,
                             startLine: oldFn.startLine
-                        });
+                        }, baseEntryOf(), oldFn));
                     }
+                }
+            }
+        }
+
+        // Outside the declarations: what the module provides and what it
+        // runs. Both revisions are needed; a new file has no "before".
+        if (oldText != null && !change.untracked) {
+            const fileLang = fileEntry.language;
+            const before = { fileEntry: baseEntryOf(), root: parseRevision(oldText, fileLang) };
+            let currentContent;
+            try { currentContent = index._readFile(change.filePath); } catch { currentContent = null; }
+            // Like with like: both revisions as the parser alone records
+            // them. The live entry also holds what later build phases add
+            // (declarations a macro invocation expands to), which no base
+            // entry has, and a macro invocation would read as code that
+            // exists only before.
+            const after = {
+                fileEntry: currentContent == null ? null : index.fileEntryForContent(change.filePath, currentContent),
+                root: currentContent == null ? null : parseRevision(currentContent, fileLang),
+            };
+            if (before.fileEntry && before.root && after.fileEntry && after.root) {
+                const moved = moduleChange(before, after, langTraits(fileLang) || {});
+                const gone = new Set(deletedFunctions.filter(item => item.filePath === change.filePath).map(item => item.name));
+                for (const item of symbolChanges.deletedSymbols) {
+                    if (item.filePath === change.filePath) gone.add(item.name);
+                }
+                // A deleted declaration's name is assessed as a deletion.
+                const removedNames = moved.removedNames.filter(name => !gone.has(name));
+                if (removedNames.length > 0 || moved.importsRemoved > 0 || moved.importsAdded > 0 ||
+                    moved.codeChanged || moved.starExportRemoved) {
+                    moduleChanges.push({
+                        filePath: change.filePath,
+                        relativePath: change.relativePath,
+                        ...moved,
+                        removedNames,
+                        removedExports: moved.removedExports.filter(name => !gone.has(name)),
+                        // Does a newly imported name already mean something in the file?
+                        shadowed: moved.addedBindings.filter(name =>
+                            new RegExp(`(?<![\\w$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(oldText)),
+                    });
                 }
             }
         }
@@ -2591,6 +2669,9 @@ function diffImpact(index, options = {}) {
                 signature: index.formatSignature(symbol),
                 addedLines: aLines,
                 deletedLines: dLines,
+                // What the change did to the contract callers rely on:
+                // 'inert', 'contract' (with what moved) or 'unknown'.
+                change: contractChange(symbol),
                 callers: confirmed.map(c => ({
                     file: c.file,
                     relativePath: c.relativePath,
@@ -2688,7 +2769,13 @@ function diffImpact(index, options = {}) {
         for (const site of refs?.unverifiedSites || []) dependencyFiles.add(site.file);
     }
 
-    return {
+    // Which lines of which file the diff added: what "outside this change"
+    // means for a name. Not enumerable: the report's shape is unchanged.
+    const addedLinesByFile = new Map();
+    for (const change of changes) {
+        if (change.addedLines.length > 0) addedLinesByFile.set(change.relativePath, new Set(change.addedLines));
+    }
+    const report = Object.defineProperty({
         base: staged ? '(staged)' : base,
         changedPaths: changes.length,
         nonSourcePaths,
@@ -2712,8 +2799,23 @@ function diffImpact(index, options = {}) {
             unverifiedCallSites: totalUnverifiedSites,
             affectedFiles: callerFileSet.size
         }
-    };
+    }, 'addedLinesByFile', { value: addedLinesByFile, enumerable: false });
+    Object.defineProperty(report, 'moduleChanges', { value: moduleChanges, enumerable: false });
+    return report;
     } finally { index._endOp(); }
+}
+
+/**
+ * A deleted callable keeps the declaration it was: the base revision's own
+ * record and that revision's file facts, for a deletion assessment
+ * (core/deletion.js). Not enumerable: the report's shape is unchanged.
+ */
+function withBaseDeclaration(item, baseEntry, oldSymbol) {
+    const declaration = (baseEntry?.symbols || []).find(symbol => symbol.name === oldSymbol.name &&
+        (symbol.className || '') === (oldSymbol.className || '') && symbol.startLine === oldSymbol.startLine);
+    Object.defineProperty(item, 'declaration', { value: declaration || null, enumerable: false });
+    Object.defineProperty(item, 'baseFileEntry', { value: baseEntry || null, enumerable: false });
+    return item;
 }
 
 // Non-callable declarations have change dependencies too. Keep them separate

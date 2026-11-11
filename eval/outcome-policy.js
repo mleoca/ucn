@@ -1041,31 +1041,27 @@ const OUTCOME_GATE_THRESHOLDS = Object.freeze({
     // by the required-slot shield. Any contract-bound false-safe fails.
     knownContractBoundFalseSafe: Object.freeze({}),
     // Precommit check. falseReady is the dangerous direction; the coverage
-    // matrix keeps an empty board from passing; the READY floor on clean
-    // changes is pinned per repo once check evaluates by change kind.
+    // matrix keeps an empty board from passing.
     maxCheckFalseReady: 0,
-    // False-ready rows of the 2026-11-10 baseline, pinned by repository,
-    // mutation kind and target, so any other false-ready row fails the gate
-    // (the same target under another mutation kind included) while these
-    // stay visible in every report. A pin that no longer matches a
-    // false-ready row is itself a failure: it is deleted with the fix, never
-    // left to cover a later regression. Each names a defect class the
-    // change-kind check closes.
-    //   websocket  a required parameter on a function that is only used as
-    //              a value (`http.HandleFunc("/r", f)`): no call site drifts.
-    //   flask      a body `yield` turns the callable into a generator; the
-    //              header is unchanged and 22 dependents break.
-    knownCheckFalseReady: Object.freeze({
-        websocket: Object.freeze([Object.freeze({
-            kind: 'required-param',
-            id: 'examples/autobahn/server.go:154:echoReadAllWritePreparedMessage',
-        })]),
-        flask: Object.freeze([Object.freeze({
-            kind: 'generator-transition',
-            id: 'examples/tutorial/flaskr/db.py:9:get_db',
-        })]),
-    }),
+    // False-ready rows pinned by repository, mutation kind and target, so
+    // any other false-ready row fails the gate while a pinned one stays
+    // visible in every report. A pin that no longer matches a false-ready
+    // row is itself a failure: it is deleted with the fix, never left to
+    // cover a later regression. Empty: the two rows of the first baseline
+    // (a required parameter on a function only used as a value; a body
+    // `yield` that turns a callable into a generator) were closed when the
+    // check began to answer by change kind.
+    knownCheckFalseReady: Object.freeze({}),
     requireCheckCoverage: true,
+    // BLOCKED means a break was observed. A BLOCKED verdict on a change the
+    // toolchain accepts outside the changed lines is a wrong observation.
+    maxCheckBlockedOnClean: 0,
+    // Kinds that are inert by construction: a new file under new names, a
+    // statement that binds nothing. Every one the toolchain accepts must be
+    // READY: a check that asks for review of an inert change is one nobody
+    // can act on.
+    checkReadyKinds: Object.freeze(['additive', 'inert-body-edit']),
+    // Overall READY floor on clean changes, per repository (optional).
     checkReadyOnCleanFloor: Object.freeze({}),
 });
 
@@ -1172,6 +1168,26 @@ function evaluateOutcomeGate(reports, thresholds = OUTCOME_GATE_THRESHOLDS) {
                         failures.push(`${repo}: pinned false-ready ${pin.kind} ${pin.id} ` +
                             'is no longer a false-ready row; remove the pin');
                     }
+                }
+            }
+            if (thresholds.maxCheckBlockedOnClean != null &&
+                (check.blockedOnClean || 0) > thresholds.maxCheckBlockedOnClean) {
+                const rows = Array.isArray(report.check.tasks)
+                    ? report.check.tasks.filter(task =>
+                        task.verdict === CHECK_VERDICTS.blocked && !((task.outsideNew || 0) > 0))
+                    : [];
+                failures.push(`${repo}: check BLOCKED on ${check.blockedOnClean} clean change(s) ` +
+                    `(max ${thresholds.maxCheckBlockedOnClean})` +
+                    (rows.length ? `: ${rows.map(task => `${task.kind} ${task.id}`).join(', ')}` : ''));
+            }
+            for (const kind of thresholds.checkReadyKinds || []) {
+                const rows = Array.isArray(report.check.tasks)
+                    ? report.check.tasks.filter(task => task.kind === kind && !((task.outsideNew || 0) > 0))
+                    : [];
+                const held = rows.filter(task => task.verdict !== CHECK_VERDICTS.ready);
+                if (held.length > 0) {
+                    failures.push(`${repo}: ${held.length} of ${rows.length} clean ${kind} change(s) not READY: ` +
+                        held.map(task => `${task.id} ${task.verdict}`).join(', '));
                 }
             }
             const readyFloor = thresholds.checkReadyOnCleanFloor &&

@@ -321,6 +321,28 @@ const STRUCTURAL_TRAITS = {
     // its own model (Go's method sets). A type that satisfies such a
     // contract by its member names keeps the members the contract requires.
     structuralContract: null,
+    // Can another file import ANY module-level name of a module, declared
+    // or merely imported there, with no export syntax (Python)? Removing
+    // such a name, an import included, takes it from its importers.
+    moduleNamesImportable: false,
+    // Is a member's type whatever the class's methods assign to it (Python
+    // instance attributes)? Then an assignment to a receiver member in any
+    // method is part of the class's contract.
+    memberTypesFromAssignments: false,
+    // Does an async function's anonymous future expose properties of its
+    // body to callers (Rust auto traits: Send, Sync)?
+    asyncReturnIsOpaque: false,
+    // Modifiers that let the compiler run a callable and hand callers its
+    // VALUE (C++ constexpr/consteval, Rust `const fn`): the body is then
+    // part of what a caller relies on. null: no such callables.
+    compileTimeCallableMarkers: null,
+    // Callable names the language supplies with no import and no
+    // declaration (builtins, globals): a bare call of one always means
+    // something. null: every callable name is declared or imported.
+    ambientCallables: null,
+    // Do files without module syntax share one global scope (classic
+    // JavaScript scripts)? Then a top-level name of one is visible in all.
+    scriptGlobalScope: false,
     // Whether a top-level type is declared in a source file named after it
     // (fix #386): javac requires `public class Widget` in Widget.java, so a
     // type rename renames that file too.
@@ -547,6 +569,28 @@ const NOMINAL_TRAITS = {
     // its own model (Go's method sets). A type that satisfies such a
     // contract by its member names keeps the members the contract requires.
     structuralContract: null,
+    // Can another file import ANY module-level name of a module, declared
+    // or merely imported there, with no export syntax (Python)? Removing
+    // such a name, an import included, takes it from its importers.
+    moduleNamesImportable: false,
+    // Is a member's type whatever the class's methods assign to it (Python
+    // instance attributes)? Then an assignment to a receiver member in any
+    // method is part of the class's contract.
+    memberTypesFromAssignments: false,
+    // Does an async function's anonymous future expose properties of its
+    // body to callers (Rust auto traits: Send, Sync)?
+    asyncReturnIsOpaque: false,
+    // Modifiers that let the compiler run a callable and hand callers its
+    // VALUE (C++ constexpr/consteval, Rust `const fn`): the body is then
+    // part of what a caller relies on. null: no such callables.
+    compileTimeCallableMarkers: null,
+    // Callable names the language supplies with no import and no
+    // declaration (builtins, globals): a bare call of one always means
+    // something. null: every callable name is declared or imported.
+    ambientCallables: null,
+    // Do files without module syntax share one global scope (classic
+    // JavaScript scripts)? Then a top-level name of one is visible in all.
+    scriptGlobalScope: false,
     // A top-level type lives in a file named after it (fix #386, Java).
     typeNamedSourceFile: false,
     // Compiler-resolved doc references (fix #390, C# crefs).
@@ -635,6 +679,29 @@ const JS_REFLECTION_API = {
     family: 'javascript',
 };
 
+// Python's builtin callables: names a bare call can mean with nothing
+// declared or imported.
+const PY_AMBIENT_CALLABLES = new Set([
+    'abs', 'aiter', 'all', 'anext', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes',
+    'callable', 'chr', 'classmethod', 'compile', 'complex', 'copyright', 'credits', 'delattr', 'dict',
+    'dir', 'divmod', 'enumerate', 'eval', 'exec', 'exit', 'filter', 'float', 'format', 'frozenset',
+    'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'input', 'int', 'isinstance',
+    'issubclass', 'iter', 'len', 'license', 'list', 'locals', 'map', 'max', 'memoryview', 'min', 'next',
+    'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'quit', 'range', 'repr', 'reversed',
+    'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple', 'type',
+    'vars', 'zip', '__import__',
+]);
+// Global functions of the JavaScript runtimes (ECMAScript, Node, browsers).
+const JS_AMBIENT_CALLABLES = new Set([
+    'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURI', 'encodeURIComponent', 'decodeURI',
+    'decodeURIComponent', 'escape', 'unescape', 'eval', 'require', 'fetch', 'setTimeout', 'setInterval',
+    'setImmediate', 'clearTimeout', 'clearInterval', 'clearImmediate', 'queueMicrotask', 'structuredClone',
+    'requestAnimationFrame', 'cancelAnimationFrame', 'requestIdleCallback', 'alert', 'confirm', 'prompt',
+    'atob', 'btoa', 'postMessage', 'importScripts', 'close', 'open', 'print', 'stop', 'focus', 'blur',
+    'scroll', 'scrollTo', 'scrollBy', 'getComputedStyle', 'matchMedia', 'reportError', 'describe', 'it',
+    'test', 'expect', 'beforeEach', 'afterEach', 'beforeAll', 'afterAll',
+]);
+
 // A TypeScript interface or object type is satisfied by shape: any class or
 // object with its members is one.
 const TS_STRUCTURAL_CONTRACT = typeDef => typeDef.type === 'interface' || typeDef.type === 'type';
@@ -658,6 +725,8 @@ const LANGUAGES = {
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
             structuralContract: TS_STRUCTURAL_CONTRACT,
+            ambientCallables: JS_AMBIENT_CALLABLES,
+            scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
             lenientCallArity: true,
@@ -677,6 +746,8 @@ const LANGUAGES = {
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
             structuralContract: TS_STRUCTURAL_CONTRACT,
+            ambientCallables: JS_AMBIENT_CALLABLES,
+            scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
@@ -695,6 +766,8 @@ const LANGUAGES = {
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
             structuralContract: TS_STRUCTURAL_CONTRACT,
+            ambientCallables: JS_AMBIENT_CALLABLES,
+            scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
@@ -713,6 +786,9 @@ const LANGUAGES = {
             callableKindFromBody: ['generator'],
             selfParam: ['self', 'cls'],
             structuralContract: PY_STRUCTURAL_CONTRACT,
+            moduleNamesImportable: true,
+            memberTypesFromAssignments: true,
+            ambientCallables: PY_AMBIENT_CALLABLES,
             // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
             // and `self.__class__(..)` in an instance method construct the
             // method's class through its first parameter (fix #434).
@@ -857,7 +933,11 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             // `-> impl Trait` hides the type but leaks the value's auto traits.
-            inferredReturnForms: ['opaque'],
+            inferredReturnForms: ['opaque', 'evaluated'],
+            // `async fn` returns an anonymous future whose auto traits
+            // (Send, Sync) come from what the body holds across an await.
+            asyncReturnIsOpaque: true,
+            compileTimeCallableMarkers: ['const'],
             selfParam: ['self', '&self', '&mut self', 'mut self'],
             inherentMethodsPrecedeTraitImpls: true,
             derefFieldAccess: true,
@@ -1072,7 +1152,10 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             // `auto` / `decltype(auto)` return types are deduced from the body.
-            inferredReturnForms: ['placeholder'],
+            // 'instantiated': a template's body is checked against each
+            // caller's arguments.
+            inferredReturnForms: ['placeholder', 'instantiated', 'evaluated'],
+            compileTimeCallableMarkers: ['constexpr', 'consteval'],
             // An override overrides every base's virtual of its signature; an
             // inherited member never implements another base's pure virtual
             // (fix #426).

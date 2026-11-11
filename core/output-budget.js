@@ -15,10 +15,12 @@ const BROAD_COMMANDS = new Set([
     ...[...BROAD_CANONICAL].map(toMcpName),
 ]);
 
-const CONTRACT_LINE_RE = /^\s*(?:(?:Summary|ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|VALUE ACCOUNT|TYPE ACCOUNT|Note):|\d+ test-file usage\(s\) hidden\b|Found \d+ (?:definitions|fuzzy matches)\b)/;
+const CONTRACT_LINE_RE = /^\s*(?:(?:Summary|ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|VALUE ACCOUNT|TYPE ACCOUNT|Note):|TRUST: (?:BLOCKED|REVIEW_REQUIRED|READY_FOR_TOOLCHAIN)\b|\d+ test-file usage\(s\) hidden\b|Found \d+ (?:definitions|fuzzy matches)\b)/;
 // Trust lines: the accounting and contract lines that qualify a caller
 // answer. A truncated answer carries every one of them or none of its body.
-const TRUST_LINE_RE = /^(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|VALUE ACCOUNT|TYPE ACCOUNT):/;
+// The pre-commit check's verdict line is one of them (`repo` prints a
+// TRUST level of its own, which is orientation, not a verdict).
+const TRUST_LINE_RE = /^(?:(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|VALUE ACCOUNT|TYPE ACCOUNT):|TRUST: (?:BLOCKED|REVIEW_REQUIRED|READY_FOR_TOOLCHAIN)\b)/;
 const MAX_PRESERVED_CONTRACT_LINES = 24;
 const MAX_PRESERVED_CONTRACT_CHARS = 8000;
 
@@ -139,7 +141,9 @@ function compactNarrowingHint(command, surface, params = {}) {
 // (`CALLERS — CONFIRMED (12, ...)`, `CALLERS — RUNTIME DISPATCH (332 sites`,
 // `UNVERIFIED CALL SITES (627) —`, `CALLEES (3):`, `BY FILE:`).
 const SECTION_HEADER_RE = /^(?:[A-Z][A-Z-]*(?: [A-Z][A-Z-]*)*(?: — [A-Z][A-Z -]*)? \(\d[^)]*\)|[A-Z][A-Z ]+:$)/;
-const SECTION_AWARE_COMMANDS = new Set(['show', 'impact']);
+// `check` groups its items by verdict (`BLOCKED (2) — ...`): a long list of
+// breaks must not push what is ready, or what to review, out of the answer.
+const SECTION_AWARE_COMMANDS = new Set(['show', 'impact', 'check']);
 
 /**
  * Cut a relationship answer to `budget` chars keeping a representative head

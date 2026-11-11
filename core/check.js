@@ -1,18 +1,69 @@
 /**
- * core/check.js — Pre-commit summary command.
+ * core/check.js - Pre-commit check: what can this change break?
  *
- * Composes diff-impact + verify + affected-tests into a single output.
- * Tells the caller, in one shot:
- *   - which functions changed
- *   - which call sites might break (signature drift)
- *   - which tests are likely affected
- *   - which new functions look orphaned
+ * Every changed declaration gets a verdict from what the change DID, not
+ * from the fact that it changed:
+ *
+ *   modified   a change that leaves the callable's contract alone (header,
+ *              kind, inferred return: core/change-kinds.js) is inert: no
+ *              caller can observe it through the contract. A contract
+ *              change is checked against its call sites.
+ *   added      a declaration whose name occurs nowhere outside the lines
+ *              the diff added, and that cannot take part in anything that
+ *              existed (core/capture.js), is inert.
+ *   deleted    the base revision's declaration is assessed with the rule
+ *              the dead-code audit uses (core/deletion.js): nothing depends
+ *              on it, something does, or a named shield says a zero is not
+ *              evidence.
+ *
+ * The three verdicts:
+ *
+ *   blocked    a break was observed: a confirmed call site that no longer
+ *              fits the signature, an import of a name its module no
+ *              longer has, a bare call nothing is left to answer.
+ *   review     the change can reach existing code and the engine cannot
+ *              settle whether it breaks: the reason is named and the sites
+ *              are listed.
+ *   ready      nothing that existed before depends on what changed.
+ *
+ * TRUST is the worst verdict among the items. BLOCKED means a definite
+ * break, or that the check itself could not run. It never means "there is
+ * something to look at": that is REVIEW_REQUIRED.
  */
 
 'use strict';
 
 const { diffImpact, composeAccount, callNotResolvedEntries } = require('./analysis');
-const { isValueDefinition } = require('./shared');
+const { isValueDefinition, isTestPath } = require('./shared');
+const { langTraits } = require('../languages');
+const { assessDeletion, definiteDependentsOf, REASON_TEXT } = require('./deletion');
+const { occurrencesOutsideChange, captureHazards, HAZARD_TEXT } = require('./capture');
+const { reviewItemsOf } = require('./review-items');
+const { resolveTarget } = require('./snapshot');
+const { projectKind, submoduleOf } = require('./deletion');
+
+const VERDICT_RANK = { ready: 0, review: 1, blocked: 2 };
+
+// What moved in a callable's contract, in words.
+const CHANGE_TEXT = Object.freeze({
+    'header': 'its declaration changed (parameters, return type, modifiers or decorators)',
+    'callable-kind': 'its body now makes it a different kind of callable',
+    'inferred-return-contract': 'its return contract is taken from its body, and what it returns changed',
+    'inferred-member-type': 'it assigns to a member of its receiver, and a member\'s type is what the class assigns to it',
+    'contract-unreadable': 'its contract before the change could not be read',
+});
+
+// What a change did to a module outside its declarations, in words.
+const MODULE_TEXT = Object.freeze({
+    'no-longer-provided': 'other files import a name from this module that it no longer provides',
+    'import-removed-still-used': 'an import was removed and the file still uses the name it bound',
+    'imports-removed': 'a module the file imported or included without binding a name is no longer imported',
+    'module-level-code': 'code outside any declaration changed; what runs when the module loads is not modeled',
+    'name-in-use': 'a new import binds a name the file already used',
+    'downstream-exposure': 'a name left the exports of a library: consumers outside the repository may use it',
+    'name-still-used': 'a name the module no longer provides is still written in a file that imports the whole module',
+    'star-export-removed': 'the module no longer passes on everything another module exports; which names its importers lose is not written in it',
+});
 
 function summarizeAccount(account) {
     if (!account) {
@@ -58,20 +109,235 @@ function incompleteReason(account) {
     return parts.length ? ` (${parts.join(', ')})` : '';
 }
 
+/** The indexed definition a diff entry names, or null. */
+function definitionOf(index, entry) {
+    const file = entry.relativePath || entry.file || '';
+    return (index.symbols.get(entry.name) || []).find(definition =>
+        (definition.relativePath === file || definition.file === entry.filePath) &&
+        (!entry.startLine || definition.startLine === entry.startLine) &&
+        (entry.className == null || (definition.className || null) === (entry.className || null))) || null;
+}
+
+/** Did the type that owns `definition` exist before the change? */
+function ownerExistedBefore(index, definition, addedLinesByFile) {
+    if (!definition.className) return false;
+    const owners = (index.symbols.get(definition.className) || []).filter(type =>
+        type.file === definition.file && !type.className &&
+        type.startLine <= definition.startLine && (type.endLine || type.startLine) >= definition.startLine);
+    // An owner declared elsewhere (a receiver method, an impl block, an
+    // out-of-class definition) is not in the lines this file added.
+    if (owners.length === 0) return true;
+    const added = addedLinesByFile.get(definition.relativePath);
+    return owners.some(owner => !added || !added.has(owner.nameLine || owner.startLine));
+}
+
+/** Callers of one declaration, both tiers, with the account over them. */
+function callersOf(index, name, definition) {
+    const raw = index.findCallers(name, {
+        includeMethods: true,
+        collectAccount: true,
+        targetDefinitions: definition ? [definition] : undefined,
+    }) || [];
+    const account = composeAccount(index, name, raw);
+    return {
+        confirmed: raw.filter(caller => caller.tier !== 'unverified'),
+        unverified: raw.filter(caller => caller.tier === 'unverified')
+            .concat(raw.unverifiedEntries || [])
+            .concat(callNotResolvedEntries(index, account)),
+        account,
+    };
+}
+
+/**
+ * Verdict of an ADDED declaration.
+ * @returns {{verdict, reasons: string[], hazards?: string[], outside?: object[]}}
+ */
+function assessAddition(index, entry, definition, addedLinesByFile, account) {
+    if (!definition) return { verdict: 'review', reasons: ['declaration-not-indexed'] };
+    const occurrences = occurrencesOutsideChange(index, entry.name, addedLinesByFile, definition);
+    const summary = summarizeAccount(account);
+    const reasons = [];
+    if (occurrences.outside.length > 0) reasons.push('name-in-use');
+    else if (summary.available && (summary.unanalyzedLines > 0 || summary.unsearchablePaths > 0 ||
+        summary.unparsedFiles > 0 || summary.unreadableFiles > 0)) reasons.push('novelty-unknown');
+    let shield;
+    try {
+        const assessment = assessDeletion(index, definition);
+        shield = assessment.verdict === 'review' ? assessment.reason : null;
+    } catch (_) { shield = null; }
+    let contract;
+    try {
+        contract = require('./deadcode').contractFactsOf(index, definition, index.files.get(definition.file)?.language);
+    } catch (_) { contract = null; }
+    const hazards = captureHazards(index, definition, {
+        ownerExisted: ownerExistedBefore(index, definition, addedLinesByFile),
+        contract,
+        shield,
+    });
+    reasons.push(...hazards);
+    return {
+        verdict: reasons.length > 0 ? 'review' : 'ready',
+        reasons,
+        ...(occurrences.outside.length > 0 && { outside: occurrences.outside }),
+    };
+}
+
+/**
+ * Verdict of a DELETED declaration, from the base revision's record.
+ * @returns {{verdict, reasons: string[], sites?: object[], basis?: string}}
+ */
+function assessRemoval(index, deleted) {
+    const declaration = deleted.declaration;
+    if (!declaration) return { verdict: 'review', reasons: ['base-declaration-unreadable'] };
+    let assessment;
+    try {
+        assessment = assessDeletion(index, declaration, { fileEntry: deleted.baseFileEntry || null });
+    } catch (_) {
+        return { verdict: 'review', reasons: ['base-declaration-unreadable'] };
+    }
+    if (assessment.verdict === 'no-static-dependents') return { verdict: 'ready', reasons: [] };
+    const definite = definiteDependentsOf(index, declaration);
+    if (definite.length > 0) {
+        return { verdict: 'blocked', reasons: ['still-referenced'], sites: definite, basis: assessment.basis };
+    }
+    return {
+        verdict: 'review',
+        reasons: [assessment.verdict === 'has-static-dependents' ? 'name-still-used' : assessment.reason],
+        basis: assessment.basis,
+        ...(assessment.site && { sites: [assessment.site] }),
+    };
+}
+
+/**
+ * Verdict of what a change did to a module outside its declarations.
+ *
+ *   blocked  another file imports a name from the module that the module
+ *            no longer provides (an export keyword or list entry removed,
+ *            an import other modules took through it);
+ *   review   an explicit export left a library's surface; an import was
+ *            dropped whose name the file still uses, or one that binds no
+ *            name here (a side effect, an inclusion); loose module code
+ *            changed; a new import binds a name the file already used.
+ *
+ * @returns {{verdict, reasons: string[], sites: object[]}}
+ */
+function assessModuleChange(index, moved) {
+    const sites = [];
+    // Files that hold the whole module under a name (`import * as ns`,
+    // `import m`): they reach its names as members, not as imports.
+    const holders = new Map(); // relative path -> local names of the module
+    const bySite = (a, b) => (a.file === b.file ? a.line - b.line : (a.file < b.file ? -1 : 1));
+    // What the module still provides: a binding of one of these names, or
+    // of a removed one, takes that name. Any other binding of the module
+    // is the module itself (`const m = require('./m')`, `import m`).
+    const own = index.files.get(moved.filePath);
+    const provides = new Set(own?.exports || []);
+    if (langTraits(own?.language)?.moduleNamesImportable) {
+        for (const symbol of own?.symbols || []) if (!symbol.className) provides.add(symbol.name);
+    }
+    const named = binding => moved.removedNames.includes(binding.name) || provides.has(binding.name);
+    for (const entry of index.files.values()) {
+        const resolved = entry.moduleResolved || {};
+        for (const binding of entry.importBindings || []) {
+            if (binding.dynamic || resolved[binding.module] !== moved.relativePath) continue;
+            if (binding.kind === 'namespace' ||
+                ((binding.kind === 'import' || binding.kind === 'require') && !named(binding))) {
+                if (!holders.has(entry.relativePath)) holders.set(entry.relativePath, new Set());
+                holders.get(entry.relativePath).add(binding.alias || binding.name);
+                continue;
+            }
+            const taken = binding.kind === 'default' ? 'default' : binding.name;
+            if (!moved.removedNames.includes(taken)) continue;
+            if (taken !== 'default' && submoduleOf(resolved, binding.module, taken)) continue;
+            sites.push({ file: entry.relativePath, line: binding.line || 0, kind: `import ${taken}` });
+        }
+    }
+    sites.sort(bySite);
+    if (sites.length > 0) return { verdict: 'blocked', reasons: ['no-longer-provided'], sites };
+    const reasons = [];
+    const stillUsed = [];
+    // A removed name still written in a file that holds the module: it may
+    // be the member that file reaches through it.
+    for (const name of moved.removedNames) {
+        if (name === 'default' || holders.size === 0) continue;
+        for (const row of index.usages(name, { includeTests: true, codeOnly: true }) || []) {
+            const file = row.relativePath || row.file;
+            if (!holders.has(file) || row.isDefinition) continue;
+            stillUsed.push({ file, line: row.line, kind: `uses ${name}` });
+        }
+    }
+    if (stillUsed.length > 0) reasons.push('name-still-used');
+    for (const name of moved.removedBindings) {
+        for (const row of index.usages(name, { includeTests: true, codeOnly: true }) || []) {
+            if ((row.relativePath || row.file) !== moved.relativePath) continue;
+            if (row.isDefinition || row.usageType === 'import' || row.usageType === 'definition') continue;
+            stillUsed.push({ file: moved.relativePath, line: row.line, kind: `uses ${name}` });
+        }
+    }
+    if (stillUsed.length > 0) reasons.push('import-removed-still-used');
+    // A module that is no longer imported and bound no name was there
+    // for what importing it does (a side effect, an inclusion).
+    if ((moved.removedBareImports || []).length > 0) reasons.push('imports-removed');
+    if (moved.removedExports.length > 0 && projectKind(index) === 'library') reasons.push('downstream-exposure');
+    if (moved.starExportRemoved) reasons.push('star-export-removed');
+    // Loose code in a test file is the test: nothing imports it for
+    // what it does when it loads.
+    if (moved.codeChanged && !isTestPath(moved.relativePath)) reasons.push('module-level-code');
+    if ((moved.shadowed || []).length > 0) reasons.push('name-in-use');
+    return { verdict: reasons.length > 0 ? 'review' : 'ready', reasons, sites: stillUsed.sort(bySite) };
+}
+
 /**
  * Run the pre-commit check.
  *
  * @param {object} index - ProjectIndex
- * @param {object} options - { base, staged, file, limit }
+ * @param {object} options - { base, staged, file, limit, strict }
+ *   strict: REVIEW_REQUIRED does not pass either (`trust.passes`).
  * @returns {object}
  */
-function check(index, options = {}) {
+function check(live, options = {}) {
+    // A staged check describes the git index. Everything below reads the
+    // tree the diff's new side lives in (core/snapshot.js).
+    let target;
+    try {
+        target = resolveTarget(live, { staged: !!options.staged, force: !!options.forceStagedSnapshot });
+    } catch (e) {
+        if (e && e.code === 'staged-snapshot-unavailable') {
+            // Did the repository itself answer? Outside one, the ordinary
+            // "not a git repository" report is the truthful one.
+            try { diffImpact(live, { base: options.base || 'HEAD', staged: true, file: options.file }); } catch (inner) {
+                const message = inner && inner.message ? inner.message : 'diff failed';
+                return {
+                    base: options.base || 'HEAD', staged: true, ok: false,
+                    status: /not a git repositor/i.test(message) ? 'not-a-repo' : 'diff-failed',
+                    error: message,
+                };
+            }
+            return {
+                base: options.base || 'HEAD', staged: true, ok: false,
+                status: 'staged-snapshot-unavailable',
+                error: `the staged tree could not be exported and indexed (${e.message}); nothing was checked`,
+            };
+        }
+        throw e;
+    }
+    try {
+        const result = checkTarget(target.index, options, target.repoRoot);
+        if (target.notes.length > 0 && result && result.ok !== false) result.notes = target.notes;
+        return result;
+    } finally {
+        target.dispose();
+    }
+}
+
+function checkTarget(index, options, repoRoot) {
     let dr;
     try {
         dr = diffImpact(index, {
             base: options.base || 'HEAD',
             staged: !!options.staged,
             file: options.file,
+            repoRoot,
         });
     } catch (e) {
         // The gate could not run at all. This must stay distinguishable from a
@@ -97,6 +363,7 @@ function check(index, options = {}) {
         ...(dr?.newSymbols || []).map(s => ({ ...s, _kind: 'added', _nonCallable: true })),
         ...(dr?.deletedSymbols || []).map(s => ({ ...s, _kind: 'deleted', _nonCallable: true })),
     ];
+    const addedLinesByFile = dr?.addedLinesByFile || new Map();
     const pathCounts = {
         changedPaths: dr?.changedPaths || 0,
         nonSourcePaths: dr?.nonSourcePaths || 0,
@@ -109,7 +376,27 @@ function check(index, options = {}) {
         ...declarations,
     ];
 
-    if (!dr || (allChanged.length === 0 && deleted.length === 0)) {
+    // Outside the declarations: what each changed module still provides to
+    // its importers, which imports it dropped, what loose code it runs.
+    const moduleItems = [];
+    for (const moved of dr?.moduleChanges || []) {
+        const outcome = assessModuleChange(index, moved);
+        if (outcome.verdict === 'ready') continue;
+        moduleItems.push({
+            name: '(module)',
+            file: moved.relativePath,
+            line: 1,
+            kind: 'module',
+            callerCount: 0,
+            unverifiedCallerCount: 0,
+            signatureMismatches: 0,
+            verdict: outcome.verdict,
+            reasons: outcome.reasons,
+            ...(outcome.sites.length > 0 && { sites: outcome.sites }),
+        });
+    }
+
+    if (!dr || (allChanged.length === 0 && deleted.length === 0 && moduleItems.length === 0)) {
         // fix #283: say what the diff actually contained. "no changes
         // detected" with three changed files reads as a false negative in a
         // pre-commit hook — the truth is the changes are outside what the
@@ -138,7 +425,6 @@ function check(index, options = {}) {
 
     const items = [];
 
-    // For each changed function, run verify and gather caller summary
     for (const fn of changed) {
         const filePath = fn.relativePath || fn.file || '';
         if (fn._nonCallable) {
@@ -148,7 +434,7 @@ function check(index, options = {}) {
             // change is reviewed there, as a function body change is through
             // its callers. A type's shape and inheritance are not checked.
             const valueDeclaration = isValueDefinition(fn);
-            items.push({
+            const item = {
                 name: fn.name, file: filePath, line: fn.startLine, kind: fn._kind,
                 symbolType: fn.type, requiresToolchainValidation: true,
                 ...(valueDeclaration && { valueDeclaration: true }),
@@ -161,74 +447,132 @@ function check(index, options = {}) {
                 unverifiedDependencyCount: (dependency?.unverifiedCount || 0) + (fn.remainingReferences?.length || 0),
                 signatureMismatches: 0,
                 account: summarizeAccount(fn.impact?.account),
-            });
+            };
+            if (fn._kind === 'added') {
+                // A new declaration under a new name, in a type that is new
+                // too, cannot be reached by anything that existed.
+                const outcome = assessAddition(index, fn, definitionOf(index, fn), addedLinesByFile, fn.impact?.account);
+                item.verdict = outcome.verdict;
+                item.reasons = outcome.reasons;
+                if (outcome.outside) item.sites = outcome.outside;
+            } else if (fn._kind === 'deleted') {
+                // Kinds the dead-code rule does not audit (fields, constants,
+                // aliases) are never cleared: what remains is the name's
+                // other occurrences, each a candidate.
+                const definite = definiteDependentsOf(index, {
+                    name: fn.name, file: fn.filePath, relativePath: filePath, className: fn.className,
+                });
+                item.verdict = definite.length > 0 ? 'blocked' : 'review';
+                item.reasons = definite.length > 0 ? ['still-referenced']
+                    : [(fn.remainingReferences || []).length > 0 ? 'name-still-used' : 'declaration-removed'];
+                if (definite.length > 0) item.sites = definite;
+            } else {
+                item.verdict = 'review';
+                item.reasons = [valueDeclaration ? 'value-change' : 'declaration-change'];
+            }
+            items.push(item);
             continue;
         }
-        // The base revision decides which call sites the changed
-        // declaration bound before (fix #394). An exception inside verify is
-        // an internal error, never a silently skipped check.
-        const verifyResult = index.verify(fn.name, {
-            file: filePath, line: fn.startLine, base: options.staged ? 'HEAD' : (options.base || 'HEAD'),
-        });
-        // Note: verify() returns `mismatches` as a COUNT and `mismatchDetails` as the array.
-        const mismatches = verifyResult && Array.isArray(verifyResult.mismatchDetails)
-            ? verifyResult.mismatchDetails
-            : [];
 
-        // For modified functions, the contracted diffImpact result carries both
-        // bands already (confirmed `callers` + visible `unverifiedCallers`).
-        let callers = Array.isArray(fn.callers) ? fn.callers : [];
-        let unverifiedCallers = Array.isArray(fn.unverifiedCallers) ? fn.unverifiedCallers : [];
-        let account = fn.account || null;
-        // An exception here is an internal error, never a silent orphan claim
-        // (fix #394).
-        if (callers.length === 0 && fn._kind === 'added') {
-            const definitions = (index.symbols.get(fn.name) || []).filter(d =>
-                (d.relativePath === filePath || d.file === fn.filePath) &&
-                (!fn.startLine || d.startLine === fn.startLine));
-            const raw = index.findCallers(fn.name, {
-                includeMethods: true,
-                collectAccount: true,
-                targetDefinitions: definitions.length > 0 ? definitions : undefined,
-            }) || [];
-            callers = raw.filter(c => c.tier !== 'unverified');
-            unverifiedCallers = raw.filter(c => c.tier === 'unverified')
-                .concat(raw.unverifiedEntries || []);
-            account = composeAccount(index, fn.name, raw);
-            unverifiedCallers = unverifiedCallers.concat(callNotResolvedEntries(index, account));
+        if (fn._kind === 'modified') {
+            const change = fn.change || { kind: 'unknown', reasons: ['contract-unreadable'] };
+            const callers = Array.isArray(fn.callers) ? fn.callers : [];
+            const unverifiedCallers = Array.isArray(fn.unverifiedCallers) ? fn.unverifiedCallers : [];
+            const item = {
+                name: fn.name,
+                file: filePath,
+                line: fn.startLine || fn.line,
+                kind: 'modified',
+                change: change.kind,
+                callerCount: callers.length,
+                unverifiedCallerCount: unverifiedCallers.length,
+                signatureMismatches: 0,
+                account: summarizeAccount(fn.account || null),
+            };
+            if (change.kind === 'inert') {
+                // The contract every caller relies on is untouched.
+                item.verdict = 'ready';
+                item.reasons = [];
+                items.push(item);
+                continue;
+            }
+            // The base revision decides which call sites the changed
+            // declaration bound before (fix #394). An exception inside verify
+            // is an internal error, never a silently skipped check.
+            const verifyResult = index.verify(fn.name, {
+                file: filePath, line: fn.startLine, base: options.staged ? 'HEAD' : (options.base || 'HEAD'),
+            });
+            // Note: verify() returns `mismatches` as a COUNT and `mismatchDetails` as the array.
+            const mismatches = verifyResult && Array.isArray(verifyResult.mismatchDetails)
+                ? verifyResult.mismatchDetails
+                : [];
+            item.signatureMismatches = mismatches.length;
+            if (mismatches.length > 0) {
+                item.mismatches = mismatches;
+                item.verdict = 'blocked';
+                item.reasons = ['signature-mismatch', ...change.reasons];
+            } else {
+                // A changed contract matters only to what depends on it.
+                // What a method assigns to a member is the CLASS's
+                // contract: its dependents are the member's users, whoever
+                // calls the method.
+                const definition = definitionOf(index, fn);
+                let dependents;
+                try { dependents = definition ? assessDeletion(index, definition) : null; } catch (_) { dependents = null; }
+                if (dependents && dependents.verdict === 'no-static-dependents' &&
+                    !change.reasons.includes('inferred-member-type')) {
+                    item.verdict = 'ready';
+                    item.reasons = [];
+                    item.noDependents = true;
+                } else {
+                    item.verdict = 'review';
+                    item.reasons = [...change.reasons];
+                    if (dependents && dependents.verdict === 'review') item.shield = dependents.reason;
+                }
+            }
+            item.reviewItems = reviewItemsOf(unverifiedCallers);
+            items.push(item);
+            continue;
         }
 
+        // Added callable.
+        const definition = definitionOf(index, fn);
+        const found = callersOf(index, fn.name, definition);
+        const outcome = assessAddition(index, fn, definition, addedLinesByFile, found.account);
         const item = {
             name: fn.name,
             file: filePath,
             line: fn.startLine || fn.line,
-            kind: fn._kind,
-            callerCount: callers.length,
-            unverifiedCallerCount: unverifiedCallers.length,
-            signatureMismatches: mismatches.length,
-            account: summarizeAccount(account),
-            ...(mismatches.length > 0 && { mismatches: mismatches.slice(0, 5) }),
+            kind: 'added',
+            callerCount: found.confirmed.length,
+            unverifiedCallerCount: found.unverified.length,
+            signatureMismatches: 0,
+            account: summarizeAccount(found.account),
+            verdict: outcome.verdict,
+            reasons: outcome.reasons,
+            ...(outcome.outside && { sites: outcome.outside }),
         };
-
         // Orphan = newly added with zero caller CANDIDATES IN EITHER TIER and
-        // not detected as an entry point. Zero confirmed + N unverified is NOT
-        // orphan (the #223 reverseTrace entry-point soundness rule — claiming
-        // "nobody calls this" after routing candidates to the unverified tier
-        // would be the exact silent-drop the contract forbids).
-        if (item.kind === 'added' && callers.length === 0 && unverifiedCallers.length === 0) {
-            // Check entry points: if the symbol is a known entry-point pattern, not orphan
-            const eps = require('./entrypoints').detectEntrypoints(index) || [];
-            const isEntry = eps.some(e => e.name === fn.name && (e.file === filePath || e.relativePath === filePath));
+        // not an entry point. Zero confirmed + N unverified is NOT orphan
+        // (the #223 reverseTrace entry-point soundness rule). Information
+        // about the addition, never a reason to hold the change.
+        if (found.confirmed.length === 0 && found.unverified.length === 0 && definition) {
+            const language = index.files.get(definition.file)?.language;
+            let adapter;
+            try { adapter = language ? require('../languages').getLanguageAdapter(language) : null; } catch (_) { adapter = null; }
+            let entryKind;
+            try { entryKind = adapter?.getEntryPointKind ? adapter.getEntryPointKind(definition) : null; } catch (_) { entryKind = null; }
+            let isEntry = !!entryKind;
+            try { isEntry = isEntry || !!adapter?.isEntryPoint?.(definition); } catch (_) { /* keep */ }
             item.orphan = !isEntry;
         }
-
         items.push(item);
     }
 
-    // Surface deleted functions inline. remainingCallSites are name-level
-    // matches still present in the tree — a deleted function that is still
-    // called is a likely break, so they count as unverified callers here.
+    // Deleted callables: the base revision's declaration, assessed against
+    // what the snapshot still holds.
     for (const d of deleted) {
+        const outcome = assessRemoval(index, d);
         items.push({
             name: d.name || '(unnamed)',
             file: d.relativePath || d.file || '',
@@ -244,8 +588,14 @@ function check(index, options = {}) {
                 semanticComplete: false,
                 safeToDelete: false,
             },
+            verdict: outcome.verdict,
+            reasons: outcome.reasons,
+            ...(outcome.basis && { basis: outcome.basis }),
+            ...(outcome.sites && { sites: outcome.sites }),
         });
     }
+
+    items.push(...moduleItems);
 
     // Affected tests (top-level summary, capped)
     let testFiles = [];
@@ -262,64 +612,116 @@ function check(index, options = {}) {
         }
     }
 
-    // Action items
+    // Action items: one per reason an item is not ready, then what else the
+    // evidence about a non-ready item says.
     const actions = [];
+    const reasonText = code => CHANGE_TEXT[code] || HAZARD_TEXT[code] || REASON_TEXT[code] || null;
     for (const it of items) {
-        if (it.requiresToolchainValidation && it.valueDeclaration && it.kind !== 'deleted') {
+        if (it.kind !== 'module') continue;
+        for (const code of it.reasons) {
             actions.push({
-                severity: 'warn',
-                kind: 'value_change',
-                message: `${it.name}: ${it.kind} ${it.symbolType}; review its ${it.dependencyCount + it.callerCount} value access site(s) and run the compiler/type checker and tests`,
-            });
-        } else if (it.requiresToolchainValidation) {
-            actions.push({
-                severity: it.kind === 'added' ? 'warn' : 'error',
-                kind: 'declaration_change',
-                message: `${it.name}: ${it.kind} ${it.symbolType}; shape/inheritance compatibility is not checked by arity analysis — review dependency sites and run the compiler/type checker and tests`,
+                severity: it.verdict === 'blocked' ? 'error' : 'warn',
+                kind: 'module_change',
+                message: `${it.file}: ${MODULE_TEXT[code] || code}` +
+                    (it.verdict === 'blocked' ? ` (${it.sites.length} site(s))` : ''),
             });
         }
-        if (!it.account || !it.account.textComplete) {
-            actions.push({
-                severity: 'error',
-                kind: 'incomplete_account',
-                message: `${it.name}: caller evidence is not text-complete` +
-                    `${incompleteReason(it.account)}; inspect warnings and usages manually`,
-            });
-        }
-        if (it.unverifiedCallerCount > 0) {
-            actions.push({
-                severity: 'warn',
-                kind: 'unverified_callers',
-                message: `${it.name}: review ${it.unverifiedCallerCount} unverified caller candidate(s)`,
-            });
-        }
-        if (it.account && it.account.filtered > 0) {
-            actions.push({
-                severity: 'warn',
-                kind: 'filtered_evidence',
-                message: `${it.name}: ${it.account.filtered} caller edge(s) were hidden by filters`,
-            });
-        }
-        if (it.account && it.account.requiresUsageReview) {
-            actions.push({
-                severity: 'warn',
-                kind: 'non_call_usages',
-                message: `${it.name}: non-call references require a usages review`,
-            });
+    }
+    for (const it of items) {
+        if (it.kind === 'module') continue;
+        if (it.verdict === 'ready') {
+            if (it.orphan) {
+                actions.push({
+                    severity: 'info',
+                    kind: 'orphan_new',
+                    message: `${it.name} is new and nothing calls it yet; it is not a detected entry point`,
+                });
+            }
+            continue;
         }
         if (it.signatureMismatches > 0) {
             actions.push({
-                severity: 'warn',
+                severity: 'error',
                 kind: 'signature_drift',
-                message: `${it.name}: ${it.signatureMismatches} call site(s) need updating`,
+                message: `${it.name}: ${it.signatureMismatches} call site(s) no longer fit the signature`,
             });
         }
-        if (it.orphan) {
+        if (it.kind === 'deleted' && it.verdict === 'blocked') {
             actions.push({
-                severity: 'warn',
-                kind: 'orphan_new',
-                message: `${it.name} is new with no observed caller candidates and is not a detected entry point; review usages before treating it as orphaned`,
+                severity: 'error',
+                kind: 'deleted_still_referenced',
+                message: `${it.name}: deleted, and ${it.sites.length} site(s) still import or call it`,
             });
+        } else if (it.kind === 'deleted') {
+            const why = it.reasons[0] === 'name-still-used'
+                ? 'the name is still used; check whether those uses meant this declaration'
+                : it.reasons[0] === 'declaration-removed'
+                    ? 'a declaration of this kind is not cleared by the engine; run the compiler/type checker and tests'
+                    : (it.basis || reasonText(it.reasons[0]) || it.reasons[0]);
+            actions.push({ severity: 'warn', kind: 'deleted_review', message: `${it.name}: deleted; ${why}` });
+        }
+        if (it.requiresToolchainValidation && it.kind === 'modified') {
+            actions.push(it.valueDeclaration ? {
+                severity: 'warn',
+                kind: 'value_change',
+                message: `${it.name}: modified ${it.symbolType}; review its ${it.dependencyCount + it.callerCount} value access site(s) and run the compiler/type checker and tests`,
+            } : {
+                severity: 'warn',
+                kind: 'declaration_change',
+                message: `${it.name}: modified ${it.symbolType}; shape/inheritance compatibility is not checked by arity analysis — review dependency sites and run the compiler/type checker and tests`,
+            });
+        }
+        if (it.kind === 'modified' && !it.requiresToolchainValidation) {
+            const moved = it.reasons.filter(code => CHANGE_TEXT[code]).map(code => CHANGE_TEXT[code]);
+            if (moved.length > 0) {
+                actions.push({
+                    severity: 'warn',
+                    kind: 'contract_change',
+                    message: `${it.name}: ${moved.join('; ')}; review its ${it.callerCount} caller(s)` +
+                        (it.shield ? ` (${reasonText(it.shield) || it.shield})` : ''),
+                });
+            }
+        }
+        if (it.kind === 'added') {
+            for (const code of it.reasons) {
+                actions.push({
+                    severity: 'warn',
+                    kind: 'addition_hazard',
+                    message: `${it.name}: ${reasonText(code) || code}`,
+                });
+            }
+        }
+        // Evidence about callers matters where the callers do.
+        if (it.kind !== 'deleted') {
+            if (!it.account || !it.account.textComplete) {
+                actions.push({
+                    severity: 'warn',
+                    kind: 'incomplete_account',
+                    message: `${it.name}: caller evidence is not text-complete` +
+                        `${incompleteReason(it.account)}; inspect warnings and usages manually`,
+                });
+            }
+            if (it.unverifiedCallerCount > 0) {
+                actions.push({
+                    severity: 'warn',
+                    kind: 'unverified_callers',
+                    message: `${it.name}: review ${it.unverifiedCallerCount} unverified caller candidate(s)`,
+                });
+            }
+            if (it.account && it.account.filtered > 0) {
+                actions.push({
+                    severity: 'warn',
+                    kind: 'filtered_evidence',
+                    message: `${it.name}: ${it.account.filtered} caller edge(s) were hidden by filters`,
+                });
+            }
+            if (it.account && it.account.requiresUsageReview) {
+                actions.push({
+                    severity: 'warn',
+                    kind: 'non_call_usages',
+                    message: `${it.name}: non-call references require a usages review`,
+                });
+            }
         }
     }
     if (limit && allChanged.length > limit) {
@@ -338,17 +740,14 @@ function check(index, options = {}) {
         });
     }
 
-    const incompleteAccounts = items.filter(it => !it.account || !it.account.textComplete).length;
-    const unverifiedCallSites = items.reduce((sum, it) => sum + (it.unverifiedCallerCount || 0), 0);
-    const signatureMismatches = items.reduce((sum, it) => sum + (it.signatureMismatches || 0), 0);
-    const filteredEdges = items.reduce((sum, it) => sum + (it.account ? it.account.filtered || 0 : 0), 0);
-    const usageReviewSymbols = items.filter(it => it.account && it.account.requiresUsageReview).length;
-    const unvalidatedDeclarations = items.filter(it => it.requiresToolchainValidation && it.kind !== 'added' &&
-        !(it.valueDeclaration && it.kind === 'modified')).length;
-    const reviewRequired = incompleteAccounts > 0 || unverifiedCallSites > 0 ||
-        signatureMismatches > 0 || filteredEdges > 0 || usageReviewSymbols > 0 ||
-        actions.some(a => a.kind === 'orphan_new' || a.kind === 'declaration_change' || a.kind === 'value_change') ||
-        !!(limit && allChanged.length > limit);
+    // Counts describe the items whose callers matter: an inert change has
+    // callers, and none of them is something to look at.
+    const open = items.filter(it => it.verdict !== 'ready');
+    const blocked = items.filter(it => it.verdict === 'blocked').length;
+    const review = items.filter(it => it.verdict === 'review').length;
+    const truncated = !!(limit && allChanged.length > limit);
+    const worst = items.reduce((rank, it) => Math.max(rank, VERDICT_RANK[it.verdict] || 0), truncated ? 1 : 0);
+    const callerItems = open.filter(it => it.kind !== 'deleted' && it.kind !== 'module');
 
     return {
         base: options.base || 'HEAD',
@@ -357,23 +756,31 @@ function check(index, options = {}) {
         status: 'checked',
         ...pathCounts,
         changed: items,
-        totalChanged: allChanged.length + deleted.length,
-        truncated: !!(limit && allChanged.length > limit),
+        totalChanged: allChanged.length + deleted.length + moduleItems.length,
+        truncated,
         testFiles,
         totalTestFiles: testFiles.length,
         totalTests: testCount,
         actions,
         trust: {
-            status: incompleteAccounts > 0 || signatureMismatches > 0 || unvalidatedDeclarations > 0
-                ? 'BLOCKED'
-                : reviewRequired ? 'REVIEW_REQUIRED' : 'READY_FOR_TOOLCHAIN',
+            status: worst === 2 ? 'BLOCKED' : worst === 1 ? 'REVIEW_REQUIRED' : 'READY_FOR_TOOLCHAIN',
+            // The one boolean a gate needs: a break never passes; something
+            // to look at passes unless the caller asked for strict.
+            passes: worst === 0 || (worst === 1 && !options.strict),
+            ...(options.strict && { strict: true }),
+            blocked,
+            review,
+            ready: items.length - blocked - review,
             accountsChecked: items.filter(it => it.account && it.account.available).length,
-            incompleteAccounts,
-            unverifiedCallSites,
-            signatureMismatches,
-            filteredEdges,
-            usageReviewSymbols,
-            unvalidatedDeclarations,
+            incompleteAccounts: callerItems.filter(it => !it.account || !it.account.textComplete).length,
+            unverifiedCallSites: callerItems.reduce((sum, it) => sum + (it.unverifiedCallerCount || 0), 0),
+            signatureMismatches: items.reduce((sum, it) => sum + (it.signatureMismatches || 0), 0),
+            filteredEdges: callerItems.reduce((sum, it) => sum + (it.account ? it.account.filtered || 0 : 0), 0),
+            usageReviewSymbols: callerItems.filter(it => it.account && it.account.requiresUsageReview).length,
+            unvalidatedDeclarations: open.filter(it => it.requiresToolchainValidation).length,
+            // What there is to look at among unverified callers: one per
+            // site a reader can settle, one per dispatch family.
+            reviewItems: callerItems.reduce((sum, it) => sum + (it.reviewItems ? it.reviewItems.items : 0), 0),
             semanticComplete: false,
             safeToDelete: false,
             requiresCompilerAndTests: true,

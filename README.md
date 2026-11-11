@@ -196,7 +196,8 @@ npm run trust:gate
 | Likely missing awaits | `audit-async` |
 | Stack-trace frame resolution | `stacktrace <text>` |
 
-`--staged` selects the Git-diff form of `impact` or `check`, without a symbol.
+`--staged` selects the Git-diff form of `impact` or `check`, without a symbol,
+and reads the staged tree from the git index, not the worktree.
 
 `deps --cycles` groups circular dependencies and, in JS/TS and Python,
 distinguishes eager imports from deferred or type-only edges. Enumeration limits are disclosed. `repo`
@@ -234,8 +235,9 @@ Ordinary text-mode command errors also exit 2. JSON keeps exit 0 for successful
 empty results and exit 1 for command errors (`meta.ok: false` plus `error`).
 An exception inside UCN is reported as `Internal error: ...` (JSON adds
 `meta.internalError: true`), never as an answer about the code.
-Target-less `check` exits 1 when `TRUST` is `BLOCKED`, 0 for other completed
-checks, and 2 if it could not run. `check <symbol>` exits 1 for a signature
+Target-less `check` exits 1 when `TRUST` is `BLOCKED` (a break was observed),
+0 for other completed checks, and 2 if it could not run. `--strict` also exits
+1 for `REVIEW_REQUIRED`. `check <symbol>` exits 1 for a signature
 mismatch or an unverified call site.
 
 Outside `--lines`, `find`, text `search`, `deadcode`, `api`, and

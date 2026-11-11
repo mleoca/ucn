@@ -1136,6 +1136,7 @@ const HANDLERS = {
                 staged: !!p.staged,
                 file: p.file,
                 limit: num(p.limit, undefined),
+                strict: !!p.strict,
             });
             addMode(result, 'diff');
             return { ok: true, result };
@@ -2329,11 +2330,32 @@ const HANDLERS = {
     },
 
     diffImpact: (index, p) => {
-        let result = index.diffImpact({
-            base: p.base || 'HEAD',
-            staged: p.staged || false,
-            file: p.file,
-        });
+        // A staged diff describes the git index: its new side is read from
+        // the tree that holds it (core/snapshot.js), never from a worktree
+        // that has moved on.
+        const { resolveTarget, rebasePaths } = require('./snapshot');
+        let target = null;
+        try {
+            target = resolveTarget(index, { staged: !!p.staged });
+        } catch (e) {
+            if (!e || e.code !== 'staged-snapshot-unavailable') throw e;
+            // Outside a repository the diff itself says so, below.
+        }
+        let result;
+        try {
+            const view = target ? target.index : index;
+            result = view.diffImpact({
+                base: p.base || 'HEAD',
+                staged: p.staged || false,
+                file: p.file,
+                ...(target && { repoRoot: target.repoRoot }),
+            });
+            // Paths of an exported snapshot are reported where the
+            // repository has them.
+            if (target && target.ephemeral) rebasePaths(result, target.index.root, target.repoRoot);
+        } finally {
+            if (target) target.dispose();
+        }
         const limit = num(p.limit, undefined);
         let note;
         if (limit && limit > 0 && result) {

@@ -17,7 +17,7 @@ function baseline(dir) {
 }
 
 describe('5.4.0 independent audit regressions', () => {
-    it('F1: type-only diffs expose references and block an unvalidated shape change', () => {
+    it('F1: type-only diffs expose references; an unvalidated shape change is review, and fails under --strict', () => {
         const dir = tmp({
             'types.ts': 'export interface Point {\n  x: number;\n}\n',
             'use.ts': 'import { Point } from "./types";\nexport function read(p: Point) { return p.x; }\n',
@@ -39,12 +39,19 @@ describe('5.4.0 independent audit regressions', () => {
             const shell = cli(dir, 'impact', '--lines');
             assert.match(shell.stdout, /types.ts:1:Point/);
             assert.match(shell.stdout, /use.ts:2:.*type-reference/);
+            // A shape the engine does not model is something to look at,
+            // never a break it observed: exit 0, and 1 only when asked.
             const checked = cli(dir, 'check', '--json');
-            assert.equal(checked.status, 1, checked.stderr);
+            assert.equal(checked.status, 0, checked.stderr);
             const data = JSON.parse(checked.stdout).data;
-            assert.equal(data.trust.status, 'BLOCKED');
-            assert.ok(data.changed.some(s => s.name === 'Point' && s.dependencyCount === 2));
+            assert.equal(data.trust.status, 'REVIEW_REQUIRED');
+            assert.equal(data.trust.passes, true);
+            assert.ok(data.changed.some(s => s.name === 'Point' && s.dependencyCount === 2 &&
+                s.verdict === 'review'));
             assert.ok(data.actions.some(a => a.kind === 'declaration_change'));
+            const strict = cli(dir, 'check', '--strict', '--json');
+            assert.equal(strict.status, 1, strict.stderr);
+            assert.equal(JSON.parse(strict.stdout).data.trust.passes, false);
         } finally { rm(dir); }
     });
 
@@ -109,7 +116,9 @@ describe('5.4.0 independent audit regressions', () => {
             assert.deepEqual(result.symbols.map(s => s.name), ['Svc']);
             assert.deepEqual(result.symbols[0].addedLines, [1]);
             checked = execute(idx(dir), 'check', {}).result;
-            assert.equal(checked.trust.status, 'BLOCKED');
+            assert.equal(checked.trust.status, 'REVIEW_REQUIRED');
+            assert.ok(checked.changed.some(s => s.name === 'Svc' && s.verdict === 'review' &&
+                s.reasons.includes('declaration-change')));
         } finally { rm(dir); }
     });
 
@@ -128,9 +137,11 @@ describe('5.4.0 independent audit regressions', () => {
             assert.deepEqual(result.symbols[1].deletedLines, [6]);
             assert.deepEqual(result.symbols[0].addedLines, [6]);
             assert.deepEqual(result.symbols[0].deletedLines, [6]);
-            assert.equal(cli(dir, 'check').status, 1);
+            assert.equal(cli(dir, 'check').status, 0);
+            assert.equal(cli(dir, 'check', '--strict').status, 1);
             git(dir, 'add', '.');
-            assert.equal(cli(dir, 'check', '--staged').status, 1);
+            assert.equal(cli(dir, 'check', '--staged').status, 0);
+            assert.equal(cli(dir, 'check', '--staged', '--strict').status, 1);
             fs.writeFileSync(dir + '/svc.py', before.replace('    value: int = 1\n', ''));
             result = execute(idx(dir), 'impact', {}).result;
             assert.deepEqual(result.symbols.map(s => s.name), ['Svc']);
@@ -153,8 +164,9 @@ describe('5.4.0 independent audit regressions', () => {
                 assert.deepEqual(result.symbols[0].addedLines, [3]);
                 assert.deepEqual(result.symbols[0].deletedLines, [3]);
                 const checked = cli(dir, 'check', '--json');
-                assert.equal(checked.status, 1, file);
-                assert.equal(JSON.parse(checked.stdout).data.trust.status, 'BLOCKED');
+                assert.equal(checked.status, 0, file);
+                assert.equal(JSON.parse(checked.stdout).data.trust.status, 'REVIEW_REQUIRED');
+                assert.equal(cli(dir, 'check', '--strict').status, 1, file);
             } finally { rm(dir); }
         }
     });
@@ -173,14 +185,15 @@ describe('5.4.0 independent audit regressions', () => {
                 fs.writeFileSync(dir + '/' + file, before.replace('\n}', '\n' + member + '}'));
                 let result = execute(idx(dir), 'impact', {}).result;
                 assert.ok(result.symbols.some(s => s.name === 'API'), file);
-                assert.equal(cli(dir, 'check').status, 1, file);
+                assert.equal(cli(dir, 'check').status, 0, file);
+                assert.equal(cli(dir, 'check', '--strict').status, 1, file);
                 // Removing a required member also changes the type contract.
                 git(dir, 'add', '.');
                 git(dir, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'added member');
                 fs.writeFileSync(dir + '/' + file, before);
                 result = execute(idx(dir), 'impact', {}).result;
                 assert.ok(result.symbols.some(s => s.name === 'API'), file);
-                assert.equal(cli(dir, 'check').status, 1, file);
+                assert.equal(cli(dir, 'check', '--strict').status, 1, file);
             } finally { rm(dir); }
         }
     });
@@ -223,7 +236,8 @@ describe('5.4.0 independent audit regressions', () => {
                 fs.writeFileSync(dir + '/svc.ts', before.replace('x: number', 'x: number, y: number'));
                 result = execute(idx(dir), 'impact', {}).result;
                 assert.deepEqual(result.symbols.map(s => s.name).sort(), ['Svc', 'run']);
-                assert.equal(cli(dir, 'check').status, 1);
+                assert.equal(cli(dir, 'check').status, 0);
+                assert.equal(cli(dir, 'check', '--strict').status, 1);
             } finally { rm(dir); }
         }
     });

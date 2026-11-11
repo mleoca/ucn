@@ -955,10 +955,44 @@ describe('outcome-policy: precommit-check tasks', () => {
         assert.ok(failures.includes('demo: no check tasks in the report'));
     });
 
+    // Kinds that are inert by construction are READY on a passing board.
+    const inert = policy.OUTCOME_GATE_THRESHOLDS.checkReadyKinds;
+
+    it('an inert change the toolchain accepts must be READY, and BLOCKED must be a break', () => {
+        const rows = verdictOf => policy.CHECK_TASK_KINDS.map(kind => ({
+            id: `a.py:1:${kind}`, kind, verdict: verdictOf(kind), outsideNew: 0 }));
+        const board = tasks => {
+            const item = report('py', 'python', all, policy.CHECK_TASK_KINDS);
+            item.check.tasks = tasks;
+            item.check.aggregate = policy.aggregateCheckTasks(tasks);
+            return [item];
+        };
+        assert.deepStrictEqual(inert, ['additive', 'inert-body-edit']);
+        assert.deepStrictEqual(policy.evaluateOutcomeGate(
+            board(rows(kind => (inert.includes(kind) ? ready : review)))), []);
+        // Review of an inert edit: a check nobody can act on.
+        assert.deepStrictEqual(policy.evaluateOutcomeGate(board(rows(() => review))), [
+            'py: 1 of 1 clean additive change(s) not READY: a.py:1:additive REVIEW_REQUIRED',
+            'py: 1 of 1 clean inert-body-edit change(s) not READY: a.py:1:inert-body-edit REVIEW_REQUIRED',
+        ]);
+        // BLOCKED where the toolchain accepts the change: a wrong observation.
+        const blocked = policy.CHECK_VERDICTS.blocked;
+        assert.deepStrictEqual(policy.evaluateOutcomeGate(board(rows(kind =>
+            (inert.includes(kind) ? ready : kind === 'required-param' ? blocked : review)))),
+        ['py: check BLOCKED on 1 clean change(s) (max 0): required-param a.py:1:required-param']);
+        // A broken inert-kind task (the toolchain rejects it) is not held to READY.
+        const broken = rows(kind => (inert.includes(kind) ? ready : review));
+        broken.find(task => task.kind === 'additive').verdict = review;
+        broken.find(task => task.kind === 'additive').outsideNew = 2;
+        assert.deepStrictEqual(policy.evaluateOutcomeGate(board(broken)), []);
+        // The shipped board has no pinned exception left.
+        assert.deepStrictEqual(policy.OUTCOME_GATE_THRESHOLDS.knownCheckFalseReady, {});
+    });
+
     it('a known false-ready row is pinned by repo, kind and target', () => {
         const tasks = [
             ...policy.CHECK_TASK_KINDS.map(kind => ({
-                id: `a.py:1:${kind}`, kind, verdict: review, outsideNew: 0 })),
+                id: `a.py:1:${kind}`, kind, verdict: inert.includes(kind) ? ready : review, outsideNew: 0 })),
             { id: 'a.py:9:known', kind: 'generator-transition', verdict: ready, outsideNew: 4 },
         ];
         const pinned = report('py', 'python', all, policy.CHECK_TASK_KINDS);
@@ -997,7 +1031,7 @@ describe('outcome-policy: precommit-check tasks', () => {
     it('a false-ready pin that no longer matches fails until it is removed', () => {
         const fixed = report('py', 'python', all, policy.CHECK_TASK_KINDS);
         fixed.check.tasks = policy.CHECK_TASK_KINDS.map(kind => ({
-            id: `a.py:1:${kind}`, kind, verdict: review, outsideNew: 0 }));
+            id: `a.py:1:${kind}`, kind, verdict: inert.includes(kind) ? ready : review, outsideNew: 0 }));
         const failures = policy.evaluateOutcomeGate([fixed], {
             ...policy.OUTCOME_GATE_THRESHOLDS,
             knownCheckFalseReady: { py: [{ kind: 'generator-transition', id: 'a.py:9:known' }] },

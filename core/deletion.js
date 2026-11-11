@@ -284,7 +284,113 @@ function assessDeletion(index, declaration, options = {}) {
     };
 }
 
+/**
+ * Dependents of a declaration that CANNOT survive its deletion: sites the
+ * toolchain will reject, not sites that might be affected.
+ *
+ *   import  another file imports the name from the module that declared
+ *           it, and that module no longer declares or exports a name like
+ *           it;
+ *   call    the declaring file (or, where a directory is the package, a
+ *           file beside it) still calls the name bare, and no declaration,
+ *           import or parameter of that name remains for the call to mean.
+ *
+ * A method call on a receiver, a call through an alias, a reference by a
+ * module path: those are dependents the engine reports, never definite
+ * ones. Meant for a declaration the index no longer holds; one it holds
+ * still satisfies every site, so the answer is empty.
+ *
+ * @returns {{file, line, kind: 'import'|'call'}[]} sorted (file, line)
+ */
+/** Is `module.name` itself a module the importer resolved (a submodule)? */
+function submoduleOf(resolved, module, name) {
+    const spelled = String(module || '');
+    return !!resolved[spelled.endsWith('.') ? spelled + name : `${spelled}.${name}`];
+}
+
+function definiteDependentsOf(index, declaration) {
+    const name = declaration.name;
+    const declaredIn = declaration.relativePath || relativeOf(index, declaration.file);
+    // Declarations of the name that a module-scope reference can mean: a
+    // member, or a function local to another function, supplies nothing
+    // there.
+    const stillDeclared = (index.symbols.get(name) || []).filter(symbol =>
+        !symbol.className && symbol.lexicalScopeStartLine == null && !symbol.isNested);
+    const sites = [];
+    // Imports of the name from its former module. A module that still has
+    // a declaration of the name, still lists it among its exports, or
+    // re-exports everything from elsewhere may still provide it.
+    const formerModule = index.files.get(declaration.file);
+    const moduleStillProvides = !!formerModule && (
+        stillDeclared.some(symbol => symbol.file === declaration.file) ||
+        (formerModule.exports || []).includes(name) ||
+        (formerModule.exportDetails || []).some(detail => detail && (detail.name === '*' || detail.type === 'star')));
+    if (!moduleStillProvides) {
+        for (const entry of index.files.values()) {
+            const resolved = entry.moduleResolved || {};
+            for (const binding of entry.importBindings || []) {
+                if (binding.name !== name || binding.dynamic) continue;
+                if (resolved[binding.module] !== declaredIn) continue;
+                // `from pkg import name` where `pkg/name` is a module of
+                // the package imports that module, not a name of pkg.
+                if (submoduleOf(resolved, binding.module, name)) continue;
+                sites.push({ file: entry.relativePath, line: binding.line || 0, kind: 'import' });
+            }
+        }
+    }
+    // Bare calls with nothing left to mean. Only a free function: a member
+    // is called through a receiver. The language's own scoping decides
+    // what a bare name means at each call (languages/lexical-scope.js):
+    // only a name that resolves at module scope, in a file where no import
+    // and no other binding supplies it, is left without a meaning.
+    if (!declaration.className) {
+        const { langTraits } = require('../languages');
+        const { referenceScope } = require('../languages/lexical-scope');
+        const { parseRevision } = require('./change-kinds');
+        const traits = langTraits(formerModule?.language || index.languageOf?.(declaration.file)) || {};
+        const directoryPackage = traits.packageScope === 'directory';
+        const beside = file => file === declaration.file ||
+            (directoryPackage && path.dirname(file) === path.dirname(declaration.file));
+        // What a module-scope name can still mean in `file`: a declaration
+        // in the file, in its package directory where that is the scope,
+        // or anywhere at all where files see each other through textual
+        // inclusion.
+        // A declaration that describes code outside the project (an
+        // ambient one) supplies the name to every file.
+        const ambient = symbol => !!symbol.ambientAugmentation || /\.d\.[cm]?ts$/.test(symbol.relativePath || '');
+        const suppliedTo = file => stillDeclared.some(symbol => traits.textualIncludes || ambient(symbol) ||
+            symbol.file === file || (directoryPackage && path.dirname(symbol.file) === path.dirname(file)));
+        // A name the language itself supplies always means something.
+        const builtin = !!(traits.ambientCallables && traits.ambientCallables.has(name));
+        for (const file of builtin ? [] : [...(index.calleeIndex?.get(name) || [])].sort()) {
+            if (!beside(file) || suppliedTo(file)) continue;
+            const entry = index.files.get(file);
+            if (!entry) continue;
+            if ((entry.importBindings || []).some(binding => (binding.alias || binding.name) === name)) continue;
+            // An import of everything a module has may bring the name.
+            if ((entry.importDetails || []).some(detail => (detail.names || []).includes('*'))) continue;
+            let root;
+            try { root = parseRevision(index._readFile(file), entry.language); } catch (_) { root = null; }
+            if (!root) continue;
+            const memo = new Map();
+            const lines = new Set();
+            for (const node of root.descendantsOfType('identifier')) {
+                if (node.text !== name) continue;
+                const callee = node.parent?.childForFieldName('function');
+                if (!callee || callee.id !== node.id) continue;
+                let scope;
+                try { scope = referenceScope(node, entry.language, memo); } catch (_) { scope = null; }
+                if (scope === 'module') lines.add(node.startPosition.row + 1);
+            }
+            for (const line of lines) sites.push({ file: entry.relativePath, line, kind: 'call' });
+        }
+    }
+    return sites.sort(compareSites);
+}
+
 module.exports = {
+    definiteDependentsOf,
+    submoduleOf,
     projectKind,
     downstreamExposureBlocks,
     assessDeletion,

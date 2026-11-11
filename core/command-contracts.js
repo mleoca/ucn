@@ -183,9 +183,9 @@ const COMMAND_CONTRACTS = Object.freeze({
         target: 'Optional symbol/handle. Omitting it selects diff/precommit mode.',
         modes: [
             { name: 'symbol', when: 'A symbol target is supplied; `base` names the revision whose declaration its call sites were written against.', answer: 'Argument-count compatibility, uncertain sites, and the caller account.' },
-            { name: 'diff', when: 'No target is supplied; `base` or `staged` selects changes.', answer: 'Composed diff impact, signature checks, and affected tests.' },
+            { name: 'diff', when: 'No target is supplied; `base` or `staged` selects changes.', answer: 'A verdict per changed symbol by what the change did: blocked (a break was observed, every site listed), review (can reach existing code, reason named) or ready (nothing that existed depends on it); TRUST is the worst of them. Affected tests.' },
         ],
-        defaults: ['Symbol mode checks static arity, not compiler type compatibility.', '`base` defaults to HEAD in both modes.'],
+        defaults: ['Symbol mode checks static arity, not compiler type compatibility.', '`base` defaults to HEAD in both modes.', 'Diff mode: `staged` reads the staged tree from the git index, never the worktree; `strict` makes REVIEW_REQUIRED fail as BLOCKED does.'],
         truth: 'Findings are static diagnostics with explicit uncertainty; a clean result is not a compiler/test pass.',
         nonGoals: ['Full type checking.', 'Linting or executing project tests.'],
         invalidCombinations: [
@@ -193,7 +193,7 @@ const COMMAND_CONTRACTS = Object.freeze({
             '`base` and `staged` cannot both select the diff.',
         ],
         examples: ['ucn check publishOrderCreated', 'ucn check publishOrderCreated --base=main', 'ucn check --staged'],
-        jsonData: 'Symbol mode returns signature, valid/mismatched/uncertain sites and accounting; diff mode returns composed diagnostics.',
+        jsonData: 'Symbol mode returns signature, valid/mismatched/uncertain sites and accounting; diff mode returns each changed symbol with `verdict` and `reasons`, and `trust` with `status` and `passes`.',
         output: 'Broad diagnostic; scope to a symbol or focused Git diff.',
         next: ['Run the language compiler/type checker and selected tests.', 'Use `plan` before a signature refactor.'],
         benchmark: 'A10',

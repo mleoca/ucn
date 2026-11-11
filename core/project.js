@@ -99,8 +99,11 @@ class ProjectIndex {
      * Create a new ProjectIndex
      * @param {string} rootDir - Project root directory
      */
-    constructor(rootDir) {
-        this.root = findProjectRoot(rootDir);
+    constructor(rootDir, options = {}) {
+        // `exactRoot`: the directory IS the project root. A tree exported
+        // from the git index has no `.git` to stop the walk toward a marker,
+        // and must not adopt a directory above itself.
+        this.root = options.exactRoot ? path.resolve(rootDir) : findProjectRoot(rootDir);
         this.files = new Map();           // path -> FileEntry
         this.symbols = new Map();         // name -> SymbolEntry[]
         this.importGraph = new Map();     // file -> [imported files]
@@ -664,7 +667,9 @@ class ProjectIndex {
             });
 
             // Merge .gitignore and .ucn.json exclude into file discovery
-            const listing = gitListing(this.root);
+            // A snapshot exported from the git index is not a repository:
+            // its tracked inventory and ignore files come with it.
+            const listing = options.gitListing !== undefined ? options.gitListing : gitListing(this.root);
             const gitignoreRules = parseGitignore(this.root, listing);
             globOpts.gitignoreRules = gitignoreRules;
             globOpts.trackedPaths = gitTrackedPaths(this.root, listing);
@@ -1142,6 +1147,52 @@ class ProjectIndex {
         });
         this.callsCacheDirty = true;
         return true;
+    }
+
+    /**
+     * Where a file of this index lives in the git repository it describes.
+     * The same path, except for a snapshot exported from the git index
+     * (core/snapshot.js), whose files stand in for the repository's.
+     */
+    repoPathOf(filePath) {
+        if (!this.repoRoot || !filePath) return filePath;
+        const relative = path.relative(this.root, filePath);
+        return relative.startsWith('..') ? filePath : path.join(this.repoRoot, relative);
+    }
+
+    /**
+     * The file entry another revision of a file would have: its symbols,
+     * exports and bindings as the index records them, built from `content`
+     * and attached to nothing. The index is not changed. Used to read a
+     * base revision (a diff's old side) with the same eyes as the current
+     * one. Returns null for a file no language claims or a parse the
+     * adapter rejects.
+     */
+    fileEntryForContent(filePath, content) {
+        const language = detectLanguage(filePath, this.root);
+        if (!language || content == null) return null;
+        try {
+            const adapter = getLanguageAdapter(language);
+            const parser = getParser(language);
+            const externalMacros = this._macroDictionary
+                ? require('./external-macros').contextFor(this._macroDictionary, language) : null;
+            const ir = adapter.analyze(content, parser, filePath,
+                externalMacros ? { externalMacros } : undefined);
+            if (validateFileIR(ir).length > 0) return null;
+            const fileEntry = createFileEntryFromIR({
+                ir,
+                filePath,
+                relativePath: path.relative(this.root, filePath),
+                hash: null,
+                mtime: 0,
+                size: Buffer.byteLength(content),
+                lineCount: content.length === 0 ? 0 : content.split('\n').length,
+            });
+            populateFileEntryFromIR(fileEntry, ir, null);
+            return fileEntry;
+        } catch (_) {
+            return null;
+        }
     }
 
     /**
