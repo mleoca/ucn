@@ -7,6 +7,7 @@ const { langTraits } = require('../../languages');
 const { dynamicImportsNote, formatGitLine, unverifiedReasonLabel } = require('./shared');
 const { provenanceReplacer } = require('./provenance');
 const { matchLabelCounts, reasonList } = require('../source-universe');
+const { uncertaintyClassOf, partitionUnverified, runtimeFamilyKey } = require('../review-items');
 
 /**
  * One short sentence (~80 chars) of a docstring, suitable for inline display
@@ -352,9 +353,7 @@ function formatContextJson(context) {
                     ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                     ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
                     ...(c.externalContract && { externalContract: true }),
-                    uncertaintyClass: c.uncertaintyClass ||
-                        (c.reason === 'possible-dispatch' && c.dispatchVia
-                            ? 'runtime-dispatch' : 'actionable-ambiguity'),
+                    uncertaintyClass: uncertaintyClassOf(c),
                     ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
                 })),
                 ...(context.ambiguityCandidates && {
@@ -415,9 +414,7 @@ function formatContextJson(context) {
                 ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                 ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
                 ...(c.externalContract && { externalContract: true }),
-                uncertaintyClass: c.uncertaintyClass ||
-                    (c.reason === 'possible-dispatch' && c.dispatchVia
-                        ? 'runtime-dispatch' : 'actionable-ambiguity'),
+                uncertaintyClass: uncertaintyClassOf(c),
                 ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
             })),
             ...(context.ambiguityCandidates && {
@@ -652,20 +649,15 @@ function formatContext(ctx, options = {}) {
     // This separates unavoidable language semantics from ambiguity the agent
     // can investigate.
     const unverified = ctx.unverifiedCallers || [];
-    const runtimeDispatch = unverified.filter(u =>
-        u.uncertaintyClass === 'runtime-dispatch' ||
-        (u.reason === 'possible-dispatch' && u.dispatchVia));
-    const compileTimeDispatch = unverified.filter(u =>
-        u.uncertaintyClass === 'compile-time-dispatch');
-    const actionableUnverified = unverified.filter(u =>
-        u.uncertaintyClass !== 'compile-time-dispatch' &&
-        !(u.uncertaintyClass === 'runtime-dispatch' ||
-          (u.reason === 'possible-dispatch' && u.dispatchVia)));
+    // One classification for the text, the JSON and the review counts
+    // (core/review-items.js).
+    const {
+        runtime: runtimeDispatch, compileTime: compileTimeDispatch, actionable: actionableUnverified,
+    } = partitionUnverified(unverified);
     if (runtimeDispatch.length > 0) {
         const groups = new Map();
         for (const site of runtimeDispatch) {
-            const key = `${site.dispatchVia}\0${site.dispatchCandidates ?? ''}\0` +
-                `${site.externalContract ? 'external' : 'project'}`;
+            const key = runtimeFamilyKey(site);
             if (!groups.has(key)) groups.set(key, []);
             groups.get(key).push(site);
         }

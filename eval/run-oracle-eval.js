@@ -51,6 +51,7 @@ const { ProjectIndex } = require('../core/project');
 const { getCachedCalls } = require('../core/callers');
 const { execute } = require('../core/execute');
 const output = require('../core/output');
+const { partitionUnverified, runtimeFamilyKey, compileTimeFamilyKey } = require('../core/review-items');
 const { dedupeOccurrences, addRuleStat, finishRuleStats, ruleTable } = require('./provenance-report');
 const { createRunManifest, population, saveManifest, referencePopulation,
     deferredReferenceShown } = require('./run-manifest');
@@ -1575,20 +1576,14 @@ async function evaluateRepo(repo, oracle) {
             kt.exactPlacement[k] += exactPlacement[k];
         }
 
-        const actionableUnverified = unverified.filter(
-            site => site.uncertaintyClass !== 'runtime-dispatch' &&
-                site.uncertaintyClass !== 'compile-time-dispatch');
-        const runtimeDispatch = unverified.filter(
-            site => site.uncertaintyClass === 'runtime-dispatch');
-        const compileTimeDispatch = unverified.filter(
-            site => site.uncertaintyClass === 'compile-time-dispatch');
-        const runtimeDispatchGroups = new Set(runtimeDispatch.map(site =>
-            `${site.dispatchVia || ''}\0${site.dispatchCandidates ?? ''}\0` +
-            `${site.externalContract ? 'external' : 'project'}`));
-        const compileTimeDispatchGroups = new Set(
-            compileTimeDispatch.map(site =>
-                `${site.dispatchFamily || ''}\0` +
-                `${site.dispatchCandidates ?? ''}`));
+        // The engine's own counter (core/review-items.js): the burden this
+        // eval charges is the one the pre-commit check and the caller
+        // listing report.
+        const {
+            actionable: actionableUnverified, runtime: runtimeDispatch, compileTime: compileTimeDispatch,
+        } = partitionUnverified(unverified);
+        const runtimeDispatchGroups = new Set(runtimeDispatch.map(runtimeFamilyKey));
+        const compileTimeDispatchGroups = new Set(compileTimeDispatch.map(compileTimeFamilyKey));
         perSymbol.push({
             name: sym.name, file: sym.file, line: sym.line, kind: sym.kind,
             oracleReplay: { references: oracleReferencePopulation, deferredShown: deferredShown.sort() },
