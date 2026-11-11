@@ -5895,7 +5895,61 @@ function annotatedReceiverType(tree, line, column, receiver) {
     return typeNameFromAnnotation(parameter.childForFieldName('type')) || undefined;
 }
 
+/**
+ * Has the type checker been told not to report line `line` (1-based)? A
+ * `# type: ignore` or `# pyright: ignore` comment on any line of the
+ * statement written there (a report covers a range, and a comment on any
+ * line of the range silences it), or a checker directive comment before
+ * any code of the file.
+ *
+ * @param {function} [rootOf] - returns the file's syntax tree; without it
+ *   only the line itself is read
+ */
+function checkSuppressedAt(lines, line, rootOf = null) {
+    let first = line;
+    let last = line;
+    const root = rootOf ? rootOf() : null;
+    if (root) {
+        let statement = null;
+        for (let node = root; node;) {
+            const child = node.namedChildren.find(candidate =>
+                candidate.startPosition.row + 1 <= line && candidate.endPosition.row + 1 >= line);
+            if (!child) break;
+            if (node.type === 'module' || node.type === 'block') statement = child;
+            node = child;
+        }
+        if (statement) {
+            // A compound statement's own lines end where its block begins.
+            const block = statement.namedChildren.find(candidate => candidate.type === 'block');
+            first = Math.min(line, statement.startPosition.row + 1);
+            last = Math.max(line, block ? block.startPosition.row : statement.endPosition.row + 1);
+        }
+    }
+    for (let at = first; at <= last; at++) {
+        if (/#\s*(?:type|pyright):\s*ignore\b/.test(String(lines[at - 1] || ''))) return true;
+    }
+    for (const raw of lines) {
+        const text = String(raw).trim();
+        if (text === '') continue;
+        if (!text.startsWith('#')) break;
+        if (/^#\s*(?:type:\s*ignore|pyright:|mypy:)/.test(text)) return true;
+    }
+    return false;
+}
+
+/**
+ * Is the import written on `line` a statement the type checker resolves?
+ * `importlib.import_module(..)` and `__import__(..)` are calls to it.
+ */
+function checkedImportAt(root, line) {
+    const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
+    return root.descendantsOfType(['import_statement', 'import_from_statement', 'future_import_statement'], ...range)
+        .some(node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line);
+}
+
 module.exports = {
+    checkSuppressedAt,
+    checkedImportAt,
     annotatedReceiverType,
     findScopeAlternativeBindings,
     findPythonModuleEvidence,

@@ -357,22 +357,43 @@ const STRUCTURAL_TRAITS = {
     // and only at a declared one. []: the language has no such type; null:
     // no return contract is read from a body in this language.
     neverReturnTypes: null,
+    // Can a type checker decide a condition from the names in it (Python:
+    // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
+    // configuration defines)? Then a condition that guards part of what a
+    // body returns is part of it; elsewhere only a condition that names
+    // nothing (`while (true)`) is decided.
+    namedConditionsDecidable: false,
     // Do files without module syntax share one global scope (classic
     // JavaScript scripts)? Then a top-level name of one is visible in all.
     scriptGlobalScope: false,
-    // Is a class compared by SHAPE, so that its member set is a contract
-    // other values are held to (a TypeScript class with no private or
-    // protected instance member)? `(classNode, ignoredLines) => boolean`
-    // over the class's syntax node, members starting on `ignoredLines` left
-    // out; null: a class is its declaration, and its members are reached
+    // Are the members of a class compared and enumerated by SHAPE
+    // (TypeScript)? Then the trait answers whether anything with the
+    // class's members is a value of it: `(classNode, ignoredLines) =>
+    // boolean`, true unless the class itself declares a private or
+    // protected instance member (members starting on `ignoredLines` left
+    // out). null: a class is its declaration, and its members are reached
     // by name only.
     classComparedByShape: null,
-    // How a class member takes part in the type of the class's values:
-    // `(classNode, name, line) => 'instance' | 'optional' | 'static' | null`.
+    // How a class member takes part in the class's type: `(classNode,
+    // name, line) => { role: 'instance' | 'optional' | 'static', hidden }
+    // | null`; hidden: private, protected or `#`.
     classMemberRole: null,
     // Members of an object literal declared as a type, read from syntax:
     // `(root, line) => { names, open } | null` (languages/javascript.js).
     typedLiteralMembers: null,
+    // The interface whose members every object has (`Object`): a project
+    // that declares one adds members to every literal.
+    universalObjectInterface: null,
+    // Has the language's checker been told not to report a line (`//
+    // @ts-ignore` above it, `# type: ignore` on its statement, a file-wide
+    // directive)? `(lines, line, rootOf) => boolean`. A break at such a
+    // site is one the toolchain will not show: check lists it and does not
+    // block on it.
+    checkSuppressedAt: null,
+    // Is the import written on a line one the project's judge resolves (an
+    // import statement), not a call it never looks into? `(root, line) =>
+    // boolean`; null: every import of the language is a statement.
+    checkedImportAt: null,
     // Does a virtual member change what a type IS to existing code (C++: a
     // class with one is no aggregate, so `T t{1, 2}` stops compiling)?
     virtualMemberChangesShape: false,
@@ -638,22 +659,43 @@ const NOMINAL_TRAITS = {
     // and only at a declared one. []: the language has no such type; null:
     // no return contract is read from a body in this language.
     neverReturnTypes: null,
+    // Can a type checker decide a condition from the names in it (Python:
+    // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
+    // configuration defines)? Then a condition that guards part of what a
+    // body returns is part of it; elsewhere only a condition that names
+    // nothing (`while (true)`) is decided.
+    namedConditionsDecidable: false,
     // Do files without module syntax share one global scope (classic
     // JavaScript scripts)? Then a top-level name of one is visible in all.
     scriptGlobalScope: false,
-    // Is a class compared by SHAPE, so that its member set is a contract
-    // other values are held to (a TypeScript class with no private or
-    // protected instance member)? `(classNode, ignoredLines) => boolean`
-    // over the class's syntax node, members starting on `ignoredLines` left
-    // out; null: a class is its declaration, and its members are reached
+    // Are the members of a class compared and enumerated by SHAPE
+    // (TypeScript)? Then the trait answers whether anything with the
+    // class's members is a value of it: `(classNode, ignoredLines) =>
+    // boolean`, true unless the class itself declares a private or
+    // protected instance member (members starting on `ignoredLines` left
+    // out). null: a class is its declaration, and its members are reached
     // by name only.
     classComparedByShape: null,
-    // How a class member takes part in the type of the class's values:
-    // `(classNode, name, line) => 'instance' | 'optional' | 'static' | null`.
+    // How a class member takes part in the class's type: `(classNode,
+    // name, line) => { role: 'instance' | 'optional' | 'static', hidden }
+    // | null`; hidden: private, protected or `#`.
     classMemberRole: null,
     // Members of an object literal declared as a type, read from syntax:
     // `(root, line) => { names, open } | null` (languages/javascript.js).
     typedLiteralMembers: null,
+    // The interface whose members every object has (`Object`): a project
+    // that declares one adds members to every literal.
+    universalObjectInterface: null,
+    // Has the language's checker been told not to report a line (`//
+    // @ts-ignore` above it, `# type: ignore` on its statement, a file-wide
+    // directive)? `(lines, line, rootOf) => boolean`. A break at such a
+    // site is one the toolchain will not show: check lists it and does not
+    // block on it.
+    checkSuppressedAt: null,
+    // Is the import written on a line one the project's judge resolves (an
+    // import statement), not a call it never looks into? `(root, line) =>
+    // boolean`; null: every import of the language is a statement.
+    checkedImportAt: null,
     // Does a virtual member change what a type IS to existing code (C++: a
     // class with one is no aggregate, so `T t{1, 2}` stops compiling)?
     virtualMemberChangesShape: false,
@@ -797,6 +839,7 @@ const LANGUAGES = {
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
             neverReturnTypes: [],
+            checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, false),
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -819,6 +862,9 @@ const LANGUAGES = {
             classComparedByShape: (classNode, ignoredLines) => !require('./javascript').classHasNominalMember(classNode, ignoredLines),
             classMemberRole: (classNode, name, line) => require('./javascript').classMemberRole(classNode, name, line),
             typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
+            universalObjectInterface: 'Object',
+            checkSuppressedAt: (lines, line) => require('./javascript').checkSuppressedAt(lines, line),
+            checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, true),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
@@ -844,6 +890,9 @@ const LANGUAGES = {
             classComparedByShape: (classNode, ignoredLines) => !require('./javascript').classHasNominalMember(classNode, ignoredLines),
             classMemberRole: (classNode, name, line) => require('./javascript').classMemberRole(classNode, name, line),
             typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
+            universalObjectInterface: 'Object',
+            checkSuppressedAt: (lines, line) => require('./javascript').checkSuppressedAt(lines, line),
+            checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, true),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
@@ -874,6 +923,9 @@ const LANGUAGES = {
             ambientCallables: PY_AMBIENT_CALLABLES,
             ambientNeverCallables: new Set(['exit', 'quit']),
             neverReturnTypes: ['NoReturn', 'Never'],
+            namedConditionsDecidable: true,
+            checkSuppressedAt: (lines, line, rootOf) => require('./python').checkSuppressedAt(lines, line, rootOf),
+            checkedImportAt: (root, line) => require('./python').checkedImportAt(root, line),
             // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
             // and `self.__class__(..)` in an instance method construct the
             // method's class through its first parameter (fix #434).

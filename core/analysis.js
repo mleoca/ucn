@@ -2273,6 +2273,7 @@ function diffImpact(index, options = {}) {
     const moduleChanges = [];
     // Files the diff removed: whoever imports one as a module lost it.
     const deletedFiles = [];
+    const addedFiles = [];
     const newFunctions = [];
     const deletedFunctions = [];
     const symbolChanges = { symbols: [], newSymbols: [], deletedSymbols: [] };
@@ -2320,6 +2321,8 @@ function diffImpact(index, options = {}) {
             }
             continue;
         }
+        // A file that did not exist at the base.
+        if (change.untracked || change.isNew) addedFiles.push(fileEntry.relativePath);
 
         // Track which functions are affected by added/modified lines
         const affectedSymbols = new Map(); // symbolName -> { symbol, addedLines, deletedLines }
@@ -2876,6 +2879,7 @@ function diffImpact(index, options = {}) {
     }, 'addedLinesByFile', { value: addedLinesByFile, enumerable: false });
     Object.defineProperty(report, 'moduleChanges', { value: moduleChanges, enumerable: false });
     Object.defineProperty(report, 'deletedFiles', { value: deletedFiles, enumerable: false });
+    Object.defineProperty(report, 'addedFiles', { value: addedFiles, enumerable: false });
     return report;
     } finally { index._endOp(); }
 }

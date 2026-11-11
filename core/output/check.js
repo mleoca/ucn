@@ -48,13 +48,14 @@ function itemLines(it) {
         const problem = m.expected ? `expected ${m.expected}, got ${m.actual}` : (m.reason || 'arity mismatch');
         const where = m.file ? `${m.file}:${m.line}` : '';
         const expression = m.expression ? `  ${String(m.expression).trim()}` : '';
-        lines.push(`    ↳ ${where}${expression}  ${problem}`);
+        lines.push(`    ↳ ${where}${expression}  ${problem}${m.unchecked ? '  (not checked by the toolchain)' : ''}`);
     }
     const sites = it.sites || [];
     const definite = it.verdict === 'blocked';
     const shown = definite ? sites : sites.slice(0, NAME_SITE_LIMIT);
     for (const site of shown) {
-        lines.push(`    ↳ ${site.file}${site.line ? `:${site.line}` : ''}${site.kind ? `  ${site.kind}` : ''}`);
+        lines.push(`    ↳ ${site.file}${site.line ? `:${site.line}` : ''}${site.kind ? `  ${site.kind}` : ''}` +
+            `${site.unchecked ? '  (not checked by the toolchain)' : ''}`);
     }
     if (sites.length > shown.length) lines.push(`    (+${sites.length - shown.length} more occurrence(s))`);
     return lines;

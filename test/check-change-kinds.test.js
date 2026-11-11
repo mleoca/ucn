@@ -189,16 +189,27 @@ describe('change kinds: what a change did to a callable\'s contract', () => {
         // A member of the receiver is a reference of its own.
         ['ts: a test of the returned member of the receiver', 'typescript',
             lines('class C {', '  get() {', '    if (this.value === undefined) return 0;', '    return this.value;', '  }', '}'),
-            lines('class C {', '  get() {', '    if (this.other === undefined) return 0;', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'contract:inferred-return-contract'],
+            lines('class C {', '  get() {', '    if (this.other === undefined) return 0;', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'contract:inferred-return-contract', 'C'],
         ['ts: a statement about another member of the receiver', 'typescript',
             lines('class C {', '  get() {', '    this.hits += 1;', '    return this.value;', '  }', '}'),
-            lines('class C {', '  get() {', '    this.hits += 2;', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'inert'],
+            lines('class C {', '  get() {', '    this.hits += 2;', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'inert', 'C'],
         ['ts: a deeper member of the returned member', 'typescript',
             lines('class C {', '  get() {', '    this.value.items.push(1);', '    return this.value;', '  }', '}'),
-            lines('class C {', '  get() {', '    this.value.items.push("text");', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'contract:inferred-return-contract'],
+            lines('class C {', '  get() {', '    this.value.items.push("text");', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'contract:inferred-return-contract', 'C'],
         ['ts: the receiver handed over whole', 'typescript',
             lines('class C {', '  get() {', '    register(this, 1);', '    return this.value;', '  }', '}'),
-            lines('class C {', '  get() {', '    register(this, 2);', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'contract:inferred-return-contract'],
+            lines('class C {', '  get() {', '    register(this, 2);', '    return this.value;', '  }', '}'), [2, 5], [2, 5], 'contract:inferred-return-contract', 'C'],
+        // A receiver whose type is written is whatever that says, a
+        // union included: a variable like any other.
+        ['ts: a receiver with a written type', 'typescript',
+            lines('class C {', '  get(this: A | B) {', '    if (this.kind === "a") return this.size;', '    return 0;', '  }', '}'),
+            lines('class C {', '  get(this: A | B) {', '    if (this.kind === "b") return this.size;', '    return 0;', '  }', '}'), [2, 5], [2, 5], 'contract:inferred-return-contract', 'C'],
+        ['ts: `this` outside a class is a variable', 'typescript',
+            lines('function get() {', '  this.hits += 1;', '  return this.value;', '}'),
+            lines('function get() {', '  this.hits += 2;', '  return this.value;', '}'), [1, 4], [1, 4], 'contract:inferred-return-contract'],
+        ['py: a receiver with a written type', 'python',
+            lines('class C:', '    def get(self: "A | B"):', '        if self.kind == "a":', '            return self.size', '        return 0'),
+            lines('class C:', '    def get(self: "A | B"):', '        if self.kind == "b":', '            return self.size', '        return 0'), [2, 5], [2, 5], 'contract:inferred-return-contract', 'C'],
         // A test of one member of a variable narrows the variable.
         ['ts: a member of a variable is the variable', 'typescript',
             lines('function f(shape) {', '  if (shape.kind === "circle") return shape.radius;', '  return 0;', '}'),
@@ -215,9 +226,36 @@ describe('change kinds: what a change did to a callable\'s contract', () => {
         ['py: a condition that names nothing is decided by the checker', 'python',
             lines('def f():', '    if ready():', '        return 1', '    return "text"'),
             lines('def f():', '    if True:', '        return 1', '    return "text"'), [1, 4], [1, 4], 'contract:inferred-return-contract'],
-        ['py: a condition that names something else, guarding the same results', 'python',
+        // A Python checker decides some conditions from the names in them
+        // (the interpreter version, TYPE_CHECKING, configured constants):
+        // a condition that guards a result is part of what is returned.
+        ['py: a condition that guards a result', 'python',
             lines('def f(a, b):', '    if a:', '        return 1', '    return "text"'),
-            lines('def f(a, b):', '    if b:', '        return 1', '    return "text"'), [1, 4], [1, 4], 'inert'],
+            lines('def f(a, b):', '    if b:', '        return 1', '    return "text"'), [1, 4], [1, 4], 'contract:inferred-return-contract'],
+        ['py: a condition that guards what the result is made of', 'python',
+            lines('def f():', '    if TYPE_CHECKING:', '        x = 1', '    else:', '        x = "text"', '    return x'),
+            lines('def f():', '    if not TYPE_CHECKING:', '        x = 1', '    else:', '        x = "text"', '    return x'), [1, 6], [1, 6], 'contract:inferred-return-contract'],
+        ['py: a loop condition decides whether the code after it is reached', 'python',
+            lines('def f(q):', '    while q.open():', '        print(1)', '    return 1'),
+            lines('def f(q):', '    while q.closed():', '        print(1)', '    return 1'), [1, 4], [1, 4], 'contract:inferred-return-contract'],
+        ['py: a condition that guards nothing returned and ends nothing', 'python',
+            lines('def f(a, b):', '    if a:', '        print(1)', '    return 1'),
+            lines('def f(a, b):', '    if b:', '        print(1)', '    return 1'), [1, 4], [1, 4], 'inert'],
+        // No JavaScript checker decides a condition from a name.
+        ['ts: a condition that names something else, guarding the same results', 'typescript',
+            lines('function f(a: boolean, b: boolean) {', '  if (a) return 1;', '  return "text";', '}'),
+            lines('function f(a: boolean, b: boolean) {', '  if (b) return 1;', '  return "text";', '}'), [1, 4], [1, 4], 'inert'],
+        // A switch that covers every value of its subject leaves no way
+        // past it, and a label narrows the subject inside its case.
+        ['ts: a label of a switch that holds a result', 'typescript',
+            lines('function f(k: K) {', '  switch (k) {', '    case "a":', '      return 1;', '    case "b":', '      return 2;', '  }', '}'),
+            lines('function f(k: K) {', '  switch (k) {', '    case "a":', '      return 1;', '    case "c":', '      return 2;', '  }', '}'), [1, 8], [1, 8], 'contract:inferred-return-contract'],
+        ['ts: the subject of a switch that holds a throw', 'typescript',
+            lines('function f(a: K, b: K) {', '  switch (a) {', '    case "x":', '      throw new Error("x");', '  }', '}'),
+            lines('function f(a: K, b: K) {', '  switch (b) {', '    case "x":', '      throw new Error("x");', '  }', '}'), [1, 6], [1, 6], 'contract:inferred-return-contract'],
+        ['ts: a label of a switch that only leaves itself', 'typescript',
+            lines('function f(k: K) {', '  switch (k) {', '    case "a":', '      console.log(1);', '      break;', '  }', '  return 1;', '}'),
+            lines('function f(k: K) {', '  switch (k) {', '    case "b":', '      console.log(1);', '      break;', '  }', '  return 1;', '}'), [1, 8], [1, 8], 'inert'],
         ['ts: a declared return type is the contract, whatever ends a path', 'typescript',
             lines('function f(k: string): number {', '  if (k === "a") return 1;', '  throw new Error("x");', '}'),
             lines('function f(k: string): number {', '  if (k === "a") return 1;', '  logger.info(k);', '  return 2;', '}'), [1, 4], [1, 5], 'inert'],
@@ -778,6 +816,112 @@ describe('check: a declaration that says nothing about never returning', () => {
     });
 });
 
+describe('check: what the project\'s own judge looks at', () => {
+    const { langTraits } = require('../languages');
+    it('typescript: a comment above the line, or before any code of the file', () => {
+        const suppressed = langTraits('typescript').checkSuppressedAt;
+        const lines = ['// @ts-ignore', 'f(1);', 'f(2);', '', '// note', '// @ts-expect-error wrong on purpose', '// more', 'f(3);'];
+        assert.deepStrictEqual([2, 3, 8].map(line => suppressed(lines, line)), [true, false, true]);
+        assert.strictEqual(suppressed(['#!/usr/bin/env node', '// @ts-nocheck', '', 'f(1);'], 4), true);
+        assert.strictEqual(suppressed(['const a = 1;', '// @ts-nocheck', 'f(1);'], 3), false, 'a directive after code is a comment');
+        assert.strictEqual(langTraits('javascript').checkSuppressedAt, null, 'no checker, nothing to suppress');
+    });
+
+    it('python: a comment on any line of the statement, or a directive before any code', () => {
+        const suppressed = langTraits('python').checkSuppressedAt;
+        const source = 'n = f(\n    1,\n)  # type: ignore\n\nif f(\n    1,\n):  # pyright: ignore\n    k = f(1)\nm = f(1)\n';
+        const root = parseRevision(source, 'python');
+        const lines = source.split('\n');
+        assert.deepStrictEqual([1, 5, 8, 9].map(line => suppressed(lines, line, () => root)), [true, true, false, false]);
+        // Without the tree only the line itself is read.
+        assert.deepStrictEqual([1, 3].map(line => suppressed(lines, line)), [false, true]);
+        assert.strictEqual(suppressed(['# pyright: basic', 'f(1)'], 2), true);
+        assert.strictEqual(suppressed(['"doc"', '# type: ignore', 'f(1)'], 3), false);
+    });
+
+    it('an import the judge resolves, and a call it does not', () => {
+        const source = 'import "./a";\nconst r = require("./h");\nasync function load() { return import("./j"); }\n' +
+            'try { require("./k"); } catch {}\nexport * from "./f";\nexport const z = require("./m");\n';
+        const typed = line => langTraits('typescript').checkedImportAt(parseRevision(source, 'typescript'), line);
+        const untyped = line => langTraits('javascript').checkedImportAt(parseRevision(source, 'javascript'), line);
+        // The compiler resolves statements and import(); a require call is a call to it.
+        assert.deepStrictEqual([1, 2, 3, 4, 5, 6].map(typed), [true, false, true, false, true, false]);
+        // With no compiler the runtime is the judge: a require outside a try block must find its module.
+        assert.deepStrictEqual([1, 2, 3, 4, 5, 6].map(untyped), [true, true, true, false, true, true]);
+        assert.strictEqual(langTraits('typescript').checkedImportAt(parseRevision('import eq = require("./i");\n', 'typescript'), 1), true);
+        const python = 'import importlib\nfrom . import gone\nmod = importlib.import_module(".gone", __package__)\n';
+        assert.deepStrictEqual([1, 2, 3].map(line => langTraits('python').checkedImportAt(parseRevision(python, 'python'), line)),
+            [true, true, false]);
+    });
+
+    it('a deleted file a JavaScript module still requires is a break, unless the failure is handled', () => {
+        const answer = use => {
+            const dir = repo({ 'gone.js': 'module.exports = { marker: 1 };\n', 'use.js': use });
+            try {
+                fs.unlinkSync(path.join(dir, 'gone.js'));
+                const item = checked(dir).changed.find(entry => entry.kind === 'module');
+                return [item.verdict, item.reasons, item.sites];
+            } finally { rm(dir); }
+        };
+        assert.deepStrictEqual(answer('const gone = require("./gone");\nmodule.exports = gone;\n'),
+            ['blocked', ['deleted-still-imported'], [{ file: 'use.js', line: 1, kind: 'import' }]]);
+        assert.deepStrictEqual(answer('let gone = null;\ntry {\n  gone = require("./gone");\n} catch (error) {\n  gone = null;\n}\nmodule.exports = gone;\n'),
+            ['review', ['deleted-still-loaded-unchecked'], [{ file: 'use.js', line: 3, kind: 'import', unchecked: true }]]);
+    });
+
+    it('a site under a suppression is listed and is not what blocks', () => {
+        const dir = repo({
+            'lib.ts': 'export function f(a: number): number {\n  return a;\n}\n',
+            'use.ts': 'import { f } from "./lib";\n// @ts-ignore\nexport const n: number = f(1);\n',
+        });
+        try {
+            write(dir, 'lib.ts', 'export function f(a: number, b: number): number {\n  return a + b;\n}\n');
+            let result = checked(dir);
+            let item = result.changed.find(entry => entry.name === 'f');
+            assert.deepStrictEqual([result.trust.status, item.verdict, item.reasons, item.signatureMismatches, item.mismatches.map(m => [m.line, m.unchecked])],
+                ['REVIEW_REQUIRED', 'review', ['site-not-checked', 'header'], 0, [[3, true]]]);
+            assert.match(output.formatCheck(result), /↳ use\.ts:3 .*\(not checked by the toolchain\)/);
+            // One site the checker does look at is enough.
+            write(dir, 'use.ts', 'import { f } from "./lib";\n// @ts-ignore\nexport const n: number = f(1);\nexport const m: number = f(2);\n');
+            git(dir, 'add', '-A');
+            result = checked(dir);
+            item = result.changed.find(entry => entry.name === 'f');
+            assert.deepStrictEqual([result.trust.status, item.signatureMismatches, item.mismatches.map(m => [m.line, !!m.unchecked])],
+                ['BLOCKED', 1, [[3, true], [4, false]]]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('check: what an object literal declared as a type has', () => {
+    const members = (source, line) => {
+        const found = require('../languages').langTraits('typescript').typedLiteralMembers(parseRevision(source, 'typescript'), line);
+        return found && [[...found.names].filter(name => !['constructor', 'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable'].includes(name)).sort(), found.open];
+    };
+    it('its written keys, and what every object has', () => {
+        const found = require('../languages').langTraits('typescript').typedLiteralMembers(
+            parseRevision('const box: Box = { size: () => 1 };\n', 'typescript'), 1);
+        assert.ok(found.names.has('size') && found.names.has('toString') && found.names.has('hasOwnProperty') && !found.open);
+        assert.deepStrictEqual(members('const box: Box = { size: () => 1, "quoted": 2, short, method() { return 1; }, get acc() { return 1; } };\n', 1),
+            [['acc', 'method', 'quoted', 'short', 'size'], false]);
+    });
+    it('is open when a member or the check cannot be read', () => {
+        const OPEN = [
+            'const box: Box = { ...rest, size: () => 1 };',
+            'const box: Box = { [key]: 1 };',
+            'const box: Box = { "\\u0062rand": 1 };',
+            'const box: Box = { \\u0062rand: 1 };',
+            'const box: Box = { 0x1: 1 };',
+            'const box: Box = { size: () => 1 } as Box;',
+            'const box: Box = Object.freeze({ size: () => 1 });',
+        ];
+        for (const source of OPEN) assert.strictEqual(members(`${source}\n`, 1)[1], true, source);
+        assert.strictEqual(members('// @ts-ignore\nconst box: Box = { size: () => 1 };\n', 2)[1], true);
+        assert.strictEqual(members('// @ts-nocheck\n\nconst box: Box = { size: () => 1 };\n', 3)[1], true);
+        assert.strictEqual(members('// a note\nconst box: Box = { size: () => 1 };\n', 2)[1], false);
+        assert.strictEqual(members('const n = 1;\n', 1), null);
+    });
+});
+
 describe('check: a new member that every value of the type must have', () => {
     it('an object literal declared as a class that gains a member is a break', () => {
         const dir = repo({
@@ -1014,22 +1158,33 @@ describe('check: an addition is inert only when nothing that existed can reach i
             { 'web.py': 'from flask import Flask\n\napp = Flask(__name__)\n' },
             dir => write(dir, 'web.py', 'from flask import Flask\n\napp = Flask(__name__)\n\n\n@app.route("/fresh")\ndef fresh_route():\n    return "ok"\n'),
             'fresh_route:added=review(registered)'],
-        // A class with a private or protected member is compared by
-        // declaration: only its own instances are one, so a new member
-        // cannot be missing from anything.
-        ['ts: a novel method of a class compared by declaration is ready',
+        // A class that declares a private or protected member has no values
+        // but its own instances. Its public members are still enumerated
+        // (keyof, mapped types): a new one is review, a new hidden one is
+        // seen by nothing.
+        ['ts: a novel public method of a class that declares a private member',
             { 'a.ts': 'class Box {\n  private count = 0;\n  size() { return this.count; }\n}\nnew Box().size();\n' },
             dir => edit(dir, 'a.ts', '  size() { return this.count; }\n', '  size() { return this.count; }\n  freshlyNamed() { return 2; }\n'),
+            'freshlyNamed:added=review(shape-of-existing-type)'],
+        ['ts: a novel private method of a class that declares a private member is ready',
+            { 'a.ts': 'class Box {\n  private count = 0;\n  size() { return this.count; }\n}\nnew Box().size();\n' },
+            dir => edit(dir, 'a.ts', '  size() { return this.count; }\n', '  size() { return this.count; }\n  private freshlyNamed() { return 2; }\n'),
             'freshlyNamed:added=ready'],
+        ['ts: a private constructor is not a private member',
+            { 'a.ts': 'class Box {\n  private constructor() {}\n  size() { return 1; }\n}\nexport const box: Box = { size: () => 1 };\n' },
+            dir => edit(dir, 'a.ts', '  size() { return 1; }\n', '  size() { return 1; }\n  private freshlyNamed() { return 2; }\n'),
+            'freshlyNamed:added=blocked(literal-lacks-new-member,shape-of-existing-type)'],
         // A class with none is compared by shape, like an interface.
         ['ts: a novel method of a class compared by shape is review',
             { 'a.ts': 'class Box {\n  size() { return 1; }\n}\nnew Box().size();\n' },
             dir => edit(dir, 'a.ts', '  size() { return 1; }\n', '  size() { return 1; }\n  freshlyNamed() { return 2; }\n'),
             'freshlyNamed:added=review(shape-of-existing-type)'],
-        ['ts: a nominal ancestor makes the class nominal',
+        // An inherited private member is shared by every class that
+        // inherits it: any of them with the class's members is a value.
+        ['ts: a private member of an ancestor does not hold the class',
             { 'a.ts': 'class Base {\n  protected seed = 0;\n}\nclass Box extends Base {\n  size() { return 1; }\n}\nnew Box().size();\n' },
             dir => edit(dir, 'a.ts', '  size() { return 1; }\n', '  size() { return 1; }\n  freshlyNamed() { return 2; }\n'),
-            'freshlyNamed:added=ready'],
+            'freshlyNamed:added=review(shape-of-existing-type)'],
         ['js: a class in a language with no type checker is reached by name only',
             { 'a.js': 'class Box {\n  size() { return 1; }\n}\nmodule.exports = { Box };\n' },
             dir => edit(dir, 'a.js', '  size() { return 1; }\n', '  size() { return 1; }\n  freshlyNamed() { return 2; }\n'),

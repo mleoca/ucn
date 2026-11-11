@@ -275,6 +275,33 @@ describe('check --staged: the git index decides, the worktree does not', () => {
         } finally { rm(dir); rm(sub); }
     });
 
+    it('a submodule of a submodule is exported at the commit its parent names', () => {
+        const leaf = repo({ 'use.py': USE });
+        const middle = repo({ 'mid.py': 'MID = 1\n' });
+        const dir = repo({ 'lib.py': LIB });
+        try {
+            git(middle, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', leaf, 'inner');
+            git(middle, 'commit', '-q', '-m', 'inner');
+            git(dir, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', middle, 'vendor');
+            git(dir, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init', '--recursive');
+            git(dir, 'commit', '-q', '-m', 'vendor');
+            // The innermost worktree moves on; the commits the index names do not.
+            write(dir, 'vendor/inner/use.py', USE.replace('widened(1)', 'widened(1, 2)'));
+            write(dir, 'lib.py', 'def widened(a, b):\n    return a\n');
+            git(dir, 'add', 'lib.py');
+            const target = resolveTarget(idx(dir), { staged: true });
+            try {
+                assert.strictEqual(target.ephemeral, true);
+                assert.strictEqual(fs.readFileSync(path.join(target.index.root, 'vendor', 'inner', 'use.py'), 'utf8'), USE);
+                assert.strictEqual(fs.readFileSync(path.join(target.index.root, 'vendor', 'mid.py'), 'utf8'), 'MID = 1\n');
+            } finally { target.dispose(); }
+            // The staged call site, two submodules down, still passes one argument.
+            const result = staged(dir);
+            assert.deepStrictEqual([result.trust.status, result.changed[0].mismatches.map(site => site.file)],
+                ['BLOCKED', ['vendor/inner/use.py']]);
+        } finally { rm(dir); rm(middle); rm(leaf); }
+    });
+
     it('a submodule the configuration says to ignore is still compared', () => {
         const sub = repo({ 'use.py': USE });
         const dir = repo({ 'lib.py': LIB });

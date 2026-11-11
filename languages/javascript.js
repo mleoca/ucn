@@ -5913,12 +5913,15 @@ const isHiddenMember = node => node.namedChildren.some(part =>
     part.type === 'accessibility_modifier' && part.text !== 'public');
 
 /**
- * Does this class declare a private or protected INSTANCE member?
- * TypeScript compares such a class by declaration: only its own instances
- * are assignable to it. A class with none is compared by shape, like an
- * interface: an object literal or another class with the same members is
- * one. A static member belongs to the constructor, not to the values, and
- * a constructor parameter with a modifier is a member.
+ * Does this class itself declare a private or protected INSTANCE member?
+ * TypeScript then holds its values to that declaration: only its own
+ * instances and those of its descendants are assignable to it. Without
+ * one, anything with the class's members is a value of it: an object
+ * literal, another class, and where a private member is inherited, any
+ * class that inherits the same one. A static member belongs to the
+ * constructor, a constructor parameter with a modifier is a member, and
+ * the constructor's own modifier says who may call it, not what a value
+ * has.
  *
  * @param {Set<number>} [ignoredLines] members that start on these lines
  *   are not counted: the class as it was before a change that added them
@@ -5930,22 +5933,24 @@ function classHasNominalMember(classNode, ignoredLines = null) {
     for (const member of body.namedChildren) {
         if (ignored(member) || isStaticMember(member)) continue;
         const name = member.childForFieldName('name');
-        if (isHiddenMember(member) || (name && name.type === 'private_property_identifier')) return true;
         if (name && name.text === 'constructor') {
             const parameters = member.childForFieldName('parameters');
             for (const parameter of parameters ? parameters.namedChildren : []) {
                 if (!ignored(parameter) && isHiddenMember(parameter)) return true;
             }
+            continue;
         }
+        if (isHiddenMember(member) || (name && name.type === 'private_property_identifier')) return true;
     }
     return false;
 }
 
 /**
  * How the member `name` of a class, declared on `line`, takes part in the
- * type of the class's values: 'instance' (every value has it), 'optional'
- * (`m?(): T`), 'static' (a member of the constructor), or null when the
- * class body has no such member.
+ * class's type: `role` is 'instance' (a member of every value), 'optional'
+ * (`m?(): T`) or 'static' (a member of the constructor); `hidden` is true
+ * for a private, protected or `#` member, which no other code can name or
+ * enumerate. null when the class body has no such member.
  */
 function classMemberRole(classNode, name, line) {
     const body = classNode && classNode.childForFieldName('body');
@@ -5953,21 +5958,97 @@ function classMemberRole(classNode, name, line) {
         const nameNode = member.childForFieldName('name');
         if (!nameNode || nameNode.text !== name) continue;
         if (line < member.startPosition.row + 1 || line > member.endPosition.row + 1) continue;
-        if (isStaticMember(member)) return 'static';
-        return member.children.some(part => part.type === '?') ? 'optional' : 'instance';
+        const hidden = isHiddenMember(member) || nameNode.type === 'private_property_identifier';
+        if (isStaticMember(member)) return { role: 'static', hidden };
+        return { role: member.children.some(part => part.type === '?') ? 'optional' : 'instance', hidden };
     }
     return null;
 }
 
-const LITERAL_KEY_NODES = new Set(['property_identifier', 'string', 'number']);
-const literalKeyText = node => (node.type === 'string' ? node.text.slice(1, -1) : node.text);
+const isCommentLine = text => text.startsWith('//') || text.startsWith('/*') || text.startsWith('*');
+
+/**
+ * Has the type checker been told not to report line `line` (1-based)? A
+ * `@ts-ignore` or `@ts-expect-error` comment directly above it, or a
+ * `@ts-nocheck` comment before any code of the file.
+ */
+function checkSuppressedAt(lines, line) {
+    for (let above = line - 2; above >= 0; above--) {
+        const text = String(lines[above]).trim();
+        if (!isCommentLine(text)) break;
+        if (/@ts-(?:ignore|expect-error)\b/.test(text)) return true;
+    }
+    for (const raw of lines) {
+        const text = String(raw).trim();
+        if (text === '' || text.startsWith('#!')) continue;
+        if (!isCommentLine(text)) break;
+        if (/@ts-nocheck\b/.test(text)) return true;
+    }
+    return false;
+}
+
+const inTryBlock = node => {
+    for (let up = node.parent; up; up = up.parent) {
+        if (up.type === 'try_statement') return true;
+        if (FUNCTION_SCOPE_NODES.has(up.type)) return false;
+    }
+    return false;
+};
+/**
+ * Is the import written on `line` one whose module must be there for the
+ * project to pass its own judge?
+ *   typed (TypeScript): an import or export-from statement, `import x =
+ *     require(..)`, or `import(..)`: the compiler resolves each of them,
+ *     wherever it is written. A `require(..)` call is a call to it.
+ *   untyped (JavaScript): the runtime is the judge. The same statements,
+ *     and a `require(..)` or `import(..)` call that is not inside a `try`
+ *     block, where a missing module is what the block is for.
+ */
+function checkedImportAt(root, line, typed) {
+    const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
+    const on = node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line;
+    if (root.descendantsOfType('import_statement', ...range).some(on)) return true;
+    if (root.descendantsOfType('export_statement', ...range)
+        .some(node => on(node) && node.childForFieldName('source'))) return true;
+    for (const call of root.descendantsOfType('call_expression', ...range)) {
+        if (!on(call)) continue;
+        const callee = call.childForFieldName('function');
+        if (!callee) continue;
+        if (callee.type === 'import') {
+            if (typed || !inTryBlock(call)) return true;
+        } else if (!typed && callee.type === 'identifier' && callee.text === 'require' && !inTryBlock(call)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Members every object has (the `Object` interface): a literal that does
+// not write `toString` still has one.
+const OBJECT_MEMBERS = ['constructor', 'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty',
+    'isPrototypeOf', 'propertyIsEnumerable'];
+const CHECK_SUPPRESSION = /@ts-(?:ignore|expect-error|nocheck)\b/;
+
+/**
+ * The name a literal's key gives its member, or null when it cannot be
+ * read off the token: an escape (`"brand"`, `brand`) or a
+ * number (`0x1` is the key "1") spells a name the text is not.
+ */
+function literalKeyName(key) {
+    if (key.text.includes('\\')) return null;
+    if (key.type === 'property_identifier' || key.type === 'shorthand_property_identifier') return key.text;
+    if (key.type === 'string') return key.text.slice(1, -1);
+    return null;
+}
 
 /**
  * Members of the object literal that starts on `line` and is the whole
- * value of a declaration with a type annotation (`const box: Box = {..}`).
- * `open`: what the literal has cannot be read from its keys (a spread, a
- * computed key), or the literal is not the declared value itself (an
- * assertion or a call around it decides its type).
+ * value of a declaration with a type annotation (`const box: Box = {..}`),
+ * with the members every object has. `open`: what the literal has, or
+ * whether it is checked at all, cannot be read: a spread, a computed,
+ * escaped or numeric key; a literal that is not the declared value itself
+ * (an assertion or a call around it decides its type); a comment that
+ * tells the checker to skip the declaration or the file.
  * @returns {{names: Set<string>, open: boolean}|null} null: no object
  *   literal starts on that line
  */
@@ -5980,7 +6061,7 @@ function typedLiteralMembers(root, line) {
         return holder && holder.type === 'variable_declarator' && holder.childForFieldName('type') &&
             holder.childForFieldName('value')?.id === node.id;
     });
-    const names = new Set();
+    const names = new Set(OBJECT_MEMBERS);
     if (declared.length !== 1) return { names, open: true };
     let open = false;
     for (const member of declared[0].namedChildren) {
@@ -5988,8 +6069,19 @@ function typedLiteralMembers(root, line) {
         const key = member.type === 'pair' ? member.childForFieldName('key')
             : member.type === 'method_definition' ? member.childForFieldName('name')
                 : member.type === 'shorthand_property_identifier' ? member : null;
-        if (key && (LITERAL_KEY_NODES.has(key.type) || key.type === 'shorthand_property_identifier')) names.add(literalKeyText(key));
+        const name = key ? literalKeyName(key) : null;
+        if (name !== null) names.add(name);
         else open = true;
+    }
+    // The statement the declaration is, and what is written above it.
+    let statement = declared[0];
+    while (statement.parent && statement.parent.id !== root.id) statement = statement.parent;
+    for (let above = statement.previousSibling; above && above.type === 'comment'; above = above.previousSibling) {
+        if (CHECK_SUPPRESSION.test(above.text)) open = true;
+    }
+    for (const first of root.children) {
+        if (first.type !== 'comment') break;
+        if (/@ts-nocheck\b/.test(first.text)) open = true;
     }
     return { names, open };
 }
@@ -5998,6 +6090,8 @@ module.exports = {
     classHasNominalMember,
     classMemberRole,
     typedLiteralMembers,
+    checkSuppressedAt,
+    checkedImportAt,
     CLASS_DECLARATION_NODES,
     findFunctions,
     findClasses,

@@ -189,38 +189,47 @@ function exportIndex(gitRoot, exportRoot) {
 /**
  * Submodules of the staged tree: each is a commit the index names, not
  * files. One that is checked out here is exported at THAT commit (what
- * the commit being made will build against); one that is not checked out
- * is absent from the worktree's analysis too, and is named in a note.
+ * the commit being made will build against), and so are the submodules
+ * that commit names, to any depth; one that is not checked out is absent
+ * from the worktree's analysis too, and is named in a note.
  * @returns {{files: string[], notes: string[]}} files relative to the project
  */
 function exportSubmodules(projectRoot, snapshotRoot) {
     const files = [];
     const notes = [];
-    for (const record of git(projectRoot, ['ls-files', '-s', '-z', '--', '.']).split('\0')) {
-        const match = /^160000 ([0-9a-f]+) \d+\t(.+)$/s.exec(record);
-        if (!match) continue;
-        const [, commit, relative] = match;
-        const worktree = path.join(projectRoot, relative);
+    let archives = 0;
+    // One submodule at the commit its parent names, then the submodules
+    // that commit names in turn.
+    const exportAt = (worktree, commit, relative) => {
         let checkedOut;
         try { checkedOut = fs.existsSync(path.join(worktree, '.git')); } catch (_) { checkedOut = false; }
         if (!checkedOut) {
             notes.push(`submodule ${relative} is not checked out: its code is not part of the staged analysis`);
-            continue;
+            return;
         }
         const target = path.join(snapshotRoot, relative);
-        const archive = path.join(snapshotRoot, '..', `${path.basename(snapshotRoot)}.${files.length}.tar`);
+        const archive = path.join(snapshotRoot, '..', `${path.basename(snapshotRoot)}.${archives++}.tar`);
+        const nested = [];
         try {
             fs.mkdirSync(target, { recursive: true });
             git(worktree, ['archive', '--format=tar', '-o', archive, commit]);
             execFileSync('tar', ['-xf', archive, '-C', target], { stdio: ['ignore', 'pipe', 'pipe'] });
-            for (const name of git(worktree, ['ls-tree', '-r', '--name-only', '-z', commit]).split('\0')) {
-                if (name) files.push(`${relative}/${name}`);
+            for (const record of git(worktree, ['ls-tree', '-r', '-z', commit]).split('\0')) {
+                const entry = /^(\d+) \w+ ([0-9a-f]+)\t(.+)$/s.exec(record);
+                if (!entry) continue;
+                if (entry[1] === '160000') nested.push([entry[3], entry[2]]);
+                else files.push(`${relative}/${entry[3]}`);
             }
         } catch (error) {
             throw unavailable(`submodule ${relative} could not be exported at ${commit.slice(0, 10)}`, error);
         } finally {
             fs.rmSync(archive, { force: true });
         }
+        for (const [inner, innerCommit] of nested) exportAt(path.join(worktree, inner), innerCommit, `${relative}/${inner}`);
+    };
+    for (const record of git(projectRoot, ['ls-files', '-s', '-z', '--', '.']).split('\0')) {
+        const match = /^160000 ([0-9a-f]+) \d+\t(.+)$/s.exec(record);
+        if (match) exportAt(path.join(projectRoot, match[2]), match[1], match[2]);
     }
     return { files, notes };
 }

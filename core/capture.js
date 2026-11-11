@@ -33,12 +33,13 @@ const HAZARD_TEXT = Object.freeze({
     'overridden-by-descendant': 'a descendant already declares this member: it now overrides the new one',
     'constructor-of-existing-type': 'changes how an existing type is constructed',
     'field-of-existing-type': 'a new member of an existing type: construction, positional initialisation and layout can depend on its members',
-    'shape-of-existing-type': 'a new member of a type that is compared by shape: values used as that type, or as its constructor, are held to it',
+    'shape-of-existing-type': 'a new member of a type whose members are compared and enumerated by shape: values used as the type or as its constructor, and types computed from its members, are held to it',
     'literal-lacks-new-member': 'an object literal declared as this type does not have the new member',
     'protocol-member': 'a member the language runtime or the compiler invokes by name',
     'registered': 'decorated or registered with a framework, which may invoke it without naming it',
     'overrides-external': 'implements or overrides something defined outside the project',
     'reflection-reachable': 'reflection in the project can reach this name',
+    'syntax-invoked': 'invoked by operator, conversion or indexer syntax that never contains its name: expressions that exist may now resolve to it',
     'registry-member': 'member of a registry that is called through a computed key',
 });
 
@@ -47,6 +48,7 @@ const HAZARD_TEXT = Object.freeze({
 const HAZARD_OF_SHIELD = Object.freeze({
     'reflection': 'reflection-reachable',
     'dynamic-dispatch': 'registry-member',
+    'operator-surface': 'syntax-invoked',
 });
 
 /**
@@ -130,10 +132,6 @@ function occurrencesOutsideChange(index, name, addedLinesByFile, definition = nu
     return { outside, total: rows.length };
 }
 
-function bareTypeName(spelled) {
-    return String(spelled || '').trim().replace(/[<[(].*$/s, '').split('.').pop().trim();
-}
-
 /** The type definitions that own a member: same file, containing it. */
 function ownersOf(index, definition) {
     return (index.symbols.get(definition.className) || []).filter(type =>
@@ -159,24 +157,32 @@ function treeReader(index) {
  * What a new member does to the SHAPE of the type that owns it: the member
  * set existing code is held to, whether or not it names the member.
  *
- *   'required'  every value used as the type must now have the member: an
- *               instance member of a class the language compares by shape
- *               (trait `classComparedByShape`);
- *   'shape'     the type is something else to existing code, with no
- *               member a value must have: a static member of such a class
- *               (the constructor is compared by shape too), a virtual
- *               member where that changes what the type is (trait
- *               `virtualMemberChangesShape`), a member whose role cannot
- *               be read;
- *   null        nothing: the class is compared by declaration, or the
- *               member is optional.
+ * Where classes are compared by shape (traits `classComparedByShape`,
+ * `classMemberRole`), a class's members are a contract in two ways. Values
+ * used as the class must have them: an object literal or any class, and
+ * where the class only INHERITS a private or protected member, any class
+ * that inherits the same one. And types computed from its members
+ * (`keyof`, mapped types, `Pick`) are held to them even when the class
+ * declares a private member of its own and so has no other values.
  *
- * "Compared by shape" is asked of the class AS IT WAS: members on lines
- * the change added are left out (the first private member of a class is
- * what makes every structural value of it stop being one). It is asked of
- * the class's own syntax and of every project class it extends: one
- * nominal ancestor makes the class nominal; a base that is not a project
- * class is unknown, and unknown is "by shape".
+ *   'required'  every value used as the type must now have the member: an
+ *               instance member of a class that declares no private or
+ *               protected member of its own. A private one included: no
+ *               other value can ever have it;
+ *   'shape'     the type is something else to existing code, with no value
+ *               that can be shown to lack the member: a public member of a
+ *               class held by its own declaration (seen by `keyof` only),
+ *               a static member (the constructor is compared by shape
+ *               too), an optional member, a member whose role cannot be
+ *               read; and a virtual member where that changes what the
+ *               type is (trait `virtualMemberChangesShape`);
+ *   null        nothing: a private or protected member of a class that
+ *               already declares one, which no other code can hold, name
+ *               or enumerate.
+ *
+ * "Declares one of its own" is asked of the class AS IT WAS: members on
+ * lines the change added are left out (the first private member of a class
+ * is what makes every structural value of it stop being one).
  *
  * @param {Map<string, Set<number>>} [addedLinesByFile] by relative path
  */
@@ -184,35 +190,20 @@ function shapeChangeOf(index, definition, addedLinesByFile = null) {
     const entry = index.files.get(definition.file);
     const traits = langTraits(entry && entry.language) || {};
     if (traits.virtualMemberChangesShape && (definition.modifiers || []).includes('virtual')) return 'shape';
-    if (typeof traits.classComparedByShape !== 'function') return null;
+    if (typeof traits.classComparedByShape !== 'function' || typeof traits.classMemberRole !== 'function') return null;
     const rootOf = treeReader(index);
-    const addedIn = type => (addedLinesByFile && addedLinesByFile.get(type.relativePath)) || null;
-    const byShape = (type, seen) => {
-        if (seen.has(type)) return false;
-        seen.add(type);
-        if (type.type !== 'class') return false; // an interface member is a requirement, asked about elsewhere
-        const root = rootOf(type.file);
-        const node = root && classNodeAt(root, type);
-        if (!node) return true;
-        if (!traits.classComparedByShape(node, addedIn(type))) return false;
-        const parents = [].concat(type.extends || []).flatMap(spelled => String(spelled).split(','))
-            .map(bareTypeName).filter(Boolean);
-        for (const parent of parents) {
-            const bases = (index.symbols.get(parent) || []).filter(candidate => candidate.type === 'class');
-            if (bases.length === 0) continue; // out of the project: unknown, stays by shape
-            if (bases.every(base => !byShape(base, seen))) return false;
-        }
-        return true;
-    };
     let change = null;
     for (const owner of ownersOf(index, definition)) {
-        if (!byShape(owner, new Set())) continue;
+        if (owner.type !== 'class') continue; // an interface member is a requirement, asked about elsewhere
         const root = rootOf(owner.file);
         const node = root && classNodeAt(root, owner);
-        const role = node && typeof traits.classMemberRole === 'function'
-            ? traits.classMemberRole(node, definition.name, definition.startLine) : null;
-        if (role === 'instance') return 'required';
-        if (role !== 'optional') change = 'shape';
+        const member = node ? traits.classMemberRole(node, definition.name, definition.startLine) : null;
+        if (!member) { change = 'shape'; continue; }
+        const added = (addedLinesByFile && addedLinesByFile.get(owner.relativePath)) || null;
+        const ownDeclaration = !traits.classComparedByShape(node, added);
+        if (member.hidden && ownDeclaration) continue;
+        if (member.role !== 'static' && (member.hidden || (member.role === 'instance' && !ownDeclaration))) return 'required';
+        change = 'shape';
     }
     return change;
 }
@@ -235,33 +226,48 @@ function classNodeAt(root, type) {
     return found;
 }
 
+// A member name that is exactly what a literal's key would spell.
+const PLAIN_MEMBER_NAME = /^#?[A-Za-z_$][A-Za-z0-9_$]*$/;
+
 /**
  * Object literals declared as the type that owns `definition` and that do
  * not have a member of its name: `const box: Box = { size: () => 1 }` once
- * `Box` gains `brandNew()`. Only what can be read is reported: the
- * declared type resolves to this very type, the literal is the declared
- * value itself, and its members are all written as keys (trait
- * `typedLiteralMembers`: a spread, a computed key, an assertion or a call
- * around the literal leave it out). Sorted (file, line) of the literal.
+ * `Box` gains `brandNew()`. This is a claim of a break, so only what can
+ * be read is reported:
+ *   - the member's name is a plain name (a quoted or escaped one may be
+ *     spelled differently in the literal);
+ *   - the file declares one type of that name, and the literal's
+ *     annotation is that name, resolved to that file (a qualified name, a
+ *     union or an array is another type);
+ *   - the literal is the declared value itself and every member it has is
+ *     a key that can be read, counting the members every object has
+ *     (trait `typedLiteralMembers`: open on a spread, a computed, escaped
+ *     or numeric key, an assertion or call around the literal, a comment
+ *     that tells the checker to skip it);
+ *   - the project does not add members to every object (trait
+ *     `universalObjectInterface`).
+ * Sorted (file, line) of the literal.
  */
 function literalsLackingMember(index, definition) {
-    const owners = ownersOf(index, definition);
-    if (owners.length === 0) return [];
+    if (!PLAIN_MEMBER_NAME.test(String(definition.name))) return [];
+    if (ownersOf(index, definition).length === 0) return [];
+    const namesakes = (index.symbols.get(definition.className) || []).filter(type =>
+        type.file === definition.file && !type.className && NON_CALLABLE_TYPES.has(type.type));
+    if (namesakes.length !== 1) return [];
     const rootOf = treeReader(index);
     const lacking = new Map(); // file\0line -> site
     for (const entry of index.files.values()) {
-        const members = langTraits(entry.language)?.typedLiteralMembers;
+        const traits = langTraits(entry.language) || {};
+        const members = traits.typedLiteralMembers;
         if (typeof members !== 'function') continue;
+        if (traits.universalObjectInterface && (index.symbols.get(traits.universalObjectInterface) || []).length > 0) continue;
         for (const symbol of entry.symbols || []) {
             if (!symbol.registryContainerType || symbol.className) continue;
-            // The annotation is the type's own name (type arguments
-            // aside): a qualified name, a union or an array is another type.
             if (String(symbol.registryContainerType).trim().replace(/<.*$/s, '').trim() !== definition.className) continue;
             const line = symbol.objectLiteralLine || symbol.startLine;
             const key = `${entry.relativePath}\0${line}`;
             if (lacking.has(key)) continue;
             lacking.set(key, null);
-            // The name the literal is declared as must be this type.
             const declaredIn = index._resolveClassFile ? index._resolveClassFile(definition.className, symbol.file) : null;
             if (declaredIn !== definition.file) continue;
             const root = rootOf(symbol.file);

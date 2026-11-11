@@ -47,6 +47,9 @@ const ASSERT_NODES = new Set(['assert_statement']);
 // Statements a condition decides: with one that names nothing (`while
 // True`, `for (;;)`, `if False`) the checker knows which way it goes.
 const CONDITION_NODES = new Set(['while_statement', 'do_statement', 'for_statement', 'if_statement', 'elif_clause']);
+const LOOP_NODES = new Set(['while_statement', 'do_statement', 'for_statement']);
+const SWITCH_NODES = new Set(['switch_statement']);
+const CASE_NODES = new Set(['switch_case', 'switch_default']);
 // A context manager can swallow what its block raises: whether the code
 // after the block is reached is a property of the manager.
 const MANAGER_NODES = new Set(['with_statement', 'with_clause']);
@@ -253,16 +256,18 @@ function overlaps(a, b) {
  * refers to the receiver itself: what it asserts about `this` is in its
  * declaration.
  *
- * @param {object} [options] - { selfName: the receiver parameter's name
- *   where the receiver is one, omit: a node whose references are not
- *   collected (the callee of a call shown to do nothing but return) }
+ * @param {object} [options] - { receiverMembers: the callable is a class
+ *   member whose receiver is an instance of the class, selfName: the
+ *   receiver parameter's name where the receiver is one, omit: a node
+ *   whose references are not collected (the callee of a call shown to do
+ *   nothing but return) }
  */
 function unitOf(node, options = {}) {
-    const { selfName = null, omit = null } = options;
+    const { receiverMembers = false, selfName = null, omit = null } = options;
     const tokens = [];
     const names = new Set();
     let yields = false;
-    const isReceiver = text => text === 'this' || (selfName !== null && text === selfName);
+    const isReceiver = text => receiverMembers && (text === 'this' || (selfName !== null && text === selfName));
     const visit = (candidate, top, quiet) => {
         if (COMMENT_NODES.has(candidate.type)) return;
         if (!top && candidate.isNamed && STATEMENT_SHAPE.test(candidate.type)) return;
@@ -393,6 +398,13 @@ function declaresPlainReturn(root, symbol, neverTypes) {
  * with the slice: what is thrown, or what a call is passed, changes no
  * type.
  *
+ * Where a checker decides conditions from the names in them (trait
+ * `namedConditionsDecidable`: an interpreter version or platform test,
+ * `TYPE_CHECKING`, a constant its configuration defines), a condition is
+ * not opaque: the branch it rules out contributes nothing. There, every
+ * statement that holds a statement of the derivation is part of it, and so
+ * is every loop condition.
+ *
  * A statement that shares no name with the slice and ends no path cannot
  * reach the result.
  *
@@ -401,10 +413,12 @@ function declaresPlainReturn(root, symbol, neverTypes) {
  */
 function returnDerivation(body, facts = null) {
     const units = [];
+    const decidable = !!(facts && facts.traits && facts.traits.namedConditionsDecidable);
+    const receiver = { receiverMembers: !!(facts && facts.receiverMembers), selfName: facts ? facts.selfName : null };
     // An expression body is the result.
     if (!body.namedChildren.some(child => STATEMENT_SHAPE.test(child.type)) &&
         !['block', 'statement_block', 'compound_statement'].includes(body.type)) {
-        units.push({ at: body.startIndex, result: true, path: [], ...unitOf(body, { selfName: facts && facts.selfName }) });
+        units.push({ at: body.startIndex, result: true, path: [], ...unitOf(body, receiver) });
     }
     const collect = (container, path, nested, holder) => {
         for (const child of container.namedChildren) {
@@ -417,10 +431,11 @@ function returnDerivation(body, facts = null) {
                 const plainCall = !!(callee && facts && provablyReturns(callee, facts));
                 const unit = {
                     at: child.startIndex,
+                    type: child.type,
                     path,
                     // The compound statement this one sits under.
                     holder,
-                    ...unitOf(child, { selfName: facts && facts.selfName, omit: plainCall ? callee : null }),
+                    ...unitOf(child, { ...receiver, omit: plainCall ? callee : null }),
                 };
                 // A `return` inside a closure is the closure's result, and
                 // what ends the closure's path ends only that.
@@ -428,7 +443,10 @@ function returnDerivation(body, facts = null) {
                 if (!nested && !unit.result) {
                     if (EXIT_NODES.has(child.type)) unit.exit = [EXIT_NODES.get(child.type)];
                     else if (ASSERT_NODES.has(child.type) || MANAGER_NODES.has(child.type)) unit.exit = [child.type, unit.tokens];
-                    else if (CONDITION_NODES.has(child.type) && unit.names.size === 0) unit.exit = ['static', unit.tokens];
+                    else if (CONDITION_NODES.has(child.type) && (unit.names.size === 0 ||
+                        (decidable && LOOP_NODES.has(child.type) && child.childForFieldName('condition')))) {
+                        unit.exit = ['static', unit.tokens];
+                    }
                     else if (callee && !plainCall) unit.exit = ['call', callee.text];
                 }
                 units.push(unit);
@@ -461,8 +479,30 @@ function returnDerivation(body, facts = null) {
             grew = true;
         }
     }
-    return JSON.stringify(units.filter(unit => slice.has(unit) || unit.exit).sort((a, b) => a.at - b.at)
-        .map(unit => (slice.has(unit) ? [unit.path, unit.tokens] : ['exit', unit.path, ...unit.exit])));
+    const kept = new Set(units.filter(unit => slice.has(unit) || unit.exit));
+    // A `switch` that covers every value of its subject leaves no way past
+    // it, and a label narrows the subject inside its case: the subject and
+    // the labels of a switch that holds part of the derivation are part of
+    // it. Leaving the switch (`break`) is not such a part.
+    const switches = new Set();
+    for (const unit of kept) {
+        if (!slice.has(unit) && unit.exit && (unit.exit[0] === 'break' || unit.exit[0] === 'continue')) continue;
+        for (let up = unit.holder; up; up = up.holder) if (SWITCH_NODES.has(up.type)) switches.add(up);
+    }
+    for (const unit of units) {
+        if (switches.has(unit) || (CASE_NODES.has(unit.type) && switches.has(unit.holder))) kept.add(unit);
+    }
+    // Where a checker can decide a condition from the names in it, every
+    // statement that holds one of these decides whether it counts.
+    if (decidable) {
+        for (const unit of [...kept]) {
+            for (let up = unit.holder; up && !kept.has(up); up = up.holder) kept.add(up);
+        }
+    }
+    return JSON.stringify([...kept].sort((a, b) => a.at - b.at).map(unit => {
+        if (slice.has(unit)) return [unit.path, unit.tokens];
+        return unit.exit ? ['exit', unit.path, ...unit.exit] : ['guard', unit.path, unit.tokens];
+    }));
 }
 
 /**
@@ -580,9 +620,18 @@ function callableContract(root, language, symbol, context = null) {
                 for (const target of bindingTargets(candidate)) identifiersOf(target, locals);
                 return true;
             });
-            const first = parameters && parameters.namedChildren[0] ? [...identifiersOf(parameters.namedChildren[0])][0] : null;
+            const leading = parameters ? parameters.namedChildren[0] : null;
+            const first = leading ? [...identifiersOf(leading)][0] : null;
             const selfName = symbol.className && first && (traits.selfParam || []).includes(first) ? first : null;
-            derivation = returnDerivation(body, { traits, context, locals, ownerClass: symbol.className || null, selfName });
+            // The receiver of a class member is an instance of the class.
+            // One whose type is WRITTEN (`this: A | B`, `self: Shape`) is
+            // whatever that says, a union included: a variable like any.
+            const typedReceiver = !!leading && (leading.descendantsOfType('this').length > 0 ||
+                (selfName !== null && leading.type !== 'identifier'));
+            derivation = returnDerivation(body, {
+                traits, context, locals, ownerClass: symbol.className || null, selfName,
+                receiverMembers: !!symbol.className && !typedReceiver,
+            });
         } else {
             derivation = JSON.stringify(tokensOf(body));
         }

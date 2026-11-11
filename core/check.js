@@ -54,6 +54,7 @@ const CHANGE_TEXT = Object.freeze({
     'inferred-return-contract': 'its return contract is taken from its body, and what it returns changed',
     'inferred-member-type': 'it assigns to a member of its receiver, and a member\'s type is what the class assigns to it',
     'contract-unreadable': 'its contract before the change could not be read',
+    'site-not-checked': 'the sites that no longer fit are under a comment that tells the toolchain not to check them: they are listed, and a build will not show them',
 });
 
 // What a change did to a module outside its declarations, in words.
@@ -67,7 +68,10 @@ const MODULE_TEXT = Object.freeze({
     'name-still-used': 'a name the module no longer provides is still written in a file that imports the whole module',
     'star-export-removed': 'the module no longer passes on everything another module exports; which names its importers lose is not written in it',
     'import-rebound': 'a name the file imports now comes from somewhere else: every use of it in the file means something new',
+    'module-name-in-use': 'the file is new and imports that existed before can resolve to it: what they meant before, they may not mean now',
     'deleted-still-imported': 'the file was deleted and other files still import it',
+    'deleted-still-loaded-unchecked': 'the file was deleted and other files still load it where the toolchain does not look (a call, or an import under a check suppression): it fails when that code runs unless the failure is handled',
+    'site-not-checked': 'a name this module no longer provides is still imported, under a comment that tells the toolchain not to check that line',
     'deleted-name-still-imported': 'the file was deleted and other files import a module of its name; a module outside the project may answer',
 });
 
@@ -196,6 +200,77 @@ function assessAddition(index, entry, definition, addedLinesByFile, account, non
 }
 
 /**
+ * What the project's own judge looks at. A break is a claim about what the
+ * language's toolchain (or, with no checker, its runtime) will reject, so
+ * a site it has been told to skip, or an import written as a call it never
+ * resolves, is not what blocks: it is listed as what it is.
+ */
+const SITE_READERS = new WeakMap();
+function siteReader(index) {
+    if (SITE_READERS.has(index)) return SITE_READERS.get(index);
+    let absolute = null;
+    const at = relativePath => {
+        if (!absolute) {
+            absolute = new Map();
+            for (const [file, entry] of index.files) absolute.set(entry.relativePath, { file, entry });
+        }
+        return absolute.get(relativePath) || null;
+    };
+    const roots = new Map();
+    const rootOf = found => {
+        if (!roots.has(found.file)) {
+            let root;
+            try {
+                root = require('./change-kinds').parseRevision(index._readFile(found.file), found.entry.language);
+            } catch (_) {
+                root = null;
+            }
+            roots.set(found.file, root);
+        }
+        return roots.get(found.file);
+    };
+    const reader = {
+        /** The checker has been told not to report this line (trait `checkSuppressedAt`). */
+        suppressed(site) {
+            const found = site && site.line ? at(site.file) : null;
+            const suppressedAt = found && langTraits(found.entry.language)?.checkSuppressedAt;
+            if (typeof suppressedAt !== 'function') return false;
+            try {
+                return !!suppressedAt(index._getFileLines(found.file), site.line, () => rootOf(found));
+            } catch (_) {
+                return false;
+            }
+        },
+        /** The import on this line is one the judge resolves (trait `checkedImportAt`). */
+        resolvesImport(site) {
+            const found = site && site.line ? at(site.file) : null;
+            const checkedAt = found && langTraits(found.entry.language)?.checkedImportAt;
+            if (typeof checkedAt !== 'function') return true;
+            const root = rootOf(found);
+            try {
+                return root ? !!checkedAt(root, site.line) : false;
+            } catch (_) {
+                return false;
+            }
+        },
+    };
+    SITE_READERS.set(index, reader);
+    return reader;
+}
+
+/** Split sites of a break into the ones the judge sees and the ones it was told to skip. */
+function byJudge(index, sites) {
+    const reader = siteReader(index);
+    const checked = [];
+    const unchecked = [];
+    for (const site of sites) {
+        if (reader.suppressed(site)) unchecked.push({ ...site, unchecked: true });
+        else checked.push(site);
+    }
+    return { checked, unchecked };
+}
+
+/**
  * Verdict of a DELETED declaration, from the base revision's record.
  * @returns {{verdict, reasons: string[], sites?: object[], basis?: string}}
  */
@@ -209,9 +284,15 @@ function assessRemoval(index, deleted) {
         return { verdict: 'review', reasons: ['base-declaration-unreadable'] };
     }
     if (assessment.verdict === 'no-static-dependents') return { verdict: 'ready', reasons: [] };
-    const definite = definiteDependentsOf(index, declaration);
-    if (definite.length > 0) {
-        return { verdict: 'blocked', reasons: ['still-referenced'], sites: definite, basis: assessment.basis };
+    const definite = byJudge(index, definiteDependentsOf(index, declaration));
+    if (definite.checked.length > 0) {
+        return {
+            verdict: 'blocked', reasons: ['still-referenced'],
+            sites: [...definite.checked, ...definite.unchecked], basis: assessment.basis,
+        };
+    }
+    if (definite.unchecked.length > 0) {
+        return { verdict: 'review', reasons: ['site-not-checked'], sites: definite.unchecked };
     }
     return {
         verdict: 'review',
@@ -266,9 +347,13 @@ function assessModuleChange(index, moved) {
         }
     }
     sites.sort(bySite);
-    if (sites.length > 0) return { verdict: 'blocked', reasons: ['no-longer-provided'], sites };
+    const importing = byJudge(index, sites);
+    if (importing.checked.length > 0) {
+        return { verdict: 'blocked', reasons: ['no-longer-provided'], sites: [...importing.checked, ...importing.unchecked] };
+    }
     const reasons = [];
     const stillUsed = [];
+    if (importing.unchecked.length > 0) reasons.push('site-not-checked');
     // A removed name still written in a file that holds the module: it may
     // be the member that file reaches through it.
     for (const name of moved.removedNames) {
@@ -280,6 +365,7 @@ function assessModuleChange(index, moved) {
         }
     }
     if (stillUsed.length > 0) reasons.push('name-still-used');
+    const held = stillUsed.length;
     for (const name of moved.removedBindings) {
         for (const row of index.usages(name, { includeTests: true, codeOnly: true }) || []) {
             if ((row.relativePath || row.file) !== moved.relativePath) continue;
@@ -287,7 +373,7 @@ function assessModuleChange(index, moved) {
             stillUsed.push({ file: moved.relativePath, line: row.line, kind: `uses ${name}` });
         }
     }
-    if (stillUsed.length > 0) reasons.push('import-removed-still-used');
+    if (stillUsed.length > held) reasons.push('import-removed-still-used');
     // A module that is no longer imported and bound no name was there
     // for what importing it does (a side effect, an inclusion).
     if ((moved.removedBareImports || []).length > 0) reasons.push('imports-removed');
@@ -298,7 +384,10 @@ function assessModuleChange(index, moved) {
     // what it does when it loads.
     if (moved.codeChanged && !isTestPath(moved.relativePath)) reasons.push('module-level-code');
     if ((moved.shadowed || []).length > 0) reasons.push('name-in-use');
-    return { verdict: reasons.length > 0 ? 'review' : 'ready', reasons, sites: stillUsed.sort(bySite) };
+    return {
+        verdict: reasons.length > 0 ? 'review' : 'ready', reasons,
+        sites: [...importing.unchecked, ...stillUsed].sort(bySite),
+    };
 }
 
 const SOURCE_EXTENSION = /\.[A-Za-z0-9+]+$/;
@@ -323,7 +412,13 @@ const PACKAGE_FILE = /(?:^|\/)(?:__init__|index|mod)$/;
  *             file (`import gone`, `#include "gone.h"`): something outside
  *             the project may carry the same name.
  *
- * @returns {{definite: object[], possible: object[]}} sites (file, line)
+ * A definite import the project's judge does not look at (a call it never
+ * resolves, a line under a check suppression: traits `checkedImportAt`,
+ * `checkSuppressedAt`) is `unchecked`: it fails when that code runs, and
+ * no build will say so.
+ *
+ * @returns {{definite: object[], unchecked: object[], possible: object[]}}
+ *   sites (file, line)
  */
 function importersOfDeletedFile(index, deleted) {
     const posix = path.posix;
@@ -450,7 +545,83 @@ function importersOfDeletedFile(index, deleted) {
         }
     }
     const bySite = (a, b) => (a.file === b.file ? a.line - b.line : (a.file < b.file ? -1 : 1));
-    return { definite: definite.sort(bySite), possible: possible.sort(bySite) };
+    const reader = siteReader(index);
+    const seen = [];
+    const unchecked = [];
+    for (const site of definite.sort(bySite)) {
+        if (reader.resolvesImport(site) && !reader.suppressed(site)) seen.push(site);
+        else unchecked.push({ ...site, unchecked: true });
+    }
+    return { definite: seen, unchecked, possible: possible.sort(bySite) };
+}
+
+/** The path forms an import's specifier can mean, read as it is written. */
+function specifierForms(entry, detail) {
+    const posix = path.posix;
+    const spelled = String(detail.module || '');
+    const from = posix.dirname(entry.relativePath);
+    // exact: relative to the importing file or its package. loose: a name
+    // that is looked up from some root.
+    const exact = [];
+    const loose = [];
+    if (!spelled) return { exact, loose };
+    if (/^\.{1,2}\//.test(spelled)) {
+        exact.push(posix.normalize(posix.join(from, spelled)).replace(SOURCE_EXTENSION, ''));
+        return { exact, loose };
+    }
+    const names = (detail.names || []).filter(name => name !== '*');
+    const dots = /^\.+/.exec(spelled);
+    if (dots) {
+        let base = from;
+        for (let up = 1; up < dots[0].length; up++) base = posix.dirname(base);
+        const rest = spelled.slice(dots[0].length).split('.').filter(Boolean);
+        const module = posix.normalize(posix.join(base, ...rest));
+        if (rest.length > 0) exact.push(module);
+        for (const name of names) exact.push(posix.normalize(posix.join(module, name)));
+        return { exact, loose };
+    }
+    const slashed = spelled.split('.').join('/');
+    loose.push(spelled.replace(SOURCE_EXTENSION, ''), slashed);
+    for (const name of names) loose.push(`${slashed}/${name}`);
+    return { exact, loose };
+}
+
+/**
+ * Imports that existed before the change and that can mean a file the
+ * change ADDED: the index now resolves them to it; or their specifier,
+ * relative to where it is written, lands on it; or it names a module of
+ * the project that the new file now stands beside under the same name
+ * (`lib.py` and a new `lib/` package, `lib/index.ts` and a new `lib.ts`).
+ * Which of two the language picks is its resolver's order; that the
+ * import meant something else before is certain.
+ *
+ * @returns {object[]} sites (file, line), sorted
+ */
+function importsThatCanMean(index, added, addedLinesByFile) {
+    const posix = path.posix;
+    const stem = added.replace(SOURCE_EXTENSION, '');
+    const asDirectory = PACKAGE_FILE.test(stem) ? posix.dirname(stem) : null;
+    const lands = form => form === stem || form === asDirectory;
+    const landsLoosely = form => lands(form) || stem.endsWith(`/${form}`) ||
+        (asDirectory !== null && asDirectory.endsWith(`/${form}`));
+    const sites = [];
+    for (const entry of index.files.values()) {
+        if (entry.relativePath === added) continue;
+        const resolved = entry.moduleResolved || {};
+        const addedLines = addedLinesByFile.get(entry.relativePath);
+        for (const detail of entry.importDetails || []) {
+            if (!detail.line || (addedLines && addedLines.has(detail.line))) continue;
+            const spelled = String(detail.module || '');
+            const composed = (detail.names || []).map(name => (spelled.endsWith('.') ? spelled + name : `${spelled}.${name}`));
+            const forms = specifierForms(entry, detail);
+            const taken = resolved[spelled] === added || composed.some(name => resolved[name] === added);
+            const beside = !!resolved[spelled] && resolved[spelled] !== added && forms.loose.some(landsLoosely);
+            if (taken || beside || forms.exact.some(lands)) {
+                sites.push({ file: entry.relativePath, line: detail.line, kind: 'import' });
+            }
+        }
+    }
+    return sites.sort((a, b) => (a.file === b.file ? a.line - b.line : (a.file < b.file ? -1 : 1)));
 }
 
 /**
@@ -579,8 +750,14 @@ function checkTarget(index, options, repoRoot) {
     // A file that is gone, and the imports that named it.
     for (const relativePath of dr?.deletedFiles || []) {
         const importers = importersOfDeletedFile(index, relativePath);
-        if (importers.definite.length === 0 && importers.possible.length === 0) continue;
+        if (importers.definite.length + importers.unchecked.length + importers.possible.length === 0) continue;
         const broken = importers.definite.length > 0;
+        const reasons = [];
+        if (broken) reasons.push('deleted-still-imported');
+        else {
+            if (importers.unchecked.length > 0) reasons.push('deleted-still-loaded-unchecked');
+            if (importers.possible.length > 0) reasons.push('deleted-name-still-imported');
+        }
         moduleItems.push({
             name: '(module)',
             file: relativePath,
@@ -590,8 +767,28 @@ function checkTarget(index, options, repoRoot) {
             unverifiedCallerCount: 0,
             signatureMismatches: 0,
             verdict: broken ? 'blocked' : 'review',
-            reasons: [broken ? 'deleted-still-imported' : 'deleted-name-still-imported'],
-            sites: broken ? importers.definite : importers.possible,
+            reasons,
+            sites: broken ? [...importers.definite, ...importers.unchecked]
+                : [...importers.unchecked, ...importers.possible].sort((a, b) =>
+                    (a.file === b.file ? a.line - b.line : (a.file < b.file ? -1 : 1))),
+        });
+    }
+
+    // A file that is new, and the imports that could already mean it.
+    for (const relativePath of dr?.addedFiles || []) {
+        const sites = importsThatCanMean(index, relativePath, addedLinesByFile);
+        if (sites.length === 0) continue;
+        moduleItems.push({
+            name: '(module)',
+            file: relativePath,
+            line: 1,
+            kind: 'module',
+            callerCount: 0,
+            unverifiedCallerCount: 0,
+            signatureMismatches: 0,
+            verdict: 'review',
+            reasons: ['module-name-in-use'],
+            sites,
         });
     }
 
@@ -658,13 +855,16 @@ function checkTarget(index, options, repoRoot) {
                 // Kinds the dead-code rule does not audit (fields, constants,
                 // aliases) are never cleared: what remains is the name's
                 // other occurrences, each a candidate.
-                const definite = definiteDependentsOf(index, {
+                const definite = byJudge(index, definiteDependentsOf(index, {
                     name: fn.name, file: fn.filePath, relativePath: filePath, className: fn.className,
-                });
-                item.verdict = definite.length > 0 ? 'blocked' : 'review';
-                item.reasons = definite.length > 0 ? ['still-referenced']
-                    : [(fn.remainingReferences || []).length > 0 ? 'name-still-used' : 'declaration-removed'];
-                if (definite.length > 0) item.sites = definite;
+                }));
+                item.verdict = definite.checked.length > 0 ? 'blocked' : 'review';
+                item.reasons = definite.checked.length > 0 ? ['still-referenced']
+                    : definite.unchecked.length > 0 ? ['site-not-checked']
+                        : [(fn.remainingReferences || []).length > 0 ? 'name-still-used' : 'declaration-removed'];
+                if (definite.checked.length + definite.unchecked.length > 0) {
+                    item.sites = [...definite.checked, ...definite.unchecked];
+                }
             } else {
                 item.verdict = 'review';
                 item.reasons = [valueDeclaration ? 'value-change' : 'declaration-change'];
@@ -705,11 +905,20 @@ function checkTarget(index, options, repoRoot) {
             const mismatches = verifyResult && Array.isArray(verifyResult.mismatchDetails)
                 ? verifyResult.mismatchDetails
                 : [];
-            item.signatureMismatches = mismatches.length;
-            if (mismatches.length > 0) {
-                item.mismatches = mismatches;
+            // A call site the checker was told to skip is listed and does
+            // not block (a deliberately wrong call under `@ts-expect-error`
+            // is still one after the signature moves).
+            const reader = siteReader(index);
+            const marked = mismatches.map(mismatch =>
+                (reader.suppressed(mismatch) ? { ...mismatch, unchecked: true } : mismatch));
+            item.signatureMismatches = marked.filter(mismatch => !mismatch.unchecked).length;
+            if (marked.length > 0) item.mismatches = marked;
+            if (item.signatureMismatches > 0) {
                 item.verdict = 'blocked';
                 item.reasons = ['signature-mismatch', ...change.reasons];
+            } else if (marked.length > 0) {
+                item.verdict = 'review';
+                item.reasons = ['site-not-checked', ...change.reasons];
             } else {
                 // A changed contract matters only to what depends on it.
                 // What a method assigns to a member is the CLASS's
