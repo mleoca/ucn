@@ -1851,6 +1851,9 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
         }
 
         return {
+            // Where the call is in the source: the same node, whoever reads
+            // the file next (an alias, the second call on a line).
+            span: { start: callNode.startIndex, end: callNode.endIndex },
             args,
             argCount: args.length,
             hasSpread: args.some(a => a.startsWith('...')) || unpackingArgs > 0,
@@ -2278,6 +2281,15 @@ function verify(index, name, options = {}) {
         };
     }
 
+    // A mismatch remembers which call it is (not part of what is printed).
+    const located = (record, analysis) => {
+        if (analysis && analysis.span) Object.defineProperty(record, 'span', { value: analysis.span, enumerable: false });
+        // `f.call(self, ..)`: the arguments start one slot later.
+        if (analysis && analysis.indirectKind) {
+            Object.defineProperty(record, 'indirect', { value: analysis.indirectKind, enumerable: false });
+        }
+        return record;
+    };
     const verifyLineSeen = new Map(); // 'file:line' -> per-line ordinal (fix #231)
     for (const call of calls) {
         const siteKey = `${call.file}:${call.line}:${call.calledAs || name}`;
@@ -2368,7 +2380,7 @@ function verify(index, name, options = {}) {
             continue;
         }
         if (!countOk || call.invalidOverload) {
-            mismatches.push({
+            mismatches.push(located({
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
@@ -2382,7 +2394,7 @@ function verify(index, name, options = {}) {
                 args: analysis.args,
                 patterns: patternFlagsFrom(analysis),
                 ...carry,
-            });
+            }, analysis));
             continue;
         }
 
@@ -2403,7 +2415,7 @@ function verify(index, name, options = {}) {
                     ...carry,
                 });
             } else {
-                mismatches.push({
+                mismatches.push(located({
                     file: call.relativePath,
                     line: call.line,
                     expression: call.content.trim(),
@@ -2417,7 +2429,7 @@ function verify(index, name, options = {}) {
                     problem: bindingProblems.join('; '),
                     patterns: patternFlagsFrom(analysis),
                     ...carry,
-                });
+                }, analysis));
             }
             continue;
         }

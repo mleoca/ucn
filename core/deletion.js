@@ -334,7 +334,8 @@ function definiteDependentsOf(index, declaration) {
                 // `from pkg import name` where `pkg/name` is a module of
                 // the package imports that module, not a name of pkg.
                 if (submoduleOf(resolved, binding.module, name)) continue;
-                sites.push({ file: entry.relativePath, line: binding.line || 0, kind: 'import' });
+                sites.push(Object.defineProperty({ file: entry.relativePath, line: binding.line || 0, kind: 'import' },
+                    'module', { value: binding.module, enumerable: false }));
             }
         }
     }

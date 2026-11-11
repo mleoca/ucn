@@ -393,9 +393,10 @@ const STRUCTURAL_TRAITS = {
     // site is one the toolchain will not show: check lists it and does not
     // block on it.
     checkSuppressedAt: null,
-    // Is the import written on a line one the project's judge resolves (an
-    // import statement), not a call it never looks into? `(root, line) =>
-    // boolean`; null: every import of the language is a statement.
+    // Is the import of `module` written on a line one the project's judge
+    // resolves (an import statement), not a call it never looks into?
+    // `(root, line, module) => boolean`; null: every import of the language
+    // is a statement.
     checkedImportAt: null,
     // Does a virtual member change what a type IS to existing code (C++: a
     // class with one is no aggregate, so `T t{1, 2}` stops compiling)?
@@ -698,9 +699,10 @@ const NOMINAL_TRAITS = {
     // site is one the toolchain will not show: check lists it and does not
     // block on it.
     checkSuppressedAt: null,
-    // Is the import written on a line one the project's judge resolves (an
-    // import statement), not a call it never looks into? `(root, line) =>
-    // boolean`; null: every import of the language is a statement.
+    // Is the import of `module` written on a line one the project's judge
+    // resolves (an import statement), not a call it never looks into?
+    // `(root, line, module) => boolean`; null: every import of the language
+    // is a statement.
     checkedImportAt: null,
     // Does a virtual member change what a type IS to existing code (C++: a
     // class with one is no aggregate, so `T t{1, 2}` stops compiling)?
@@ -845,7 +847,7 @@ const LANGUAGES = {
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
             neverReturnTypes: [],
-            checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, false),
+            checkedImportAt: (root, line, module) => require('./javascript').checkedImportAt(root, line, false, module),
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -870,7 +872,7 @@ const LANGUAGES = {
             typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
             universalObjectInterface: 'Object',
             checkSuppressedAt: site => require('./javascript').checkSuppressedAt(site),
-            checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, true),
+            checkedImportAt: (root, line, module) => require('./javascript').checkedImportAt(root, line, true, module),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
@@ -898,7 +900,7 @@ const LANGUAGES = {
             typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
             universalObjectInterface: 'Object',
             checkSuppressedAt: site => require('./javascript').checkSuppressedAt(site),
-            checkedImportAt: (root, line) => require('./javascript').checkedImportAt(root, line, true),
+            checkedImportAt: (root, line, module) => require('./javascript').checkedImportAt(root, line, true, module),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
@@ -931,7 +933,7 @@ const LANGUAGES = {
             neverReturnTypes: ['NoReturn', 'Never'],
             namedConditionsDecidable: true,
             checkSuppressedAt: site => require('./python').checkSuppressedAt(site),
-            checkedImportAt: (root, line) => require('./python').checkedImportAt(root, line),
+            checkedImportAt: (root, line, module) => require('./python').checkedImportAt(root, line, module),
             // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
             // and `self.__class__(..)` in an instance method construct the
             // method's class through its first parameter (fix #434).

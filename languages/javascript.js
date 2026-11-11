@@ -5971,7 +5971,8 @@ function classMemberRole(classNode, name, line) {
 // `@ts-nocheck` is a pragma of a `//` comment.
 const TS_DIRECTIVE_LINE = /^\/\/\/?\s*@(?:ts-expect-error|ts-ignore)/;
 const TS_DIRECTIVE_BLOCK = /^(?:\/|\*)*\s*@(?:ts-expect-error|ts-ignore)/;
-const TS_NOCHECK = /^\/\/\/?\s*@ts-nocheck(?=$|\s)/i;
+// A file pragma: `// @name`, the name ending at a space or a colon.
+const TS_FILE_PRAGMA = /^\/\/\/?\s*@([^\s:]+)/;
 
 /** Lines that hold a directive comment, and whether the file is unchecked. */
 function checkDirectives(root) {
@@ -5983,11 +5984,16 @@ function checkDirectives(root) {
             : TS_DIRECTIVE_BLOCK.test(text.slice(text.lastIndexOf('\n') + 1).trimStart());
         if (directive) lines.add(comment.endPosition.row + 1);
     }
-    // The pragma is read from the comments before the first token.
+    // `@ts-nocheck` and `@ts-check` are pragmas of the `//` comments
+    // before the first token, read without regard to case: the last of
+    // either decides.
     for (const first of root.children) {
         if (first.type === 'hash_bang_line') continue;
         if (first.type !== 'comment') break;
-        if (first.text.startsWith('//') && TS_NOCHECK.test(first.text)) unchecked = true;
+        const pragma = first.text.startsWith('//') ? TS_FILE_PRAGMA.exec(first.text) : null;
+        const name = pragma ? pragma[1].toLowerCase() : null;
+        if (name === 'ts-nocheck') unchecked = true;
+        else if (name === 'ts-check') unchecked = false;
     }
     return { lines, unchecked };
 }
@@ -5999,30 +6005,46 @@ function checkDirectives(root) {
  *   import-name  the imported name; import-module: the module string;
  *   literal      the declared name of the variable the literal is assigned to.
  * `site.line` is where the engine saw the site; the two differ when a
- * statement runs over several lines.
+ * statement runs over several lines. The call is the one the engine
+ * measured (`site.span`: its source range), whatever name it is called
+ * under and however many calls share its line; an import is the statement
+ * that names `site.module`.
  */
 function reportedLine(root, site) {
     const line = site.line;
     const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
     const spans = node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line;
     if (site.kind === 'arity') {
-        for (const call of root.descendantsOfType(['call_expression', 'new_expression'], ...range)) {
+        const calls = site.span ? [nodeAtSpan(root, site.span, CALL_SHAPES)].filter(Boolean)
+            : root.descendantsOfType([...CALL_SHAPES], ...range).filter(call => {
+                const callee = call.childForFieldName(call.type === 'new_expression' ? 'constructor' : 'function');
+                const named = callee && (callee.childForFieldName('property') || callee);
+                return !!named && named.startPosition.row + 1 === line &&
+                    (call.type === 'new_expression' || !site.name || named.text === site.name);
+            });
+        for (const call of calls) {
             const callee = call.childForFieldName(call.type === 'new_expression' ? 'constructor' : 'function');
             const named = callee && (callee.childForFieldName('property') || callee);
-            if (!named || named.startPosition.row + 1 !== line) continue;
-            if (call.type === 'call_expression' && site.name && named.text !== site.name) continue;
+            if (!named) continue;
             const given = (call.childForFieldName('arguments')?.namedChildren || [])
                 .filter(argument => argument.type !== 'comment');
-            if (Number.isInteger(site.most) && given.length > site.most) {
-                return given[site.most].startPosition.row + 1;
+            // `f.apply(self, [..])` is reported at the list; `f.call(self,
+            // ..)` passes its arguments one slot later.
+            if (site.indirect === 'apply' && given[1]) return given[1].startPosition.row + 1;
+            const first = site.indirect === 'call' ? 1 : 0;
+            if (Number.isInteger(site.most) && given.length - first > site.most) {
+                return given[site.most + first].startPosition.row + 1;
             }
             return (call.type === 'new_expression' ? call : named).startPosition.row + 1;
         }
         return line;
     }
     if (site.kind === 'import-name' || site.kind === 'import-module') {
-        for (const statement of root.descendantsOfType(['import_statement', 'export_statement'], ...range)) {
-            if (!spans(statement)) continue;
+        const quoted = node => (node ? node.text.slice(1, -1) : null);
+        const statements = root.descendantsOfType(['import_statement', 'export_statement'], ...range).filter(spans);
+        const naming = site.module === undefined ? statements
+            : statements.filter(statement => quoted(statement.childForFieldName('source')) === site.module);
+        for (const statement of naming.length > 0 ? naming : statements) {
             if (site.kind === 'import-name') {
                 const clause = statement.descendantsOfType('import_clause')[0];
                 const named = site.name === 'default' ? (clause ? clause.namedChildren[0] : null)
@@ -6086,17 +6108,21 @@ const inTryBlock = node => {
  *   untyped (JavaScript): the runtime is the judge. The same statements,
  *     and a `require(..)` or `import(..)` call that is not inside a `try`
  *     block, where a missing module is what the block is for.
+ * Several imports can share a line: the one asked about is the one that
+ * names `module`, as it is written.
  */
-function checkedImportAt(root, line, typed) {
+function checkedImportAt(root, line, typed, module) {
     const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
     const on = node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line;
-    if (root.descendantsOfType('import_statement', ...range).some(on)) return true;
+    const names = written => module === undefined || (!!written && written.text.slice(1, -1) === module);
+    if (root.descendantsOfType('import_statement', ...range).some(node => on(node) &&
+        names(node.childForFieldName('source') || node.descendantsOfType('string')[0]))) return true;
     if (root.descendantsOfType('export_statement', ...range)
-        .some(node => on(node) && node.childForFieldName('source'))) return true;
+        .some(node => on(node) && node.childForFieldName('source') && names(node.childForFieldName('source')))) return true;
     for (const call of root.descendantsOfType('call_expression', ...range)) {
         if (!on(call)) continue;
         const callee = call.childForFieldName('function');
-        if (!callee) continue;
+        if (!callee || !names(call.childForFieldName('arguments')?.namedChildren[0])) continue;
         if (callee.type === 'import') {
             if (typed || !inTryBlock(call)) return true;
         } else if (!typed && callee.type === 'identifier' && callee.text === 'require' && !inTryBlock(call)) {
@@ -6104,6 +6130,17 @@ function checkedImportAt(root, line, typed) {
         }
     }
     return false;
+}
+
+const CALL_SHAPES = new Set(['call_expression', 'new_expression']);
+
+/** The node of one of `types` that covers exactly `span`, or null. */
+function nodeAtSpan(root, span, types) {
+    for (let node = root.descendantForIndex(span.start, Math.max(span.start, span.end - 1)); node; node = node.parent) {
+        if (node.startIndex === span.start && node.endIndex === span.end && types.has(node.type)) return node;
+        if (node.startIndex < span.start || node.endIndex > span.end) break;
+    }
+    return null;
 }
 
 // Members every object has (the `Object` interface): a literal that does

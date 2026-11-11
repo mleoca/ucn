@@ -5944,55 +5944,95 @@ function checkDirectives(root, lines) {
         if (list.some(operand => CHECK_MODES.has(operand))) levels.clear();
         for (const operand of list) {
             const [rule, level] = operand.split('=').map(part => part.trim());
-            if (level !== undefined && rule) levels.set(rule, level);
+            // A level the checker does not know leaves the rule as it was.
+            if (rule && CHECK_LEVELS.has(level)) levels.set(rule, level);
         }
     }
     return { all, ignored, levels };
 }
 
+// The levels a `# pyright: rule=level` comment may set.
+const CHECK_LEVELS = new Set(['true', 'false', 'error', 'warning', 'information', 'none']);
+
+/** The `call` node that covers exactly `span`, or null. */
+function callAtSpan(root, span) {
+    for (let node = root.descendantForIndex(span.start, Math.max(span.start, span.end - 1)); node; node = node.parent) {
+        if (node.startIndex === span.start && node.endIndex === span.end && node.type === 'call') return node;
+        if (node.startIndex < span.start || node.endIndex > span.end) break;
+    }
+    return null;
+}
+
 /**
- * The lines of the range the checker reports a break over: a comment on
- * any of them silences the report.
- *   arity           the whole call, or the first argument too many;
+ * The ranges the checker reports a break over, one per report it makes: a
+ * comment on any line of a range silences that report, and the break is
+ * silenced when every report is.
+ *   arity           too few arguments: the whole call. One positional
+ *                   argument too many, a keyword the callable does not
+ *                   take or takes twice: that argument;
  *   import-name     the imported name; import-module: the module name;
  *   undefined-name  the line itself.
+ * The call is the one the engine measured (`site.span`), whatever name it
+ * is called under and however many calls share its line; an import is the
+ * statement that names `site.module`.
  */
-function reportedLines(root, site) {
+function reportedRanges(root, site) {
     const line = site.line;
     const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
     const rows = node => [node.startPosition.row + 1, node.endPosition.row + 1];
     const spans = node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line;
     if (site.kind === 'arity') {
-        const calls = root.descendantsOfType('call', ...range).filter(call => {
-            const callee = call.childForFieldName('function');
-            const named = callee && (callee.childForFieldName('attribute') || callee);
-            return !!named && named.startPosition.row + 1 === line;
-        });
         const nameOf = call => {
             const callee = call.childForFieldName('function');
-            return (callee.childForFieldName('attribute') || callee).text;
+            return callee ? (callee.childForFieldName('attribute') || callee) : null;
         };
-        const call = calls.find(candidate => site.name && nameOf(candidate) === site.name) || calls[0];
-        if (!call) return [line, line];
+        const call = site.span ? callAtSpan(root, site.span)
+            : root.descendantsOfType('call', ...range).filter(candidate => {
+                const named = nameOf(candidate);
+                return !!named && named.startPosition.row + 1 === line;
+            }).find((candidate, at, all) => !site.name || nameOf(candidate).text === site.name ||
+                !all.some(other => nameOf(other).text === site.name));
+        if (!call) return [[line, line]];
         const given = (call.childForFieldName('arguments')?.namedChildren || [])
             .filter(argument => argument.type !== 'comment');
-        if (Number.isInteger(site.most) && given.length > site.most) return rows(given[site.most]);
-        return rows(call);
+        const keyword = name => given.find(argument => argument.type === 'keyword_argument' &&
+            argument.childForFieldName('name')?.text === name);
+        const reports = [];
+        // What the call was measured against, problem by problem.
+        for (const problem of String(site.problem || '').split('; ').filter(Boolean)) {
+            const named = /'([^']+)'/.exec(problem);
+            if (/^takes \d+ positional/.test(problem)) {
+                const positional = given.filter(argument => argument.type !== 'keyword_argument');
+                const count = Number(/^takes (\d+)/.exec(problem)[1]);
+                reports.push(rows(positional[count] || call));
+            } else if (named && !/^missing/.test(problem) && keyword(named[1])) {
+                reports.push(rows(keyword(named[1])));
+            } else {
+                reports.push(rows(call));
+            }
+        }
+        if (reports.length > 0) return reports;
+        if (Number.isInteger(site.most) && given.length > site.most) return [rows(given[site.most])];
+        return [rows(call)];
     }
     if (site.kind === 'import-name' || site.kind === 'import-module') {
-        for (const statement of root.descendantsOfType(['import_from_statement', 'import_statement'], ...range)) {
-            if (!spans(statement)) continue;
+        const statements = root.descendantsOfType(['import_from_statement', 'import_statement'], ...range).filter(spans);
+        const moduleOf = statement => statement.childForFieldName('module_name') ||
+            statement.namedChildren.find(child => child.type === 'dotted_name' || child.type === 'aliased_import');
+        const naming = site.module === undefined ? statements
+            : statements.filter(statement => statement.descendantsOfType(['dotted_name', 'relative_import'])
+                .some(node => node.text === site.module));
+        for (const statement of naming.length > 0 ? naming : statements) {
             if (site.kind === 'import-name') {
                 const named = statement.descendantsOfType(['dotted_name', 'identifier'])
                     .find(node => node.text === site.name);
-                if (named) return rows(named);
+                if (named) return [rows(named)];
             }
-            const module = statement.childForFieldName('module_name') ||
-                statement.namedChildren.find(child => child.type === 'dotted_name' || child.type === 'aliased_import');
-            if (module) return rows(module);
+            const module = moduleOf(statement);
+            if (module) return [rows(module)];
         }
     }
-    return [line, line];
+    return [[line, line]];
 }
 
 /**
@@ -6000,9 +6040,10 @@ function reportedLines(root, site) {
  * reads its comments: a `type: ignore` before any code, the break's rule
  * set to anything but an error by a `# pyright:` comment, or a
  * `type: ignore` / `pyright: ignore` comment (naming the rule, when it
- * names any) on a line of the reported range.
+ * names any) on a line of every range it is reported over.
  *
- * @param {object} site - { lines, root, line, kind, name, most, memo }
+ * @param {object} site - { lines, root, line, kind, name, most, span,
+ *   problem, module, memo }
  */
 function checkSuppressedAt(site) {
     const { lines, root, memo } = site;
@@ -6013,23 +6054,29 @@ function checkSuppressedAt(site) {
     const rule = RULE_OF[site.kind] || null;
     const level = rule ? directives.levels.get(rule) : undefined;
     if (level !== undefined && level !== 'true' && level !== 'error') return true;
-    const [first, last] = reportedLines(root, site);
-    for (let at = first; at <= last; at++) {
-        if (!directives.ignored.has(at)) continue;
-        const rules = directives.ignored.get(at);
-        if (rules === null || (rule !== null && rules.includes(rule))) return true;
-    }
-    return false;
+    const silenced = ([first, last]) => {
+        for (let at = first; at <= last; at++) {
+            if (!directives.ignored.has(at)) continue;
+            const rules = directives.ignored.get(at);
+            if (rules === null || (rule !== null && rules.includes(rule))) return true;
+        }
+        return false;
+    };
+    return reportedRanges(root, site).every(silenced);
 }
 
 /**
  * Is the import written on `line` a statement the type checker resolves?
  * `importlib.import_module(..)` and `__import__(..)` are calls to it.
+ * Several imports can share a line: the one asked about is the one that
+ * names `module`, as it is written.
  */
-function checkedImportAt(root, line) {
+function checkedImportAt(root, line, module) {
     const range = [{ row: line - 1, column: 0 }, { row: line, column: 0 }];
     return root.descendantsOfType(['import_statement', 'import_from_statement', 'future_import_statement'], ...range)
-        .some(node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line);
+        .some(node => node.startPosition.row + 1 <= line && node.endPosition.row + 1 >= line &&
+            (module === undefined || node.descendantsOfType(['dotted_name', 'relative_import'])
+                .some(named => named.text === module)));
 }
 
 module.exports = {

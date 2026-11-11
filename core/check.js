@@ -260,7 +260,7 @@ function siteReader(index) {
             if (typeof checkedAt !== 'function') return true;
             const root = rootOf(found);
             try {
-                return root ? !!checkedAt(root, site.line) : false;
+                return root ? !!checkedAt(root, site.line, site.module) : false;
             } catch (_) {
                 return false;
             }
@@ -283,7 +283,7 @@ function byJudge(judge, sites, describe) {
 }
 
 // A site of a name that is gone: an import of it, or a bare call of it.
-const goneName = name => site => ({ kind: site.kind === 'call' ? 'undefined-name' : 'import-name', name });
+const goneName = name => site => ({ kind: site.kind === 'call' ? 'undefined-name' : 'import-name', name, module: site.module });
 
 /**
  * Verdict of a DELETED declaration, from the base revision's record.
@@ -358,11 +358,13 @@ function assessModuleChange(index, moved, judge) {
             const taken = binding.kind === 'default' ? 'default' : binding.name;
             if (!moved.removedNames.includes(taken)) continue;
             if (taken !== 'default' && submoduleOf(resolved, binding.module, taken)) continue;
-            sites.push({ file: entry.relativePath, line: binding.line || 0, kind: `import ${taken}` });
+            sites.push(Object.defineProperty({ file: entry.relativePath, line: binding.line || 0, kind: `import ${taken}` },
+                'module', { value: binding.module, enumerable: false }));
         }
     }
     sites.sort(bySite);
-    const importing = byJudge(judge, sites, site => ({ kind: 'import-name', name: site.kind.replace(/^import /, '') }));
+    const importing = byJudge(judge, sites, site =>
+        ({ kind: 'import-name', name: site.kind.replace(/^import /, ''), module: site.module }));
     if (importing.checked.length > 0) {
         return { verdict: 'blocked', reasons: ['no-longer-provided'], sites: [...importing.checked, ...importing.unchecked] };
     }
@@ -490,7 +492,7 @@ function importersOfDeletedFile(index, deleted, judge) {
     const place = (site, named, packageFile, traits) => {
         const supplies = named.map(name => supplyOf(packageFile, name, traits));
         if (supplies.includes('none')) {
-            missing.set(site, { kind: 'import-name', name: named[supplies.indexOf('none')] });
+            missing.set(site, { kind: 'import-name', name: named[supplies.indexOf('none')], module: site.module });
             (twin ? possible : definite).push(site);
         } else if (supplies.includes('open')) possible.push(site);
     };
@@ -503,7 +505,8 @@ function importersOfDeletedFile(index, deleted, judge) {
         for (const detail of entry.importDetails || []) {
             const spelled = String(detail.module || '');
             if (!spelled) continue;
-            const site = { file: entry.relativePath, line: detail.line || 0, kind: 'import' };
+            const site = Object.defineProperty({ file: entry.relativePath, line: detail.line || 0, kind: 'import' },
+                'module', { value: spelled, enumerable: false });
             if (resolved[spelled]) {
                 // The module is still there. Where a from-import can bind a
                 // submodule file (trait `submoduleImports`), a name the
@@ -568,7 +571,8 @@ function importersOfDeletedFile(index, deleted, judge) {
     const seen = [];
     const unchecked = [];
     for (const site of definite.sort(bySite)) {
-        if (judge.resolvesImport(site) && !judge.suppressed(site, missing.get(site) || { kind: 'import-module' })) seen.push(site);
+        if (judge.resolvesImport(site) &&
+            !judge.suppressed(site, missing.get(site) || { kind: 'import-module', module: site.module })) seen.push(site);
         else unchecked.push({ ...site, unchecked: true });
     }
     return { definite: seen, unchecked, possible: possible.sort(bySite) };
@@ -936,8 +940,10 @@ function checkTarget(index, options, repoRoot) {
                 return counts ? Number(counts[counts.length - 1]) : undefined;
             };
             const marked = mismatches.map(mismatch =>
-                (judge.suppressed(mismatch, { kind: 'arity', name: fn.name, most: most(mismatch) })
-                    ? { ...mismatch, unchecked: true } : mismatch));
+                (judge.suppressed(mismatch, {
+                    kind: 'arity', name: fn.name, most: most(mismatch), span: mismatch.span,
+                    problem: mismatch.problem, indirect: mismatch.indirect,
+                }) ? { ...mismatch, unchecked: true } : mismatch));
             item.signatureMismatches = marked.filter(mismatch => !mismatch.unchecked).length;
             if (marked.length > 0) item.mismatches = marked;
             if (item.signatureMismatches > 0) {

@@ -877,6 +877,68 @@ describe('check: what the project\'s own judge looks at', () => {
         for (const [source, line, expected] of ROWS) assert.strictEqual(silenced('typescript', source, line), expected, source);
     });
 
+    it('typescript: of `@ts-nocheck` and `@ts-check`, the last one decides', () => {
+        const ROWS = [
+            ['// @ts-nocheck\n// @ts-check\nf(1);\n', 3, false],
+            ['// @ts-check\n// @ts-nocheck\nf(1);\n', 3, true],
+            ['// @ts-nocheck\n// @ts-check\n// @ts-nocheck\nf(1);\n', 4, true],
+            ['// @ts-nocheck\n\n/* note */\n// @ts-check\nf(1);\n', 5, false],
+            // A pragma is a `//` comment before the first token, whatever its case.
+            ['// @ts-nocheck\n/* @ts-check */\nf(1);\n', 3, true],
+            ['// @ts-nocheck\ng(1);\n// @ts-check\nf(1);\n', 4, true],
+            ['// @TS-NOCHECK\nf(1);\n', 2, true],
+            ['// @ts-nocheck\n// @TS-CHECK\nf(1);\n', 3, false],
+            // Its name ends at a space or a colon, and is the whole name.
+            ['// @ts-nocheck: generated\nf(1);\n', 2, true],
+            ['// @ts-nochecked\nf(1);\n', 2, false],
+            ['// @ts-nocheck\n// @ts-checked\nf(1);\n', 3, true],
+        ];
+        for (const [source, line, expected] of ROWS) assert.strictEqual(silenced('typescript', source, line), expected, source);
+    });
+
+    it('python: a level the checker does not know leaves the rule on', () => {
+        const ROWS = [
+            ['# pyright: reportCallIssue=False\nf(1)\n', 2, false],
+            ['# pyright: reportcallissue=false\nf(1)\n', 2, false],
+            ['# Pyright: reportCallIssue=false\nf(1)\n', 2, false],
+            ['# pyright: reportCallIssue=false\n# pyright: basic\nf(1)\n', 3, false],
+            ['# pyright: reportCallIssue=false\n# pyright: reportCallIssue=true\nf(1)\n', 3, false],
+            ['# pyright: reportCallIssue=true\n# pyright: reportCallIssue=false\nf(1)\n', 3, true],
+            // Within one comment the rule set is chosen first.
+            ['# pyright: reportCallIssue=false, basic\nf(1)\n', 2, true],
+            ['# type: ignore\n# pyright: strict\nf(1)\n', 3, true],
+        ];
+        for (const [source, line, expected] of ROWS) assert.strictEqual(silenced('python', source, line), expected, source);
+    });
+
+    it('the call is the one that was measured, by where it is in the source', () => {
+        // Two calls on a line, an alias, a nested call: the span says which.
+        const at = (source, text) => ({ start: source.indexOf(text), end: source.indexOf(text) + text.length });
+        const two = 'f(1); f(1,\n// @ts-ignore\n2);\n';
+        const tooMany = { kind: 'arity', name: 'f', most: 1 };
+        assert.strictEqual(silenced('typescript', two, 1, { ...tooMany, span: at(two, 'f(1,\n// @ts-ignore\n2)') }), true);
+        assert.strictEqual(silenced('typescript', two, 1, { ...tooMany, span: at(two, 'f(1)') }), false);
+        const alias = 'g(1,\n// @ts-ignore\n2);\n';
+        assert.strictEqual(silenced('typescript', alias, 1, { ...tooMany, span: at(alias, 'g(1,\n// @ts-ignore\n2)') }), true);
+        const made = 'const k = new K(1,\n// @ts-ignore\n2);\n';
+        assert.strictEqual(silenced('typescript', made, 1, { kind: 'arity', name: 'constructor', most: 1, span: at(made, 'new K(1,\n// @ts-ignore\n2)') }), true);
+        const nested = 'n = f(f(1,\n        2))  # type: ignore\n';
+        assert.strictEqual(silenced('python', nested, 1, { ...tooMany, span: at(nested, 'f(1,\n        2)') }), true);
+        const twoPy = 'f(1, 2); n = f(1,\n    2)  # type: ignore\n';
+        assert.strictEqual(silenced('python', twoPy, 1, { ...tooMany, span: at(twoPy, 'f(1, 2)') }), false);
+        // Each report of a call has its own range: every one must be silenced.
+        const keyword = 'n = f(\n    1,\n    b=2,  # type: ignore\n)\n';
+        const problem = { kind: 'arity', name: 'f', span: at(keyword, 'f(\n    1,\n    b=2,  # type: ignore\n)') };
+        assert.strictEqual(silenced('python', keyword, 1, { ...problem, problem: "unexpected keyword argument 'b'" }), true);
+        assert.strictEqual(silenced('python', keyword, 1, { ...problem, problem: "unexpected keyword argument 'b'; missing required argument(s): c" }), true);
+        const elsewhere = 'n = f(  # type: ignore\n    1,\n    b=2,\n)\n';
+        assert.strictEqual(silenced('python', elsewhere, 1, { kind: 'arity', name: 'f', span: at(elsewhere, 'f(  # type: ignore\n    1,\n    b=2,\n)'), problem: "unexpected keyword argument 'b'" }), false);
+        // An import statement is the one that names the module.
+        const imports = 'import { gone } from "./other"; import {\n  // @ts-ignore\n  gone as again,\n} from "./lib";\n';
+        assert.strictEqual(silenced('typescript', imports, 1, { kind: 'import-name', name: 'gone', module: './lib' }), true);
+        assert.strictEqual(silenced('typescript', imports, 1, { kind: 'import-name', name: 'gone', module: './other' }), false);
+    });
+
     it('python: a comment on a line of the reported range, naming the rule when it names any', () => {
         const ROWS = [
             ['f(1)  # type: ignore\n', 1, true],
@@ -951,6 +1013,12 @@ describe('check: what the project\'s own judge looks at', () => {
         // With no compiler the runtime is the judge: a require outside a try block must find its module.
         assert.deepStrictEqual([1, 2, 3, 4, 5, 6].map(untyped), [true, true, true, false, true, true]);
         assert.strictEqual(langTraits('typescript').checkedImportAt(parseRevision('import eq = require("./i");\n', 'typescript'), 1), true);
+        // Several imports can share a line: the one asked about is the one that names the module.
+        const shared = 'import a from "./a"; const b = require("./gone");\n';
+        const sharedTyped = parseRevision(shared, 'typescript');
+        assert.deepStrictEqual(['./a', './gone'].map(module => langTraits('typescript').checkedImportAt(sharedTyped, 1, module)), [true, false]);
+        const sharedPython = parseRevision('import os; m = importlib.import_module(".gone", __package__)\n', 'python');
+        assert.deepStrictEqual(['os', '.gone'].map(module => langTraits('python').checkedImportAt(sharedPython, 1, module)), [true, false]);
         const python = 'import importlib\nfrom . import gone\nmod = importlib.import_module(".gone", __package__)\n';
         assert.deepStrictEqual([1, 2, 3].map(line => langTraits('python').checkedImportAt(parseRevision(python, 'python'), line)),
             [true, true, false]);
