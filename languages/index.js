@@ -325,6 +325,14 @@ const STRUCTURAL_TRAITS = {
     // or merely imported there, with no export syntax (Python)? Removing
     // such a name, an import included, takes it from its importers.
     moduleNamesImportable: false,
+    // Is a directory importable as a package without its package file
+    // (Python namespace packages)? Then deleting that file takes away the
+    // names it declared, not the package.
+    packageFileOptional: false,
+    // Module-level names that let a module supply names it does not write
+    // (Python: a module `__getattr__`, a rewritten package `__path__`). A
+    // package that declares one cannot be shown to lack a submodule.
+    moduleSupplyHooks: [],
     // Is a member's type whatever the class's methods assign to it (Python
     // instance attributes)? Then an assignment to a receiver member in any
     // method is part of the class's contract.
@@ -340,9 +348,34 @@ const STRUCTURAL_TRAITS = {
     // declaration (builtins, globals): a bare call of one always means
     // something. null: every callable name is declared or imported.
     ambientCallables: null,
+    // Builtins among `ambientCallables` that never return (Python `exit`),
+    // and global objects whose every member returns (`console`).
+    ambientNeverCallables: null,
+    ambientReturningNamespaces: null,
+    // How a declaration says "a call of this never returns" (`never`,
+    // `NoReturn`): a type checker ends the caller's path at a call of one,
+    // and only at a declared one. []: the language has no such type; null:
+    // no return contract is read from a body in this language.
+    neverReturnTypes: null,
     // Do files without module syntax share one global scope (classic
     // JavaScript scripts)? Then a top-level name of one is visible in all.
     scriptGlobalScope: false,
+    // Is a class compared by SHAPE, so that its member set is a contract
+    // other values are held to (a TypeScript class with no private or
+    // protected instance member)? `(classNode, ignoredLines) => boolean`
+    // over the class's syntax node, members starting on `ignoredLines` left
+    // out; null: a class is its declaration, and its members are reached
+    // by name only.
+    classComparedByShape: null,
+    // How a class member takes part in the type of the class's values:
+    // `(classNode, name, line) => 'instance' | 'optional' | 'static' | null`.
+    classMemberRole: null,
+    // Members of an object literal declared as a type, read from syntax:
+    // `(root, line) => { names, open } | null` (languages/javascript.js).
+    typedLiteralMembers: null,
+    // Does a virtual member change what a type IS to existing code (C++: a
+    // class with one is no aggregate, so `T t{1, 2}` stops compiling)?
+    virtualMemberChangesShape: false,
     // Whether a top-level type is declared in a source file named after it
     // (fix #386): javac requires `public class Widget` in Widget.java, so a
     // type rename renames that file too.
@@ -573,6 +606,14 @@ const NOMINAL_TRAITS = {
     // or merely imported there, with no export syntax (Python)? Removing
     // such a name, an import included, takes it from its importers.
     moduleNamesImportable: false,
+    // Is a directory importable as a package without its package file
+    // (Python namespace packages)? Then deleting that file takes away the
+    // names it declared, not the package.
+    packageFileOptional: false,
+    // Module-level names that let a module supply names it does not write
+    // (Python: a module `__getattr__`, a rewritten package `__path__`). A
+    // package that declares one cannot be shown to lack a submodule.
+    moduleSupplyHooks: [],
     // Is a member's type whatever the class's methods assign to it (Python
     // instance attributes)? Then an assignment to a receiver member in any
     // method is part of the class's contract.
@@ -588,9 +629,34 @@ const NOMINAL_TRAITS = {
     // declaration (builtins, globals): a bare call of one always means
     // something. null: every callable name is declared or imported.
     ambientCallables: null,
+    // Builtins among `ambientCallables` that never return (Python `exit`),
+    // and global objects whose every member returns (`console`).
+    ambientNeverCallables: null,
+    ambientReturningNamespaces: null,
+    // How a declaration says "a call of this never returns" (`never`,
+    // `NoReturn`): a type checker ends the caller's path at a call of one,
+    // and only at a declared one. []: the language has no such type; null:
+    // no return contract is read from a body in this language.
+    neverReturnTypes: null,
     // Do files without module syntax share one global scope (classic
     // JavaScript scripts)? Then a top-level name of one is visible in all.
     scriptGlobalScope: false,
+    // Is a class compared by SHAPE, so that its member set is a contract
+    // other values are held to (a TypeScript class with no private or
+    // protected instance member)? `(classNode, ignoredLines) => boolean`
+    // over the class's syntax node, members starting on `ignoredLines` left
+    // out; null: a class is its declaration, and its members are reached
+    // by name only.
+    classComparedByShape: null,
+    // How a class member takes part in the type of the class's values:
+    // `(classNode, name, line) => 'instance' | 'optional' | 'static' | null`.
+    classMemberRole: null,
+    // Members of an object literal declared as a type, read from syntax:
+    // `(root, line) => { names, open } | null` (languages/javascript.js).
+    typedLiteralMembers: null,
+    // Does a virtual member change what a type IS to existing code (C++: a
+    // class with one is no aggregate, so `T t{1, 2}` stops compiling)?
+    virtualMemberChangesShape: false,
     // A top-level type lives in a file named after it (fix #386, Java).
     typeNamedSourceFile: false,
     // Compiler-resolved doc references (fix #390, C# crefs).
@@ -702,6 +768,9 @@ const JS_AMBIENT_CALLABLES = new Set([
     'test', 'expect', 'beforeEach', 'afterEach', 'beforeAll', 'afterAll',
 ]);
 
+// Global objects of the JavaScript runtimes whose members all return.
+const JS_RETURNING_NAMESPACES = new Set(['console', 'Math', 'JSON', 'Object', 'Array', 'Reflect', 'Number', 'String']);
+
 // A TypeScript interface or object type is satisfied by shape: any class or
 // object with its members is one.
 const TS_STRUCTURAL_CONTRACT = typeDef => typeDef.type === 'interface' || typeDef.type === 'type';
@@ -726,6 +795,8 @@ const LANGUAGES = {
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
+            ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
+            neverReturnTypes: [],
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -745,8 +816,13 @@ const LANGUAGES = {
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
+            classComparedByShape: (classNode, ignoredLines) => !require('./javascript').classHasNominalMember(classNode, ignoredLines),
+            classMemberRole: (classNode, name, line) => require('./javascript').classMemberRole(classNode, name, line),
+            typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
+            ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
+            neverReturnTypes: ['never'],
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -765,8 +841,13 @@ const LANGUAGES = {
             selfParam: ['this'],
             reflectionApi: JS_REFLECTION_API,
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
+            classComparedByShape: (classNode, ignoredLines) => !require('./javascript').classHasNominalMember(classNode, ignoredLines),
+            classMemberRole: (classNode, name, line) => require('./javascript').classMemberRole(classNode, name, line),
+            typedLiteralMembers: (root, line) => require('./javascript').typedLiteralMembers(root, line),
             structuralContract: TS_STRUCTURAL_CONTRACT,
             ambientCallables: JS_AMBIENT_CALLABLES,
+            ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
+            neverReturnTypes: ['never'],
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -787,8 +868,12 @@ const LANGUAGES = {
             selfParam: ['self', 'cls'],
             structuralContract: PY_STRUCTURAL_CONTRACT,
             moduleNamesImportable: true,
+            moduleSupplyHooks: ['__getattr__', '__path__'],
+            packageFileOptional: true,
             memberTypesFromAssignments: true,
             ambientCallables: PY_AMBIENT_CALLABLES,
+            ambientNeverCallables: new Set(['exit', 'quit']),
+            neverReturnTypes: ['NoReturn', 'Never'],
             // `cls(..)` in a classmethod (or an implicit one), `type(self)(..)`
             // and `self.__class__(..)` in an instance method construct the
             // method's class through its first parameter (fix #434).
@@ -1155,6 +1240,7 @@ const LANGUAGES = {
             // 'instantiated': a template's body is checked against each
             // caller's arguments.
             inferredReturnForms: ['placeholder', 'instantiated', 'evaluated'],
+            virtualMemberChangesShape: true,
             compileTimeCallableMarkers: ['constexpr', 'consteval'],
             // An override overrides every base's virtual of its signature; an
             // inherited member never implements another base's pure virtual

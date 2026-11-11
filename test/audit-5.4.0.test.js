@@ -172,12 +172,16 @@ describe('5.4.0 independent audit regressions', () => {
     });
 
     it('F1: required interface and trait members change the containing contract', () => {
-        for (const [file, before, member] of [
-            ['api.ts', 'export interface API {\n  run(): void;\n}\nconst api: API = { run() {} };\n', '  stop(): void;\n'],
-            ['API.java', 'interface API {\n  void run();\n}\n', '  void stop();\n'],
-            ['api.rs', 'trait API {\n  fn run(&self);\n}\n', '  fn stop(&self);\n'],
-            ['api.go', 'package api\ntype API interface {\n  Run()\n}\n', '  Stop()\n'],
-            ['API.cs', 'interface API {\n  void Run();\n}\n', '  void Stop();\n'],
+        // The last column is the exit status of a plain check: the object
+        // literal declared as the interface does not have the new member,
+        // which is a break and not only a contract to review.
+        for (const [file, before, member, status] of [
+            ['api.ts', 'export interface API {\n  run(): void;\n}\nconst api: API = { run() {} };\n', '  stop(): void;\n', 1],
+            ['plain.ts', 'export interface API {\n  run(): void;\n}\n', '  stop(): void;\n', 0],
+            ['API.java', 'interface API {\n  void run();\n}\n', '  void stop();\n', 0],
+            ['api.rs', 'trait API {\n  fn run(&self);\n}\n', '  fn stop(&self);\n', 0],
+            ['api.go', 'package api\ntype API interface {\n  Run()\n}\n', '  Stop()\n', 0],
+            ['API.cs', 'interface API {\n  void Run();\n}\n', '  void Stop();\n', 0],
         ]) {
             const dir = tmp({ [file]: before });
             try {
@@ -185,7 +189,7 @@ describe('5.4.0 independent audit regressions', () => {
                 fs.writeFileSync(dir + '/' + file, before.replace('\n}', '\n' + member + '}'));
                 let result = execute(idx(dir), 'impact', {}).result;
                 assert.ok(result.symbols.some(s => s.name === 'API'), file);
-                assert.equal(cli(dir, 'check').status, 0, file);
+                assert.equal(cli(dir, 'check').status, status, file);
                 assert.equal(cli(dir, 'check', '--strict').status, 1, file);
                 // Removing a required member also changes the type contract.
                 git(dir, 'add', '.');

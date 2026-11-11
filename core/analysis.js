@@ -24,7 +24,7 @@ const symbolKey = (file, line) => entrypoints().symbolKey(file, line);
 const { getLanguageAdapter } = require('../languages');
 const { parseOpenCallShape } = require('../languages/rust-value-flow');
 const { projectComputedDispatch, declarationSnapshots } = require('./ast-analysis');
-const { callableContract, classifyChange, baseCounterpart, parseRevision, moduleChange } = require('./change-kinds');
+const { callableContract, classifyChange, baseCounterpart, parseRevision, moduleChange, declaresPlainReturn } = require('./change-kinds');
 const { findAccessorReferences } = require('./accessors');
 
 // JS/TS test framework helpers — calls to these bracket a test case.
@@ -2056,6 +2056,77 @@ function about(index, name, options = {}) {
 }
 
 /**
+ * What one revision of a file, and the project, say about the callees a
+ * body calls as bare statements (core/change-kinds.js `provablyReturns`).
+ *
+ *   fileNames   every name the revision declares or imports: a builtin of
+ *               that name means something else there;
+ *   returning   (name, ownerClass) => every declaration the name can mean
+ *               is one a call of which returns (`declaresPlainReturn`): a
+ *               function the revision declares, or imports by name from a
+ *               project module, or the method its own class declares.
+ *
+ * Declarations are read as the project holds them now, for both revisions:
+ * a callee whose own declaration changed is a changed symbol of its own.
+ */
+const CALLEE_FACTS = new WeakMap();
+const NAMED_IMPORT_KINDS = new Set(['named', 'from']);
+function calleeFacts(index, entry, filePath) {
+    if (!entry) return null;
+    if (CALLEE_FACTS.has(entry)) return CALLEE_FACTS.get(entry);
+    const live = index.files.get(filePath);
+    const traits = langTraits(live && live.language) || {};
+    const fileNames = new Set();
+    for (const symbol of entry.symbols || []) fileNames.add(symbol.name);
+    for (const binding of entry.importBindings || []) fileNames.add(binding.alias || binding.name);
+    const plain = definition => {
+        const owner = index.files.get(definition.file);
+        const never = owner && langTraits(owner.language)?.neverReturnTypes;
+        if (!Array.isArray(never)) return false;
+        try {
+            const content = index._readFile(definition.file);
+            const root = index._getParsedTree(definition.file, content, owner.language)?.rootNode ||
+                parseRevision(content, owner.language);
+            return declaresPlainReturn(root, definition, never);
+        } catch (_) {
+            return false;
+        }
+    };
+    const allPlain = (name, mine) => {
+        const definitions = (index.symbols.get(name) || []).filter(mine);
+        return definitions.length > 0 && definitions.every(plain);
+    };
+    const verdicts = new Map();
+    const facts = {
+        fileNames,
+        returning(name, ownerClass) {
+            if (!Array.isArray(traits.neverReturnTypes)) return false;
+            const key = `${ownerClass || ''}\0${name}`;
+            if (verdicts.has(key)) return verdicts.get(key);
+            let verdict;
+            if (ownerClass) {
+                verdict = (entry.symbols || []).some(symbol => symbol.name === name && symbol.className === ownerClass) &&
+                    allPlain(name, definition => definition.className === ownerClass && definition.file === filePath);
+            } else {
+                let declared = (entry.symbols || []).some(symbol => symbol.name === name && !symbol.className) ? name : null;
+                if (!declared) {
+                    const resolved = (live && live.moduleResolved) || {};
+                    const binding = (entry.importBindings || []).find(candidate =>
+                        (candidate.alias || candidate.name) === name && NAMED_IMPORT_KINDS.has(candidate.kind) &&
+                        resolved[candidate.module]);
+                    if (binding) declared = binding.name;
+                }
+                verdict = !!declared && allPlain(declared, definition => !definition.className);
+            }
+            verdicts.set(key, verdict);
+            return verdict;
+        },
+    };
+    CALLEE_FACTS.set(entry, facts);
+    return facts;
+}
+
+/**
  * Diff-based impact analysis: find which functions changed and who calls them.
  *
  * @param {object} index - ProjectIndex instance
@@ -2200,6 +2271,8 @@ function diffImpact(index, options = {}) {
     // What each changed file did outside its declarations: names it no
     // longer provides to importers, import statements, loose module code.
     const moduleChanges = [];
+    // Files the diff removed: whoever imports one as a module lost it.
+    const deletedFiles = [];
     const newFunctions = [];
     const deletedFunctions = [];
     const symbolChanges = { symbols: [], newSymbols: [], deletedSymbols: [] };
@@ -2222,6 +2295,7 @@ function diffImpact(index, options = {}) {
 
         // Handle deleted files: entire file was removed, all functions are deleted
         if (!fileEntry) {
+            if (change.isDeleted) deletedFiles.push(change.relativePath);
             if (change.isDeleted && change.deletedLines.length > 0) {
                 const ref = staged ? 'HEAD' : base;
                 try {
@@ -2306,8 +2380,8 @@ function diffImpact(index, options = {}) {
             }
             const base = baseCounterpart(baseEntryOf()?.symbols, symbol, isDiffCallable);
             return classifyChange(
-                base ? callableContract(baseRoot, fileLang, base) : null,
-                callableContract(currentRoot, fileLang, symbol), fileLang);
+                base ? callableContract(baseRoot, fileLang, base, calleeFacts(index, baseEntryOf(), change.filePath)) : null,
+                callableContract(currentRoot, fileLang, symbol, calleeFacts(index, fileEntry, change.filePath)), fileLang);
         };
 
         // Several callables can share a changed line (`class Box {
@@ -2579,7 +2653,7 @@ function diffImpact(index, options = {}) {
                 // A deleted declaration's name is assessed as a deletion.
                 const removedNames = moved.removedNames.filter(name => !gone.has(name));
                 if (removedNames.length > 0 || moved.importsRemoved > 0 || moved.importsAdded > 0 ||
-                    moved.codeChanged || moved.starExportRemoved) {
+                    moved.codeChanged || moved.starExportRemoved || moved.reboundBindings.length > 0) {
                     moduleChanges.push({
                         filePath: change.filePath,
                         relativePath: change.relativePath,
@@ -2801,6 +2875,7 @@ function diffImpact(index, options = {}) {
         }
     }, 'addedLinesByFile', { value: addedLinesByFile, enumerable: false });
     Object.defineProperty(report, 'moduleChanges', { value: moduleChanges, enumerable: false });
+    Object.defineProperty(report, 'deletedFiles', { value: deletedFiles, enumerable: false });
     return report;
     } finally { index._endOp(); }
 }

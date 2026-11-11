@@ -87,9 +87,9 @@ describe('check --staged: the git index decides, the worktree does not', () => {
         const dir = repo({ 'lib.py': LIB, 'use.py': USE });
         try {
             // Staged: an inert edit. Unstaged: a new required parameter.
-            write(dir, 'lib.py', 'def widened(a):\n    print(a)\n    return a\n');
+            write(dir, 'lib.py', 'def widened(a):\n    print("staged")\n    return a\n');
             git(dir, 'add', 'lib.py');
-            write(dir, 'lib.py', 'def widened(a, b):\n    print(a)\n    return a\n');
+            write(dir, 'lib.py', 'def widened(a, b):\n    print("staged")\n    return a\n');
             assert.deepStrictEqual(verdicts(staged(dir)), ['widened:modified=ready']);
             // The worktree check sees the other change.
             const worktree = execute(idx(dir), 'check', {}).result;
@@ -223,6 +223,90 @@ describe('check --staged: the git index decides, the worktree does not', () => {
         });
         assert.match(text, /CHECK DID NOT RUN \[staged-snapshot-unavailable\]/);
         assert.match(text, /This is not a pass, and says nothing about the worktree\./);
+    });
+
+    it('a path git was told to skip or to assume unchanged is still part of the staged tree', () => {
+        // skip-worktree: the caller is staged and absent from disk.
+        let dir = repo({ 'lib.py': LIB, 'use.py': USE });
+        try {
+            write(dir, 'lib.py', 'def widened(a, b):\n    return a\n');
+            git(dir, 'add', 'lib.py');
+            git(dir, 'update-index', '--skip-worktree', 'use.py');
+            fs.unlinkSync(path.join(dir, 'use.py'));
+            const live = idx(dir);
+            assert.deepStrictEqual(worktreeMatchesIndex(dir, live),
+                { same: false, why: 'use.py is marked assume-unchanged or skip-worktree: git does not compare it' });
+            const result = staged(dir);
+            assert.deepStrictEqual([result.trust.status, result.changed[0].mismatches.map(site => site.file)],
+                ['BLOCKED', ['use.py']]);
+        } finally { rm(dir); }
+        // assume-unchanged: an unstaged repair git does not report.
+        dir = repo({ 'lib.py': LIB, 'use.py': USE });
+        try {
+            write(dir, 'lib.py', 'def widened(a, b):\n    return a\n');
+            git(dir, 'add', 'lib.py');
+            git(dir, 'update-index', '--assume-unchanged', 'use.py');
+            write(dir, 'use.py', USE.replace('widened(1)', 'widened(1, 2)'));
+            assert.strictEqual(worktreeMatchesIndex(dir, idx(dir)).same, false);
+            assert.strictEqual(staged(dir).trust.status, 'BLOCKED');
+            // The worktree check says which files git will not report.
+            const worktree = execute(idx(dir), 'check', {}).result;
+            assert.ok((worktree.notes || []).some(note =>
+                /1 tracked path\(s\) are marked assume-unchanged or skip-worktree \(use\.py\)/.test(note)));
+        } finally { rm(dir); }
+    });
+
+    it('a checked-out submodule is exported at the commit the index names', () => {
+        const sub = repo({ 'use.py': USE });
+        const dir = repo({ 'lib.py': LIB });
+        try {
+            git(dir, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'vendor');
+            git(dir, 'commit', '-q', '-m', 'submodule');
+            // The submodule's worktree moves on; the index still names the
+            // commit whose call site passes one argument.
+            write(dir, 'vendor/use.py', USE.replace('widened(1)', 'widened(1, 2)'));
+            write(dir, 'lib.py', 'def widened(a, b):\n    return a\n');
+            git(dir, 'add', 'lib.py');
+            const target = resolveTarget(idx(dir), { staged: true });
+            try {
+                assert.strictEqual(target.ephemeral, true);
+                assert.strictEqual(fs.readFileSync(path.join(target.index.root, 'vendor', 'use.py'), 'utf8'), USE);
+            } finally { target.dispose(); }
+        } finally { rm(dir); rm(sub); }
+    });
+
+    it('a submodule the configuration says to ignore is still compared', () => {
+        const sub = repo({ 'use.py': USE });
+        const dir = repo({ 'lib.py': LIB });
+        try {
+            git(dir, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'vendor');
+            git(dir, 'commit', '-q', '-m', 'submodule');
+            assert.strictEqual(worktreeMatchesIndex(dir).same, true);
+            // The submodule moves to a commit the index does not name.
+            write(dir, 'vendor/use.py', USE.replace('widened(1)', 'widened(1, 2)'));
+            git(path.join(dir, 'vendor'), 'commit', '-q', '-am', 'moved on');
+            git(dir, 'config', 'diff.ignoreSubmodules', 'all');
+            git(dir, 'config', 'submodule.vendor.ignore', 'all');
+            assert.strictEqual(worktreeMatchesIndex(dir).same, false);
+        } finally { rm(dir); rm(sub); }
+    });
+
+    it('impact --staged declines when the staged tree cannot be exported', () => {
+        const dir = repo({ 'lib.py': LIB, 'use.py': USE, '.gitattributes': '*.py filter=unavailable\n' });
+        try {
+            write(dir, 'lib.py', 'def widened(a, b):\n    return a\n');
+            git(dir, 'add', 'lib.py');
+            write(dir, 'lib.py', LIB); // unstaged repair
+            git(dir, 'config', 'filter.unavailable.smudge', 'false');
+            git(dir, 'config', 'filter.unavailable.required', 'true');
+            const index = idx(dir);
+            const impact = execute(index, 'impact', { staged: true });
+            assert.strictEqual(impact.ok, false);
+            assert.match(impact.error, /^The staged tree could not be exported and indexed \(staged-snapshot-unavailable: .*\); nothing was analyzed\.$/);
+            assert.doesNotMatch(impact.error, /ucn-staged-/, 'no temporary path in the message');
+            const checkedResult = execute(index, 'check', { staged: true }).result;
+            assert.deepStrictEqual([checkedResult.ok, checkedResult.status], [false, 'staged-snapshot-unavailable']);
+        } finally { rm(dir); }
     });
 
     it('the snapshot is never saved and leaves nothing behind', () => {

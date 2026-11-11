@@ -5906,7 +5906,99 @@ function isEntryPoint(symbol) {
     return getEntryPointKind(symbol) !== null;
 }
 
+const CLASS_DECLARATION_NODES = new Set(['class_declaration', 'abstract_class_declaration', 'class']);
+
+const isStaticMember = member => member.children.some(part => part.type === 'static');
+const isHiddenMember = node => node.namedChildren.some(part =>
+    part.type === 'accessibility_modifier' && part.text !== 'public');
+
+/**
+ * Does this class declare a private or protected INSTANCE member?
+ * TypeScript compares such a class by declaration: only its own instances
+ * are assignable to it. A class with none is compared by shape, like an
+ * interface: an object literal or another class with the same members is
+ * one. A static member belongs to the constructor, not to the values, and
+ * a constructor parameter with a modifier is a member.
+ *
+ * @param {Set<number>} [ignoredLines] members that start on these lines
+ *   are not counted: the class as it was before a change that added them
+ */
+function classHasNominalMember(classNode, ignoredLines = null) {
+    const body = classNode && classNode.childForFieldName('body');
+    if (!body) return false;
+    const ignored = node => !!ignoredLines && ignoredLines.has(node.startPosition.row + 1);
+    for (const member of body.namedChildren) {
+        if (ignored(member) || isStaticMember(member)) continue;
+        const name = member.childForFieldName('name');
+        if (isHiddenMember(member) || (name && name.type === 'private_property_identifier')) return true;
+        if (name && name.text === 'constructor') {
+            const parameters = member.childForFieldName('parameters');
+            for (const parameter of parameters ? parameters.namedChildren : []) {
+                if (!ignored(parameter) && isHiddenMember(parameter)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * How the member `name` of a class, declared on `line`, takes part in the
+ * type of the class's values: 'instance' (every value has it), 'optional'
+ * (`m?(): T`), 'static' (a member of the constructor), or null when the
+ * class body has no such member.
+ */
+function classMemberRole(classNode, name, line) {
+    const body = classNode && classNode.childForFieldName('body');
+    for (const member of body ? body.namedChildren : []) {
+        const nameNode = member.childForFieldName('name');
+        if (!nameNode || nameNode.text !== name) continue;
+        if (line < member.startPosition.row + 1 || line > member.endPosition.row + 1) continue;
+        if (isStaticMember(member)) return 'static';
+        return member.children.some(part => part.type === '?') ? 'optional' : 'instance';
+    }
+    return null;
+}
+
+const LITERAL_KEY_NODES = new Set(['property_identifier', 'string', 'number']);
+const literalKeyText = node => (node.type === 'string' ? node.text.slice(1, -1) : node.text);
+
+/**
+ * Members of the object literal that starts on `line` and is the whole
+ * value of a declaration with a type annotation (`const box: Box = {..}`).
+ * `open`: what the literal has cannot be read from its keys (a spread, a
+ * computed key), or the literal is not the declared value itself (an
+ * assertion or a call around it decides its type).
+ * @returns {{names: Set<string>, open: boolean}|null} null: no object
+ *   literal starts on that line
+ */
+function typedLiteralMembers(root, line) {
+    const objects = root.descendantsOfType('object', { row: line - 1, column: 0 }, { row: line, column: 0 })
+        .filter(node => node.startPosition.row + 1 === line);
+    if (objects.length === 0) return null;
+    const declared = objects.filter(node => {
+        const holder = node.parent;
+        return holder && holder.type === 'variable_declarator' && holder.childForFieldName('type') &&
+            holder.childForFieldName('value')?.id === node.id;
+    });
+    const names = new Set();
+    if (declared.length !== 1) return { names, open: true };
+    let open = false;
+    for (const member of declared[0].namedChildren) {
+        if (member.type === 'comment') continue;
+        const key = member.type === 'pair' ? member.childForFieldName('key')
+            : member.type === 'method_definition' ? member.childForFieldName('name')
+                : member.type === 'shorthand_property_identifier' ? member : null;
+        if (key && (LITERAL_KEY_NODES.has(key.type) || key.type === 'shorthand_property_identifier')) names.add(literalKeyText(key));
+        else open = true;
+    }
+    return { names, open };
+}
+
 module.exports = {
+    classHasNominalMember,
+    classMemberRole,
+    typedLiteralMembers,
+    CLASS_DECLARATION_NODES,
     findFunctions,
     findClasses,
     findStateObjects,

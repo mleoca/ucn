@@ -2339,7 +2339,12 @@ const HANDLERS = {
             target = resolveTarget(index, { staged: !!p.staged });
         } catch (e) {
             if (!e || e.code !== 'staged-snapshot-unavailable') throw e;
-            // Outside a repository the diff itself says so, below.
+            // Outside a repository the diff itself says so, below. Anything
+            // else is a staged tree that could not be read: an answer from
+            // the worktree would be an answer about another tree.
+            if (e.reason !== 'not-a-repository') {
+                return { ok: false, error: `The staged tree could not be exported and indexed (${e.message}); nothing was analyzed.` };
+            }
         }
         let result;
         try {

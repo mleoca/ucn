@@ -14,8 +14,8 @@
  *   return      where the language takes the return contract from the body
  *               (trait `inferredReturnForms`: no annotation, a placeholder
  *               type, an opaque type, a body instantiated per caller), the
- *               expressions that produce the result and everything that
- *               binds a name they use.
+ *               expressions that produce the result and every statement
+ *               connected to them through a variable name.
  *   members     where a member's type is whatever the class's methods
  *               assign to it (trait `memberTypesFromAssignments`), the
  *               assignments the body makes to members of its receiver.
@@ -37,6 +37,21 @@ const { CALLABLE_NODES, COMMENT_NODES } = require('./ast-analysis');
 // Statements that end the callable with a value.
 const RESULT_NODES = new Set(['return_statement', 'return_expression']);
 const YIELD_NODES = new Set(['yield', 'yield_expression', 'yield_statement']);
+
+// Statements that end a path of the callable without a value.
+const EXIT_NODES = new Map([
+    ['throw_statement', 'throw'], ['raise_statement', 'throw'],
+    ['break_statement', 'break'], ['continue_statement', 'continue'],
+]);
+const ASSERT_NODES = new Set(['assert_statement']);
+// Statements a condition decides: with one that names nothing (`while
+// True`, `for (;;)`, `if False`) the checker knows which way it goes.
+const CONDITION_NODES = new Set(['while_statement', 'do_statement', 'for_statement', 'if_statement', 'elif_clause']);
+// A context manager can swallow what its block raises: whether the code
+// after the block is reached is a property of the manager.
+const MANAGER_NODES = new Set(['with_statement', 'with_clause']);
+const CALL_NODES = new Set(['call_expression', 'call']);
+const AWAIT_NODES = new Set(['await_expression', 'await']);
 
 // Nodes that hold declarations rather than being one: a callable's
 // declaration never grows past them.
@@ -188,46 +203,266 @@ function bindingTargets(node) {
     return fields.map(field => node.childForFieldName(field)).filter(Boolean);
 }
 
+// Statement-level nodes: the units a body is made of. A compound statement
+// is the unit of its own header (a condition, a loop target, an `except`
+// pattern); the statements it holds are units of their own.
+const STATEMENT_SHAPE = /(?:_statement|_declaration|_definition|_clause|^switch_case|^switch_default)$/;
+const VARIABLE_LEAVES = new Set([
+    'identifier', 'shorthand_property_identifier', 'shorthand_property_identifier_pattern',
+]);
+
+/** A member or keyword name: spelled like a variable, naming none. */
+function namesNoVariable(node) {
+    const parent = node.parent;
+    if (!parent) return false;
+    const member = parent.childForFieldName('attribute') || parent.childForFieldName('property') ||
+        (parent.type === 'keyword_argument' ? parent.childForFieldName('name') : null);
+    return !!member && member.id === node.id;
+}
+
+// A member access, and the field that holds the member's name.
+const MEMBER_NODES = new Map([['member_expression', 'property'], ['attribute', 'attribute']]);
+
+/** `this.a.b` as ['this', 'a', 'b'], or null when it is not a plain chain. */
+function chainOf(node) {
+    if (node.type === 'this' || VARIABLE_LEAVES.has(node.type)) return [node.text];
+    const field = MEMBER_NODES.get(node.type);
+    if (!field) return null;
+    const object = node.childForFieldName('object');
+    const member = node.childForFieldName(field);
+    if (!object || !member || member.childCount > 0) return null;
+    const head = chainOf(object);
+    return head ? [...head, member.text] : null;
+}
+
+/** Do two references name the same thing, or one a part of the other? */
+function overlaps(a, b) {
+    return a === b || a.startsWith(`${b}.`) || b.startsWith(`${a}.`);
+}
+
 /**
- * The return derivation of a body: each result expression with the control
- * nesting it sits under (wrapping a `return` in an `if` lets the callable
- * fall off its end), then every node that binds a name those expressions
- * use, closed over the names the bindings use in turn.
+ * A unit's own tokens and what it refers to: everything in the node except
+ * the statements it holds.
+ *
+ * A reference is a variable name, with one refinement. A member of the
+ * receiver (`this.count`, `self.count`) is its own reference: a type
+ * checker narrows and assigns `this.count` apart from `this.total`, and
+ * the receiver is no union a test of one member could narrow as a whole.
+ * Members of anything else stay under the variable (a test of `shape.kind`
+ * narrows `shape`, and with it `shape.radius`). A call on the receiver
+ * refers to the receiver itself: what it asserts about `this` is in its
+ * declaration.
+ *
+ * @param {object} [options] - { selfName: the receiver parameter's name
+ *   where the receiver is one, omit: a node whose references are not
+ *   collected (the callee of a call shown to do nothing but return) }
  */
-function returnDerivation(body) {
-    const parts = [];
+function unitOf(node, options = {}) {
+    const { selfName = null, omit = null } = options;
+    const tokens = [];
     const names = new Set();
+    let yields = false;
+    const isReceiver = text => text === 'this' || (selfName !== null && text === selfName);
+    const visit = (candidate, top, quiet) => {
+        if (COMMENT_NODES.has(candidate.type)) return;
+        if (!top && candidate.isNamed && STATEMENT_SHAPE.test(candidate.type)) return;
+        if (YIELD_NODES.has(candidate.type)) yields = true;
+        if (!quiet && omit && sameNode(candidate, omit)) quiet = true;
+        if (!quiet && MEMBER_NODES.has(candidate.type)) {
+            const chain = chainOf(candidate);
+            if (chain && isReceiver(chain[0])) {
+                const parent = candidate.parent;
+                const called = !!parent && CALL_NODES.has(parent.type) &&
+                    sameNode(parent.childForFieldName('function'), candidate);
+                const reach = called ? chain.slice(0, -1) : chain;
+                names.add(reach.slice(0, 2).join('.'));
+                quiet = true;
+            }
+        }
+        if (candidate.childCount === 0) {
+            tokens.push([candidate.type, candidate.text]);
+            if (!quiet && (candidate.type === 'this' ||
+                (VARIABLE_LEAVES.has(candidate.type) && !namesNoVariable(candidate)))) names.add(candidate.text);
+            return;
+        }
+        for (const child of candidate.children) visit(child, false, quiet);
+    };
+    visit(node, true, false);
+    return { tokens, names, yields };
+}
+
+/** The callee of a statement that is nothing but a call, or null. */
+function bareCallee(statement) {
+    if (statement.type !== 'expression_statement' || statement.namedChildCount !== 1) return null;
+    let expression = statement.namedChildren[0];
+    if (AWAIT_NODES.has(expression.type)) expression = expression.namedChildren[0];
+    if (!expression || !CALL_NODES.has(expression.type)) return null;
+    return expression.childForFieldName('function');
+}
+
+/**
+ * Can a statement that only calls `callee` be shown to return to the next
+ * statement? A type checker ends the path at a call it is TOLD never
+ * returns (a declared `never` / `NoReturn`), so the question is what the
+ * callee is declared as:
+ *   - a name the callable binds itself (a parameter, a local): unknown;
+ *   - a function or an own method of the project whose every declaration
+ *     says nothing of the kind (`facts.context.returning`);
+ *   - a builtin of the language that returns (traits `ambientCallables`
+ *     minus `ambientNeverCallables`; members of
+ *     `ambientReturningNamespaces`), unless the file gives the name
+ *     another meaning;
+ *   - anything else (a member of a value, an import from outside the
+ *     project): unknown, which is no.
+ */
+function provablyReturns(callee, facts) {
+    const { traits, context, locals, ownerClass, selfName } = facts;
+    const shadowed = name => locals.has(name) || !!(context && context.fileNames && context.fileNames.has(name));
+    if (callee.type === 'identifier') {
+        const name = callee.text;
+        if (locals.has(name)) return false;
+        if (context && context.returning && context.returning(name, null)) return true;
+        return !!traits.ambientCallables && traits.ambientCallables.has(name) && !shadowed(name) &&
+            !(traits.ambientNeverCallables && traits.ambientNeverCallables.has(name));
+    }
+    const object = callee.childForFieldName('object');
+    const member = callee.childForFieldName('property') || callee.childForFieldName('attribute');
+    if (!object || !member) return false;
+    if (object.type === 'this' || (selfName && object.type === 'identifier' && object.text === selfName)) {
+        return !!(ownerClass && context && context.returning && context.returning(member.text, ownerClass));
+    }
+    let root = object;
+    while (root.childForFieldName('object')) root = root.childForFieldName('object');
+    return root.type === 'identifier' && !!traits.ambientReturningNamespaces &&
+        traits.ambientReturningNamespaces.has(root.text) && !shadowed(root.text);
+}
+
+/**
+ * Does this declaration say nothing that could make a call of it end the
+ * caller's path? Yes for a function or method with a body and either no
+ * return annotation or one made of keywords only (`void`, `None`) that is
+ * not a never type. No (unknown) for everything a checker could read a
+ * never type from: an annotation that names a type (it may be an alias of
+ * one), a decorator (it can replace the callable), a function held by a
+ * typed variable or field (it has that type), a declaration with no body
+ * (an overload signature).
+ *
+ * @param {string[]} neverTypes - trait `neverReturnTypes`
+ */
+function declaresPlainReturn(root, symbol, neverTypes) {
+    if (!root || !symbol) return false;
+    const range = rangeOf(symbol);
+    const node = callableNodeOf(root, range);
+    if (!node || node.hasError || !node.childForFieldName('body')) return false;
+    // Everything the callable is written inside, up to the block or body
+    // that holds its declaration (a symbol's range can be the function
+    // value alone, without the variable it is assigned to).
+    for (let up = node; up && !CONTAINER_NODES.has(up.type); up = up.parent) {
+        if (up.type === 'decorated_definition' || up.namedChildren.some(child => child.type === 'decorator')) return false;
+        if (up.previousNamedSibling && LEADING_NODES.has(up.previousNamedSibling.type)) return false;
+        if (!sameNode(up, node) && up.childForFieldName('type')) return false;
+    }
+    const written = node.childForFieldName('return_type');
+    if (!written) return true;
+    return !tokensOf(written).some(([type, text]) =>
+        /identifier|string/.test(type) || (neverTypes || []).includes(text));
+}
+
+/**
+ * The return derivation of a body: what the type of its result can depend
+ * on, read conservatively from syntax.
+ *
+ * The result expressions come first, each with the control nesting it sits
+ * under (wrapping a `return` in an `if` lets the callable fall off its
+ * end). Then every statement connected to them through a variable name, in
+ * any position and transitively: a binding of a returned name, a call that
+ * mutates the object it names (`xs.push("text")` before `return xs`), a
+ * condition that narrows it (`typeof x === 'number'` before `return x`), a
+ * closure that assigns it, and whatever those statements name in turn;
+ * and every statement that sits under a condition of the slice. A type
+ * checker follows fewer of these; which ones is its business, and every
+ * one it does follow is here.
+ *
+ * Last, the statements that END a path, whatever they name: the result is
+ * the union of the ends that can be reached, so removing the `throw` at
+ * the end of a function gives it one more (falling off the end). These are
+ * `throw` / `raise`, `break` / `continue`, an assertion, a context
+ * manager, a condition that names nothing (`while True`, `if False`), and
+ * a statement that only calls something not shown to return
+ * (`provablyReturns`). Each is kept by kind and nesting, in source order
+ * with the slice: what is thrown, or what a call is passed, changes no
+ * type.
+ *
+ * A statement that shares no name with the slice and ends no path cannot
+ * reach the result.
+ *
+ * @param {object} [facts] - what `provablyReturns` asks; without it every
+ *   bare call is one that may not return
+ */
+function returnDerivation(body, facts = null) {
+    const units = [];
     // An expression body is the result.
-    if (!body.namedChildren.some(child => child.type.endsWith('statement') || child.type.endsWith('declaration')) &&
+    if (!body.namedChildren.some(child => STATEMENT_SHAPE.test(child.type)) &&
         !['block', 'statement_block', 'compound_statement'].includes(body.type)) {
-        parts.push({ at: body.startIndex, text: JSON.stringify([[], tokensOf(body)]) });
-        identifiersOf(body, names);
+        units.push({ at: body.startIndex, result: true, path: [], ...unitOf(body, { selfName: facts && facts.selfName }) });
     }
-    const bindings = [];
-    walkOwn(body, (node, path) => {
-        if (RESULT_NODES.has(node.type) || YIELD_NODES.has(node.type)) {
-            parts.push({ at: node.startIndex, text: JSON.stringify([path, tokensOf(node)]) });
-            identifiersOf(node, names);
-            return false;
+    const collect = (container, path, nested, holder) => {
+        for (const child of container.namedChildren) {
+            if (COMMENT_NODES.has(child.type)) continue;
+            const inner = nested || CALLABLE_NODES.has(child.type);
+            if (STATEMENT_SHAPE.test(child.type)) {
+                // A statement that only calls something shown to return:
+                // the call itself narrows nothing and ends nothing.
+                const callee = nested ? null : bareCallee(child);
+                const plainCall = !!(callee && facts && provablyReturns(callee, facts));
+                const unit = {
+                    at: child.startIndex,
+                    path,
+                    // The compound statement this one sits under.
+                    holder,
+                    ...unitOf(child, { selfName: facts && facts.selfName, omit: plainCall ? callee : null }),
+                };
+                // A `return` inside a closure is the closure's result, and
+                // what ends the closure's path ends only that.
+                unit.result = !nested && (RESULT_NODES.has(child.type) || unit.yields);
+                if (!nested && !unit.result) {
+                    if (EXIT_NODES.has(child.type)) unit.exit = [EXIT_NODES.get(child.type)];
+                    else if (ASSERT_NODES.has(child.type) || MANAGER_NODES.has(child.type)) unit.exit = [child.type, unit.tokens];
+                    else if (CONDITION_NODES.has(child.type) && unit.names.size === 0) unit.exit = ['static', unit.tokens];
+                    else if (callee && !plainCall) unit.exit = ['call', callee.text];
+                }
+                units.push(unit);
+                collect(child, [...path, child.type], inner, unit);
+            } else {
+                collect(child, path, inner, holder);
+            }
         }
-        if (bindingTargets(node).length > 0) bindings.push(node);
-        return true;
-    });
-    const taken = new Set();
-    for (let changed = true; changed;) {
-        changed = false;
-        for (const node of bindings) {
-            if (taken.has(node.id)) continue;
-            const bound = new Set();
-            for (const target of bindingTargets(node)) identifiersOf(target, bound);
-            if (![...bound].some(name => names.has(name))) continue;
-            taken.add(node.id);
-            parts.push({ at: node.startIndex, text: JSON.stringify(tokensOf(node)) });
-            identifiersOf(node, names);
-            changed = true;
+    };
+    collect(body, [], false, null);
+    const slice = new Set(units.filter(unit => unit.result));
+    const names = new Set();
+    for (const unit of slice) for (const name of unit.names) names.add(name);
+    const shares = unit => {
+        for (const mine of unit.names) for (const name of names) if (overlaps(mine, name)) return true;
+        return false;
+    };
+    // Data dependence: a shared variable name. Control dependence: a
+    // statement under a condition that is in the slice decides what that
+    // condition lets through (`if x is None: fail()` narrows `x` after it
+    // only while `fail()` never returns).
+    const held = unit => { for (let up = unit.holder; up; up = up.holder) if (slice.has(up)) return true; return false; };
+    for (let grew = slice.size > 0; grew;) {
+        grew = false;
+        for (const unit of units) {
+            if (slice.has(unit)) continue;
+            if (!held(unit) && !shares(unit)) continue;
+            slice.add(unit);
+            for (const name of unit.names) names.add(name);
+            grew = true;
         }
     }
-    return JSON.stringify(parts.sort((a, b) => a.at - b.at).map(part => part.text));
+    return JSON.stringify(units.filter(unit => slice.has(unit) || unit.exit).sort((a, b) => a.at - b.at)
+        .map(unit => (slice.has(unit) ? [unit.path, unit.tokens] : ['exit', unit.path, ...unit.exit])));
 }
 
 /**
@@ -278,10 +513,14 @@ function returnFormOf(node, declaration, symbol, traits) {
  *
  * @param {object} root - syntax tree root of that revision
  * @param {string} language
- * @param {object} symbol - { startLine, endLine, sourceSpan? } in that revision
+ * @param {object} symbol - { startLine, endLine, sourceSpan?, className? } in that revision
+ * @param {object} [context] - what the revision's file and the project say
+ *   about callees: { fileNames: Set of names the file declares or imports,
+ *   returning(name, ownerClass): every project declaration of the name
+ *   (of the class's own method) is one a call of which returns }
  * @returns {{header, generator, returnForm, inferred, derivation}|null}
  */
-function callableContract(root, language, symbol) {
+function callableContract(root, language, symbol, context = null) {
     if (!root || !symbol) return null;
     const range = rangeOf(symbol);
     const node = callableNodeOf(root, range);
@@ -331,7 +570,22 @@ function callableContract(root, language, symbol) {
     if (inferred && body) {
         // Expression by expression where the form is "no annotation"; the
         // whole body where the compiler deduces the type from all of it.
-        derivation = returnForm === 'unannotated' ? returnDerivation(body) : JSON.stringify(tokensOf(body));
+        if (returnForm === 'unannotated') {
+            // Names the callable binds itself: its parameters and whatever
+            // its own statements assign.
+            const locals = new Set();
+            const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
+            if (parameters) identifiersOf(parameters, locals);
+            walkOwn(body, candidate => {
+                for (const target of bindingTargets(candidate)) identifiersOf(target, locals);
+                return true;
+            });
+            const first = parameters && parameters.namedChildren[0] ? [...identifiersOf(parameters.namedChildren[0])][0] : null;
+            const selfName = symbol.className && first && (traits.selfParam || []).includes(first) ? first : null;
+            derivation = returnDerivation(body, { traits, context, locals, ownerClass: symbol.className || null, selfName });
+        } else {
+            derivation = JSON.stringify(tokensOf(body));
+        }
     }
     // Where a member's type is whatever the class's methods assign to it
     // (trait `memberTypesFromAssignments`), every assignment to a member of
@@ -493,6 +747,18 @@ function providedNames(fileEntry, traits) {
     return { names, open };
 }
 
+/** Where each module-level import binding of a file comes from, by local name. */
+function sourcesOf(fileEntry) {
+    const sources = new Map();
+    for (const binding of (fileEntry && fileEntry.importBindings) || []) {
+        if (binding.lexicalScopeStartLine != null) continue;
+        const local = binding.alias || binding.name;
+        const source = `${binding.module}\0${binding.name}\0${binding.kind || ''}`;
+        sources.set(local, sources.has(local) ? `${sources.get(local)}\n${source}` : source);
+    }
+    return sources;
+}
+
 /** Multiset difference: entries of `before` that `after` does not have. */
 function removedFrom(before, after) {
     const remaining = new Map();
@@ -510,7 +776,7 @@ function removedFrom(before, after) {
  * What a change did to a module outside its declarations.
  *
  * @returns {{removedNames, removedExports, starExportRemoved, importsRemoved,
- *   importsAdded, addedBindings, removedBindings, codeChanged}}
+ *   importsAdded, addedBindings, removedBindings, reboundBindings, codeChanged}}
  *   removedNames: names importers could take from the module and no longer
  *   can; removedExports: those of them the module exported explicitly;
  *   removedBindings / addedBindings: local names its imports no longer /
@@ -542,6 +808,10 @@ function moduleChange(before, after, traits) {
         // longer does: which names that took away is not written here.
         starExportRemoved: was.open && !is.open,
         removedBindings: [...hadLocals].filter(name => !hasLocals.has(name)).sort(),
+        // Local names that are still imported, from somewhere else or as
+        // something else: every use of the name in the file now means it.
+        reboundBindings: [...hasLocals].filter(name => hadLocals.has(name) &&
+            sourcesOf(before.fileEntry).get(name) !== sourcesOf(after.fileEntry).get(name)).sort(),
         // Modules the file imported or included, binding no name, and no
         // longer does: they were there for what importing them does.
         removedBareImports: removedFrom(
@@ -565,5 +835,5 @@ function parseRevision(content, language) {
 
 module.exports = {
     callableContract, classifyChange, baseCounterpart, parseRevision,
-    moduleStatements, providedNames, moduleChange,
+    declaresPlainReturn, moduleStatements, providedNames, moduleChange,
 };

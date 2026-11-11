@@ -13,7 +13,9 @@
  *
  * The live index answers for the staged snapshot only when the worktree
  * provably holds the same thing:
- *   (a) no tracked path has an unstaged modification or deletion,
+ *   (a) no tracked path has an unstaged modification or deletion, and none
+ *       is marked assume-unchanged or skip-worktree (for those git reports
+ *       no difference whatever the worktree holds),
  *   (b) no untracked path exists that git does not ignore,
  *   (c) no ignored file exists that analysis reads as metadata
  *       (ANALYSIS_METADATA: the names every reader of a non-source file
@@ -22,7 +24,9 @@
  * When any of the three is false or cannot be established, the snapshot is
  * built: the git index is exported to a temporary directory and indexed
  * there, with the staged file list as the tracked inventory (a tracked file
- * that matches a .gitignore rule stays in). That index is never saved.
+ * that matches a .gitignore rule stays in). Every staged file is exported,
+ * skip-worktree paths included, and a checked-out submodule at the commit
+ * the index names. That index is never saved.
  *
  * When the export cannot be built the answer is that the check could not
  * run (`staged-snapshot-unavailable`), never an answer about the worktree.
@@ -60,11 +64,28 @@ function isAnalysisMetadata(relativePath) {
     return METADATA_NAMES.has(base) || ANALYSIS_METADATA_SUFFIXES.some(suffix => base.endsWith(suffix));
 }
 
-function git(cwd, args) {
+function git(cwd, args, env = null) {
     return execFileSync('git', args, {
         cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+        ...(env && { env: { ...process.env, ...env } }),
     });
+}
+
+/**
+ * Tracked paths under `root` that git has been told not to compare with
+ * the worktree: assume-unchanged (`h`) and skip-worktree (`S`, `s`). For
+ * these `git diff` reports nothing whatever the file holds, or whether it
+ * exists, so a quiet diff says nothing about them.
+ * @returns {{path: string, skipWorktree: boolean}[]}
+ */
+function flaggedPaths(root) {
+    const flagged = [];
+    for (const record of git(root, ['ls-files', '-v', '-z', '--', '.']).split('\0')) {
+        if (record.length < 3 || record[0] === 'H') continue;
+        flagged.push({ path: record.slice(2), skipWorktree: record[0] === 'S' || record[0] === 's' });
+    }
+    return flagged;
 }
 
 /**
@@ -76,8 +97,16 @@ function git(cwd, args) {
  */
 function worktreeMatchesIndex(root, index = null) {
     try {
+        // A path git was told not to compare is one a quiet diff cannot
+        // vouch for: the worktree may hold anything there, or nothing.
+        const flagged = flaggedPaths(root);
+        if (flagged.length > 0) {
+            return { same: false, why: `${flagged[0].path} is marked assume-unchanged or skip-worktree: git does not compare it` };
+        }
         try {
-            git(root, ['diff', '--quiet', '--', '.']);
+            // Submodules are compared whatever the configuration says to
+            // ignore: the snapshot exports them at the staged commit.
+            git(root, ['diff', '--quiet', '--ignore-submodules=none', '--', '.']);
         } catch (error) {
             if (error.status === 1) return { same: false, why: 'tracked files have unstaged changes' };
             throw error;
@@ -113,10 +142,87 @@ function worktreeMatchesIndex(root, index = null) {
     }
 }
 
-function unavailable(detail, cause) {
+function unavailable(detail, cause, reason = null) {
     const error = new UcnError(`staged-snapshot-unavailable: ${detail}`, cause ? { cause } : undefined);
     error.code = 'staged-snapshot-unavailable';
+    // 'not-a-repository': there is no git index to describe at all.
+    if (reason) error.reason = reason;
     return error;
+}
+
+/**
+ * Write every file of the git index under `exportRoot`, whatever the
+ * worktree holds: a path marked skip-worktree is staged like any other.
+ * Git older than the option that says so gets the same through a private
+ * copy of the index with the marks cleared; the repository's index is
+ * never written.
+ */
+function exportIndex(gitRoot, exportRoot) {
+    const prefix = `--prefix=${exportRoot}${path.sep}`;
+    try {
+        git(gitRoot, ['checkout-index', '--all', '--force', '--ignore-skip-worktree-bits', prefix]);
+        return;
+    } catch (error) {
+        if (!/unknown option|usage:/i.test(String(error.stderr || error.message))) throw error;
+    }
+    // The index git itself would read: a hook runs with its own.
+    const indexFile = path.resolve(gitRoot, process.env.GIT_INDEX_FILE ||
+        git(gitRoot, ['rev-parse', '--git-path', 'index']).trim());
+    const privateIndex = path.join(exportRoot, '..', `${path.basename(exportRoot)}.index`);
+    try {
+        fs.copyFileSync(indexFile, privateIndex);
+        const env = { GIT_INDEX_FILE: privateIndex };
+        const skipped = git(gitRoot, ['ls-files', '-v', '-z'], env).split('\0')
+            .filter(record => record[0] === 'S' || record[0] === 's').map(record => record.slice(2));
+        if (skipped.length > 0) {
+            execFileSync('git', ['update-index', '--no-skip-worktree', '-z', '--stdin'], {
+                cwd: gitRoot, input: skipped.join('\0') + '\0', env: { ...process.env, ...env },
+                stdio: ['pipe', 'pipe', 'pipe'],
+            });
+        }
+        git(gitRoot, ['checkout-index', '--all', '--force', prefix], env);
+    } finally {
+        fs.rmSync(privateIndex, { force: true });
+    }
+}
+
+/**
+ * Submodules of the staged tree: each is a commit the index names, not
+ * files. One that is checked out here is exported at THAT commit (what
+ * the commit being made will build against); one that is not checked out
+ * is absent from the worktree's analysis too, and is named in a note.
+ * @returns {{files: string[], notes: string[]}} files relative to the project
+ */
+function exportSubmodules(projectRoot, snapshotRoot) {
+    const files = [];
+    const notes = [];
+    for (const record of git(projectRoot, ['ls-files', '-s', '-z', '--', '.']).split('\0')) {
+        const match = /^160000 ([0-9a-f]+) \d+\t(.+)$/s.exec(record);
+        if (!match) continue;
+        const [, commit, relative] = match;
+        const worktree = path.join(projectRoot, relative);
+        let checkedOut;
+        try { checkedOut = fs.existsSync(path.join(worktree, '.git')); } catch (_) { checkedOut = false; }
+        if (!checkedOut) {
+            notes.push(`submodule ${relative} is not checked out: its code is not part of the staged analysis`);
+            continue;
+        }
+        const target = path.join(snapshotRoot, relative);
+        const archive = path.join(snapshotRoot, '..', `${path.basename(snapshotRoot)}.${files.length}.tar`);
+        try {
+            fs.mkdirSync(target, { recursive: true });
+            git(worktree, ['archive', '--format=tar', '-o', archive, commit]);
+            execFileSync('tar', ['-xf', archive, '-C', target], { stdio: ['ignore', 'pipe', 'pipe'] });
+            for (const name of git(worktree, ['ls-tree', '-r', '--name-only', '-z', commit]).split('\0')) {
+                if (name) files.push(`${relative}/${name}`);
+            }
+        } catch (error) {
+            throw unavailable(`submodule ${relative} could not be exported at ${commit.slice(0, 10)}`, error);
+        } finally {
+            fs.rmSync(archive, { force: true });
+        }
+    }
+    return { files, notes };
 }
 
 /**
@@ -140,6 +246,10 @@ function resolveTarget(index, options = {}) {
     let listed;
     try {
         gitRoot = git(index.root, ['rev-parse', '--show-toplevel']).trim();
+    } catch (error) {
+        throw unavailable('not a git repository', error, 'not-a-repository');
+    }
+    try {
         // Staged paths under the project, relative to it.
         listed = git(index.root, ['ls-files', '--cached', '-z', '--', '.']).split('\0').filter(Boolean);
     } catch (error) {
@@ -148,20 +258,21 @@ function resolveTarget(index, options = {}) {
     let exportRoot = null;
     try {
         exportRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-staged-')));
-        git(gitRoot, ['checkout-index', '--all', '--force', `--prefix=${exportRoot}${path.sep}`]);
+        exportIndex(gitRoot, exportRoot);
         const prefix = path.relative(fs.realpathSync(gitRoot), fs.realpathSync(index.root));
         const snapshotRoot = prefix ? path.join(exportRoot, prefix) : exportRoot;
         if (!fs.existsSync(snapshotRoot)) fs.mkdirSync(snapshotRoot, { recursive: true });
-        const files = new Set(listed);
+        const submodules = exportSubmodules(index.root, snapshotRoot);
+        const files = new Set([...listed, ...submodules.files]);
         const directories = new Set();
-        for (const file of listed) {
+        for (const file of files) {
             for (let slash = file.lastIndexOf('/'); slash > 0; slash = file.lastIndexOf('/', slash - 1)) {
                 const parent = file.slice(0, slash);
                 if (directories.has(parent)) break;
                 directories.add(parent);
             }
         }
-        const gitignores = listed
+        const gitignores = [...files]
             .filter(file => file === '.gitignore' || file.endsWith('/.gitignore'))
             .map(file => path.join(snapshotRoot, file));
         const { ProjectIndex } = require('./project');
@@ -169,7 +280,7 @@ function resolveTarget(index, options = {}) {
         // Git commands about this tree run in the repository it came from.
         snapshot.repoRoot = index.root;
         snapshot.build(null, { quiet: true, gitListing: { tracked: { files, directories }, gitignores } });
-        const notes = [];
+        const notes = [...submodules.notes];
         if (!files.has('.ucn.json') && fs.existsSync(path.join(index.root, '.ucn.json'))) {
             notes.push('the .ucn.json in the worktree is not in the git index: the staged check does not apply it');
         }
@@ -184,7 +295,11 @@ function resolveTarget(index, options = {}) {
     } catch (error) {
         if (exportRoot) fs.rmSync(exportRoot, { recursive: true, force: true });
         if (error && error.code === 'staged-snapshot-unavailable') throw error;
-        throw unavailable(String(error && error.message ? error.message : error).split('\n')[0], error);
+        // What git said, not the command line (which names a temporary
+        // directory nobody can act on).
+        const said = String((error && error.stderr) || '').split('\n').map(line => line.trim()).find(Boolean) ||
+            String(error && error.message ? error.message : error).split('\n')[0];
+        throw unavailable(exportRoot ? said.split(exportRoot).join('<export>') : said, error);
     }
 }
 
@@ -210,6 +325,6 @@ function rebasePaths(value, fromRoot, toRoot, seen = new Set()) {
 }
 
 module.exports = {
-    resolveTarget, rebasePaths, worktreeMatchesIndex, isAnalysisMetadata,
+    resolveTarget, rebasePaths, worktreeMatchesIndex, flaggedPaths, isAnalysisMetadata,
     ANALYSIS_METADATA, ANALYSIS_METADATA_SUFFIXES,
 };

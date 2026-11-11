@@ -34,12 +34,15 @@
 'use strict';
 
 const { diffImpact, composeAccount, callNotResolvedEntries } = require('./analysis');
+const { providedNames } = require('./change-kinds');
+const fs = require('fs');
+const path = require('path');
 const { isValueDefinition, isTestPath } = require('./shared');
 const { langTraits } = require('../languages');
 const { assessDeletion, definiteDependentsOf, REASON_TEXT } = require('./deletion');
-const { occurrencesOutsideChange, captureHazards, HAZARD_TEXT } = require('./capture');
+const { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, HAZARD_TEXT } = require('./capture');
 const { reviewItemsOf } = require('./review-items');
-const { resolveTarget } = require('./snapshot');
+const { resolveTarget, flaggedPaths } = require('./snapshot');
 const { projectKind, submoduleOf } = require('./deletion');
 
 const VERDICT_RANK = { ready: 0, review: 1, blocked: 2 };
@@ -63,6 +66,9 @@ const MODULE_TEXT = Object.freeze({
     'downstream-exposure': 'a name left the exports of a library: consumers outside the repository may use it',
     'name-still-used': 'a name the module no longer provides is still written in a file that imports the whole module',
     'star-export-removed': 'the module no longer passes on everything another module exports; which names its importers lose is not written in it',
+    'import-rebound': 'a name the file imports now comes from somewhere else: every use of it in the file means something new',
+    'deleted-still-imported': 'the file was deleted and other files still import it',
+    'deleted-name-still-imported': 'the file was deleted and other files import a module of its name; a module outside the project may answer',
 });
 
 function summarizeAccount(account) {
@@ -152,7 +158,7 @@ function callersOf(index, name, definition) {
  * Verdict of an ADDED declaration.
  * @returns {{verdict, reasons: string[], hazards?: string[], outside?: object[]}}
  */
-function assessAddition(index, entry, definition, addedLinesByFile, account) {
+function assessAddition(index, entry, definition, addedLinesByFile, account, nonCallable = false) {
     if (!definition) return { verdict: 'review', reasons: ['declaration-not-indexed'] };
     const occurrences = occurrencesOutsideChange(index, entry.name, addedLinesByFile, definition);
     const summary = summarizeAccount(account);
@@ -169,12 +175,19 @@ function assessAddition(index, entry, definition, addedLinesByFile, account) {
     try {
         contract = require('./deadcode').contractFactsOf(index, definition, index.files.get(definition.file)?.language);
     } catch (_) { contract = null; }
-    const hazards = captureHazards(index, definition, {
-        ownerExisted: ownerExistedBefore(index, definition, addedLinesByFile),
-        contract,
-        shield,
-    });
+    const ownerExisted = ownerExistedBefore(index, definition, addedLinesByFile);
+    let shape;
+    try { shape = ownerExisted ? shapeChangeOf(index, definition, addedLinesByFile) : null; } catch (_) { shape = 'shape'; }
+    const hazards = captureHazards(index, definition, { ownerExisted, contract, shield, nonCallable, shape });
     reasons.push(...hazards);
+    // A member every value of the type must now have, and an object
+    // literal declared as that type that does not: a break, not a hazard.
+    const mustHave = hazards.includes('new-requirement') || shape === 'required';
+    const lacking = ownerExisted && mustHave ? literalsLackingMember(index, definition)
+        .filter(site => !addedLinesByFile.get(site.file)?.has(site.line)) : [];
+    if (lacking.length > 0) {
+        return { verdict: 'blocked', reasons: ['literal-lacks-new-member', ...reasons], outside: lacking };
+    }
     return {
         verdict: reasons.length > 0 ? 'review' : 'ready',
         reasons,
@@ -279,12 +292,165 @@ function assessModuleChange(index, moved) {
     // for what importing it does (a side effect, an inclusion).
     if ((moved.removedBareImports || []).length > 0) reasons.push('imports-removed');
     if (moved.removedExports.length > 0 && projectKind(index) === 'library') reasons.push('downstream-exposure');
+    if ((moved.reboundBindings || []).length > 0) reasons.push('import-rebound');
     if (moved.starExportRemoved) reasons.push('star-export-removed');
     // Loose code in a test file is the test: nothing imports it for
     // what it does when it loads.
     if (moved.codeChanged && !isTestPath(moved.relativePath)) reasons.push('module-level-code');
     if ((moved.shadowed || []).length > 0) reasons.push('name-in-use');
     return { verdict: reasons.length > 0 ? 'review' : 'ready', reasons, sites: stillUsed.sort(bySite) };
+}
+
+const SOURCE_EXTENSION = /\.[A-Za-z0-9+]+$/;
+// A file that stands for its directory when imported.
+const PACKAGE_FILE = /(?:^|\/)(?:__init__|index|mod)$/;
+
+/**
+ * Imports that named a file the change deleted, read from how each import
+ * is written (nothing resolves to a file that is gone).
+ *
+ *   definite  a specifier that can only have meant the deleted file: a
+ *             relative one that lands exactly on it (`./gone`,
+ *             `from .gone import x`), or a name inside a package of the
+ *             project that still resolves (`import pkg.gone`,
+ *             `from pkg import gone` where the package's own file does not
+ *             supply `gone` itself). Never while something else on disk
+ *             can answer the same specifier: the name with another
+ *             extension (`gone.d.ts`, `gone.pyi`), a directory of that
+ *             name, or the directory itself where a package needs no
+ *             package file (trait `packageFileOptional`);
+ *   possible  an absolute module name whose path form ends at the deleted
+ *             file (`import gone`, `#include "gone.h"`): something outside
+ *             the project may carry the same name.
+ *
+ * @returns {{definite: object[], possible: object[]}} sites (file, line)
+ */
+function importersOfDeletedFile(index, deleted) {
+    const posix = path.posix;
+    const stem = deleted.replace(SOURCE_EXTENSION, '');
+    // A package's own file stands for its directory.
+    const asDirectory = PACKAGE_FILE.test(stem) ? posix.dirname(stem) : null;
+    const lands = candidate => candidate === stem || candidate === deleted || (asDirectory !== null && candidate === asDirectory);
+    // What is left on disk beside the deleted file: the same name with
+    // another extension or as a directory, and the directory it stood for.
+    let twin = false;
+    let directoryLeft = false;
+    try {
+        const name = posix.basename(stem);
+        const beside = fs.readdirSync(path.join(index.root, posix.dirname(deleted)));
+        twin = beside.some(other => other === name || other.startsWith(`${name}.`));
+        directoryLeft = asDirectory !== null;
+    } catch (_) {
+        // The directory went with the file.
+    }
+    // Is a landing on the deleted file one nothing else can answer?
+    const final = (candidate, traits) => !twin &&
+        !(directoryLeft && candidate === asDirectory && traits.packageFileOptional);
+    // The directory a package's own file stands for, when `file` is one.
+    const packageDirectory = file => {
+        const own = String(file).replace(SOURCE_EXTENSION, '');
+        return PACKAGE_FILE.test(own) ? posix.dirname(own) : null;
+    };
+    let byRelativePath = null;
+    const entryAt = relativePath => {
+        if (!byRelativePath) {
+            byRelativePath = new Map();
+            for (const fileEntry of index.files.values()) byRelativePath.set(fileEntry.relativePath, fileEntry);
+        }
+        return byRelativePath.get(relativePath) || null;
+    };
+    // Can the package's own file hand out `name` without a submodule of
+    // that name? 'named': it declares or imports it. 'open': it takes
+    // everything another module has, computes its names (trait
+    // `moduleSupplyHooks`), or cannot be read. 'none': the name was the
+    // submodule.
+    const supplyOf = (packageFile, name, traits) => {
+        const own = packageFile ? entryAt(packageFile) : null;
+        if (!own) return packageFile ? 'open' : 'none';
+        const provided = providedNames(own, traits);
+        if (provided.names.has(name)) return 'named';
+        return provided.open ||
+            (traits.moduleSupplyHooks || []).some(hook => provided.names.has(hook)) ||
+            (own.importDetails || []).some(detail => (detail.names || []).includes('*')) ? 'open' : 'none';
+    };
+    // A from-import of names that land on the deleted file.
+    const place = (site, named, packageFile, traits) => {
+        const supplies = named.map(name => supplyOf(packageFile, name, traits));
+        if (supplies.includes('none')) (twin ? possible : definite).push(site);
+        else if (supplies.includes('open')) possible.push(site);
+    };
+    const definite = [];
+    const possible = [];
+    for (const entry of index.files.values()) {
+        const resolved = entry.moduleResolved || {};
+        const from = posix.dirname(entry.relativePath);
+        const traits = langTraits(entry.language) || {};
+        for (const detail of entry.importDetails || []) {
+            const spelled = String(detail.module || '');
+            if (!spelled) continue;
+            const site = { file: entry.relativePath, line: detail.line || 0, kind: 'import' };
+            if (resolved[spelled]) {
+                // The module is still there. Where a from-import can bind a
+                // submodule file (trait `submoduleImports`), a name the
+                // package's own file does not supply was that file.
+                const directory = traits.submoduleImports ? packageDirectory(resolved[spelled]) : null;
+                if (directory === null) continue;
+                const named = (detail.names || []).filter(name => name !== '*' &&
+                    !submoduleOf(resolved, spelled, name) && lands(posix.join(directory, name)));
+                place(site, named, resolved[spelled], traits);
+                continue;
+            }
+            if (/^\.{1,2}\//.test(spelled)) {
+                // A path relative to the importing file.
+                const target = posix.normalize(posix.join(from, spelled)).replace(SOURCE_EXTENSION, '');
+                if (lands(target)) (final(target, traits) ? definite : possible).push(site);
+                continue;
+            }
+            const dots = /^\.+/.exec(spelled);
+            if (dots) {
+                // A module relative to the importing package: one dot is
+                // the package, each further dot its parent.
+                let base = from;
+                for (let up = 1; up < dots[0].length; up++) base = posix.dirname(base);
+                const rest = spelled.slice(dots[0].length).split('.').filter(Boolean);
+                if (rest.length > 0) {
+                    const target = posix.normalize(posix.join(base, ...rest));
+                    if (lands(target)) (final(target, traits) ? definite : possible).push(site);
+                    continue;
+                }
+                // `from . import name`: the package's own file may be what
+                // supplies the name.
+                const directory = posix.normalize(base);
+                let packageFile = null;
+                for (const other of index.files.values()) {
+                    if (other.language === entry.language && packageDirectory(other.relativePath) === directory) {
+                        packageFile = other.relativePath;
+                        break;
+                    }
+                }
+                const named = (detail.names || []).filter(name => lands(posix.normalize(posix.join(base, name))));
+                place(site, named, packageFile, traits);
+                continue;
+            }
+            // A dotted name under a package of the project that still
+            // resolves: the rest of the path is inside that package.
+            const parts = spelled.split('.');
+            let inside = false;
+            for (let length = parts.length - 1; length > 0 && !inside; length--) {
+                const prefix = resolved[parts.slice(0, length).join('.')];
+                const directory = prefix ? packageDirectory(prefix) : null;
+                if (directory !== null && lands(posix.join(directory, ...parts.slice(length)))) inside = true;
+            }
+            if (inside) { (twin ? possible : definite).push(site); continue; }
+            // An absolute name: its path form, anchored at any directory.
+            const forms = [spelled.replace(SOURCE_EXTENSION, ''), spelled.split('.').join('/')];
+            for (const name of detail.names || []) forms.push(`${spelled.split('.').join('/')}/${name}`);
+            if (forms.some(form => stem === form || stem.endsWith(`/${form}`) ||
+                (asDirectory !== null && (asDirectory === form || asDirectory.endsWith(`/${form}`))))) possible.push(site);
+        }
+    }
+    const bySite = (a, b) => (a.file === b.file ? a.line - b.line : (a.file < b.file ? -1 : 1));
+    return { definite: definite.sort(bySite), possible: possible.sort(bySite) };
 }
 
 /**
@@ -303,15 +469,17 @@ function check(live, options = {}) {
         target = resolveTarget(live, { staged: !!options.staged, force: !!options.forceStagedSnapshot });
     } catch (e) {
         if (e && e.code === 'staged-snapshot-unavailable') {
-            // Did the repository itself answer? Outside one, the ordinary
-            // "not a git repository" report is the truthful one.
-            try { diffImpact(live, { base: options.base || 'HEAD', staged: true, file: options.file }); } catch (inner) {
-                const message = inner && inner.message ? inner.message : 'diff failed';
-                return {
-                    base: options.base || 'HEAD', staged: true, ok: false,
-                    status: /not a git repositor/i.test(message) ? 'not-a-repo' : 'diff-failed',
-                    error: message,
-                };
+            // Outside a repository there is no index to describe: the
+            // ordinary "not a git repository" report is the truthful one.
+            if (e.reason === 'not-a-repository') {
+                try { diffImpact(live, { base: options.base || 'HEAD', staged: true, file: options.file }); } catch (inner) {
+                    const message = inner && inner.message ? inner.message : 'diff failed';
+                    return {
+                        base: options.base || 'HEAD', staged: true, ok: false,
+                        status: /not a git repositor/i.test(message) ? 'not-a-repo' : 'diff-failed',
+                        error: message,
+                    };
+                }
             }
             return {
                 base: options.base || 'HEAD', staged: true, ok: false,
@@ -323,7 +491,19 @@ function check(live, options = {}) {
     }
     try {
         const result = checkTarget(target.index, options, target.repoRoot);
-        if (target.notes.length > 0 && result && result.ok !== false) result.notes = target.notes;
+        const notes = [...target.notes];
+        // A worktree check reads the worktree, but which files CHANGED is
+        // git's answer, and git does not look at a path it was told to
+        // assume unchanged or to skip.
+        if (!options.staged && result && result.ok !== false) {
+            let flagged;
+            try { flagged = flaggedPaths(live.root); } catch (_) { flagged = []; }
+            if (flagged.length > 0) {
+                notes.push(`${flagged.length} tracked path(s) are marked assume-unchanged or skip-worktree ` +
+                    `(${flagged[0].path}${flagged.length > 1 ? ', ...' : ''}): git does not report their changes, so they are not checked`);
+            }
+        }
+        if (notes.length > 0 && result && result.ok !== false) result.notes = notes;
         return result;
     } finally {
         target.dispose();
@@ -396,6 +576,25 @@ function checkTarget(index, options, repoRoot) {
         });
     }
 
+    // A file that is gone, and the imports that named it.
+    for (const relativePath of dr?.deletedFiles || []) {
+        const importers = importersOfDeletedFile(index, relativePath);
+        if (importers.definite.length === 0 && importers.possible.length === 0) continue;
+        const broken = importers.definite.length > 0;
+        moduleItems.push({
+            name: '(module)',
+            file: relativePath,
+            line: 1,
+            kind: 'module',
+            callerCount: 0,
+            unverifiedCallerCount: 0,
+            signatureMismatches: 0,
+            verdict: broken ? 'blocked' : 'review',
+            reasons: [broken ? 'deleted-still-imported' : 'deleted-name-still-imported'],
+            sites: broken ? importers.definite : importers.possible,
+        });
+    }
+
     if (!dr || (allChanged.length === 0 && deleted.length === 0 && moduleItems.length === 0)) {
         // fix #283: say what the diff actually contained. "no changes
         // detected" with three changed files reads as a false negative in a
@@ -451,7 +650,7 @@ function checkTarget(index, options, repoRoot) {
             if (fn._kind === 'added') {
                 // A new declaration under a new name, in a type that is new
                 // too, cannot be reached by anything that existed.
-                const outcome = assessAddition(index, fn, definitionOf(index, fn), addedLinesByFile, fn.impact?.account);
+                const outcome = assessAddition(index, fn, definitionOf(index, fn), addedLinesByFile, fn.impact?.account, true);
                 item.verdict = outcome.verdict;
                 item.reasons = outcome.reasons;
                 if (outcome.outside) item.sites = outcome.outside;
@@ -682,8 +881,16 @@ function checkTarget(index, options, repoRoot) {
                 });
             }
         }
+        if (it.kind === 'added' && it.verdict === 'blocked') {
+            actions.push({
+                severity: 'error',
+                kind: 'addition_breaks',
+                message: `${it.name}: ${(it.sites || []).length} object literal(s) declared as its type do not have it`,
+            });
+        }
         if (it.kind === 'added') {
             for (const code of it.reasons) {
+                if (code === 'literal-lacks-new-member') continue;
                 actions.push({
                     severity: 'warn',
                     kind: 'addition_hazard',
