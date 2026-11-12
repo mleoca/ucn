@@ -1,4 +1,12 @@
 {
+  "cargo-attribute-macro-makes-tests": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib  [holds more tests]",
+    "  S tests",
+    "  T tests > doubled [conditional] => cargo test --lib -- tests::doubled --exact",
+    "  T tests > removed [conditional] => cargo test --lib -- tests::removed --exact",
+    "  T tests > plain => cargo test --lib -- tests::plain --exact",
+    "all: cargo test --lib"
+  ],
   "cargo-attribute-macros": [
     "src/lib.rs [tests] cargo-test  run: cargo test --lib  [holds more tests]",
     "  S tests",
@@ -98,6 +106,31 @@
     "  T CalcTests > Rows => dotnet test --filter FullyQualifiedName=Calc.Tests.CalcTests.Rows",
     "all: dotnet test --filter 'FullyQualifiedName~Calc.Tests.CalcTests.|FullyQualifiedName~Calc.Tests.CalcTests+'"
   ],
+  "dotnet-mstest-class-mark-of-the-class-that-runs": [
+    "LookupTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Marked.|FullyQualifiedName~P.Tests.Marked+|FullyQualifiedName~P.Tests.MarkedOverPlain.|FullyQualifiedName~P.Tests.MarkedOverPlain+'",
+    "  S Marked",
+    "  T Marked > Kept (from LookupTests.cs:9) => dotnet test --filter FullyQualifiedName=P.Tests.Marked.Kept",
+    "  S MarkedOverPlain",
+    "  T MarkedOverPlain > FromPlain (from LookupTests.cs:20) => dotnet test --filter FullyQualifiedName=P.Tests.MarkedOverPlain.FromPlain",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.Marked.|FullyQualifiedName~P.Tests.Marked+|FullyQualifiedName~P.Tests.MarkedOverPlain.|FullyQualifiedName~P.Tests.MarkedOverPlain+'"
+  ],
+  "dotnet-mstest-rows-and-overrides": [
+    "LookupTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+|FullyQualifiedName~P.Tests.ChildOfIgnored.|FullyQualifiedName~P.Tests.ChildOfIgnored+'",
+    "  S ChildOfIgnored",
+    "  T ChildOfIgnored > Inherited (from LookupTests.cs:10) => dotnet test --filter FullyQualifiedName=P.Tests.ChildOfIgnored.Inherited",
+    "  S Child",
+    "  T Child > Kept [conditional] (from LookupTests.cs:26) => dotnet test --filter FullyQualifiedName=P.Tests.Child.Kept",
+    "  T Child > Reenabled [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.Child.Reenabled",
+    "RowTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.RowTests.|FullyQualifiedName~P.Tests.RowTests+'  [holds more tests]",
+    "  S RowTests",
+    "  T RowTests > NoRows [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.NoRows",
+    "  T RowTests > RowsOnTestMethod => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.RowsOnTestMethod",
+    "  T RowTests > DynamicNone [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.DynamicNone",
+    "  T RowTests > DynamicTwo [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.DynamicTwo",
+    "  T RowTests > Plain => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.Plain",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+|FullyQualifiedName~P.Tests.ChildOfIgnored.|FullyQualifiedName~P.Tests.ChildOfIgnored+'",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.RowTests.|FullyQualifiedName~P.Tests.RowTests+'"
+  ],
   "dotnet-mstest-what-is-not-discovered": [
     "Loose.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Loose.Tests.Marked.|FullyQualifiedName~Loose.Tests.Marked+'",
     "  S Marked",
@@ -118,6 +151,44 @@
     "  T QueueTests > Rows => dotnet test --filter FullyQualifiedName=Queue.Tests.QueueTests.Rows",
     "  T QueueTests > PushesMore => dotnet test --filter FullyQualifiedName=Queue.Tests.QueueTests.PushesMore",
     "all: dotnet test --filter 'FullyQualifiedName~Queue.Tests.QueueTests.|FullyQualifiedName~Queue.Tests.QueueTests+'"
+  ],
+  "dotnet-nunit-explicit-base-and-fixture-arguments": [
+    "LookupTests.cs [tests] dotnet-test  run: (withheld: generated-cases)  [holds more tests]",
+    "  S ChildOfExplicit",
+    "  T ChildOfExplicit > Inherited [conditional] (from LookupTests.cs:9) => dotnet test --filter FullyQualifiedName=P.Tests.ChildOfExplicit.Inherited",
+    "  S ChildOfArguments",
+    "  T ChildOfArguments > FromBase (from LookupTests.cs:20) => (withheld: generated-cases)"
+  ],
+  "dotnet-nunit-rows-fixtures-and-overrides": [
+    "LookupTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+|FullyQualifiedName~P.Tests.ChildOfIgnored.|FullyQualifiedName~P.Tests.ChildOfIgnored+'",
+    "  S ChildOfIgnored",
+    "  T ChildOfIgnored > Inherited (from LookupTests.cs:9) => dotnet test --filter FullyQualifiedName=P.Tests.ChildOfIgnored.Inherited",
+    "  S Child",
+    "  T Child > Kept [conditional] (from LookupTests.cs:23) => dotnet test --filter FullyQualifiedName=P.Tests.Child.Kept",
+    "  T Child > Reenabled [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.Child.Reenabled",
+    "RowTests.cs [tests] dotnet-test  run: (withheld: generated-cases)  [holds more tests]",
+    "  S ValuesTests",
+    "  T ValuesTests > Each => dotnet test --filter FullyQualifiedName=P.Tests.ValuesTests.Each",
+    "  T ValuesTests > Ranged => dotnet test --filter FullyQualifiedName=P.Tests.ValuesTests.Ranged",
+    "  S RepeatTests",
+    "  T RepeatTests > Thrice => dotnet test --filter FullyQualifiedName=P.Tests.RepeatTests.Thrice",
+    "  S SourceTests",
+    "  T SourceTests > NoRows [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.SourceTests.NoRows",
+    "  T SourceTests > TwoRows [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.SourceTests.TwoRows",
+    "  S IgnoreTests",
+    "  T IgnoreTests > SomeIgnored => dotnet test --filter FullyQualifiedName=P.Tests.IgnoreTests.SomeIgnored",
+    "  T IgnoreTests > AllIgnored [skipped] => dotnet test --filter FullyQualifiedName=P.Tests.IgnoreTests.AllIgnored",
+    "  T IgnoreTests > ExplicitRow [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.IgnoreTests.ExplicitRow",
+    "  S PlatformTests",
+    "  T PlatformTests > OnePlatform [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.PlatformTests.OnePlatform",
+    "  S TheoryTests",
+    "  T TheoryTests > TheoryWithoutData [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.TheoryTests.TheoryWithoutData",
+    "  T TheoryTests > Plain => dotnet test --filter FullyQualifiedName=P.Tests.TheoryTests.Plain",
+    "  S TwiceFixture",
+    "  T TwiceFixture > Runs => (withheld: generated-cases)",
+    "  S PlainFixture",
+    "  T PlainFixture > Runs => dotnet test --filter FullyQualifiedName=P.Tests.PlainFixture.Runs",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+|FullyQualifiedName~P.Tests.ChildOfIgnored.|FullyQualifiedName~P.Tests.ChildOfIgnored+'"
   ],
   "dotnet-nunit-setup-ignores": [
     "Tests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~N.Tests.Free.|FullyQualifiedName~N.Tests.Free+|FullyQualifiedName~N.Tests.Guarded.|FullyQualifiedName~N.Tests.Guarded+'",
@@ -151,6 +222,23 @@
     "  S Concrete",
     "  T Concrete > Inherited (from FooTests.cs:35) => dotnet test --filter FullyQualifiedName=My.App.Tests.Concrete.Inherited",
     "all: dotnet test --filter 'FullyQualifiedName~My.App.Tests.Concrete.|FullyQualifiedName~My.App.Tests.Concrete+|FullyQualifiedName~My.App.Tests.FooTests.|FullyQualifiedName~My.App.Tests.FooTests+|FullyQualifiedName~My.App.Tests.FooTestsMore.|FullyQualifiedName~My.App.Tests.FooTestsMore+'"
+  ],
+  "dotnet-xunit-rows-and-overrides": [
+    "LookupTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+'",
+    "  S Child",
+    "  T Child > Kept (from LookupTests.cs:11) => dotnet test --filter FullyQualifiedName=P.Tests.Child.Kept",
+    "  T Child > Overridden => dotnet test --filter FullyQualifiedName=P.Tests.Child.Overridden",
+    "  T Child > Reenabled => dotnet test --filter FullyQualifiedName=P.Tests.Child.Reenabled",
+    "  T Child > SkippedBelow [skipped] => dotnet test --filter FullyQualifiedName=P.Tests.Child.SkippedBelow",
+    "RowTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.RowTests.|FullyQualifiedName~P.Tests.RowTests+'  [holds more tests]",
+    "  S RowTests",
+    "  T RowTests > AllRowsSkipped [skipped] => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.AllRowsSkipped",
+    "  T RowTests > SomeRowsSkipped => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.SomeRowsSkipped",
+    "  T RowTests > NoRows [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.NoRows",
+    "  T RowTests > TwoRows [conditional] => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.TwoRows",
+    "  T RowTests > Plain => dotnet test --filter FullyQualifiedName=P.Tests.RowTests.Plain",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+'",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.RowTests.|FullyQualifiedName~P.Tests.RowTests+'"
   ],
   "dotnet-xunit-skip-is-a-value": [
     "SkipValues.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~Values.Tests.SkipValues.|FullyQualifiedName~Values.Tests.SkipValues+'  [holds more tests]",
@@ -463,6 +551,25 @@
     "test/b.test.js [tests] jest  run: (withheld: runner-config-not-read)",
     "  T under the default pattern => (withheld: runner-config-not-read)"
   ],
+  "jest-tables-of-cases": [
+    "test/a.test.js [tests] jest  run: npx jest --runTestsByPath test/a.test.js  [holds more tests]",
+    "  T written out %i => (withheld: generated-cases)",
+    "  T by name %i => (withheld: generated-cases)",
+    "  T by call %i [conditional] => (withheld: generated-cases)",
+    "  T skipped table %i [skipped] => (withheld: generated-cases)",
+    "  S suite %i",
+    "  T suite %i > inside => (withheld: suite-name-not-literal)",
+    "  T to do [skipped] => npx jest --runTestsByPath test/a.test.js -t '^to do$'",
+    "  T plain => npx jest --runTestsByPath test/a.test.js -t '^plain$'",
+    "test/b.test.js [tests] jest  run: npx jest --runTestsByPath test/b.test.js",
+    "  S no suite %i",
+    "  T no suite %i > inside [skipped] => (withheld: suite-name-not-literal)",
+    "  T plain [conditional] => npx jest --runTestsByPath test/b.test.js -t '^plain$'",
+    "test/c.test.js [tests] jest  run: npx jest --runTestsByPath test/c.test.js",
+    "  T no rows %i [skipped] => (withheld: generated-cases)",
+    "  T plain [conditional] => npx jest --runTestsByPath test/c.test.js -t '^plain$'",
+    "all: npx jest --runTestsByPath test/a.test.js test/b.test.js test/c.test.js"
+  ],
   "js-runner-not-modeled": [
     "test/a.test.js [tests] no runner: runner-not-modeled  run: (withheld: runner-not-modeled)",
     "  T b => (withheld: runner-not-modeled)"
@@ -484,6 +591,28 @@
     "  T OnlyInheritsTest > shared (from src/test/java/com/x/BaseChecks.java:9) => mvn test '-Dtest=com.x.OnlyInheritsTest#shared'",
     "all: mvn test -Dtest=com.x.ChildTest",
     "all: mvn test -Dtest=com.x.OnlyInheritsTest"
+  ],
+  "maven-junit4-overrides-runners-and-ignored-bases": [
+    "src/test/java/com/x/Base4.java [support] maven",
+    "src/test/java/com/x/Child4Test.java [tests] maven  run: mvn test -Dtest=com.x.Child4Test",
+    "  S Child4Test",
+    "  T Child4Test > kept [conditional] (from src/test/java/com/x/Base4.java:12) => mvn test '-Dtest=com.x.Child4Test#kept'",
+    "  T Child4Test > overridden [conditional] => mvn test '-Dtest=com.x.Child4Test#overridden'",
+    "src/test/java/com/x/ChildOfIgnoredTest.java [tests] maven  run: mvn test -Dtest=com.x.ChildOfIgnoredTest",
+    "  S ChildOfIgnoredTest",
+    "  T ChildOfIgnoredTest > inherited (from src/test/java/com/x/IgnoredBase.java:9) => mvn test '-Dtest=com.x.ChildOfIgnoredTest#inherited'",
+    "src/test/java/com/x/EmptyTableTest.java [tests] maven  run: mvn test -Dtest=com.x.EmptyTableTest  [holds more tests]",
+    "  S EmptyTableTest",
+    "  T EmptyTableTest > row [conditional] => mvn test '-Dtest=com.x.EmptyTableTest#row'",
+    "src/test/java/com/x/IgnoredBase.java [support] maven",
+    "src/test/java/com/x/Rec.java [support] maven",
+    "src/test/java/com/x/TableTest.java [tests] maven  run: mvn test -Dtest=com.x.TableTest  [holds more tests]",
+    "  S TableTest",
+    "  T TableTest > row [conditional] => mvn test '-Dtest=com.x.TableTest#row'",
+    "all: mvn test -Dtest=com.x.Child4Test",
+    "all: mvn test -Dtest=com.x.ChildOfIgnoredTest",
+    "all: mvn test -Dtest=com.x.EmptyTableTest",
+    "all: mvn test -Dtest=com.x.TableTest"
   ],
   "maven-junit5": [
     "src/test/java/com/x/Fixtures.java [support] maven",
@@ -510,6 +639,37 @@
     "src/test/java/com/x/Flaky.java [support] maven",
     "src/test/java/com/x/Quick.java [support] maven",
     "all: mvn test -Dtest=com.x.ConditionsTest"
+  ],
+  "maven-junit5-rows-and-repeats": [
+    "src/test/java/com/x/Rec.java [support] maven",
+    "src/test/java/com/x/RowsTest.java [tests] maven  run: mvn test -Dtest=com.x.RowsTest  [holds more tests]",
+    "  S RowsTest",
+    "  T RowsTest > noRows [conditional] => mvn test '-Dtest=com.x.RowsTest#noRows'",
+    "  T RowsTest > twoRows [conditional] => mvn test '-Dtest=com.x.RowsTest#twoRows'",
+    "  T RowsTest > emptyValues [skipped] => mvn test '-Dtest=com.x.RowsTest#emptyValues'",
+    "  T RowsTest > everyKind => mvn test '-Dtest=com.x.RowsTest#everyKind'",
+    "  T RowsTest > oneNull => mvn test '-Dtest=com.x.RowsTest#oneNull'",
+    "  T RowsTest > noSource [skipped] => mvn test '-Dtest=com.x.RowsTest#noSource'",
+    "  T RowsTest > thrice => mvn test '-Dtest=com.x.RowsTest#thrice'",
+    "  T RowsTest > once => mvn test '-Dtest=com.x.RowsTest#once'",
+    "  T RowsTest > made => mvn test '-Dtest=com.x.RowsTest#made'",
+    "  T RowsTest > plain => mvn test '-Dtest=com.x.RowsTest#plain'",
+    "all: mvn test -Dtest=com.x.RowsTest"
+  ],
+  "maven-junit5-what-a-class-inherits": [
+    "src/test/java/com/x/Base.java [support] maven",
+    "src/test/java/com/x/ChildOfDisabledTest.java [tests] maven  run: mvn test -Dtest=com.x.ChildOfDisabledTest",
+    "  S ChildOfDisabledTest",
+    "  T ChildOfDisabledTest > inherited (from src/test/java/com/x/DisabledBase.java:9) => mvn test '-Dtest=com.x.ChildOfDisabledTest#inherited'",
+    "src/test/java/com/x/ChildTest.java [tests] maven  run: mvn test -Dtest=com.x.ChildTest",
+    "  S ChildTest",
+    "  T ChildTest > kept [conditional] (from src/test/java/com/x/Base.java:13) => mvn test '-Dtest=com.x.ChildTest#kept'",
+    "  T ChildTest > reenabled [conditional] => mvn test '-Dtest=com.x.ChildTest#reenabled'",
+    "  T ChildTest > disabledBelow [conditional] [skipped] => mvn test '-Dtest=com.x.ChildTest#disabledBelow'",
+    "src/test/java/com/x/DisabledBase.java [support] maven",
+    "src/test/java/com/x/Rec.java [support] maven",
+    "all: mvn test -Dtest=com.x.ChildOfDisabledTest",
+    "all: mvn test -Dtest=com.x.ChildTest"
   ],
   "maven-junit5-what-is-not-run": [
     "src/test/java/com/x/RulesTest.java [tests] maven  run: mvn test -Dtest=com.x.RulesTest",
@@ -553,6 +713,51 @@
     "  T FreeTest > runs => mvn test '-Dtest=com.x.FreeTest#runs'",
     "all: mvn test -Dtest=com.x.AssumeTest",
     "all: mvn test -Dtest=com.x.FreeTest"
+  ],
+  "maven-testng": [
+    "src/test/java/com/x/ChildOfIgnoredTTest.java [tests] maven  run: mvn test -Dtest=com.x.ChildOfIgnoredTTest",
+    "  S ChildOfIgnoredTTest",
+    "  T ChildOfIgnoredTTest > inherited [skipped] (from src/test/java/com/x/IgnoredBaseT.java:9) => (withheld: declared-in-a-base-class)",
+    "src/test/java/com/x/ClassLevelTest.java [tests] maven  run: mvn test -Dtest=com.x.ClassLevelTest",
+    "  S ClassLevelTest",
+    "  T ClassLevelTest > everyPublicMethod => mvn test '-Dtest=com.x.ClassLevelTest#everyPublicMethod'",
+    "src/test/java/com/x/DisabledClassTest.java [tests] maven  run: mvn test -Dtest=com.x.DisabledClassTest",
+    "  S DisabledClassTest",
+    "  T DisabledClassTest > b => mvn test '-Dtest=com.x.DisabledClassTest#b'",
+    "src/test/java/com/x/GuardedTest.java [tests] maven  run: mvn test -Dtest=com.x.GuardedTest",
+    "  S GuardedTest",
+    "  T GuardedTest > guarded [conditional] => mvn test '-Dtest=com.x.GuardedTest#guarded'",
+    "src/test/java/com/x/IgnoredBaseT.java [support] maven",
+    "src/test/java/com/x/IgnoredTest.java [tests] maven  run: mvn test -Dtest=com.x.IgnoredTest",
+    "  S IgnoredTest",
+    "  T IgnoredTest > a [skipped] => mvn test '-Dtest=com.x.IgnoredTest#a'",
+    "src/test/java/com/x/PlainTest.java [tests] maven  run: mvn test -Dtest=com.x.PlainTest  [holds more tests]",
+    "  S PlainTest",
+    "  T PlainTest > runs => mvn test '-Dtest=com.x.PlainTest#runs'",
+    "  T PlainTest > off [skipped] => mvn test '-Dtest=com.x.PlainTest#off'",
+    "  T PlainTest > thrice => mvn test '-Dtest=com.x.PlainTest#thrice'",
+    "  T PlainTest > never [skipped] => mvn test '-Dtest=com.x.PlainTest#never'",
+    "  T PlainTest > twoRows [conditional] => mvn test '-Dtest=com.x.PlainTest#twoRows'",
+    "  T PlainTest > noRows [conditional] => mvn test '-Dtest=com.x.PlainTest#noRows'",
+    "src/test/java/com/x/Rec.java [support] maven",
+    "src/test/java/com/x/TAllChildTest.java [tests] maven  run: mvn test -Dtest=com.x.TAllChildTest",
+    "  S TAllChildTest",
+    "  T TAllChildTest > fromBase (from src/test/java/com/x/TBaseAll.java:7) => (withheld: declared-in-a-base-class)",
+    "  T TAllChildTest > own => (withheld: declared-in-a-base-class)",
+    "src/test/java/com/x/TBase.java [support] maven",
+    "src/test/java/com/x/TBaseAll.java [support] maven",
+    "src/test/java/com/x/TChildTest.java [tests] maven  run: mvn test -Dtest=com.x.TChildTest",
+    "  S TChildTest",
+    "  T TChildTest > inherited (from src/test/java/com/x/TBase.java:7) => (withheld: declared-in-a-base-class)",
+    "  T TChildTest > overridden => (withheld: declared-in-a-base-class)",
+    "all: mvn test -Dtest=com.x.ChildOfIgnoredTTest",
+    "all: mvn test -Dtest=com.x.ClassLevelTest",
+    "all: mvn test -Dtest=com.x.DisabledClassTest",
+    "all: mvn test -Dtest=com.x.GuardedTest",
+    "all: mvn test -Dtest=com.x.IgnoredTest",
+    "all: mvn test -Dtest=com.x.PlainTest",
+    "all: mvn test -Dtest=com.x.TAllChildTest",
+    "all: mvn test -Dtest=com.x.TChildTest"
   ],
   "mocha-config-adds-files": [
     "test/a.test.js [tests] mocha  run: (withheld: runner-config-not-read)",
@@ -627,6 +832,43 @@
     "  T where the configuration points => (withheld: runner-config-not-read)",
     "test/case.test.js [tests] mocha  run: (withheld: runner-config-not-read)",
     "  T in the default place => (withheld: runner-config-not-read)"
+  ],
+  "mocha-declarations-in-lists-and-loops": [
+    "test/a.test.js [tests] mocha  run: npx mocha test/a.test.js  [holds more tests]",
+    "  S lists",
+    "  T lists > (computed name) [conditional] => (withheld: name-not-literal)",
+    "  T lists > (computed name) [conditional] => (withheld: name-not-literal)",
+    "  T lists > same title => npx mocha test/a.test.js --grep '^lists same title$'",
+    "  T lists > pending [skipped] => npx mocha test/a.test.js --grep '^lists pending$'",
+    "  T lists > crossed out [skipped] => npx mocha test/a.test.js --grep '^lists crossed out$'",
+    "  T lists > plain => npx mocha test/a.test.js --grep '^lists plain$'",
+    "  S (computed name)",
+    "  T  > inside [conditional] => (withheld: declared-indirectly)",
+    "  S crossed out suite",
+    "  T crossed out suite > inside [skipped] => npx mocha test/a.test.js --grep '^crossed out suite inside$'",
+    "all: npx mocha test/a.test.js"
+  ],
+  "mocha-declarations-under-control-flow": [
+    "test/a.test.js [tests] mocha  run: npx mocha test/a.test.js  [holds more tests]",
+    "  S s",
+    "  T s > in an if [conditional] => npx mocha test/a.test.js --grep '^s in an if$'",
+    "  T s > in an else [conditional] => npx mocha test/a.test.js --grep '^s in an else$'",
+    "  T s > after and [conditional] => npx mocha test/a.test.js --grep '^s after and$'",
+    "  T s > after or [conditional] => npx mocha test/a.test.js --grep '^s after or$'",
+    "  T s > first arm [conditional] => npx mocha test/a.test.js --grep '^s first arm$'",
+    "  T s > second arm [conditional] => npx mocha test/a.test.js --grep '^s second arm$'",
+    "  T s > in a case [conditional] => npx mocha test/a.test.js --grep '^s in a case$'",
+    "  T s > in the default [conditional] => npx mocha test/a.test.js --grep '^s in the default$'",
+    "  T s > in a try => npx mocha test/a.test.js --grep '^s in a try$'",
+    "  T s > in a catch [conditional] => npx mocha test/a.test.js --grep '^s in a catch$'",
+    "  T s > in a finally => npx mocha test/a.test.js --grep '^s in a finally$'",
+    "  T s > in a while [conditional] => npx mocha test/a.test.js --grep '^s in a while$'",
+    "  T s > in a do => npx mocha test/a.test.js --grep '^s in a do$'",
+    "  T s > in a for [conditional] => npx mocha test/a.test.js --grep '^s in a for$'",
+    "  T s > in a for in [conditional] => npx mocha test/a.test.js --grep '^s in a for in$'",
+    "  T s > in a block => npx mocha test/a.test.js --grep '^s in a block$'",
+    "  T s > plain => npx mocha test/a.test.js --grep '^s plain$'",
+    "all: npx mocha test/a.test.js"
   ],
   "mocha-focused-tests": [
     "test/focus.test.js [tests] mocha  run: npx mocha test/focus.test.js",
@@ -755,6 +997,27 @@
     "  T read => node --test --test-name-pattern='^read$' test/a.test.js",
     "all: node --test test/a.test.js"
   ],
+  "node-test-declarations-under-control-flow": [
+    "test/a.test.js [tests] node-test  run: node --test test/a.test.js  [holds more tests]",
+    "  T in an if [conditional] => node --test --test-name-pattern='^in an if$' test/a.test.js",
+    "  T in an else [conditional] => node --test --test-name-pattern='^in an else$' test/a.test.js",
+    "  T after and [conditional] => node --test --test-name-pattern='^after and$' test/a.test.js",
+    "  T after or [conditional] => node --test --test-name-pattern='^after or$' test/a.test.js",
+    "  T first arm [conditional] => node --test --test-name-pattern='^first arm$' test/a.test.js",
+    "  T second arm [conditional] => node --test --test-name-pattern='^second arm$' test/a.test.js",
+    "  T in a case [conditional] => node --test --test-name-pattern='^in a case$' test/a.test.js",
+    "  T in the default [conditional] => node --test --test-name-pattern='^in the default$' test/a.test.js",
+    "  T in a try => node --test --test-name-pattern='^in a try$' test/a.test.js",
+    "  T in a catch [conditional] => node --test --test-name-pattern='^in a catch$' test/a.test.js",
+    "  T in a finally => node --test --test-name-pattern='^in a finally$' test/a.test.js",
+    "  T in a while [conditional] => node --test --test-name-pattern='^in a while$' test/a.test.js",
+    "  T in a do => node --test --test-name-pattern='^in a do$' test/a.test.js",
+    "  T in a for [conditional] => node --test --test-name-pattern='^in a for$' test/a.test.js",
+    "  T in a for in [conditional] => node --test --test-name-pattern='^in a for in$' test/a.test.js",
+    "  T in a block => node --test --test-name-pattern='^in a block$' test/a.test.js",
+    "  T plain => node --test --test-name-pattern='^plain$' test/a.test.js",
+    "all: node --test test/a.test.js"
+  ],
   "node-test-esm-bindings": [
     "test/esm.mjs [tests] node-test  run: node --test test/esm.mjs",
     "  T aliased => node --test --test-name-pattern='^aliased$' test/esm.mjs",
@@ -777,6 +1040,23 @@
     "test/helpers/util.js [support] node-test",
     "test/smoke.js [tests] node-test  run: node --test test/smoke.js  [holds more tests]",
     "all: node --test test/a.test.js test/smoke.js"
+  ],
+  "node-test-loops-and-options": [
+    "test/a.test.js [tests] node-test  run: node --test test/a.test.js  [holds more tests]",
+    "  T same title => node --test --test-name-pattern='^same title$' test/a.test.js",
+    "  T never [conditional] => node --test --test-name-pattern='^never$' test/a.test.js",
+    "  T skip option [skipped] => node --test --test-name-pattern='^skip option$' test/a.test.js",
+    "  T skip by value [conditional] => node --test --test-name-pattern='^skip by value$' test/a.test.js",
+    "  T todo option => node --test --test-name-pattern='^todo option$' test/a.test.js",
+    "  T to do => node --test --test-name-pattern='^to do$' test/a.test.js",
+    "  T skipped [skipped] => node --test --test-name-pattern='^skipped$' test/a.test.js",
+    "  T no body [skipped] => node --test --test-name-pattern='^no body$' test/a.test.js",
+    "  S suite",
+    "  T suite > inside [skipped] => node --test --test-name-pattern='^suite inside$' test/a.test.js",
+    "  S suite by value",
+    "  T suite by value > inside [conditional] => node --test --test-name-pattern='^suite by value inside$' test/a.test.js",
+    "  T plain => node --test --test-name-pattern='^plain$' test/a.test.js",
+    "all: node --test test/a.test.js"
   ],
   "node-test-name-read-two-ways": [
     "test/n.test.js [tests] node-test  run: node --test test/n.test.js",
@@ -1071,6 +1351,180 @@
     "  T test_b => pytest tests/test_x.py::test_b",
     "all: pytest free/test_free.py tests/test_x.py"
   ],
+  "pytest-constructor-builtin-bases": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S TestError",
+    "  T TestError > test_m [conditional] => (withheld: base-not-resolved)",
+    "  S TestDict",
+    "  T TestDict > test_m [conditional] => (withheld: base-not-resolved)",
+    "  S TestGeneric",
+    "  T TestGeneric > test_m => pytest tests/test_case.py::TestGeneric::test_m",
+    "  S TestObject",
+    "  T TestObject > test_m => pytest tests/test_case.py::TestObject::test_m",
+    "  S TestEnum",
+    "  T TestEnum > test_m [conditional] => (withheld: base-not-resolved)",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-custom-after-reset": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-dataclass": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestData",
+    "  T TestData > test_m [conditional] => pytest tests/test_case.py::TestData::test_m",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-inherited-runtest": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S Base",
+    "  T Base > runTest => pytest tests/test_case.py::Base::runTest",
+    "  S Child",
+    "  T Child > runTest (from tests/test_case.py:11) => pytest tests/test_case.py::Child::runTest",
+    "  S WithTest",
+    "  T WithTest > test_w => pytest tests/test_case.py::WithTest::test_w",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-init-a-function-of-the-module": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestRefused",
+    "  T TestRefused > test_m [conditional] => (withheld: constructor-not-read)",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-init-deleted": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_m => pytest tests/test_case.py::TestActual::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-init-in-a-branch": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_m [conditional] => (withheld: constructor-not-read)",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-init-none": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual [conditional] (from tests/test_case.py:10) => (withheld: constructor-not-read)",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-init-of-a-plain-class": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual [conditional] (from tests/test_case.py:10) => (withheld: constructor-not-read)",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-lookup-order-of-two-bases": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestBA",
+    "  T TestBA > test_m => pytest tests/test_case.py::TestBA::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-marks-reset-in-subclass": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestK",
+    "  T TestK > test_m [skipped] (from tests/test_case.py:12) => pytest tests/test_case.py::TestK::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-nested-constructor": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestOuter",
+    "  S TestOuter > TestFree",
+    "  T TestOuter > TestFree > test_f => pytest tests/test_case.py::TestOuter::TestFree::test_f",
+    "  T TestOuter > test_o => pytest tests/test_case.py::TestOuter::test_o",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-new-custom-and-reset": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual (from tests/test_case.py:10) => pytest tests/test_case.py::TestActual::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-new-reset-support-base": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual (from tests/helpers.py:10) => pytest tests/test_case.py::TestActual::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-reset": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual (from tests/test_case.py:10) => pytest tests/test_case.py::TestActual::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-reset-in-the-middle": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual (from tests/test_case.py:10) => pytest tests/test_case.py::TestActual::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-reset-over-a-base-not-read": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S TestOrdered",
+    "  T TestOrdered > test_m [conditional] => (withheld: base-not-resolved)",
+    "  S TestSpace",
+    "  T TestSpace > test_m [conditional] => (withheld: base-not-resolved)",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-reset-support-base": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual (from tests/helpers.py:10) => pytest tests/test_case.py::TestActual::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-set-from-outside": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestActual",
+    "  T TestActual > test_actual [conditional] (from tests/test_case.py:10) => (withheld: constructor-not-read)",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-setup-overridden": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestK",
+    "  T TestK > test_m [conditional] (from tests/helpers.py:13) => pytest tests/test_case.py::TestK::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-switch-on-then-constructor": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-constructor-unittest-constructor": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S K",
+    "  T K > test_m => pytest tests/test_case.py::K::test_m",
+    "all: pytest tests/test_case.py"
+  ],
   "pytest-counts-of-parametrized-tests": [
     "tests/__init__.py [support] pytest",
     "tests/test_a.py [tests] pytest  run: pytest tests/test_a.py  [holds more tests]",
@@ -1240,7 +1694,7 @@
     "free/test_free.py [tests] pytest  run: pytest free/test_free.py",
     "  T test_free => pytest free/test_free.py::test_free",
     "tests/__init__.py [support] pytest",
-    "tests/test_x.py [tests] pytest  run: pytest tests/test_x.py",
+    "tests/test_x.py [tests] pytest  run: pytest tests/test_x.py  [holds more tests]",
     "  T test_a [conditional] => pytest tests/test_x.py::test_a",
     "all: pytest free/test_free.py tests/test_x.py"
   ],
@@ -1441,6 +1895,148 @@
     "  T test_d => pytest tests/test_x.py::test_d",
     "all: pytest free/test_free.py tests/test_x.py"
   ],
+  "pytest-object-alias-in-helper-imported": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_o (from tests/helpers.py:8) => pytest tests/test_case.py::test_o",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-alias-of-off": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-class-off-then-on-by-importer": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestK",
+    "  T TestK > test_m (from tests/helpers.py:10) => pytest tests/test_case.py::TestK::test_m",
+    "tests/test_other.py [tests] pytest  run: pytest tests/test_other.py",
+    "  S K",
+    "  T K > test_m (from tests/helpers.py:10) => pytest tests/test_other.py::K::test_m",
+    "all: pytest tests/test_case.py",
+    "all: pytest tests/test_other.py"
+  ],
+  "pytest-object-fixture-imported-as-test": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-method-off-in-base": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestK",
+    "  T TestK > test_n (from tests/helpers.py:12) => pytest tests/test_case.py::TestK::test_n",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-module-off-origin": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_x (from tests/test_off.py:10) => pytest tests/test_case.py::test_x",
+    "tests/test_off.py [tests] pytest  run: (withheld: collection-switched-off)",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-off-and-imported": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-off-by-importer-loaded-first": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_a.py [tests] pytest  run: pytest tests/test_a.py",
+    "  T test_own => pytest tests/test_a.py::test_own",
+    "tests/test_b.py [tests] pytest  run: pytest tests/test_b.py",
+    "  T test_x [conditional] => (withheld: collection-switch)",
+    "all: pytest tests/test_a.py",
+    "all: pytest tests/test_b.py"
+  ],
+  "pytest-object-off-by-importer-loaded-later": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_a.py [tests] pytest  run: pytest tests/test_a.py",
+    "  T test_x [conditional] => (withheld: collection-switch)",
+    "tests/test_b.py [tests] pytest  run: pytest tests/test_b.py",
+    "  T test_own => pytest tests/test_b.py::test_own",
+    "all: pytest tests/test_a.py",
+    "all: pytest tests/test_b.py"
+  ],
+  "pytest-object-off-method-alias-in-subclass": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-off-on-in-origin-then-imported": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T helper (from tests/helpers.py:8) => pytest tests/test_case.py::helper",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-off-then-on-by-importer": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual (from tests/helpers.py:8) => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-off-then-on-two-test-files": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual (from tests/test_helpers.py:8) => pytest tests/test_case.py::test_actual",
+    "tests/test_helpers.py [tests] pytest  run: pytest tests/test_helpers.py",
+    "  T helper [conditional] => (withheld: collection-switch)",
+    "  T test_own => pytest tests/test_helpers.py::test_own",
+    "all: pytest tests/test_case.py",
+    "all: pytest tests/test_helpers.py"
+  ],
+  "pytest-object-on-by-importer-any-name": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T helper (from tests/helpers.py:8) => pytest tests/test_case.py::helper",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-star-import-of-off": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_kept (from tests/helpers.py:13) => pytest tests/test_case.py::test_kept",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-star-import-then-on": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_shared (from tests/helpers.py:8) => pytest tests/test_case.py::test_shared",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-switch-in-a-branch-by-importer": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "  T test_actual [conditional] (from tests/helpers.py:8) => (withheld: collection-switch)",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-object-switch-through-another-name": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T helper [conditional] (from tests/helpers.py:8) => (withheld: collection-switch)",
+    "  T test_x [conditional] (from tests/helpers.py:8) => (withheld: collection-switch)",
+    "  S TestK",
+    "  T TestK > test_m [conditional] (from tests/helpers.py:14) => (withheld: collection-switch)",
+    "all: pytest tests/test_case.py"
+  ],
   "pytest-options-deselect": [
     "tests/__init__.py [support] pytest",
     "tests/deco.py [support] pytest",
@@ -1504,6 +2100,178 @@
     "  T TestX > test_own [skipped] => pytest tests/test_a.py::TestX::test_own",
     "all: pytest free/test_free.py tests/test_a.py"
   ],
+  "pytest-rows-class-level": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S TestK",
+    "  T TestK > test_m [skipped] => pytest tests/test_case.py::TestK::test_m",
+    "  S TestL",
+    "  T TestL > test_m [skipped] => pytest tests/test_case.py::TestL::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-fixture-rows": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_by_name [conditional] => pytest tests/test_case.py::test_by_name",
+    "  T test_some => pytest tests/test_case.py::test_some",
+    "  T test_maybe [conditional] => pytest tests/test_case.py::test_maybe",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-fixture-skip-all": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-indirect": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-module-level": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual [skipped] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-param-imported-by-name": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_off [skipped] => pytest tests/test_case.py::test_off",
+    "  T test_on => pytest tests/test_case.py::test_on",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-row-by-helper": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_off [conditional] => pytest tests/test_case.py::test_off",
+    "  T test_on => pytest tests/test_case.py::test_on",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-row-by-name": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_off [skipped] => pytest tests/test_case.py::test_off",
+    "  T test_on => pytest tests/test_case.py::test_on",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-row-imported": [
+    "tests/__init__.py [support] pytest",
+    "tests/cases.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_off [conditional] => pytest tests/test_case.py::test_off",
+    "  T test_on => pytest tests/test_case.py::test_on",
+    "  T test_module_off [conditional] => pytest tests/test_case.py::test_module_off",
+    "  T test_module_on => pytest tests/test_case.py::test_module_on",
+    "  T test_member_on => pytest tests/test_case.py::test_member_on",
+    "  T test_member_off [skipped] => pytest tests/test_case.py::test_member_off",
+    "  T test_call_off [conditional] => pytest tests/test_case.py::test_call_off",
+    "  T test_call_on => pytest tests/test_case.py::test_call_on",
+    "  T test_class_on => pytest tests/test_case.py::test_class_on",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-row-mark-and-expression": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "  T test_own => pytest tests/test_case.py::test_own",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-row-usefixtures": [
+    "tests/__init__.py [support] pytest",
+    "tests/conftest.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-rows-by-name": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual [skipped] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-rows-from-a-call": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-rows-starred": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_off [skipped] => pytest tests/test_case.py::test_off",
+    "  T test_none [skipped] => pytest tests/test_case.py::test_none",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-rows-that-run": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_xfail => pytest tests/test_case.py::test_xfail",
+    "  T test_id => pytest tests/test_case.py::test_id",
+    "  T test_tuple => pytest tests/test_case.py::test_tuple",
+    "  T test_class => pytest tests/test_case.py::test_class",
+    "  T test_member => pytest tests/test_case.py::test_member",
+    "  T test_instance => pytest tests/test_case.py::test_instance",
+    "  T test_package => pytest tests/test_case.py::test_package",
+    "  T test_builtin => pytest tests/test_case.py::test_builtin",
+    "  T test_helper => pytest tests/test_case.py::test_helper",
+    "  T test_lambda => pytest tests/test_case.py::test_lambda",
+    "  T test_negative => pytest tests/test_case.py::test_negative",
+    "  T test_text => pytest tests/test_case.py::test_text",
+    "  T test_own_mark => pytest tests/test_case.py::test_own_mark",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-skip-all": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual [skipped] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-skip-some": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-skipif-all": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-stacked": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual [skipped] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-unittest-skips": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S K",
+    "  T K > test_sub => pytest tests/test_case.py::K::test_sub",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-xfail-no-run": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual [skipped] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-rows-xfail-that-does-not-run-under-a-condition": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_condition_false => pytest tests/test_case.py::test_condition_false",
+    "  T test_condition_true [skipped] => pytest tests/test_case.py::test_condition_true",
+    "  T test_condition_computed [conditional] => pytest tests/test_case.py::test_condition_computed",
+    "  T test_condition_keyword => pytest tests/test_case.py::test_condition_keyword",
+    "  T test_never [skipped] => pytest tests/test_case.py::test_never",
+    "  T test_condition_text [conditional] => pytest tests/test_case.py::test_condition_text",
+    "  T test_skipif_false [conditional] => pytest tests/test_case.py::test_skipif_false",
+    "  T test_skip_with_argument [skipped] => pytest tests/test_case.py::test_skip_with_argument",
+    "all: pytest tests/test_case.py"
+  ],
   "pytest-setup-cfg-and-tox": [
     "tests/test_s.py [tests] pytest  run: pytest tests/test_s.py",
     "  T test_x => pytest tests/test_s.py::test_x",
@@ -1532,6 +2300,189 @@
     "tests/test_x.py [tests] pytest  run: pytest tests/test_x.py",
     "  T test_a [conditional] => pytest tests/test_x.py::test_a",
     "all: pytest free/test_free.py tests/test_x.py"
+  ],
+  "pytest-several-autouse": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-asks-for-a-table": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-beside": [
+    "other/test_there.py [tests] pytest  run: pytest other/test_there.py  [holds more tests]",
+    "  T test_there => pytest other/test_there.py::test_there",
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest other/test_there.py tests/test_case.py"
+  ],
+  "pytest-several-autouse-conftest": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-fixture-by-name": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-in-base-class": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S TestK",
+    "  T TestK > test_m => pytest tests/test_case.py::TestK::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-in-class": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S TestK",
+    "  T TestK > test_m => pytest tests/test_case.py::TestK::test_m",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-in-plugin": [
+    "tests/__init__.py [support] pytest",
+    "tests/plugin.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-rows-skip": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-table-empty": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-autouse-unittest": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S K",
+    "  T K > test_m [conditional] => pytest tests/test_case.py::K::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-class-generate": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S TestK",
+    "  T TestK > test_m [conditional] => pytest tests/test_case.py::TestK::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-class-usefixtures": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S TestK",
+    "  T TestK > test_m => pytest tests/test_case.py::TestK::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-doctest-modules": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: (withheld: runner-options-not-read)",
+    "  T test_actual => (withheld: runner-options-not-read)"
+  ],
+  "pytest-several-fixture-computed-params-autouse": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-fixture-params-by-name": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-generate-in-plugin": [
+    "tests/__init__.py [support] pytest",
+    "tests/plugin.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-generate-tests": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "  T test_plain [conditional] => pytest tests/test_case.py::test_plain",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-generate-tests-in-module": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual [conditional] => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-imported-test-under-autouse": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_check (from tests/helpers.py:8) => pytest tests/test_case.py::test_check",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-ini-usefixtures": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-setup-class-autouse-module-scope": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "  T test_second => pytest tests/test_case.py::test_second",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-table-fixture-overridden": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  T test_actual => pytest tests/test_case.py::test_actual",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-table-on-base-class": [
+    "tests/__init__.py [support] pytest",
+    "tests/helpers.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S TestK",
+    "  T TestK > test_m => pytest tests/test_case.py::TestK::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-unittest-autouse-plain": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py",
+    "  S K",
+    "  T K > test_m => pytest tests/test_case.py::K::test_m",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-unittest-parametrize": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S K",
+    "  T K > test_m => pytest tests/test_case.py::K::test_m",
+    "  T K > test_n => pytest tests/test_case.py::K::test_n",
+    "all: pytest tests/test_case.py"
+  ],
+  "pytest-several-unittest-usefixtures-table": [
+    "tests/__init__.py [support] pytest",
+    "tests/test_case.py [tests] pytest  run: pytest tests/test_case.py  [holds more tests]",
+    "  S K",
+    "  T K > test_m [conditional] => pytest tests/test_case.py::K::test_m",
+    "  S L",
+    "  T L > test_m => pytest tests/test_case.py::L::test_m",
+    "all: pytest tests/test_case.py"
   ],
   "pytest-star-import": [
     "tests/__init__.py [support] pytest",
@@ -1650,12 +2601,12 @@
     "tests/__init__.py [support] pytest",
     "tests/test_a.py [tests] pytest  run: pytest tests/test_a.py",
     "  S TestHome",
-    "  T TestHome > test_m (from tests/test_a.py:8) => pytest tests/test_a.py::TestHome::test_m",
+    "  T TestHome > test_m [conditional] (from tests/test_a.py:8) => (withheld: collection-switch)",
     "tests/test_b.py [tests] pytest  run: pytest tests/test_b.py",
     "  T test_free => pytest tests/test_b.py::test_free",
     "tests/test_c.py [tests] pytest  run: pytest tests/test_c.py",
     "  S TestLater",
-    "  T TestLater > test_m (from tests/test_a.py:8) => pytest tests/test_c.py::TestLater::test_m",
+    "  T TestLater > test_m [conditional] (from tests/test_a.py:8) => (withheld: collection-switch)",
     "all: pytest tests/test_a.py tests/test_c.py",
     "all: pytest tests/test_b.py"
   ],
@@ -1663,7 +2614,7 @@
     "tests/__init__.py [support] pytest",
     "tests/test_a.py [tests] pytest  run: pytest tests/test_a.py",
     "  S TestA",
-    "  T TestA > test_m => pytest tests/test_a.py::TestA::test_m",
+    "  T TestA > test_m [conditional] => (withheld: collection-switch)",
     "tests/test_b.py [tests] pytest  run: pytest tests/test_b.py",
     "all: pytest tests/test_a.py",
     "all: pytest tests/test_b.py"
@@ -1671,7 +2622,7 @@
   "pytest-switch-written-on-an-imported-function": [
     "tests/__init__.py [support] pytest",
     "tests/test_a.py [tests] pytest  run: pytest tests/test_a.py",
-    "  T test_x => pytest tests/test_a.py::test_x",
+    "  T test_x [conditional] => (withheld: collection-switch)",
     "tests/test_b.py [tests] pytest  run: pytest tests/test_b.py",
     "all: pytest tests/test_a.py",
     "all: pytest tests/test_b.py"
@@ -1942,5 +2893,29 @@
     "  T skipped group > inside [skipped] => npx vitest run src/skips.test.js -t '^skipped group inside$'",
     "  T with options [skipped] => npx vitest run src/skips.test.js -t '^with options$'",
     "all: npx vitest run src/skips.test.js"
+  ],
+  "vitest-tables-of-cases": [
+    "test/a.test.js [tests] vitest  run: npx vitest run test/a.test.js  [holds more tests]",
+    "  T written out %i => (withheld: generated-cases)",
+    "  T by name %i => (withheld: generated-cases)",
+    "  T no rows by name %i [skipped] => (withheld: generated-cases)",
+    "  T no rows %i [skipped] => (withheld: generated-cases)",
+    "  T for %i => (withheld: generated-cases)",
+    "  S suite %i",
+    "  T suite %i > inside => (withheld: suite-name-not-literal)",
+    "  S no suite %i",
+    "  T no suite %i > inside [skipped] => (withheld: suite-name-not-literal)",
+    "  T skip if true [conditional] => npx vitest run test/a.test.js -t '^skip if true$'",
+    "  T skip if false [conditional] => npx vitest run test/a.test.js -t '^skip if false$'",
+    "  T run if false [conditional] => npx vitest run test/a.test.js -t '^run if false$'",
+    "  T run if true [conditional] => npx vitest run test/a.test.js -t '^run if true$'",
+    "  S suite skipped if",
+    "  T suite skipped if > inside [conditional] => npx vitest run test/a.test.js -t '^suite skipped if inside$'",
+    "  S suite run if",
+    "  T suite run if > inside [conditional] => npx vitest run test/a.test.js -t '^suite run if inside$'",
+    "  T to do [skipped] => npx vitest run test/a.test.js -t '^to do$'",
+    "  T no body [skipped] => npx vitest run test/a.test.js -t '^no body$'",
+    "  T plain => npx vitest run test/a.test.js -t '^plain$'",
+    "all: npx vitest run test/a.test.js"
   ]
 }

@@ -6429,6 +6429,10 @@ function testUnits(fileEntry, helpers) {
         const ownGate = attributes.some(attribute => /^cfg(_attr)?$/.test(String(attribute.name)) &&
             String(attribute.args || '').replace(/[\s()]/g, '') !== 'test');
         const inTestModule = (symbol.modifiers || []).includes('cfg_test_module');
+        // An attribute that is none of the language's is a macro that rewrites the function.
+        const rewritten = names.some(name => !/(^|::)test$/.test(name) &&
+            !RUST_INERT_ATTRIBUTES.has(name) && !RUST_CASE_ATTRIBUTES.has(name.split('::').pop()) &&
+            !/^(clippy|rustfmt|rustc|diagnostic)(::|_)/.test(name));
         for (const outer of chain) holding.add(outer);
         units.push({
             kind: 'test', name: symbol.name, suite: chain.map(outer => outer.name),
@@ -6437,9 +6441,10 @@ function testUnits(fileEntry, helpers) {
             // Declared, and left out of a run unless asked for.
             ...(names.includes('ignore') && { ignored: true, skipped: true }),
             ...((ownGate || gates > (inTestModule ? 1 : 0)) && { conditional: true, notInEveryBuild: true }),
-            ...(!(ownGate || gates > (inTestModule ? 1 : 0)) && names.some(name => !/(^|::)test$/.test(name) &&
-                !RUST_INERT_ATTRIBUTES.has(name) && !RUST_CASE_ATTRIBUTES.has(name.split('::').pop()) &&
-                !/^(clippy|rustfmt|rustc|diagnostic)(::|_)/.test(name)) && { conditional: true }),
+            ...(!(ownGate || gates > (inTestModule ? 1 : 0)) && rewritten && { conditional: true }),
+            // What a macro makes of the function is not read: none, one
+            // or several tests.
+            ...(rewritten && { several: true }),
             ...(cases && { dynamic: 'generated-cases' }),
         });
     }

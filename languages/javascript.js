@@ -6462,6 +6462,14 @@ function createTestBinder(helpers, root) {
         functionOf: node => functions.get(node.id) || null,
         /** What a name declared at the top of the file holds, or undefined. */
         bound: name => top.names.has(name) ? valueOfBinding(top.names.get(name)) : undefined,
+        /** The one value a name is bound to where it is used ({ node, scope }), or null. */
+        valueAt: (node, scope) => {
+            if (!node || node.type !== 'identifier') return null;
+            const found = lookup(scope, node.text);
+            const writes = found && !found.dynamic && found.binding ? found.binding.writes : [];
+            return writes.length === 1 && writes[0].kind === 'value' && writes[0].node
+                ? { node: writes[0].node, scope: writes[0].env } : null;
+        },
     };
 }
 
@@ -6474,10 +6482,11 @@ function testBinderOf(helpers, tree) {
     return binder;
 }
 
-/** The declaring call a call node is, or null: { kind, table, skip, todo, only, sometimes }. */
+/** The declaring call a call node is, or null: { kind, table, rows, skip, todo, only, sometimes }. */
 function testApiCall(node, resolve) {
     let callee = node.childForFieldName('function');
     let table = false;
+    let rows = null;
     let sometimes = false;
     if (callee && callee.type === 'call_expression') {
         // it.each(rows)(...), it.skipIf(cond)(...)
@@ -6485,8 +6494,12 @@ function testApiCall(node, resolve) {
         if (!inner || inner.type !== 'member_expression') return null;
         const property = inner.childForFieldName('property');
         if (!property) return null;
-        if (TEST_API_TABLES.has(property.text)) table = true;
-        else if (TEST_API_CONDITIONS.has(property.text)) sometimes = true;
+        if (TEST_API_TABLES.has(property.text)) {
+            table = true;
+            // The table: the call's argument, or the template it is tagged with.
+            const given = callee.childForFieldName('arguments');
+            rows = !given ? null : given.type === 'template_string' ? given : given.namedChildren[0] || null;
+        } else if (TEST_API_CONDITIONS.has(property.text)) sometimes = true;
         else return null;
         callee = inner.childForFieldName('object');
     }
@@ -6497,7 +6510,7 @@ function testApiCall(node, resolve) {
     const modifiers = resolved.modifiers || [];
     return {
         kind: TEST_SUITE_APIS.has(api) ? 'suite' : 'test',
-        table, sometimes,
+        table, rows, sometimes,
         skip: /^x/.test(api) || modifiers.includes('skip'),
         todo: modifiers.includes('todo'),
         only: modifiers.includes('only') || api === 'fit' || api === 'fdescribe',
@@ -6605,12 +6618,126 @@ function declaredSkip(values, hasCallback) {
  * outside a test: one that declares tests when called gives them to
  * this file ("calledWhenCalled": from inside a function of the file, so
  * to whoever calls that function).
+ *
+ * A declaration exists as often as the statement that makes it runs, up
+ * to the function that holds it: in a branch, a handler or after a
+ * statement that may leave (a return, a throw) it runs only sometimes; in
+ * a loop it stands for several tests, and for none when the loop does not
+ * run. A table of cases is read where it is written out, here or in the
+ * one value its name is bound to: an empty one declares nothing (jest
+ * refuses the file: "emptyTable"), one that is not written out may be
+ * empty.
  */
 function testUnits(fileEntry, helpers) {
     const tree = helpers.tree();
     if (!tree) return null;
     const binder = testBinderOf(helpers, tree);
     const units = [];
+    // ---- where a declaration stands in the flow of its function ----
+    const CLASS_NODES = new Set(['class_declaration', 'class', 'class_body', 'abstract_class_declaration']);
+    // Can running a statement leave the function it stands in: a return,
+    // a throw that no handler around it catches, process.exit.
+    const leaves = (node, caught = false) => {
+        if (FUNCTION_NODES.has(node.type) || CLASS_NODES.has(node.type)) return false;
+        if (node.type === 'return_statement') return true;
+        if (node.type === 'throw_statement') return !caught;
+        if (node.type === 'call_expression') {
+            const callee = node.childForFieldName('function');
+            if (callee && callee.type === 'member_expression' && callee.childForFieldName('object')?.text === 'process' &&
+                callee.childForFieldName('property')?.text === 'exit') return true;
+        }
+        if (node.type === 'try_statement') {
+            const handled = !!node.childForFieldName('handler');
+            return node.namedChildren.some(child => leaves(child,
+                caught || (handled && sameNode(child, node.childForFieldName('body')))));
+        }
+        return node.namedChildren.some(child => leaves(child, caught));
+    };
+    const leaveMemo = new Map(); // id of a block -> where its first statement that may leave it ends
+    const leavesBefore = (block, statement) => {
+        if (!leaveMemo.has(block.id)) {
+            const first = block.namedChildren.find(statement => leaves(statement));
+            leaveMemo.set(block.id, first ? first.endIndex : Infinity);
+        }
+        return statement.startIndex >= leaveMemo.get(block.id);
+    };
+    const flowMemo = new Map();
+    /**
+     * What the statements around a call say, up to the function or the
+     * file that holds it: it runs only `sometimes`, or as often as a loop
+     * does (`several`).
+     */
+    const flowOf = (node, scope) => {
+        if (flowMemo.has(node.id)) return flowMemo.get(node.id);
+        let sometimes = false;
+        let several = false;
+        for (let child = node, parent = node.parent; parent; child = parent, parent = parent.parent) {
+            if (FUNCTION_NODES.has(parent.type) || CLASS_NODES.has(parent.type)) break;
+            const is = field => sameNode(parent.childForFieldName(field), child);
+            switch (parent.type) {
+                case 'if_statement': case 'ternary_expression':
+                    if (!is('condition')) sometimes = true;
+                    break;
+                case 'binary_expression':
+                    if (is('right') && /^(&&|\|\||\?\?)$/.test(parent.childForFieldName('operator')?.text || '')) sometimes = true;
+                    break;
+                case 'switch_case':
+                    if (!is('value')) sometimes = true;
+                    break;
+                case 'switch_default': case 'catch_clause':
+                    sometimes = true;
+                    break;
+                case 'for_statement':
+                    if (!is('initializer')) several = sometimes = true;
+                    break;
+                case 'for_in_statement':
+                    if (is('body')) {
+                        several = true;
+                        // Over a list written out that holds something, the body runs.
+                        if (!parent.children.some(part => part.type === 'of') ||
+                            tableRows(parent.childForFieldName('right'), scope) !== 'rows') sometimes = true;
+                    }
+                    break;
+                case 'while_statement':
+                    several = sometimes = true;
+                    break;
+                case 'do_statement':
+                    // The body runs once at least.
+                    several = true;
+                    break;
+                case 'statement_block': case 'program':
+                    if (leavesBefore(parent, child)) sometimes = true;
+                    break;
+                default: break;
+            }
+        }
+        const answer = { sometimes, several };
+        flowMemo.set(node.id, answer);
+        return answer;
+    };
+    /** What a table of cases holds: 'rows', 'empty', or 'unread'. */
+    const tableRows = (node, scope, depth = 0) => {
+        if (!node || depth > 4) return 'unread';
+        switch (node.type) {
+            // A table written as a template has a heading and rows.
+            case 'template_string': return 'rows';
+            case 'parenthesized_expression': case 'as_expression': case 'satisfies_expression': case 'non_null_expression':
+                return tableRows(node.namedChildren[0], scope, depth + 1);
+            case 'array': {
+                const items = node.namedChildren.filter(item => item.type !== 'comment');
+                if (items.length === 0) return 'empty';
+                if (items.some(item => item.type !== 'spread_element')) return 'rows';
+                const parts = items.map(item => tableRows(item.namedChildren[0], scope, depth + 1));
+                return parts.includes('rows') ? 'rows' : parts.every(part => part === 'empty') ? 'empty' : 'unread';
+            }
+            case 'identifier': {
+                const held = binder.valueAt(node, scope);
+                return held ? tableRows(held.node, held.scope, depth + 1) : 'unread';
+            }
+            default: return 'unread';
+        }
+    };
+    let emptyTable = false;
     // A call through a name that may be the runner's function and is not
     // read: a test this does not see.
     let unreadCall = false;
@@ -6721,16 +6848,21 @@ function testUnits(fileEntry, helpers) {
         const dynamic = title == null ? 'name-not-literal'
             : api.table ? 'generated-cases'
             : ctx.indirect || ctx.inTest ? 'declared-indirectly' : null;
+        const flow = flowOf(node, call.scope);
+        const rows = api.table ? tableRows(api.rows, call.scope) : 'rows';
+        if (rows === 'empty') emptyTable = true;
         const option = declaredSkip(rest, hasBody);
         // Options that are not written out here: a name bound to
         // something that is no function, or an expression beside
         // the one that is the body.
         const optionsUnread = hasBody && (kinds.includes('held') || given > (callback ? 0 : 1));
         // A test with no body has nothing to execute (pending, todo).
-        const skipped = api.skip || (api.kind === 'test' && !hasBody) || option === 'skip' ||
+        const skipped = api.skip || (api.kind === 'test' && !hasBody) || option === 'skip' || rows === 'empty' ||
             ctx.suites.some(suite => suite.skipped);
         const sometimes = api.sometimes || option === 'sometimes' || (optionsUnread && !skipped) ||
+            flow.sometimes || rows === 'unread' ||
             ctx.indirect || ctx.inTest || ctx.suites.some(suite => suite.sometimes);
+        const several = flow.several || ctx.suites.some(suite => suite.several);
         const index = units.length;
         const outer = ctx.suites[ctx.suites.length - 1];
         units.push({
@@ -6744,6 +6876,8 @@ function testUnits(fileEntry, helpers) {
             ...((dynamic || ctx.suites.some(suite => suite.dynamic)) && {
                 dynamic: dynamic || 'suite-name-not-literal',
             }),
+            // Declared by a statement that runs more than once.
+            ...(several && { several: true }),
             // Declared where a function of the file is called, by whoever calls it.
             ...(ctx.indirect && { indirect: true }),
         });
@@ -6754,7 +6888,7 @@ function testUnits(fileEntry, helpers) {
             owners.set(held, {
                 context: ctx, kind: api.kind,
                 suite: api.kind === 'suite'
-                    ? { name: title == null ? '' : title, dynamic: !!dynamic, skipped, sometimes, index } : null,
+                    ? { name: title == null ? '' : title, dynamic: !!dynamic, skipped, sometimes, several, index } : null,
             });
         }
     }
@@ -6774,6 +6908,7 @@ function testUnits(fileEntry, helpers) {
     return {
         units,
         open: unreadCall || handedOver,
+        ...(emptyTable && { emptyTable: true }),
         ...(calledModules.size > 0 && { calledModules: [...calledModules].sort() }),
         ...(calledWhenCalled.size > 0 && { calledWhenCalled: [...calledWhenCalled].sort() }),
         ...(units.some(unit => unit.only) && { focus: true }),

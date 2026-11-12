@@ -19,9 +19,12 @@
  * `repeats` (bodies that execute more often than the tests listed for
  * them: a table of cases), `atLeast` (files whose count the engine gives
  * as a lower bound: every file from which the runner executes something
- * the engine does not list has to be one). `undeclared` and `repeats`
- * name a mark as it is written (`<file>::<label>`), a line
- * (`<file>:<line>`) or a run-time label.
+ * the engine does not list has to be one), `onlyInWholeRun` (tests a
+ * whole run executes because of the order files are loaded in, which the
+ * file's own command cannot run: the engine has to call them
+ * conditional). `undeclared`, `repeats` and `onlyInWholeRun` name a mark
+ * as it is written (`<file>::<label>`), a line (`<file>:<line>`) or a
+ * run-time label.
  *
  * Two consumers share this data: eval/run-test-unit-matrix.js runs the
  * runners; test/test-units.test.js pins the engine's answer on every case
@@ -33,6 +36,8 @@
 const PY = 'import os\ndef mark(i):\n    open(os.environ["UCN_RAN"], "a").write(i + "\\n")\n';
 // The identity of the pytest test that is running: `<file>::<suite > name>`.
 const RID = 'def rid():\n    n = os.environ["PYTEST_CURRENT_TEST"].split(" ")[0].split("::")\n    return n[0] + "::" + " > ".join(n[1:])\n';
+// The same for a test that runs once for each row of a table: the row is not part of the identity.
+const RIDP = 'def rid():\n    n = os.environ["PYTEST_CURRENT_TEST"].split(" ")[0].split("::")\n    n[-1] = n[-1].split("[")[0]\n    return n[0] + "::" + " > ".join(n[1:])\n';
 const CJS = "const mark = id => require('fs').appendFileSync(process.env.UCN_RAN, id + '\\n');\n";
 const ESM = "import { appendFileSync } from 'node:fs';\nconst mark = id => appendFileSync(process.env.UCN_RAN, id + '\\n');\n";
 const GO = pkg => `package ${pkg}\n\nimport (\n\t"os"\n)\n\nfunc mark(id string) {\n\tf, _ := os.OpenFile(os.Getenv("UCN_RAN"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)\n\tf.WriteString(id + "\\n")\n\tf.Close()\n}\n`;
@@ -52,6 +57,7 @@ DEPENDENCIES
 `;
 const JUPITER = '    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.10.2</version><scope>test</scope></dependency>';
 const JUNIT4 = '    <dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version><scope>test</scope></dependency>';
+const TESTNG = '    <dependency><groupId>org.testng</groupId><artifactId>testng</artifactId><version>7.10.2</version><scope>test</scope></dependency>';
 const CSPROJ = packages => `<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net9.0</TargetFramework><IsPackable>false</IsPackable><Nullable>disable</Nullable></PropertyGroup>
   <ItemGroup>
@@ -60,6 +66,8 @@ ${packages.map(([name, version]) => `    <PackageReference Include="${name}" Ver
 </Project>
 `;
 const XUNIT = [['Microsoft.NET.Test.Sdk', '17.12.0'], ['xunit', '2.9.3'], ['xunit.runner.visualstudio', '3.1.5']];
+const NUNIT = [['Microsoft.NET.Test.Sdk', '17.12.0'], ['NUnit', '3.12.0'], ['NUnit3TestAdapter', '4.6.0']];
+const MSTEST = [['Microsoft.NET.Test.Sdk', '17.12.0'], ['MSTest.TestAdapter', '1.2.1'], ['MSTest.TestFramework', '1.2.1']];
 
 const CASES = [
     // ------------------------------------------------------------------ pytest
@@ -2873,6 +2881,8 @@ class TestX(Base):
     },
     {
         id: 'pytest-switch-written-on-an-imported-class', runner: 'pytest',
+        // In the module the class comes from, the switch holds where the writer was loaded first.
+        sometimes: ['tests/test_a.py::TestA > test_m'],
         emptyTestFiles: ['tests/test_b.py'],
         files: {
             'pytest.ini': '[pytest]\n',
@@ -2995,6 +3005,7 @@ class Inherits(Base):
     },
     {
         id: 'pytest-switch-written-on-an-imported-function', runner: 'pytest',
+        sometimes: ['tests/test_a.py::test_x'],
         emptyTestFiles: ['tests/test_b.py'],
         files: {
             'pytest.ini': '[pytest]\n',
@@ -3559,6 +3570,7 @@ def test_d(v):
     {
         id: 'pytest-hook-of-the-module-generates', runner: 'pytest',
         sometimes: ['tests/test_x.py::test_a'],
+        atLeast: ['tests/test_x.py'],
         emptyTestFiles: ['tests/test_x.py'],
         files: {
             'pytest.ini': '[pytest]\n',
@@ -4870,7 +4882,8 @@ class TestFree:
         // (measured) for every module pytest loads after that one, which
         // is why the writing module is never joined with another file.
         id: 'pytest-switch-written-on-an-imported-base', runner: 'pytest',
-        notRunByDefault: ['tests/test_c.py::TestLater > test_m'],
+        // The whole run loads the writer before test_c.py and after test_a.py.
+        sometimes: ['tests/test_a.py::TestHome > test_m', 'tests/test_c.py::TestLater > test_m'],
         files: {
             'pytest.ini': '[pytest]\n',
             'tests/__init__.py': '',
@@ -4896,6 +4909,2818 @@ def test_free():
 
 class TestLater(Base):
     pass
+`,
+        },
+    },
+    // ------ pytest: a switch is the state of an object, whoever holds it
+    {
+        id: 'pytest-object-off-then-on-by-importer', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+
+helper.__test__ = False
+`,
+            'tests/test_case.py': 'from tests.helpers import helper as test_actual\ntest_actual.__test__ = True\n',
+        },
+    },
+    {
+        id: 'pytest-object-off-and-imported', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+
+helper.__test__ = False
+`,
+            'tests/test_case.py': `${PY}def test_own():
+    mark("tests/test_case.py::test_own")
+
+from tests.helpers import helper as test_actual
+`,
+        },
+    },
+    {
+        id: 'pytest-object-on-by-importer-any-name', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+`,
+            'tests/test_case.py': 'from tests.helpers import helper\nhelper.__test__ = True\n',
+        },
+    },
+    {
+        id: 'pytest-object-off-by-importer-loaded-later', runner: 'pytest',
+        sometimes: ['tests/test_a.py::test_x'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RIDP}def test_x():
+    mark(rid())
+`,
+            'tests/test_b.py': `${PY}from tests.test_a import test_x
+test_x.__test__ = False
+
+def test_own():
+    mark("tests/test_b.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-object-off-by-importer-loaded-first', runner: 'pytest',
+        sometimes: ['tests/test_b.py::test_x'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_b.py': `${PY}${RIDP}def test_x():
+    mark(rid())
+`,
+            'tests/test_a.py': `${PY}from tests.test_b import test_x
+test_x.__test__ = False
+
+def test_own():
+    mark("tests/test_a.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-object-fixture-imported-as-test', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `import pytest
+
+@pytest.fixture
+def fix():
+    return 1
+`,
+            'tests/test_case.py': `${PY}def test_own():
+    mark("tests/test_case.py::test_own")
+
+from tests.helpers import fix as test_fix
+`,
+        },
+    },
+    {
+        id: 'pytest-object-alias-of-off', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}def test_own():
+    mark("tests/test_case.py::test_own")
+${RIDP}
+def helper():
+    mark(rid())
+
+helper.__test__ = False
+test_alias = helper
+`,
+        },
+    },
+    {
+        id: 'pytest-object-alias-in-helper-imported', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+
+other = helper
+`,
+            'tests/test_case.py': 'from tests.helpers import other as test_o\n',
+        },
+    },
+    {
+        id: 'pytest-object-method-off-in-base', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}class Base:
+    def test_m(self):
+        mark(rid())
+    test_m.__test__ = False
+    def test_n(self):
+        mark(rid())
+`,
+            'tests/test_case.py': `from tests.helpers import Base
+
+class TestK(Base):
+    pass
+`,
+        },
+    },
+    {
+        id: 'pytest-object-class-off-then-on-by-importer', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}class K:
+    __test__ = False
+    def test_m(self):
+        mark(rid())
+`,
+            'tests/test_case.py': 'from tests.helpers import K as TestK\nTestK.__test__ = True\n',
+            'tests/test_other.py': 'from tests.helpers import K\nK.__test__ = True\n',
+        },
+    },
+    {
+        id: 'pytest-object-off-then-on-two-test-files', runner: 'pytest',
+        sometimes: ['tests/test_helpers.py::helper'],
+        onlyInWholeRun: ['tests/test_helpers.py::helper'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+
+helper.__test__ = False
+
+def test_own():
+    mark("tests/test_helpers.py::test_own")
+`,
+            'tests/test_case.py': 'from tests.test_helpers import helper as test_actual\ntest_actual.__test__ = True\n',
+        },
+    },
+    {
+        id: 'pytest-object-switch-in-a-branch-by-importer', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+
+helper.__test__ = False
+`,
+            'tests/test_case.py': `${PY}def test_own():
+    mark("tests/test_case.py::test_own")
+
+from tests.helpers import helper as test_actual
+if os.environ.get("UCN_NEVER"):
+    test_actual.__test__ = True
+`,
+        },
+    },
+    {
+        id: 'pytest-object-module-off-origin', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_off.py': `${PY}${RIDP}__test__ = False
+
+def test_x():
+    mark(rid())
+`,
+            'tests/test_case.py': 'from tests.test_off import test_x\n',
+        },
+    },
+    {
+        id: 'pytest-object-off-on-in-origin-then-imported', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+
+helper.__test__ = False
+helper.__test__ = True
+`,
+            'tests/test_case.py': 'from tests.helpers import helper\n',
+        },
+    },
+    {
+        id: 'pytest-object-star-import-of-off', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def test_shared():
+    mark(rid())
+
+test_shared.__test__ = False
+
+def test_kept():
+    mark(rid())
+`,
+            'tests/test_case.py': 'from tests.helpers import *\n',
+        },
+    },
+    {
+        id: 'pytest-object-star-import-then-on', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def test_shared():
+    mark(rid())
+
+test_shared.__test__ = False
+`,
+            'tests/test_case.py': 'from tests.helpers import *\ntest_shared.__test__ = True\n',
+        },
+    },
+    {
+        id: 'pytest-object-off-method-alias-in-subclass', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}class Base:
+    def check(self):
+        mark(rid())
+    check.__test__ = False
+`,
+            'tests/test_case.py': `${PY}def test_own():
+    mark("tests/test_case.py::test_own")
+
+from tests.helpers import Base
+
+class TestK(Base):
+    test_again = Base.check
+`,
+        },
+    },
+    {
+        id: 'pytest-object-switch-through-another-name', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestK > test_m', 'tests/test_case.py::helper', 'tests/test_case.py::test_x'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def helper():
+    mark(rid())
+
+helper.__test__ = False
+
+class Base:
+    def test_m(self):
+        mark(rid())
+    test_m.__test__ = False
+`,
+            'tests/test_case.py': `from tests.helpers import helper, Base
+
+test_x = helper
+test_x.__test__ = True
+
+class TestK(Base):
+    pass
+
+Base.test_m.__test__ = True
+`,
+        },
+    },
+    // ---- pytest: a class has the constructor its lookup order binds first
+    {
+        id: 'pytest-constructor-reset', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Base:
+    def __init__(self): pass
+    def test_actual(self):
+        mark(rid())
+
+class TestActual(Base):
+    __init__ = object.__init__
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-reset-support-base', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}class Base:
+    def __init__(self): pass
+    def test_actual(self):
+        mark(rid())
+`,
+            'tests/test_case.py': `from tests.helpers import Base
+
+class TestActual(Base):
+    __init__ = object.__init__
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-new-reset-support-base', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}class Base:
+    def __new__(cls): return object.__new__(cls)
+    def test_actual(self):
+        mark(rid())
+`,
+            'tests/test_case.py': `from tests.helpers import Base
+
+class TestActual(Base):
+    __new__ = object.__new__
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-init-none', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestActual > test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Base:
+    def __init__(self): pass
+    def test_actual(self):
+        mark(rid())
+
+class TestActual(Base):
+    __init__ = None
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-reset-in-the-middle', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Base:
+    def __init__(self): pass
+    def test_actual(self):
+        mark(rid())
+
+class Mid(Base):
+    __init__ = object.__init__
+
+class TestActual(Mid):
+    pass
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-custom-after-reset', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Base:
+    def __init__(self): pass
+    def test_actual(self):
+        mark(rid())
+
+class Mid(Base):
+    __init__ = object.__init__
+
+class TestActual(Mid):
+    def __init__(self): pass
+
+def test_own():
+    mark("tests/test_case.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-init-of-a-plain-class', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestActual > test_actual'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Base:
+    def __init__(self): pass
+    def test_actual(self):
+        mark(rid())
+
+class Plain:
+    pass
+
+class TestActual(Base):
+    __init__ = Plain.__init__
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-init-deleted', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class TestActual:
+    def __init__(self): pass
+    del __init__
+    def test_m(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-lookup-order-of-two-bases', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class A:
+    def __init__(self): pass
+
+class B:
+    __init__ = object.__init__
+
+class TestBA(B, A):
+    def test_m(self):
+        mark(rid())
+
+class TestAB(A, B):
+    def test_m(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-set-from-outside', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestActual > test_actual'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Base:
+    def __init__(self): pass
+    def test_actual(self):
+        mark(rid())
+
+class TestActual(Base):
+    pass
+
+TestActual.__init__ = object.__init__
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-dataclass', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestData > test_m'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}import dataclasses
+
+@dataclasses.dataclass
+class TestData:
+    x: int = 0
+    def test_m(self):
+        mark(rid())
+
+def test_own():
+    mark("tests/test_case.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-builtin-bases', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestDict > test_m', 'tests/test_case.py::TestEnum > test_m', 'tests/test_case.py::TestError > test_m'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}import enum
+import typing
+
+T = typing.TypeVar("T")
+
+class TestError(Exception):
+    def test_m(self):
+        mark(rid())
+
+class TestDict(dict):
+    def test_m(self):
+        mark(rid())
+
+class TestProtocol(typing.Protocol):
+    def test_m(self):
+        mark(rid())
+
+class TestGeneric(typing.Generic[T]):
+    def test_m(self):
+        mark(rid())
+
+class TestObject(object):
+    def test_m(self):
+        mark(rid())
+
+class TestEnum(enum.Enum):
+    def test_m(self):
+        mark(rid())
+
+def test_own():
+    mark("tests/test_case.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-new-custom-and-reset', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Base:
+    def __new__(cls): return object.__new__(cls)
+    def test_actual(self):
+        mark(rid())
+
+class TestRefused(Base):
+    pass
+
+class TestActual(Base):
+    __new__ = object.__new__
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-init-in-a-branch', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestActual > test_m'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class TestActual:
+    if os.environ.get("UCN_NEVER"):
+        def __init__(self): pass
+    def test_m(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-init-a-function-of-the-module', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestRefused > test_m'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}def _init(self):
+    pass
+
+class TestRefused:
+    __init__ = _init
+    def test_m(self):
+        mark(rid())
+
+def test_own():
+    mark("tests/test_case.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-inherited-runtest', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}import unittest
+
+class Base(unittest.TestCase):
+    def runTest(self):
+        mark(rid())
+
+class Child(Base):
+    pass
+
+class WithTest(Base):
+    def test_w(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-unittest-constructor', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}import unittest
+
+class K(unittest.TestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    def test_m(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-reset-over-a-base-not-read', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestOrdered > test_m', 'tests/test_case.py::TestSpace > test_m'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}import collections
+import argparse
+
+class TestOrdered(collections.OrderedDict):
+    __init__ = object.__init__
+    def test_m(self):
+        mark(rid())
+
+class TestSpace(argparse.Namespace):
+    __init__ = object.__init__
+    def test_m(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-nested-constructor', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class TestOuter:
+    class TestInner:
+        def __init__(self): pass
+        def test_i(self):
+            mark(rid())
+    class TestFree:
+        def test_f(self):
+            mark(rid())
+    def test_o(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-setup-overridden', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestK > test_m'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}import pytest
+
+class Base:
+    def setup_method(self):
+        pytest.skip("no")
+    def test_m(self):
+        mark(rid())
+`,
+            'tests/test_case.py': `from tests.helpers import Base
+
+class TestK(Base):
+    def setup_method(self):
+        self.ready = True
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-marks-reset-in-subclass', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}import pytest
+
+@pytest.mark.skip(reason="base")
+class Base:
+    def test_m(self):
+        mark(rid())
+
+class TestK(Base):
+    pytestmark = []
+`,
+        },
+    },
+    {
+        id: 'pytest-constructor-switch-on-then-constructor', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}${RIDP}class Helper:
+    __test__ = True
+    def __init__(self): pass
+    def test_m(self):
+        mark(rid())
+
+def test_own():
+    mark("tests/test_case.py::test_own")
+`,
+        },
+    },
+    // ---- pytest: a table of parameters runs the body through a row that does
+    {
+        id: 'pytest-rows-skip-all', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.skip(reason="off"))])
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-fixture-skip-all', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[pytest.param(1, marks=pytest.mark.skip(reason="off"))])
+def value(request): return request.param
+
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-xfail-no-run', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.xfail(run=False))])
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-skip-some', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.skip(reason="off")), 2])
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-skipif-all', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.skipif(True, reason="off"))])
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-row-by-name', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+OFF = pytest.param(1, marks=pytest.mark.skip(reason="off"))
+ON = pytest.param(2)
+
+@pytest.mark.parametrize("value", [OFF])
+def test_off(value):
+    mark("tests/test_case.py::test_off")
+
+@pytest.mark.parametrize("value", [ON])
+def test_on(value):
+    mark("tests/test_case.py::test_on")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-row-by-helper', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_off'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+def off(v):
+    return pytest.param(v, marks=pytest.mark.skip(reason="off"))
+
+def plain(v):
+    return v + 1
+
+@pytest.mark.parametrize("value", [off(1)])
+def test_off(value):
+    mark("tests/test_case.py::test_off")
+
+@pytest.mark.parametrize("value", [plain(1)])
+def test_on(value):
+    mark("tests/test_case.py::test_on")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-row-imported', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_call_off', 'tests/test_case.py::test_module_off', 'tests/test_case.py::test_off'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/cases.py': `import pytest
+
+OFF = pytest.param(1, marks=pytest.mark.skip(reason="off"))
+ON = 2
+
+class Kind:
+    A = 1
+    OFF = pytest.param(1, marks=pytest.mark.skip(reason="off"))
+
+def off(v):
+    return pytest.param(v, marks=pytest.mark.skip(reason="off"))
+
+def plain(v):
+    return v
+`,
+            'tests/test_case.py': `${PY}import pytest
+
+from tests.cases import OFF, ON, Kind, off, plain
+from tests import cases
+
+@pytest.mark.parametrize("value", [OFF])
+def test_off(value):
+    mark("tests/test_case.py::test_off")
+
+@pytest.mark.parametrize("value", [ON])
+def test_on(value):
+    mark("tests/test_case.py::test_on")
+
+@pytest.mark.parametrize("value", [cases.OFF])
+def test_module_off(value):
+    mark("tests/test_case.py::test_module_off")
+
+@pytest.mark.parametrize("value", [cases.ON])
+def test_module_on(value):
+    mark("tests/test_case.py::test_module_on")
+
+@pytest.mark.parametrize("value", [Kind.A])
+def test_member_on(value):
+    mark("tests/test_case.py::test_member_on")
+
+@pytest.mark.parametrize("value", [Kind.OFF])
+def test_member_off(value):
+    mark("tests/test_case.py::test_member_off")
+
+@pytest.mark.parametrize("value", [off(1)])
+def test_call_off(value):
+    mark("tests/test_case.py::test_call_off")
+
+@pytest.mark.parametrize("value", [plain(1)])
+def test_call_on(value):
+    mark("tests/test_case.py::test_call_on")
+
+@pytest.mark.parametrize("value", [Kind])
+def test_class_on(value):
+    mark("tests/test_case.py::test_class_on")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-class-level', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.skip(reason="off"))])
+class TestK:
+    def test_m(self, value):
+        mark("tests/test_case.py::TestK > test_m")
+
+class TestL:
+    pytestmark = pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.skip(reason="off"))])
+    def test_m(self, value):
+        mark("tests/test_case.py::TestL > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-module-level', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+pytestmark = pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.skip(reason="off"))])
+
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-row-usefixtures', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/conftest.py': `import pytest
+
+@pytest.fixture
+def db():
+    pytest.skip("no db")
+`,
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.usefixtures("db"))])
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-indirect', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture
+def value(request):
+    pytest.skip("no")
+
+@pytest.mark.parametrize("value", [1], indirect=True)
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-param-imported-by-name', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}from pytest import mark as m, param
+import pytest
+
+@m.parametrize("value", [param(1, marks=m.skip(reason="off"))])
+def test_off(value):
+    mark("tests/test_case.py::test_off")
+
+@m.parametrize("value", [param(1)])
+def test_on(value):
+    mark("tests/test_case.py::test_on")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-rows-by-name', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+ROWS = [pytest.param(1, marks=pytest.mark.skip(reason="off"))]
+
+@pytest.mark.parametrize("value", ROWS)
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-rows-starred', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+ROWS = [pytest.param(1, marks=pytest.mark.skip(reason="off"))]
+NONE = []
+
+@pytest.mark.parametrize("value", [*ROWS])
+def test_off(value):
+    mark("tests/test_case.py::test_off")
+
+@pytest.mark.parametrize("value", [*NONE])
+def test_none(value):
+    mark("tests/test_case.py::test_none")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-stacked', runner: 'pytest',
+        emptyTestFiles: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("other", [1, 2])
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.skip(reason="off"))])
+def test_actual(value, other):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-rows-that-run', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': `[pytest]
+markers =
+    slow: slow
+`,
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+import decimal
+
+class Kind:
+    A = 1
+
+def make(v):
+    return [v]
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.xfail(strict=False))])
+def test_xfail(value):
+    mark("tests/test_case.py::test_xfail")
+
+@pytest.mark.parametrize("value", [pytest.param(1, id="one")])
+def test_id(value):
+    mark("tests/test_case.py::test_id")
+
+@pytest.mark.parametrize("value", [(pytest.param(1, marks=pytest.mark.skip(reason="off")),)])
+def test_tuple(value):
+    mark("tests/test_case.py::test_tuple")
+
+@pytest.mark.parametrize("value", [Kind])
+def test_class(value):
+    mark("tests/test_case.py::test_class")
+
+@pytest.mark.parametrize("value", [Kind.A])
+def test_member(value):
+    mark("tests/test_case.py::test_member")
+
+@pytest.mark.parametrize("value", [Kind()])
+def test_instance(value):
+    mark("tests/test_case.py::test_instance")
+
+@pytest.mark.parametrize("value", [decimal.Decimal("1")])
+def test_package(value):
+    mark("tests/test_case.py::test_package")
+
+@pytest.mark.parametrize("value", [dict])
+def test_builtin(value):
+    mark("tests/test_case.py::test_builtin")
+
+@pytest.mark.parametrize("value", [make(1)])
+def test_helper(value):
+    mark("tests/test_case.py::test_helper")
+
+@pytest.mark.parametrize("value", [lambda: 1])
+def test_lambda(value):
+    mark("tests/test_case.py::test_lambda")
+
+@pytest.mark.parametrize("value", [-1])
+def test_negative(value):
+    mark("tests/test_case.py::test_negative")
+
+@pytest.mark.parametrize("value", [f"a{1}"])
+def test_text(value):
+    mark("tests/test_case.py::test_text")
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.slow)])
+def test_own_mark(value):
+    mark("tests/test_case.py::test_own_mark")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-row-mark-and-expression', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': `[pytest]
+addopts = -m "not slow"
+markers =
+    slow: slow
+`,
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.mark.parametrize("value", [pytest.param(1, marks=pytest.mark.slow)])
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+
+def test_own():
+    mark("tests/test_case.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-fixture-rows', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_by_name', 'tests/test_case.py::test_maybe'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+OFF = pytest.param(1, marks=pytest.mark.skip(reason="off"))
+
+@pytest.fixture(params=[OFF])
+def by_name(request): return request.param
+
+@pytest.fixture(params=[pytest.param(1, marks=pytest.mark.skip(reason="off")), 2])
+def some(request): return request.param
+
+@pytest.fixture(params=[pytest.param(1, marks=pytest.mark.skipif(True, reason="off"))])
+def maybe(request): return request.param
+
+def test_by_name(by_name):
+    mark("tests/test_case.py::test_by_name")
+
+def test_some(some):
+    mark("tests/test_case.py::test_some")
+
+def test_maybe(maybe):
+    mark("tests/test_case.py::test_maybe")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-unittest-skips', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import unittest
+
+class K(unittest.TestCase):
+    def test_sub(self):
+        with self.subTest(i=1):
+            mark("tests/test_case.py::K > test_sub")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-rows-from-a-call', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+def rows():
+    return [pytest.param(1, marks=pytest.mark.skip(reason="off"))]
+
+@pytest.mark.parametrize("value", rows())
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-rows-xfail-that-does-not-run-under-a-condition', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_condition_computed', 'tests/test_case.py::test_condition_text', 'tests/test_case.py::test_skipif_false'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+import sys
+
+@pytest.mark.xfail(False, run=False, reason="x")
+def test_condition_false():
+    mark("tests/test_case.py::test_condition_false")
+
+@pytest.mark.xfail(True, run=False, reason="x")
+def test_condition_true():
+    mark("tests/test_case.py::test_condition_true")
+
+@pytest.mark.xfail(sys.platform == "nope", run=False, reason="x")
+def test_condition_computed():
+    mark("tests/test_case.py::test_condition_computed")
+
+@pytest.mark.xfail(condition=False, run=False, reason="x")
+def test_condition_keyword():
+    mark("tests/test_case.py::test_condition_keyword")
+
+@pytest.mark.xfail(run=False)
+def test_never():
+    mark("tests/test_case.py::test_never")
+
+@pytest.mark.xfail("sys.platform == 'nope'", run=False)
+def test_condition_text():
+    mark("tests/test_case.py::test_condition_text")
+
+@pytest.mark.skipif(False, reason="x")
+def test_skipif_false():
+    mark("tests/test_case.py::test_skipif_false")
+
+@pytest.mark.skip(False)
+def test_skip_with_argument():
+    mark("tests/test_case.py::test_skip_with_argument")
+`,
+        },
+    },
+    // ---- pytest: what runs a test more than once without its declaration saying so
+    {
+        id: 'pytest-several-autouse', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[1, 2], autouse=True)
+def value(request): return request.param
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-conftest', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'conftest.py': `import pytest
+
+@pytest.fixture(params=[1, 2], autouse=True)
+def value(request): return request.param
+`,
+            'tests/test_case.py': `${PY}def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-asks-for-a-table', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[1, 2])
+def value(request): return request.param
+
+@pytest.fixture(autouse=True)
+def every(value): return value
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-in-class', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+class TestK:
+    @pytest.fixture(params=[1, 2], autouse=True)
+    def value(self, request): return request.param
+    def test_m(self):
+        mark("tests/test_case.py::TestK > test_m")
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-in-base-class', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `import pytest
+
+class Base:
+    @pytest.fixture(params=[1, 2], autouse=True)
+    def value(self, request): return request.param
+`,
+            'tests/test_case.py': `${PY}from tests.helpers import Base
+
+class TestK(Base):
+    def test_m(self):
+        mark("tests/test_case.py::TestK > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-in-plugin', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/plugin.py': `import pytest
+
+@pytest.fixture(params=[1, 2], autouse=True)
+def value(request): return request.param
+`,
+            'conftest.py': 'pytest_plugins = ["tests.plugin"]\n',
+            'tests/test_case.py': `${PY}def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-unittest', runner: 'pytest',
+        sometimes: ['tests/test_case.py::K > test_m'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'conftest.py': `import pytest
+
+@pytest.fixture(params=[1, 2], autouse=True)
+def value(request): return request.param
+`,
+            'tests/test_case.py': `${PY}import unittest
+
+class K(unittest.TestCase):
+    def test_m(self):
+        mark("tests/test_case.py::K > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-generate-tests', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual', 'tests/test_case.py::test_plain'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'conftest.py': `def pytest_generate_tests(metafunc):
+    if "value" in metafunc.fixturenames:
+        metafunc.parametrize("value", [1, 2])
+`,
+            'tests/test_case.py': `${PY}def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+
+def test_plain():
+    mark("tests/test_case.py::test_plain")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-generate-tests-in-module', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}def pytest_generate_tests(metafunc):
+    metafunc.parametrize("value", [1, 2])
+
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-ini-usefixtures', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\nusefixtures = value\n',
+            'tests/__init__.py': '',
+            'conftest.py': `import pytest
+
+@pytest.fixture(params=[1, 2])
+def value(request): return request.param
+`,
+            'tests/test_case.py': `${PY}def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-class-usefixtures', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[1, 2])
+def value(request): return request.param
+
+@pytest.mark.usefixtures("value")
+class TestK:
+    def test_m(self):
+        mark("tests/test_case.py::TestK > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-table-fixture-overridden', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'conftest.py': `import pytest
+
+@pytest.fixture(params=[1, 2])
+def value(request): return request.param
+`,
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture
+def value(): return 3
+
+def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-beside', runner: 'pytest',
+        atLeast: ['other/test_there.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'other/__init__.py': '',
+            'other/conftest.py': `import pytest
+
+@pytest.fixture(params=[1, 2], autouse=True)
+def value(request): return request.param
+`,
+            'other/test_there.py': `${PY}def test_there():
+    mark("other/test_there.py::test_there")
+`,
+            'tests/test_case.py': `${PY}def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-imported-test-under-autouse', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RIDP}def check():
+    mark(rid())
+`,
+            'tests/test_case.py': `import pytest
+from tests.helpers import check as test_check
+
+@pytest.fixture(params=[1, 2], autouse=True)
+def value(request): return request.param
+`,
+        },
+    },
+    {
+        id: 'pytest-several-doctest-modules', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\naddopts = --doctest-modules\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}def helper():
+    """
+    >>> 1 + 1
+    2
+    """
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-table-empty', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[], autouse=True)
+def value(request): return request.param
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-rows-skip', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[pytest.param(1, marks=pytest.mark.skip(reason="off"))], autouse=True)
+def value(request): return request.param
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-autouse-fixture-by-name', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[1, 2], autouse=True, name="other")
+def value(request): return request.param
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-table-on-base-class', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `import pytest
+
+@pytest.mark.parametrize("value", [1, 2])
+class Base:
+    pass
+`,
+            'tests/test_case.py': `${PY}from tests.helpers import Base
+
+class TestK(Base):
+    def test_m(self, value):
+        mark("tests/test_case.py::TestK > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-setup-class-autouse-module-scope', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+@pytest.fixture(params=[1, 2], autouse=True, scope="module")
+def value(request): return request.param
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+
+def test_second():
+    mark("tests/test_case.py::test_second")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-unittest-usefixtures-table', runner: 'pytest',
+        sometimes: ['tests/test_case.py::K > test_m'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+import unittest
+
+@pytest.fixture(params=[1, 2])
+def value(request): return request.param
+
+@pytest.fixture
+def plain(): return 1
+
+@pytest.mark.usefixtures("value")
+class K(unittest.TestCase):
+    def test_m(self):
+        mark("tests/test_case.py::K > test_m")
+
+@pytest.mark.usefixtures("plain")
+class L(unittest.TestCase):
+    def test_m(self):
+        mark("tests/test_case.py::L > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-unittest-parametrize', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+import unittest
+
+class K(unittest.TestCase):
+    @pytest.mark.parametrize("value", [1, 2])
+    def test_m(self, value=0):
+        mark("tests/test_case.py::K > test_m")
+
+    def test_n(self):
+        mark("tests/test_case.py::K > test_n")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-unittest-autouse-plain', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'conftest.py': `import pytest
+
+@pytest.fixture(autouse=True)
+def every(): return 1
+`,
+            'tests/test_case.py': `${PY}import unittest
+
+class K(unittest.TestCase):
+    def test_m(self):
+        mark("tests/test_case.py::K > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-generate-in-plugin', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/plugin.py': `def pytest_generate_tests(metafunc):
+    if "value" in metafunc.fixturenames:
+        metafunc.parametrize("value", [1, 2])
+`,
+            'conftest.py': 'pytest_plugins = ["tests.plugin"]\n',
+            'tests/test_case.py': `${PY}def test_actual(value):
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-class-generate', runner: 'pytest',
+        sometimes: ['tests/test_case.py::TestK > test_m'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}class TestK:
+    def pytest_generate_tests(self, metafunc):
+        metafunc.parametrize("value", [1, 2])
+
+    def test_m(self, value):
+        mark("tests/test_case.py::TestK > test_m")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-fixture-params-by-name', runner: 'pytest',
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+ROWS = [1, 2]
+
+@pytest.fixture(params=ROWS, autouse=True)
+def value(request): return request.param
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    {
+        id: 'pytest-several-fixture-computed-params-autouse', runner: 'pytest',
+        sometimes: ['tests/test_case.py::test_actual'],
+        emptyTestFiles: ['tests/test_case.py'],
+        atLeast: ['tests/test_case.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_case.py': `${PY}import pytest
+
+def rows():
+    return []
+
+@pytest.fixture(params=rows(), autouse=True)
+def value(request): return request.param
+
+def test_actual():
+    mark("tests/test_case.py::test_actual")
+`,
+        },
+    },
+    // ---- JUnit and TestNG: what a class inherits, rows, repeats, runners
+    {
+        id: 'maven-junit5-what-a-class-inherits', runner: 'maven',
+        sometimes: ['src/test/java/com/x/ChildTest.java::ChildTest > disabledBelow', 'src/test/java/com/x/ChildTest.java::ChildTest > kept', 'src/test/java/com/x/ChildTest.java::ChildTest > reenabled'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+class Rec {
+${JAVA}}
+`,
+            'src/test/java/com/x/DisabledBase.java': `package com.x;
+
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+
+@Disabled("base only")
+abstract class DisabledBase {
+    @Test
+    void inherited() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > inherited"); }
+}
+`,
+            'src/test/java/com/x/ChildOfDisabledTest.java': `package com.x;
+
+class ChildOfDisabledTest extends DisabledBase {
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
+
+abstract class Base {
+    @BeforeEach
+    void prepare() { Assumptions.assumeTrue(false); }
+
+    @Test
+    void kept() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kept"); }
+
+    @Test
+    void overridden() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > overridden"); }
+
+    @Test
+    @Disabled("off in the base")
+    void reenabled() { Rec.mark("src/test/java/com/x/Base.java::never"); }
+
+    @Test
+    void disabledBelow() { Rec.mark("src/test/java/com/x/Base.java::never"); }
+}
+`,
+            'src/test/java/com/x/ChildTest.java': `package com.x;
+
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+
+class ChildTest extends Base {
+    @Override
+    void prepare() { }
+
+    @Override
+    void overridden() { Rec.mark("src/test/java/com/x/ChildTest.java::ChildTest > overridden without the annotation"); }
+
+    @Override
+    @Test
+    void reenabled() { Rec.mark("src/test/java/com/x/ChildTest.java::ChildTest > reenabled"); }
+
+    @Override
+    @Test
+    @Disabled("off here")
+    void disabledBelow() { Rec.mark("src/test/java/com/x/ChildTest.java::ChildTest > disabledBelow"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-junit5-rows-and-repeats', runner: 'maven',
+        sometimes: ['src/test/java/com/x/RowsTest.java::RowsTest > noRows', 'src/test/java/com/x/RowsTest.java::RowsTest > twoRows'],
+        atLeast: ['src/test/java/com/x/RowsTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+class Rec {
+${JAVA}}
+`,
+            'src/test/java/com/x/RowsTest.java': `package com.x;
+
+import java.util.stream.Stream;
+import org.junit.jupiter.api.DynamicTest;
+import org.junit.jupiter.api.RepeatedTest;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestFactory;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+class RowsTest {
+    enum Kind { A, B }
+
+    static Stream<Integer> none() { return Stream.empty(); }
+    static Stream<Integer> two() { return Stream.of(1, 2); }
+
+    @ParameterizedTest
+    @MethodSource("none")
+    void noRows(int x) { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > noRows"); }
+
+    @ParameterizedTest
+    @MethodSource("two")
+    void twoRows(int x) { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > twoRows"); }
+
+    @ParameterizedTest
+    @ValueSource(ints = {})
+    void emptyValues(int x) { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > emptyValues"); }
+
+    @ParameterizedTest
+    @EnumSource(Kind.class)
+    void everyKind(Kind kind) { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > everyKind"); }
+
+    @ParameterizedTest
+    @NullSource
+    void oneNull(String text) { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > oneNull"); }
+
+    @ParameterizedTest
+    void noSource(int x) { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > noSource"); }
+
+    @RepeatedTest(3)
+    void thrice() { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > thrice"); }
+
+    @RepeatedTest(1)
+    void once() { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > once"); }
+
+    @TestFactory
+    Stream<DynamicTest> made() {
+        return Stream.of(DynamicTest.dynamicTest("a", () -> Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > made")),
+            DynamicTest.dynamicTest("b", () -> Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > made")));
+    }
+
+    @Test
+    void plain() { Rec.mark("src/test/java/com/x/RowsTest.java::RowsTest > plain"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-junit4-overrides-runners-and-ignored-bases', runner: 'maven',
+        sometimes: ['src/test/java/com/x/Child4Test.java::Child4Test > kept', 'src/test/java/com/x/Child4Test.java::Child4Test > overridden', 'src/test/java/com/x/EmptyTableTest.java::EmptyTableTest > row', 'src/test/java/com/x/TableTest.java::TableTest > row'],
+        emptyTestFiles: ['src/test/java/com/x/EmptyTableTest.java'],
+        atLeast: ['src/test/java/com/x/EmptyTableTest.java', 'src/test/java/com/x/TableTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUNIT4),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+class Rec {
+${JAVA}}
+`,
+            'src/test/java/com/x/IgnoredBase.java': `package com.x;
+
+import org.junit.Ignore;
+import org.junit.Test;
+
+@Ignore("base only")
+public abstract class IgnoredBase {
+    @Test
+    public void inherited() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > inherited"); }
+}
+`,
+            'src/test/java/com/x/ChildOfIgnoredTest.java': `package com.x;
+
+public class ChildOfIgnoredTest extends IgnoredBase {
+}
+`,
+            'src/test/java/com/x/Base4.java': `package com.x;
+
+import org.junit.Assume;
+import org.junit.Before;
+import org.junit.Test;
+
+public abstract class Base4 {
+    @Before
+    public void prepare() { Assume.assumeTrue(false); }
+
+    @Test
+    public void kept() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kept"); }
+
+    @Test
+    public void overridden() { Rec.mark("src/test/java/com/x/Base4.java::never"); }
+}
+`,
+            'src/test/java/com/x/Child4Test.java': `package com.x;
+
+public class Child4Test extends Base4 {
+    @Override
+    public void prepare() { }
+
+    @Override
+    public void overridden() { Rec.mark("src/test/java/com/x/Child4Test.java::Child4Test > overridden without the annotation"); }
+}
+`,
+            'src/test/java/com/x/TableTest.java': `package com.x;
+
+import java.util.Arrays;
+import java.util.Collection;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
+
+@RunWith(Parameterized.class)
+public class TableTest {
+    @Parameters
+    public static Collection<Object[]> rows() { return Arrays.asList(new Object[][] { { 1 }, { 2 } }); }
+
+    private final int x;
+    public TableTest(int x) { this.x = x; }
+
+    @Test
+    public void row() { Rec.mark("src/test/java/com/x/TableTest.java::TableTest > row"); }
+}
+`,
+            'src/test/java/com/x/EmptyTableTest.java': `package com.x;
+
+import java.util.Arrays;
+import java.util.Collection;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
+
+@RunWith(Parameterized.class)
+public class EmptyTableTest {
+    @Parameters
+    public static Collection<Object[]> rows() { return Arrays.asList(new Object[][] { }); }
+
+    public EmptyTableTest(int x) { }
+
+    @Test
+    public void row() { Rec.mark("src/test/java/com/x/EmptyTableTest.java::EmptyTableTest > row"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-testng', runner: 'maven',
+        sometimes: ['src/test/java/com/x/GuardedTest.java::GuardedTest > guarded', 'src/test/java/com/x/PlainTest.java::PlainTest > noRows', 'src/test/java/com/x/PlainTest.java::PlainTest > twoRows'],
+        emptyTestFiles: ['src/test/java/com/x/ChildOfIgnoredTTest.java', 'src/test/java/com/x/GuardedTest.java', 'src/test/java/com/x/IgnoredTest.java'],
+        atLeast: ['src/test/java/com/x/PlainTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', TESTNG),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/PlainTest.java': `package com.x;
+
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+public class PlainTest {
+    @Test
+    public void runs() { Rec.mark("src/test/java/com/x/PlainTest.java::PlainTest > runs"); }
+
+    @Test(enabled = false)
+    public void off() { Rec.mark("src/test/java/com/x/PlainTest.java::PlainTest > off"); }
+
+    @Test(invocationCount = 3)
+    public void thrice() { Rec.mark("src/test/java/com/x/PlainTest.java::PlainTest > thrice"); }
+
+    @Test(invocationCount = 0)
+    public void never() { Rec.mark("src/test/java/com/x/PlainTest.java::PlainTest > never"); }
+
+    @DataProvider(name = "rows")
+    public Object[][] rows() { return new Object[][] { { 1 }, { 2 } }; }
+
+    @DataProvider(name = "none")
+    public Object[][] none() { return new Object[][] { }; }
+
+    @Test(dataProvider = "rows")
+    public void twoRows(int x) { Rec.mark("src/test/java/com/x/PlainTest.java::PlainTest > twoRows"); }
+
+    @Test(dataProvider = "none")
+    public void noRows(int x) { Rec.mark("src/test/java/com/x/PlainTest.java::PlainTest > noRows"); }
+
+    public void helper() { Rec.mark("src/test/java/com/x/PlainTest.java::PlainTest > helper"); }
+}
+`,
+            'src/test/java/com/x/ClassLevelTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+@Test
+public class ClassLevelTest {
+    public void everyPublicMethod() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > everyPublicMethod"); }
+
+    void notPublic() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > notPublic"); }
+}
+`,
+            'src/test/java/com/x/DisabledClassTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+@Test(enabled = false)
+public class DisabledClassTest {
+    public void a() { Rec.mark("src/test/java/com/x/DisabledClassTest.java::DisabledClassTest > a"); }
+
+    @Test
+    public void b() { Rec.mark("src/test/java/com/x/DisabledClassTest.java::DisabledClassTest > b"); }
+}
+`,
+            'src/test/java/com/x/GuardedTest.java': `package com.x;
+
+import org.testng.SkipException;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.Test;
+
+public class GuardedTest {
+    @BeforeMethod
+    public void prepare() { throw new SkipException("no"); }
+
+    @Test
+    public void guarded() { Rec.mark("src/test/java/com/x/GuardedTest.java::GuardedTest > guarded"); }
+}
+`,
+            'src/test/java/com/x/TBase.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public abstract class TBase {
+    @Test
+    public void inherited() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > inherited"); }
+
+    @Test
+    public void overridden() { Rec.mark("src/test/java/com/x/TBase.java::never"); }
+}
+`,
+            'src/test/java/com/x/TChildTest.java': `package com.x;
+
+public class TChildTest extends TBase {
+    @Override
+    public void overridden() { Rec.mark("src/test/java/com/x/TChildTest.java::TChildTest > overridden"); }
+}
+`,
+            'src/test/java/com/x/TBaseAll.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+@Test
+public abstract class TBaseAll {
+    public void fromBase() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > fromBase"); }
+}
+`,
+            'src/test/java/com/x/TAllChildTest.java': `package com.x;
+
+public class TAllChildTest extends TBaseAll {
+    public void own() { Rec.mark("src/test/java/com/x/TAllChildTest.java::TAllChildTest > own"); }
+}
+`,
+            'src/test/java/com/x/IgnoredBaseT.java': `package com.x;
+
+import org.testng.annotations.Ignore;
+import org.testng.annotations.Test;
+
+@Ignore
+public abstract class IgnoredBaseT {
+    @Test
+    public void inherited() { Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > inherited"); }
+}
+`,
+            'src/test/java/com/x/ChildOfIgnoredTTest.java': `package com.x;
+
+public class ChildOfIgnoredTTest extends IgnoredBaseT {
+}
+`,
+            'src/test/java/com/x/IgnoredTest.java': `package com.x;
+
+import org.testng.annotations.Ignore;
+import org.testng.annotations.Test;
+
+@Ignore
+public class IgnoredTest {
+    @Test
+    public void a() { Rec.mark("src/test/java/com/x/IgnoredTest.java::IgnoredTest > a"); }
+}
+`,
+        },
+    },
+    // ------------- xUnit, NUnit and MSTest: rows, fixtures and overrides
+    {
+        id: 'dotnet-xunit-rows-and-overrides', runner: 'dotnet-test',
+        sometimes: ['RowTests.cs::RowTests > NoRows', 'RowTests.cs::RowTests > TwoRows'],
+        atLeast: ['RowTests.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'RowTests.cs': `using System.Collections.Generic;
+using Xunit;
+
+namespace P.Tests
+{
+    public class RowTests
+    {
+        public static IEnumerable<object[]> None => new List<object[]>();
+        public static IEnumerable<object[]> Two => new List<object[]> { new object[] { 1 }, new object[] { 2 } };
+
+        [Theory]
+        [InlineData(1, Skip = "off")]
+        public void AllRowsSkipped(int x) { Rec.Mark("RowTests.cs::RowTests > AllRowsSkipped"); }
+
+        [Theory]
+        [InlineData(1, Skip = "off")]
+        [InlineData(2)]
+        public void SomeRowsSkipped(int x) { Rec.Mark("RowTests.cs::RowTests > SomeRowsSkipped"); }
+
+        [Theory]
+        [MemberData(nameof(None))]
+        public void NoRows(int x) { Rec.Mark("RowTests.cs::RowTests > NoRows"); }
+
+        [Theory]
+        [MemberData(nameof(Two))]
+        public void TwoRows(int x) { Rec.Mark("RowTests.cs::RowTests > TwoRows"); }
+
+        [Fact]
+        public void Plain() { Rec.Mark("RowTests.cs::RowTests > Plain"); }
+    }
+}
+`,
+            'LookupTests.cs': `using Xunit;
+
+namespace P.Tests
+{
+    public abstract class Base
+    {
+        [Fact]
+        public virtual void Overridden() { Rec.Mark("LookupTests.cs::never"); }
+
+        [Fact]
+        public void Kept() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > Kept"); }
+
+        [Fact(Skip = "off in the base")]
+        public virtual void Reenabled() { Rec.Mark("LookupTests.cs::never"); }
+
+        [Fact]
+        public virtual void SkippedBelow() { Rec.Mark("LookupTests.cs::never"); }
+    }
+
+    public class Child : Base
+    {
+        public override void Overridden() { Rec.Mark("LookupTests.cs::Child > Overridden"); }
+
+        [Fact]
+        public override void Reenabled() { Rec.Mark("LookupTests.cs::Child > Reenabled"); }
+
+        [Fact(Skip = "off here")]
+        public override void SkippedBelow() { Rec.Mark("LookupTests.cs::Child > SkippedBelow"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-rows-fixtures-and-overrides', runner: 'dotnet-test',
+        sometimes: ['LookupTests.cs::Child > Kept', 'LookupTests.cs::Child > Reenabled', 'RowTests.cs::IgnoreTests > ExplicitRow', 'RowTests.cs::PlatformTests > OnePlatform', 'RowTests.cs::SourceTests > NoRows', 'RowTests.cs::SourceTests > TwoRows', 'RowTests.cs::TheoryTests > TheoryWithoutData'],
+        atLeast: ['RowTests.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'RowTests.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class ValuesTests
+    {
+        [Test]
+        public void Each([Values(1, 2)] int x) { Rec.Mark("RowTests.cs::ValuesTests > Each"); }
+
+        [Test]
+        public void Ranged([Range(1, 3)] int x) { Rec.Mark("RowTests.cs::ValuesTests > Ranged"); }
+    }
+
+    public class RepeatTests
+    {
+        [Test, Repeat(3)]
+        public void Thrice() { Rec.Mark("RowTests.cs::RepeatTests > Thrice"); }
+    }
+
+    public class SourceTests
+    {
+        static object[] None = { };
+        static object[] Two = { 1, 2 };
+
+        [TestCaseSource(nameof(None))]
+        public void NoRows(int x) { Rec.Mark("RowTests.cs::SourceTests > NoRows"); }
+
+        [TestCaseSource(nameof(Two))]
+        public void TwoRows(int x) { Rec.Mark("RowTests.cs::SourceTests > TwoRows"); }
+    }
+
+    public class IgnoreTests
+    {
+        [TestCase(1, Ignore = "off")]
+        [TestCase(2)]
+        public void SomeIgnored(int x) { Rec.Mark("RowTests.cs::IgnoreTests > SomeIgnored"); }
+
+        [TestCase(1, Ignore = "off")]
+        [TestCase(2, Ignore = "off")]
+        public void AllIgnored(int x) { Rec.Mark("RowTests.cs::IgnoreTests > AllIgnored"); }
+
+        [TestCase(1, Explicit = true)]
+        public void ExplicitRow(int x) { Rec.Mark("RowTests.cs::IgnoreTests > ExplicitRow"); }
+    }
+
+    public class PlatformTests
+    {
+        [TestCase(1, IncludePlatform = "Win")]
+        [TestCase(1, IncludePlatform = "Unix")]
+        public void OnePlatform(int x) { Rec.Mark("RowTests.cs::PlatformTests > OnePlatform"); }
+    }
+
+    public class TheoryTests
+    {
+        [Theory]
+        public void TheoryWithoutData(int x) { Rec.Mark("RowTests.cs::TheoryTests > TheoryWithoutData"); }
+
+        [Test]
+        public void Plain() { Rec.Mark("RowTests.cs::TheoryTests > Plain"); }
+    }
+
+    [TestFixture(1)]
+    [TestFixture(2)]
+    public class TwiceFixture
+    {
+        public TwiceFixture(int x) { }
+
+        [Test]
+        public void Runs() { Rec.Mark("RowTests.cs::TwiceFixture > Runs"); }
+    }
+
+    [TestFixture]
+    public class PlainFixture
+    {
+        [Test]
+        public void Runs() { Rec.Mark("RowTests.cs::PlainFixture > Runs"); }
+    }
+}
+`,
+            'LookupTests.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    [Ignore("base only")]
+    public abstract class IgnoredBase
+    {
+        [Test]
+        public void Inherited() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > Inherited"); }
+    }
+
+    public class ChildOfIgnored : IgnoredBase { }
+
+    public abstract class Base
+    {
+        [SetUp]
+        public virtual void Prepare() { Assume.That(false); }
+
+        [Test]
+        public virtual void Overridden() { Rec.Mark("LookupTests.cs::never"); }
+
+        [Test]
+        public void Kept() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > Kept"); }
+
+        [Test]
+        [Ignore("off in the base")]
+        public virtual void Reenabled() { Rec.Mark("LookupTests.cs::never"); }
+    }
+
+    public class Child : Base
+    {
+        public override void Prepare() { }
+
+        public override void Overridden() { Rec.Mark("LookupTests.cs::Child > Overridden"); }
+
+        [Test]
+        public override void Reenabled() { Rec.Mark("LookupTests.cs::Child > Reenabled"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-mstest-rows-and-overrides', runner: 'dotnet-test',
+        sometimes: ['LookupTests.cs::Child > Kept', 'LookupTests.cs::Child > Reenabled', 'RowTests.cs::RowTests > DynamicNone', 'RowTests.cs::RowTests > DynamicTwo', 'RowTests.cs::RowTests > NoRows'],
+        atLeast: ['RowTests.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(MSTEST),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'RowTests.cs': `using System.Collections.Generic;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace P.Tests
+{
+    [TestClass]
+    public class RowTests
+    {
+        public static IEnumerable<object[]> None => new List<object[]>();
+        public static IEnumerable<object[]> Two => new List<object[]> { new object[] { 1 }, new object[] { 2 } };
+
+        [DataTestMethod]
+        public void NoRows(int x) { Rec.Mark("RowTests.cs::RowTests > NoRows"); }
+
+        [TestMethod]
+        [DataRow(1)]
+        [DataRow(2)]
+        public void RowsOnTestMethod(int x) { Rec.Mark("RowTests.cs::RowTests > RowsOnTestMethod"); }
+
+        [DataTestMethod]
+        [DynamicData(nameof(None))]
+        public void DynamicNone(int x) { Rec.Mark("RowTests.cs::RowTests > DynamicNone"); }
+
+        [DataTestMethod]
+        [DynamicData(nameof(Two))]
+        public void DynamicTwo(int x) { Rec.Mark("RowTests.cs::RowTests > DynamicTwo"); }
+
+        [TestMethod]
+        public void Plain() { Rec.Mark("RowTests.cs::RowTests > Plain"); }
+    }
+}
+`,
+            'LookupTests.cs': `using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace P.Tests
+{
+    [TestClass]
+    [Ignore]
+    public abstract class IgnoredBase
+    {
+        [TestMethod]
+        public void Inherited() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > Inherited"); }
+    }
+
+    [TestClass]
+    public class ChildOfIgnored : IgnoredBase { }
+
+    [TestClass]
+    public abstract class Base
+    {
+        [TestInitialize]
+        public virtual void Prepare() { Assert.Inconclusive("no"); }
+
+        [TestMethod]
+        public virtual void Overridden() { Rec.Mark("LookupTests.cs::never"); }
+
+        [TestMethod]
+        public void Kept() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > Kept"); }
+
+        [TestMethod]
+        [Ignore]
+        public virtual void Reenabled() { Rec.Mark("LookupTests.cs::never"); }
+    }
+
+    [TestClass]
+    public class Child : Base
+    {
+        public override void Prepare() { }
+
+        public override void Overridden() { Rec.Mark("LookupTests.cs::Child > Overridden"); }
+
+        [TestMethod]
+        public override void Reenabled() { Rec.Mark("LookupTests.cs::Child > Reenabled"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-mstest-class-mark-of-the-class-that-runs', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(MSTEST),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'LookupTests.cs': `using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace P.Tests
+{
+    [TestClass]
+    public abstract class Base
+    {
+        [TestMethod]
+        public void Kept() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > Kept"); }
+    }
+
+    public class Unmarked : Base { }
+
+    [TestClass]
+    public class Marked : Base { }
+
+    public abstract class PlainBase
+    {
+        [TestMethod]
+        public void FromPlain() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > FromPlain"); }
+    }
+
+    [TestClass]
+    public class MarkedOverPlain : PlainBase { }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-explicit-base-and-fixture-arguments', runner: 'dotnet-test',
+        sometimes: ['LookupTests.cs::ChildOfExplicit > Inherited'],
+        atLeast: ['LookupTests.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'LookupTests.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    [Explicit]
+    public abstract class ExplicitBase
+    {
+        [Test]
+        public void Inherited() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > Inherited"); }
+    }
+
+    public class ChildOfExplicit : ExplicitBase { }
+
+    [TestFixture(1)]
+    public abstract class ArgumentBase
+    {
+        protected ArgumentBase(int x) { }
+
+        [Test]
+        public void FromBase() { Rec.Mark("LookupTests.cs::" + GetType().Name + " > FromBase"); }
+    }
+
+    [TestFixture(2)]
+    public class ChildOfArguments : ArgumentBase
+    {
+        public ChildOfArguments(int x) : base(x) { }
+    }
+}
+`,
+        },
+    },
+    // ---- JavaScript: tables of cases, and declarations under control flow
+    {
+        id: 'jest-tables-of-cases', runner: 'jest',
+        sometimes: ['test/a.test.js::by call %i', 'test/b.test.js::plain', 'test/c.test.js::plain'],
+        emptyTestFiles: ['test/b.test.js'],
+        atLeast: ['test/a.test.js'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" }, "devDependencies": { "jest": "*" } }\n',
+            'test/a.test.js': `${CJS}const none = [];
+const two = [1, 2];
+function rows() { return [1]; }
+
+test.each([1, 2])('written out %i', () => { mark('test/a.test.js::written out %i'); });
+test.each(two)('by name %i', () => { mark('test/a.test.js::by name %i'); });
+test.each(rows())('by call %i', () => { mark('test/a.test.js::by call %i'); });
+test.skip.each([1])('skipped table %i', () => { mark('test/a.test.js::skipped table %i'); });
+describe.each([1, 2])('suite %i', () => {
+    test('inside', () => { mark('test/a.test.js::suite %i > inside'); });
+});
+test.todo('to do');
+test('plain', () => { mark('test/a.test.js::plain'); });
+`,
+            'test/b.test.js': `${CJS}const none = [];
+describe.each(none)('no suite %i', () => {
+    test('inside', () => { mark('test/b.test.js::no suite %i > inside'); });
+});
+test('plain', () => { mark('test/b.test.js::plain'); });
+`,
+            'test/c.test.js': `${CJS}test.each([])('no rows %i', () => { mark('test/c.test.js::no rows %i'); });
+test('plain', () => { mark('test/c.test.js::plain'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-tables-of-cases', runner: 'vitest',
+        sometimes: ['test/a.test.js::run if false', 'test/a.test.js::run if true', 'test/a.test.js::skip if false', 'test/a.test.js::skip if true', 'test/a.test.js::suite run if > inside', 'test/a.test.js::suite skipped if > inside'],
+        atLeast: ['test/a.test.js'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" }, "devDependencies": { "vitest": "*" } }\n',
+            'test/a.test.js': `${ESM}import { describe, it, test } from 'vitest';
+const none = [];
+const two = [1, 2];
+
+test.each([1, 2])('written out %i', () => { mark('test/a.test.js::written out %i'); });
+test.each(two)('by name %i', () => { mark('test/a.test.js::by name %i'); });
+test.each(none)('no rows by name %i', () => { mark('test/a.test.js::no rows by name %i'); });
+test.each([])('no rows %i', () => { mark('test/a.test.js::no rows %i'); });
+test.for([1, 2])('for %i', () => { mark('test/a.test.js::for %i'); });
+describe.each([1, 2])('suite %i', () => {
+    test('inside', () => { mark('test/a.test.js::suite %i > inside'); });
+});
+describe.each(none)('no suite %i', () => {
+    test('inside', () => { mark('test/a.test.js::no suite %i > inside'); });
+});
+it.skipIf(true)('skip if true', () => { mark('test/a.test.js::skip if true'); });
+it.skipIf(false)('skip if false', () => { mark('test/a.test.js::skip if false'); });
+it.runIf(false)('run if false', () => { mark('test/a.test.js::run if false'); });
+it.runIf(true)('run if true', () => { mark('test/a.test.js::run if true'); });
+describe.skipIf(true)('suite skipped if', () => {
+    test('inside', () => { mark('test/a.test.js::suite skipped if > inside'); });
+});
+describe.runIf(process.env.UCN_NEVER)('suite run if', () => {
+    test('inside', () => { mark('test/a.test.js::suite run if > inside'); });
+});
+test.todo('to do');
+test('no body');
+test('plain', () => { mark('test/a.test.js::plain'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-declarations-in-lists-and-loops', runner: 'mocha',
+        sometimes: ['test/a.test.js:: > inside', 'test/a.test.js::lists > (computed name)'],
+        atLeast: ['test/a.test.js'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" }, "devDependencies": { "mocha": "*" } }\n',
+            'test/a.test.js': `${CJS}const none = [];
+describe('lists', function () {
+    [1, 2].forEach(n => {
+        it('each ' + n, function () { mark('test/a.test.js::lists > each'); });
+    });
+    none.forEach(n => {
+        it('never ' + n, function () { mark('test/a.test.js::lists > never'); });
+    });
+    for (const n of [1, 2]) {
+        it('same title', function () { mark('test/a.test.js::lists > same title'); });
+    }
+    it('pending');
+    xit('crossed out', function () { mark('test/a.test.js::lists > crossed out'); });
+    it('plain', function () { mark('test/a.test.js::lists > plain'); });
+});
+[1, 2].forEach(n => {
+    describe('suite ' + n, function () {
+        it('inside', function () { mark('test/a.test.js::suite > inside'); });
+    });
+});
+xdescribe('crossed out suite', function () {
+    it('inside', function () { mark('test/a.test.js::crossed out suite > inside'); });
+});
+`,
+        },
+    },
+    {
+        id: 'node-test-loops-and-options', runner: 'node-test',
+        sometimes: ['test/a.test.js::never', 'test/a.test.js::skip by value', 'test/a.test.js::suite by value > inside'],
+        atLeast: ['test/a.test.js'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/a.test.js': `${CJS}const { test, describe, it } = require('node:test');
+const none = [];
+for (const n of [1, 2]) {
+    test('same title', () => { mark('test/a.test.js::same title'); });
+}
+for (const n of none) {
+    test('never', () => { mark('test/a.test.js::never'); });
+}
+test('skip option', { skip: true }, () => { mark('test/a.test.js::skip option'); });
+test('skip by value', { skip: !!process.env.UCN_NEVER }, () => { mark('test/a.test.js::skip by value'); });
+test('todo option', { todo: true }, () => { mark('test/a.test.js::todo option'); });
+it.todo('to do', () => { mark('test/a.test.js::to do'); });
+it.skip('skipped', () => { mark('test/a.test.js::skipped'); });
+test('no body');
+describe('suite', { skip: true }, () => {
+    it('inside', () => { mark('test/a.test.js::suite > inside'); });
+});
+describe('suite by value', { skip: process.env.UCN_NEVER }, () => {
+    it('inside', () => { mark('test/a.test.js::suite by value > inside'); });
+});
+test('plain', () => { mark('test/a.test.js::plain'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-declarations-under-control-flow', runner: 'node-test',
+        sometimes: ['test/a.test.js::after and', 'test/a.test.js::after or', 'test/a.test.js::first arm', 'test/a.test.js::in a case', 'test/a.test.js::in a catch', 'test/a.test.js::in a for', 'test/a.test.js::in a for in', 'test/a.test.js::in a while', 'test/a.test.js::in an else', 'test/a.test.js::in an if', 'test/a.test.js::in the default', 'test/a.test.js::second arm'],
+        atLeast: ['test/a.test.js'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/a.test.js': `${CJS}const { test } = require('node:test');
+const never = process.env.UCN_NEVER;
+if (never) {
+    test('in an if', () => { mark('test/a.test.js::in an if'); });
+} else {
+    test('in an else', () => { mark('test/a.test.js::in an else'); });
+}
+never && test('after and', () => { mark('test/a.test.js::after and'); });
+never || test('after or', () => { mark('test/a.test.js::after or'); });
+never ? test('first arm', () => { mark('test/a.test.js::first arm'); }) : test('second arm', () => { mark('test/a.test.js::second arm'); });
+switch (never) {
+    case 'x': test('in a case', () => { mark('test/a.test.js::in a case'); }); break;
+    default: test('in the default', () => { mark('test/a.test.js::in the default'); });
+}
+try {
+    test('in a try', () => { mark('test/a.test.js::in a try'); });
+} catch (e) {
+    test('in a catch', () => { mark('test/a.test.js::in a catch'); });
+} finally {
+    test('in a finally', () => { mark('test/a.test.js::in a finally'); });
+}
+let n = 0;
+while (n++ < 2) {
+    test('in a while', () => { mark('test/a.test.js::in a while'); });
+}
+do {
+    test('in a do', () => { mark('test/a.test.js::in a do'); });
+} while (false);
+for (let i = 0; i < 2; i++) {
+    test('in a for', () => { mark('test/a.test.js::in a for'); });
+}
+for (const key in { a: 1, b: 2 }) {
+    test('in a for in', () => { mark('test/a.test.js::in a for in'); });
+}
+{
+    test('in a block', () => { mark('test/a.test.js::in a block'); });
+}
+test('plain', () => { mark('test/a.test.js::plain'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-declarations-under-control-flow', runner: 'mocha',
+        sometimes: ['test/a.test.js::s > after and', 'test/a.test.js::s > after or', 'test/a.test.js::s > first arm', 'test/a.test.js::s > in a case', 'test/a.test.js::s > in a catch', 'test/a.test.js::s > in a for', 'test/a.test.js::s > in a for in', 'test/a.test.js::s > in a while', 'test/a.test.js::s > in an else', 'test/a.test.js::s > in an if', 'test/a.test.js::s > in the default', 'test/a.test.js::s > second arm'],
+        atLeast: ['test/a.test.js'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" }, "devDependencies": { "mocha": "*" } }\n',
+            'test/a.test.js': `${CJS}const test = it;
+describe('s', function () {
+const never = process.env.UCN_NEVER;
+if (never) {
+    test('in an if', () => { mark('test/a.test.js::s > in an if'); });
+} else {
+    test('in an else', () => { mark('test/a.test.js::s > in an else'); });
+}
+never && test('after and', () => { mark('test/a.test.js::s > after and'); });
+never || test('after or', () => { mark('test/a.test.js::s > after or'); });
+never ? test('first arm', () => { mark('test/a.test.js::s > first arm'); }) : test('second arm', () => { mark('test/a.test.js::s > second arm'); });
+switch (never) {
+    case 'x': test('in a case', () => { mark('test/a.test.js::s > in a case'); }); break;
+    default: test('in the default', () => { mark('test/a.test.js::s > in the default'); });
+}
+try {
+    test('in a try', () => { mark('test/a.test.js::s > in a try'); });
+} catch (e) {
+    test('in a catch', () => { mark('test/a.test.js::s > in a catch'); });
+} finally {
+    test('in a finally', () => { mark('test/a.test.js::s > in a finally'); });
+}
+let n = 0;
+while (n++ < 2) {
+    test('in a while', () => { mark('test/a.test.js::s > in a while'); });
+}
+do {
+    test('in a do', () => { mark('test/a.test.js::s > in a do'); });
+} while (false);
+for (let i = 0; i < 2; i++) {
+    test('in a for', () => { mark('test/a.test.js::s > in a for'); });
+}
+for (const key in { a: 1, b: 2 }) {
+    test('in a for in', () => { mark('test/a.test.js::s > in a for in'); });
+}
+{
+    test('in a block', () => { mark('test/a.test.js::s > in a block'); });
+}
+test('plain', () => { mark('test/a.test.js::s > plain'); });
+});
+`,
+        },
+    },
+    // ------------------ cargo: a test under an attribute that is a macro
+    {
+        id: 'cargo-attribute-macro-makes-tests', runner: 'cargo-test',
+        sometimes: ['src/lib.rs::tests > doubled', 'src/lib.rs::tests > removed'],
+        atLeast: ['src/lib.rs'],
+        files: {
+            'Cargo.toml': `[package]
+name = "x"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+twice = { path = "twice" }
+`,
+            'twice/Cargo.toml': `[package]
+name = "twice"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+`,
+            'twice/src/lib.rs': `extern crate proc_macro;
+use proc_macro::TokenStream;
+
+/// Declares the function twice, the second time under another name.
+#[proc_macro_attribute]
+pub fn twice(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let text = item.to_string();
+    let second = text.replacen("fn ", "fn again_", 1);
+    format!("{}\\n{}", text, second).parse().unwrap()
+}
+
+/// Declares nothing.
+#[proc_macro_attribute]
+pub fn never(_attr: TokenStream, _item: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
+`,
+            'src/lib.rs': `${RS}
+#[cfg(test)]
+mod tests {
+    use twice::{never, twice};
+
+    #[twice]
+    #[test]
+    fn doubled() { crate::mark("src/lib.rs::tests > doubled"); }
+
+    #[never]
+    #[test]
+    fn removed() { crate::mark("src/lib.rs::tests > removed"); }
+
+    #[test]
+    fn plain() { crate::mark("src/lib.rs::tests > plain"); }
+}
 `,
         },
     },

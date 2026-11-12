@@ -5535,7 +5535,11 @@ function extractConstructorName(node) {
 
 
 // Bases every class may name without bringing a constructor or a test.
+// (typing.Protocol brings no test and no __new__; the constructor it gives
+// the class that lists it is read with that class.)
 const PYTHON_PLAIN_BASES = new Set(['object', 'ABC', 'Generic', 'Protocol']);
+// The two members by which pytest refuses a class: a constructor that is not object's.
+const PYTHON_CONSTRUCTORS = ['__init__', '__new__'];
 // Statements whose blocks run only sometimes.
 const PY_BRANCHING = new Set(['if_statement', 'elif_clause', 'else_clause', 'try_statement', 'except_clause',
     'except_group_clause', 'finally_clause', 'with_statement', 'for_statement', 'while_statement',
@@ -5683,6 +5687,7 @@ function testUnits(fileEntry, helpers) {
     };
     const scopeWrites = new Map(); // 'module' or a class node's id -> name -> writes
     const attributeWrites = new Map(); // '<scope>\0<name>' -> writes of <name>.__test__ in that scope
+    const constructorWrites = new Set(); // names of the module whose __init__ or __new__ is written from outside the class
     const definitions = new Map(); // row of a def's or class's name -> { node, straight, scope }
     const accounted = new Set(); // start offsets of the __test__ and pytestmark names read as writes
     const stars = []; // modules whose every name the module takes
@@ -5728,6 +5733,8 @@ function testUnits(fileEntry, helpers) {
                     if (!attributeWrites.has(key)) attributeWrites.set(key, []);
                     attributeWrites.get(key).push(write);
                     accounted.add(attribute.startIndex);
+                } else if (object && object.type === 'identifier' && attribute && PYTHON_CONSTRUCTORS.includes(attribute.text)) {
+                    constructorWrites.add(object.text);
                 }
             } else {
                 for (const target of targetsOf(left)) note(scope, target.text, { ...write, kind: 'other', value: null });
@@ -5909,13 +5916,262 @@ function testUnits(fileEntry, helpers) {
     if (/__test__|pytestmark/.test(root.text)) scan(root);
     // A switch written on a name is read only where the name is one
     // definition or one import of its scope: any other object is not followed.
+    // A name the module never writes and takes by a star import is one.
+    const starBound = (scope, name) => scope === 'module' && stars.length > 0 && !imported.has(name) &&
+        writesOf('module', name).length === 0;
     for (const key of attributeWrites.keys()) {
         const [scope, name] = key.split('\0');
         const scopeKey = scope === 'module' ? 'module' : Number(scope);
         const writes = writesOf(scopeKey, name);
+        if (starBound(scopeKey, name)) continue;
         if (writes.length !== 1 || !['def', 'class', 'import'].includes(writes[0].kind)) switchUnsettled = true;
     }
     const attributeSwitch = (scope, name) => switchValue(attributeWrites.get(`${scope}\0${name}`));
+
+    // ---- rows of parameters ----
+    const functionsNamed = new Map(); // names of the module's top -> their definition nodes
+    for (const info of definitions.values()) {
+        if (info.scope !== 'module' || info.node.type !== 'function_definition') continue;
+        const name = info.node.childForFieldName('name').text;
+        if (!functionsNamed.has(name)) functionsNamed.set(name, []);
+        functionsNamed.get(name).push(info.node);
+    }
+    const parameterNames = fn => {
+        const names = [];
+        const list = fn.childForFieldName('parameters');
+        for (const parameter of list ? list.namedChildren : []) {
+            let name = parameter.type === 'identifier' ? parameter : parameter.childForFieldName('name');
+            if (!name && (parameter.type === 'list_splat_pattern' || parameter.type === 'dictionary_splat_pattern')) {
+                name = parameter.namedChildren[0];
+            }
+            if (name && name.type === 'identifier') names.push(name.text);
+        }
+        return names;
+    };
+    // Names some class body writes: in a decorator inside that class the
+    // name is the class's, which is not followed.
+    const classWritten = new Set();
+    for (const [scope, names] of scopeWrites) {
+        if (scope !== 'module') for (const name of names.keys()) classWritten.add(name);
+    }
+    const RUN = 'run';
+    /**
+     * What a row of a table of parameters does to the body of the test:
+     * 'run' (the body executes with it), 'skip' (the row's own marks leave
+     * the body out), 'sometimes', or { via } where a name of another
+     * module of the project decides. Only pytest.param makes a row that
+     * carries marks: a value written out, a class, a function, a name of
+     * the module bound once to one of those is a plain row. A name, a
+     * member or a call that is not read may be a marked one.
+     */
+    const rowState = (node, depth = 0) => {
+        const value = unwrapped(node);
+        if (!value || depth > 4) return 'sometimes';
+        switch (value.type) {
+            // The value of an operator is no row, whatever its operands are.
+            case 'lambda': case 'comparison_operator': case 'not_operator': case 'unary_operator': case 'binary_operator':
+                return RUN;
+            case 'boolean_operator':
+                return value.namedChildren.every(part => rowState(part, depth + 1) === RUN) ? RUN : 'sometimes';
+            case 'conditional_expression': {
+                const parts = value.namedChildren;
+                return parts.length === 3 && rowState(parts[0], depth + 1) === RUN && rowState(parts[2], depth + 1) === RUN
+                    ? RUN : 'sometimes';
+            }
+            case 'identifier': return nameState(value.text, depth);
+            case 'attribute': return memberState(value, depth);
+            case 'call': return callState(value, depth);
+            default: return PY_PLAIN_VALUES.has(value.type) ? RUN : 'sometimes';
+        }
+    };
+    const writeState = (candidates, depth) => {
+        if (candidates.length !== 1 || !candidates[0]) return 'sometimes';
+        const write = candidates[0];
+        if (write.kind === 'def' || write.kind === 'class') return RUN;
+        return write.kind === 'assign' ? rowState(write.value, depth + 1) : 'sometimes';
+    };
+    const nameState = (name, depth) => {
+        if (classWritten.has(name)) return 'sometimes';
+        const candidates = candidatesOf(writesOf('module', name));
+        const binding = imported.get(name);
+        if (binding && candidates.length === 1 && candidates[0] && candidates[0].kind === 'import') {
+            // A module is no row; a name of another module of the project is read there.
+            if (binding.kind === 'import') return RUN;
+            return inProject(binding.module) ? { via: { module: binding.module, name: binding.name } } : RUN;
+        }
+        // A name the module never binds is a builtin.
+        if (candidates.length === 0) return stars.length === 0 && !binding ? RUN : 'sometimes';
+        return writeState(candidates, depth);
+    };
+    const memberState = (node, depth) => {
+        const written = dotted(node);
+        if (!written) return 'sometimes';
+        const parts = written.split('.');
+        if (classWritten.has(parts[0])) return 'sometimes';
+        const binding = imported.get(parts[0]);
+        if (binding) {
+            const path = pathOf(written);
+            if (path && /^_?pytest(\.|$)/.test(path)) return 'sometimes';
+            const held = candidatesOf(writesOf('module', parts[0]));
+            if (held.length !== 1 || !held[0] || held[0].kind !== 'import') return 'sometimes';
+            if (!inProject(binding.module)) return RUN;
+            if (parts.length === 2 && binding.kind === 'import') return { via: { module: binding.module, name: parts[1] } };
+            // A member of a class taken by name, or a name of a module taken from its package.
+            if (parts.length === 2) return { via: { module: binding.module, name: binding.name, member: parts[1] } };
+            return 'sometimes';
+        }
+        const candidates = candidatesOf(writesOf('module', parts[0]));
+        if (candidates.length === 0) return stars.length === 0 ? RUN : 'sometimes';
+        // A member of a class of the module, where the class body binds it.
+        if (parts.length !== 2 || candidates.length !== 1 || !candidates[0] || candidates[0].kind !== 'class') return 'sometimes';
+        const members = candidatesOf(writesOf(candidates[0].node.id, parts[1]));
+        return members.length === 0 ? 'sometimes' : writeState(members, depth);
+    };
+    const argumentsOf = call => {
+        const args = call.childForFieldName('arguments');
+        return (args ? args.namedChildren : []).filter(argument => argument.type !== 'comment');
+    };
+    const callState = (call, depth) => {
+        const callee = call.childForFieldName('function');
+        const written = dotted(callee);
+        const parts = written ? written.split('.') : [];
+        const binding = written ? imported.get(parts[0]) : null;
+        const path = binding ? pathOf(written) : null;
+        const given = argumentsOf(call);
+        // Calling what a call gave back: a row only where that could be one.
+        if (callee && callee.type === 'call') {
+            if (given.some(argument => argument.type === 'list_splat' || argument.type === 'dictionary_splat' ||
+                carriesRows(argument.type === 'keyword_argument' ? argument.childForFieldName('value') : argument, null, depth + 1))) {
+                return 'sometimes';
+            }
+            return callState(callee, depth + 1) === RUN ? RUN : 'sometimes';
+        }
+        if (path === 'pytest.param') {
+            if (given.some(argument => argument.type === 'list_splat' || argument.type === 'dictionary_splat')) return 'sometimes';
+            const marks = given.find(argument => argument.type === 'keyword_argument' &&
+                argument.childForFieldName('name')?.text === 'marks');
+            if (!marks) return RUN;
+            const read = marksOfValue(unwrapped(marks.childForFieldName('value')));
+            // pytest refuses a row that asks for fixtures.
+            if (read.unread || read.fixturesOpen || read.marks.includes('usefixtures')) return 'sometimes';
+            return read.skip === 'skip' ? 'skip' : read.skip === 'sometimes' ? 'sometimes' : RUN;
+        }
+        if (path && /^_?pytest(\.|$)/.test(path)) return 'sometimes';
+        // What is handed in may come back out.
+        if (given.some(argument => argument.type === 'list_splat' || argument.type === 'dictionary_splat' ||
+            carriesRows(argument.type === 'keyword_argument' ? argument.childForFieldName('value') : argument, null, depth + 1))) {
+            return 'sometimes';
+        }
+        if (!written || classWritten.has(parts[0])) return 'sometimes';
+        if (binding) {
+            const candidates = candidatesOf(writesOf('module', parts[0]));
+            if (candidates.length !== 1 || !candidates[0] || candidates[0].kind !== 'import') return 'sometimes';
+            // What a package's code gives back is not read.
+            if (!inProject(binding.module)) return RUN;
+            if (parts.length === 1 && binding.kind !== 'import') return { via: { module: binding.module, name: binding.name, call: true } };
+            if (parts.length === 2 && binding.kind === 'import') return { via: { module: binding.module, name: parts[1], call: true } };
+            if (parts.length === 2) return { via: { module: binding.module, name: binding.name, member: parts[1], call: true } };
+            return 'sometimes';
+        }
+        const candidates = candidatesOf(writesOf('module', parts[0]));
+        if (candidates.length === 0) return stars.length === 0 ? RUN : 'sometimes';
+        if (parts.length !== 1 || candidates.length !== 1 || !candidates[0]) return 'sometimes';
+        // An instance of a class of the module; what a function of the module gives back.
+        if (candidates[0].kind === 'class') return RUN;
+        return candidates[0].kind === 'def' && !makesRows(candidates[0].node, depth + 1) ? RUN : 'sometimes';
+    };
+    /**
+     * Does an expression or a body hold anything that is a marked row or
+     * may give one: pytest's param, a keyword `marks`, a name that is not
+     * a plain row, a call that may give one back, the module's namespace.
+     * `locals`: names of the function around it, which are what it was
+     * handed.
+     */
+    const carriesRows = (node, locals, depth) => {
+        if (!node) return false;
+        if (depth > 6) return true;
+        switch (node.type) {
+            case 'keyword_argument':
+                if (node.childForFieldName('name')?.text === 'marks') return true;
+                return carriesRows(node.childForFieldName('value'), locals, depth);
+            case 'identifier': {
+                const name = node.text;
+                if (name === 'param' || name === 'ParameterSet' || PY_NAMESPACE_NAMES.has(name)) return true;
+                if (locals && locals.has(name)) return false;
+                return nameState(name, depth + 1) !== RUN;
+            }
+            case 'attribute': {
+                const written = dotted(node);
+                if (!written) return carriesRows(node.childForFieldName('object'), locals, depth);
+                const name = node.childForFieldName('attribute').text;
+                if (name === 'param' || name === 'ParameterSet' || PY_NAMESPACE_NAMES.has(name)) return true;
+                if (locals && locals.has(written.split('.')[0])) return false;
+                return memberState(node, depth + 1) !== RUN;
+            }
+            case 'call': {
+                const callee = node.childForFieldName('function');
+                const written = dotted(callee);
+                const root = written ? written.split('.')[0] : null;
+                if (!(root && locals && locals.has(root)) && callState(node, depth + 1) !== RUN) return true;
+                return argumentsOf(node).some(argument => carriesRows(argument, locals, depth));
+            }
+            default:
+                return node.namedChildren.some(child => carriesRows(child, locals, depth));
+        }
+    };
+    const makesMemo = new Map();
+    /** Can a function of the module's top give back a marked row? */
+    const makesRows = (fn, depth = 0) => {
+        if (makesMemo.has(fn.id)) return makesMemo.get(fn.id);
+        // A function that calls itself adds nothing by that.
+        makesMemo.set(fn.id, false);
+        const locals = new Set(parameterNames(fn));
+        const body = fn.childForFieldName('body');
+        // Names the body binds are what it computed from the rest.
+        const bind = node => {
+            if (node.type === 'assignment' || node.type === 'augmented_assignment' || node.type === 'named_expression') {
+                for (const target of targetsOf(node.childForFieldName('left') || node.childForFieldName('name'))) locals.add(target.text);
+            } else if (node.type === 'for_statement' || node.type === 'for_in_clause') {
+                for (const target of targetsOf(node.childForFieldName('left'))) locals.add(target.text);
+            }
+            for (const child of node.namedChildren) bind(child);
+        };
+        if (body) bind(body);
+        const answer = !body || carriesRows(body, locals, depth);
+        makesMemo.set(fn.id, answer);
+        return answer;
+    };
+    const NO_TABLE = Object.freeze({ skip: null });
+    /**
+     * What a table of parameters leaves of a test: nothing where one row
+     * runs; `skip` ('skip': no row runs the body; 'sometimes': one may);
+     * `table` where names of other modules of the project decide (`rest`:
+     * what the other rows say).
+     */
+    const tableState = values => {
+        const rows = [];
+        let open = false; // a part that is not written out may be empty
+        const add = (list, depth) => {
+            for (const item of list.namedChildren) {
+                if (item.type === 'comment') continue;
+                if (item.type === 'list_splat') {
+                    const inner = depth < 4 ? sequenceOf(item.namedChildren[0]) : null;
+                    if (inner) add(inner, depth + 1);
+                    // The characters of a text written out are plain rows.
+                    else if (stringOf(item.namedChildren[0])) rows.push(RUN);
+                    else open = true;
+                    continue;
+                }
+                rows.push(rowState(item));
+            }
+        };
+        add(values, 0);
+        if (rows.some(state => state === RUN)) return NO_TABLE;
+        if (rows.length === 0) return { skip: open ? 'sometimes' : 'skip' };
+        const via = rows.filter(state => typeof state === 'object').map(state => state.via);
+        const rest = !open && rows.every(state => typeof state === 'object' || state === 'skip') ? 'skip' : 'sometimes';
+        return via.length === 0 ? { skip: rest } : { skip: null, table: { rest, via } };
+    };
 
     // ---- decorators and marks ----
     const NOTHING = Object.freeze({ skip: null, marks: [], open: false, fixtures: [], fixturesOpen: false });
@@ -5952,19 +6208,31 @@ function testUnits(fileEntry, helpers) {
                 if (mark[1] === 'skip') return plainMark('skip', { skip: 'skip' });
                 if (mark[1] === 'skipif') return plainMark('skipif', { skip: 'sometimes' });
                 if (mark[1] === 'xfail') {
+                    // run=False leaves the body out where the mark applies:
+                    // always without a condition, else where one is true.
                     const run = call ? keywordOf(call, 'run') : null;
                     const truth = run ? truthOf(run) : true;
-                    return plainMark('xfail', { skip: truth === false ? 'skip' : truth == null ? 'sometimes' : null });
+                    if (truth === true) return plainMark('xfail');
+                    const conditions = call ? [...positional(call), keywordOf(call, 'condition')].filter(Boolean) : [];
+                    // A condition written as text is evaluated by pytest.
+                    const held = conditions.map(condition => stringOf(condition) != null ? null : truthOf(condition));
+                    const applies = conditions.length === 0 || held.includes(true) ? true : held.every(each => each === false) ? false : null;
+                    return plainMark('xfail', {
+                        skip: applies === false ? null : truth === false && applies === true ? 'skip' : 'sometimes',
+                    });
                 }
                 if (mark[1] === 'parametrize') {
                     // No value to run with: pytest skips the test. A list
                     // that is not written out may be empty.
+                    // A row carries its own marks: one that runs the body
+                    // has to be in view.
                     const given = call ? keywordOf(call, 'argvalues') || positional(call)[1] : null;
                     const values = sequenceOf(given);
-                    const skip = !call || !given ? 'sometimes'
-                        : !values ? 'sometimes'
-                            : values.namedChildren.filter(item => item.type !== 'comment').length === 0 ? 'skip' : null;
-                    return plainMark('parametrize', { skip, open: !!call && mentionsMarks(call) });
+                    const table = !call || !given || !values ? { skip: 'sometimes' } : tableState(values);
+                    return plainMark('parametrize', {
+                        skip: table.skip, open: !!call && mentionsMarks(call),
+                        ...(table.table && { tables: [table.table] }),
+                    });
                 }
                 if (mark[1] === 'usefixtures') {
                     const names = call ? positional(call).map(stringOf) : [];
@@ -6003,6 +6271,7 @@ function testUnits(fileEntry, helpers) {
         fixtures: [...new Set(parts.flatMap(part => part.fixtures || []))],
         fixturesOpen: parts.some(part => part.fixturesOpen),
         ...(parts.some(part => part.fixture) && { fixture: true }),
+        ...(parts.some(part => part.tables) && { tables: parts.flatMap(part => part.tables || []) }),
     });
     const marksOfValue = node => {
         if (!node) return UNREAD_MARK;
@@ -6035,13 +6304,6 @@ function testUnits(fileEntry, helpers) {
         : settledModuleMarks;
 
     // ---- code that can stop a test before its body ----
-    const functionsNamed = new Map(); // names of the module's top -> their definition nodes
-    for (const info of definitions.values()) {
-        if (info.scope !== 'module' || info.node.type !== 'function_definition') continue;
-        const name = info.node.childForFieldName('name').text;
-        if (!functionsNamed.has(name)) functionsNamed.set(name, []);
-        functionsNamed.get(name).push(info.node);
-    }
     const stopMemo = new Map();
     const NO_STOP = Object.freeze({ stops: false, calls: [] });
     /**
@@ -6123,18 +6385,6 @@ function testUnits(fileEntry, helpers) {
             default: break;
         }
         return node.namedChildren.some(child => stops(child, calls, raises));
-    };
-    const parameterNames = fn => {
-        const names = [];
-        const list = fn.childForFieldName('parameters');
-        for (const parameter of list ? list.namedChildren : []) {
-            let name = parameter.type === 'identifier' ? parameter : parameter.childForFieldName('name');
-            if (!name && (parameter.type === 'list_splat_pattern' || parameter.type === 'dictionary_splat_pattern')) {
-                name = parameter.namedChildren[0];
-            }
-            if (name && name.type === 'identifier') names.push(name.text);
-        }
-        return names;
     };
     /**
      * Can a hook change what is collected or run: it can stop a test, it
@@ -6228,13 +6478,16 @@ function testUnits(fileEntry, helpers) {
         const autouse = call ? keywordOf(call, 'autouse') : null;
         const params = call ? keywordOf(call, 'params') : null;
         const values = params ? sequenceOf(params) : null;
-        const empty = !!params && (!values || values.namedChildren.filter(item => item.type !== 'comment').length === 0);
+        // No row that runs the body in view: a list that is not written
+        // out, an empty one, rows whose own marks skip.
+        const table = !params ? NO_TABLE : !values ? { skip: 'sometimes' } : tableState(values);
         return {
             name: renamed ? stringOf(renamed) : functionName,
             function: functionName,
             // A value that is not written out may be true.
             autouse: !!autouse && truthOf(autouse) !== false,
-            decides: mayStop(info.node) || empty || (!!renamed && stringOf(renamed) == null),
+            decides: mayStop(info.node) || table.skip != null || (!!renamed && stringOf(renamed) == null),
+            ...(table.table && { tables: [table.table] }),
             // A test that asks for it runs once for every parameter.
             ...(params && { params: true }),
             ...(stopFacts(info.node).calls.length > 0 && { calls: stopFacts(info.node).calls }),
@@ -6326,8 +6579,9 @@ function testUnits(fileEntry, helpers) {
     };
     /**
      * A function as a test, by what it is itself: its definition, its
-     * decorators, a switch written on it. Null: no test (gone, a fixture,
-     * switched off).
+     * decorators, a switch written on it. Null: no test (gone, a fixture).
+     * One switched off stays (`off`): the switch is the state of an object
+     * that another module may hold under another name and write again.
      */
     const rowOf = symbol => {
         const info = infoOf(symbol);
@@ -6336,14 +6590,16 @@ function testUnits(fileEntry, helpers) {
         const own = decoratedOf(info);
         if (own.fixture) return null;
         const written = attributeSwitch(info.scope, symbol.name);
-        if (written && written.on === false) return null;
         const dynamic = state === 'maybe' ? 'defined-conditionally'
             : (switchUnsettled || (written && written.on === 'unknown')) ? 'collection-switch' : null;
         return {
             name: symbol.name, line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
             endLine: symbol.endLine ?? symbol.startLine,
             named: functionNamed(symbol.name), prefixed: symbol.name.startsWith('test'),
+            // (Where a switch of the file is not read, off is not settled either.)
+            ...(written && written.on === false && !switchUnsettled && { off: true }),
             ...(written && written.forced && { forced: written.forced }),
+            ...(own.tables && { tables: own.tables }),
             ...(own.skip === 'skip' && { skipped: true }),
             ...((own.skip === 'sometimes' || dynamic) && { conditional: true }),
             ...(dynamic && { dynamic }),
@@ -6371,7 +6627,7 @@ function testUnits(fileEntry, helpers) {
         const row = rowOf(symbol);
         if (!row) continue;
         functions.push(row);
-        if (row.named || row.forced) units.push({ kind: 'test', suite: [], ...row });
+        if ((row.named || row.forced) && !row.off) units.push({ kind: 'test', suite: [], ...row });
     }
     for (const [name, writes] of scopeWrites.get('module') || []) {
         const write = settled('module', name);
@@ -6444,10 +6700,40 @@ function testUnits(fileEntry, helpers) {
         const fixtures = [];
         const guardCalls = [];
         let guard = false;
+        let generates = false;
+        // What the class body leaves under a constructor's name: 'custom'
+        // (a function of its own: pytest refuses the class), 'object' (the
+        // builtin's, written back), 'unknown'. Undefined: the body binds
+        // none and the next class in the lookup order decides.
+        const constructorOf = name => {
+            if (info.scope === 'module' && constructorWrites.has(cls.name)) return 'unknown';
+            const kinds = candidatesOf(writesOf(scope, name)).map(write => {
+                if (write === null || write.kind === 'del') return 'absent';
+                if (write.kind === 'def') return 'custom';
+                const value = write.kind === 'assign' ? dotted(unwrapped(write.value)) : null;
+                return value === `object.${name}` && !imported.has('object') && writesOf('module', 'object').length === 0 &&
+                    stars.length === 0 ? 'object' : 'unknown';
+            });
+            if (kinds.every(kind => kind === 'absent')) return undefined;
+            return kinds.every(kind => kind === kinds[0]) ? kinds[0] : 'unknown';
+        };
+        const constructs = {};
+        for (const name of PYTHON_CONSTRUCTORS) {
+            const kind = constructorOf(name);
+            if (kind) constructs[name] = kind;
+        }
+        // typing.Protocol gives every class that lists it a constructor
+        // of its own (measured: pytest refuses the class and what derives from it).
+        if (written.some(entry => /^Protocol(\[|$)/.test(entry.from.name) &&
+            (entry.from.bound ? /^typing(_extensions)?$/.test(entry.from.module) : !declaredHere(entry.base.split('.')[0].replace(/\[.*$/, ''))))) {
+            constructs.__init__ = 'custom';
+        }
         for (const symbol of symbols) {
             if (!holds(cls, symbol) || !helpers.isCallable(symbol)) continue;
             const memberInfo = infoOf(symbol);
             if (!memberInfo || memberInfo.scope !== scope) continue;
+            // pytest calls a class's own pytest_generate_tests for its tests.
+            if (symbol.name === 'pytest_generate_tests' && stateOf(memberInfo, symbol.name) !== 'gone') generates = true;
             if (decoratorsOf(memberInfo).some(expression => {
                 const path = pathOf(dotted(expression.type === 'call' ? expression.childForFieldName('function') : expression) || '');
                 return !!path && PY_ABSTRACT_PATHS.has(path);
@@ -6466,6 +6752,10 @@ function testUnits(fileEntry, helpers) {
             if (symbol.type === 'constructor') continue;
             const row = rowOf(symbol);
             if (!row) continue;
+            // A member switched off is no test of the class or of one
+            // deriving from it (`off`): it stays, for its name hides the
+            // one further up and a module that takes the class may write
+            // the switch again.
             if (row.named || row.prefixed || row.forced || symbol.name === 'runTest') tests.push(row);
         }
         // Another name for a test of the class is one more test.
@@ -6473,7 +6763,7 @@ function testUnits(fileEntry, helpers) {
             const write = settled(scope, name);
             const value = write && write.kind === 'assign' ? unwrapped(write.value) : null;
             const target = value && value.type === 'identifier' && value.text !== name
-                ? tests.find(row => row.name === value.text && !row.alias) : null;
+                ? tests.find(row => row.name === value.text && !row.alias && !row.off) : null;
             if (target && settled(scope, value.text) && settled(scope, value.text).kind === 'def') {
                 tests.push({
                     ...target, name, line: write.line, of: target.line, alias: true,
@@ -6492,9 +6782,12 @@ function testUnits(fileEntry, helpers) {
             named: classNamed(cls.name),
             ...(written.some(entry => (entry.from.module === 'unittest' && /TestCase$/.test(entry.from.name)) ||
                 (entry.from.module === null && /^unittest\.\w*TestCase$/.test(entry.base)) || outsideCase(entry)) && { unittestBase: true }),
-            // pytest does not collect a class that has a constructor, its
-            // own or inherited; unittest's classes are built by unittest.
-            refusedIfDeclares: ['__init__', '__new__'],
+            // pytest does not collect a class whose constructor, by its
+            // lookup order, is not object's; unittest's classes are built
+            // by unittest.
+            ...(Object.keys(constructs).length > 0 && { constructs }),
+            ...(generates && { generates: true }),
+            ...(ownMarks.tables && { tables: ownMarks.tables }),
             ...(ownSwitch && { enabled: ownSwitch.on }),
             ...(ownSwitch && ownSwitch.forced && { forced: ownSwitch.forced }),
             ...(stateOf(info, cls.name) === 'maybe' && { unsettled: true }),
@@ -6589,11 +6882,57 @@ function testUnits(fileEntry, helpers) {
     const exportsAll = allWrites.length === 0 ? null
         : allNames && allNames.every(name => name != null) && allWrites.length === 1 ? allNames : 'unknown';
 
+    const takenConstructors = [...constructorWrites].filter(name => imported.has(name) || starBound('module', name));
+    /**
+     * What a name of this module is as a row of parameters, for a module
+     * that takes it: `member` of a class the name holds, `call` for what
+     * calling it gives back. Null: the module does not bind the name.
+     * { via }: it is what a name of another module is, to be read there;
+     * { stars }: one of the modules this one takes every name of binds it.
+     */
+    const rowNamed = (name, member = null, call = false, depth = 0) => {
+        if (depth > 4 || classWritten.has(name)) return 'sometimes';
+        if (writesOf('module', name).length === 0) {
+            if (namespaceWritten) return 'sometimes';
+            return stars.length > 0 ? { stars: stars.map(star => star.module) } : null;
+        }
+        const top = settled('module', name);
+        if (!top) return 'sometimes';
+        if (top.kind === 'import') {
+            const binding = imported.get(name);
+            if (!binding) return 'sometimes';
+            // A module taken whole is a plain row; a name of it is read in it.
+            if (binding.kind === 'import') {
+                return member ? { via: { module: binding.module, name: member, call } } : call ? 'sometimes' : RUN;
+            }
+            return { via: { module: binding.module, name: binding.name, ...(member && { member }), call } };
+        }
+        if (top.kind === 'assign') {
+            // Another name for something of the module is what that is.
+            const value = unwrapped(top.value);
+            if (value && value.type === 'identifier' && value.text !== name) return rowNamed(value.text, member, call, depth + 1);
+            return member || call ? 'sometimes' : rowState(top.value, 1);
+        }
+        if (member) {
+            if (top.kind !== 'class' || call) return 'sometimes';
+            const members = candidatesOf(writesOf(top.node.id, member));
+            return members.length === 0 ? 'sometimes' : writeState(members, 0);
+        }
+        if (top.kind === 'class') return RUN;
+        if (top.kind === 'def') return call && makesRows(top.node) ? 'sometimes' : RUN;
+        return 'sometimes';
+    };
     const collected = collection.collected !== false;
     return {
         derived: true,
+        rowNamed,
+        // A switch written in a way that is not read: which of the names
+        // the module holds it turned on or off is not settled.
+        ...(switchUnsettled && { switchesOpen: true }),
         units: collected ? units : [],
         classes, functions, imports, stars, exportsAll, linearization: 'c3',
+        // The members whose lookup decides whether pytest takes a class.
+        constructors: PYTHON_CONSTRUCTORS,
         module: {
             ...(moduleMarks.skip || moduleSkips ? { skip: moduleMarks.skip === 'skip' ? 'skip' : 'sometimes' } : {}),
             ...(moduleSwitch && moduleSwitch.on === 'unknown' && { unsettled: true }),
@@ -6608,8 +6947,12 @@ function testUnits(fileEntry, helpers) {
             // Switches written here on names taken from other modules.
             switches: Object.fromEntries([...attributeWrites.keys()].filter(key => key.startsWith('module\0'))
                 .map(key => key.slice('module\0'.length))
-                .filter(name => writesOf('module', name).length === 1 && writesOf('module', name)[0].kind === 'import')
+                .filter(name => starBound('module', name) ||
+                    (writesOf('module', name).length === 1 && writesOf('module', name)[0].kind === 'import'))
                 .map(name => [name, switchUnsettled ? OPEN_SWITCH : attributeSwitch('module', name)])),
+            // Names taken from other modules whose constructor is written here.
+            ...(takenConstructors.length > 0 && { constructorWrites: takenConstructors }),
+            ...(moduleMarks.tables && { tables: moduleMarks.tables }),
         },
         runtime: {
             decides: hooksDecide, everywhere: hooksEverywhere, generates, fixtures: moduleFixtures, plugins,

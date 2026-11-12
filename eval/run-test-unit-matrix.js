@@ -47,6 +47,11 @@
  * WRONG-SELECTOR as well (go runs a package and cargo a module tree: both
  * hold several files; a test declared inside a function of another file
  * belongs to the file that calls it, whose count is a lower bound).
+ * A test the whole run executes because of the order files are loaded in
+ * (another module switched it on first) is one a file's own command
+ * cannot run: its case names it (`onlyInWholeRun`), the engine has to
+ * call it conditional, and one named that the file's command does run
+ * fails as well.
  * The run fails on any of them, on an answer that differs from
  * the pin, and on a runner it could not start (a missing runner is never a
  * pass; --allow-missing permits a partial run, a run that judged nothing
@@ -140,7 +145,10 @@ function namedIdentities(testCase) {
         });
     }
     const resolve = list => (list || []).map(id => lines.get(id) || id);
-    return { ...testCase, undeclared: resolve(testCase.undeclared), repeats: resolve(testCase.repeats) };
+    return {
+        ...testCase, undeclared: resolve(testCase.undeclared), repeats: resolve(testCase.repeats),
+        onlyInWholeRun: resolve(testCase.onlyInWholeRun),
+    };
 }
 
 function writeProject(dir, files) {
@@ -315,10 +323,11 @@ function judgeWholeRun(testCase, answer, ran, counts = {}) {
     if (!sameSet(undeclared, allowed)) {
         fail('UNDECLARED', `the runner executes [${undeclared.join(', ')}], the case names [${allowed.join(', ')}]`);
     }
-    // A body that executes more often than the tests listed for it.
+    // A body that executes more often than the tests listed for it. That
+    // a test runs only sometimes says nothing about how often.
     const oftener = ran.filter(id => {
         const owners = answer.units.filter(unit => !unit.skipped && owns(unit, id));
-        if (owners.some(unit => unit.conditional || unit.generated)) return false;
+        if (owners.some(unit => unit.generated)) return false;
         return (counts[id] || 1) > Math.max(1, owners.length);
     }).sort();
     // What the engine prints as a count is exact only where the runner
@@ -428,11 +437,15 @@ function main() {
                 fail('RUNNER-RAN-NOTHING', `${testCase.full || spec.full} (exit ${full.status})\n${full.output.slice(-1500)}`);
                 continue;
             }
-            const whole = judgeWholeRun(namedIdentities(testCase), answer, full.ran, full.counts);
+            const named = namedIdentities(testCase);
+            const whole = judgeWholeRun(named, answer, full.ran, full.counts);
             for (const problem of whole.problems) fail(problem.kind, problem.detail);
             totals.undeclared += whole.undeclared.length;
             const empty = [];
             const ownRan = new Set();
+            // Tests only the order of a whole run executes, as the case names them.
+            const orderOnly = new Set(named.onlyInWholeRun || []);
+            const orderLost = new Set();
             for (const file of answer.files) {
                 if (file.role !== 'tests' || !file.run) continue;
                 // What the file's own tests executed in the whole run.
@@ -441,7 +454,12 @@ function main() {
                 const got = runRecorded(file.run, dir, env);
                 for (const id of got.ran) ownRan.add(id);
                 if (got.ran.length === 0) empty.push(file.file);
-                const lost = mine.filter(id => !got.ran.includes(id));
+                const lost = mine.filter(id => !got.ran.includes(id)).filter(id => {
+                    const units = answer.units.filter(unit => unit.file === file.file && owns(unit, id));
+                    if (!orderOnly.has(id) || !units.every(unit => unit.conditional)) return true;
+                    orderLost.add(id);
+                    return false;
+                });
                 if (lost.length > 0) {
                     fail('WRONG-SELECTOR', `${file.run} does not run ${lost.join(', ')} (exit ${got.status})\n${got.output.slice(-800)}`);
                 }
@@ -458,6 +476,10 @@ function main() {
                 if (foreign.length > 0) {
                     fail('WRONG-SELECTOR', `${file.run} runs tests of other files: ${foreign.join(', ')}`);
                 }
+            }
+            const unused = [...orderOnly].filter(id => !orderLost.has(id)).sort();
+            if (unused.length > 0) {
+                fail('WRONG-SELECTOR', `the case names [${unused.join(', ')}] as run only by the order of a whole run; a file's own command runs them, or the engine does not call them conditional`);
             }
             empty.sort();
             if (!sameSet(empty, (testCase.emptyTestFiles || []).slice().sort())) {

@@ -2888,6 +2888,17 @@ const JAVA_STOPPING_NAMES = /^(assum\w*|Assum\w*|abort|TestAbortedException|Assu
 // Annotations of JUnit and of the language that leave what runs alone.
 // Any other on a test or its class may disable it (a condition of
 // JUnit's, an extension, an annotation of the project that carries one).
+// What gives a @ParameterizedTest its rows: written out in the annotation,
+// or computed when the test runs.
+const JAVA_WRITTEN_SOURCES = new Set(['ValueSource', 'CsvSource', 'EnumSource', 'NullSource', 'EmptySource', 'NullAndEmptySource']);
+const JAVA_COMPUTED_SOURCES = new Set(['MethodSource', 'FieldSource', 'ArgumentsSource', 'ArgumentsSources', 'CsvFileSource']);
+// Members of TestNG's @Test that leave what runs alone. `enabled`,
+// `invocationCount` and the data provider are read; any other may not.
+const TESTNG_INERT_MEMBERS = new Set(['description', 'priority', 'timeOut', 'invocationTimeOut', 'expectedExceptions',
+    'expectedExceptionsMessageRegExp', 'groups', 'alwaysRun', 'singleThreaded', 'threadPoolSize', 'successPercentage',
+    'testName', 'suiteName', 'retryAnalyzer', 'skipFailedInvocations', 'ignoreMissingDependencies', 'attributes']);
+// Annotations under which TestNG calls a method that is no test.
+const TESTNG_CONFIGURATION = /^(Before|After)(Suite|Test|Groups|Class|Method)$|^(DataProvider|Factory|Parameters|Listeners)$/;
 const JAVA_INERT_ANNOTATIONS = new Set([...JAVA_TEST_ANNOTATIONS, 'DisplayName', 'DisplayNameGeneration', 'Tag',
     'Tags', 'Order', 'Timeout', 'TestMethodOrder', 'TestClassOrder', 'TestInstance', 'Nested', 'BeforeEach',
     'AfterEach', 'BeforeAll', 'AfterAll', 'Before', 'After', 'BeforeClass', 'AfterClass', 'ValueSource',
@@ -2904,6 +2915,21 @@ const JAVA_INERT_ANNOTATIONS = new Set([...JAVA_TEST_ANNOTATIONS, 'DisplayName',
  * runs through the types that inherit it. `classes` says, for every type,
  * what it derives from and which tests it declares, so the tests a
  * concrete class inherits can be found.
+ *
+ * Which framework an annotation is of is read from where it is imported
+ * from, because the three differ (measured with each):
+ * - A class that redeclares a method without the annotation: JUnit 5 no
+ *   longer runs it as a test; JUnit 4 and TestNG run the test the nearest
+ *   annotated declaration makes, with the body the class has
+ *   (`byDeclaration`, `memberRows`).
+ * - @Disabled and @Ignore on a class hold for that class and the classes
+ *   inside it, not for a class that derives from it: a row says what the
+ *   method's own annotations say, a class what its own do.
+ * - A @ParameterizedTest runs once for each row its sources give: none
+ *   written (no source, an empty array) and the body never executes; rows
+ *   that are computed may be none. TestNG's @Test says the same by
+ *   `enabled`, `invocationCount` and a data provider, and on a class makes
+ *   every public method a test.
  */
 function testUnits(fileEntry, helpers) {
     const symbols = fileEntry.symbols || [];
@@ -2963,13 +2989,148 @@ function testUnits(fileEntry, helpers) {
         annotationMemo.set(symbol, out);
         return out;
     };
-    // @Disabled (JUnit 5) and @Ignore (JUnit 4): declared, not executed.
-    const disabled = symbol => annotationsOf(symbol).has('Disabled') || annotationsOf(symbol).has('Ignore');
-    // An annotation that is not one of those: the test may not run.
-    const unsettled = symbol => [...annotationsOf(symbol)].some(name => !JAVA_INERT_ANNOTATIONS.has(name));
     // A setup method of a class whose body can stop the test (it names an
     // assumption, an abort): the class's tests run only sometimes.
     const tree = helpers.tree();
+    // The annotations of a declaration as they are written, by the row its
+    // name stands on: each with its members' values as syntax.
+    const writtenAt = new Map();
+    const noteAnnotations = node => {
+        if (/_declaration$/.test(node.type)) {
+            const name = node.childForFieldName('name');
+            const modifiers = node.namedChildren.find(child => child.type === 'modifiers');
+            if (name && modifiers) {
+                const rows = [name.startPosition.row, node.startPosition.row].filter(row => !writtenAt.has(row));
+                const read = modifiers.namedChildren
+                    .filter(child => child.type === 'annotation' || child.type === 'marker_annotation')
+                    .map(annotation => {
+                        const members = new Map();
+                        const list = annotation.childForFieldName('arguments');
+                        for (const argument of list ? list.namedChildren : []) {
+                            if (argument.type === 'element_value_pair') {
+                                members.set(argument.childForFieldName('key')?.text, argument.childForFieldName('value'));
+                            } else if (argument.type !== 'line_comment' && argument.type !== 'block_comment') {
+                                members.set('value', argument);
+                            }
+                        }
+                        return { name: String(annotation.childForFieldName('name')?.text || '').split('.').pop(), members };
+                    });
+                for (const row of rows) writtenAt.set(row, read);
+            }
+        }
+        for (const child of node.namedChildren) noteAnnotations(child);
+    };
+    if (tree) noteAnnotations(tree.rootNode);
+    const written = symbol => writtenAt.get((symbol.nameLine || symbol.startLine) - 1) ||
+        writtenAt.get(symbol.startLine - 1) || [];
+    /** The annotation of a declaration written under one of the names, or null. */
+    const writtenAs = (symbol, names) => written(symbol).find(annotation => names.has(annotation.name)) || null;
+    const literalInt = node => node && /^(decimal|hex|octal|binary)_integer_literal$/.test(node.type)
+        ? Number(node.text.replace(/_/g, '').replace(/[lL]$/, '')) : null;
+    const emptyArray = node => !!node && node.type === 'element_value_array_initializer' &&
+        node.namedChildren.filter(child => !/comment$/.test(child.type)).length === 0;
+    // Which framework an annotation written with one of the shared names
+    // is of: by its own qualifier, the import that names it, or the one
+    // package imported whole.
+    const imports = (fileEntry.imports || []).map(String);
+    const packageKind = name => /^org\.junit\.jupiter(\.|$)/.test(name) ? 'junit5'
+        : /^org\.testng(\.|$)/.test(name) ? 'testng' : /^(org\.junit|junit)(\.|$)/.test(name) ? 'junit4' : null;
+    const frameworkOf = writtenName => {
+        const text = String(writtenName);
+        const simple = text.split('.').pop();
+        const named = text.includes('.') ? text : imports.find(name => name.endsWith(`.${simple}`));
+        if (named) return packageKind(named);
+        const whole = new Set(imports.filter(name => name.endsWith('.*')).map(name => packageKind(name.slice(0, -2))).filter(Boolean));
+        return whole.size === 1 ? [...whole][0] : null;
+    };
+    const frameworkMemo = new Map();
+    /** The framework of the declaration's own test annotation ('junit4', 'junit5', 'testng'), or null. */
+    const testFramework = symbol => {
+        if (!frameworkMemo.has(symbol)) {
+            const own = (symbol.annotationsWithArgs || []).find(annotation => String(annotation.name).split('.').pop() === 'Test');
+            frameworkMemo.set(symbol, own ? frameworkOf(own.name) : null);
+        }
+        return frameworkMemo.get(symbol);
+    };
+    /**
+     * What TestNG's @Test on a declaration says: 'skip' (enabled = false,
+     * no invocation), 'sometimes' (a member that is not read, a data
+     * provider, a dependency), `several` (more than one invocation).
+     */
+    const testngState = symbol => {
+        const answer = { skip: null, several: false };
+        const test = testFramework(symbol) === 'testng' ? writtenAs(symbol, new Set(['Test'])) : null;
+        if (!test) return answer;
+        const weaker = () => {
+            if (answer.skip !== 'skip') answer.skip = 'sometimes';
+        };
+        for (const [member, value] of test.members) {
+            if (member === 'enabled') {
+                if (value.type === 'false') answer.skip = 'skip';
+                else if (value.type !== 'true') weaker();
+            } else if (member === 'invocationCount') {
+                const count = literalInt(value);
+                if (count === 0) answer.skip = 'skip';
+                else if (count == null) weaker();
+                if (count !== 1) answer.several = true;
+            } else if (member === 'dataProvider' || member === 'dataProviderClass') {
+                // Rows computed when the test runs: there may be none.
+                weaker();
+                answer.several = true;
+            } else if (!TESTNG_INERT_MEMBERS.has(member)) {
+                weaker();
+            }
+        }
+        return answer;
+    };
+    /**
+     * What the sources of a JUnit 5 test with parameters leave of it:
+     * 'skip' (none gives a row: the runner reports an error and the body
+     * never executes), 'sometimes' (rows computed at run time), or null.
+     */
+    const sourcesState = symbol => {
+        const names = annotationsOf(symbol);
+        if (names.has('RepeatedTest')) {
+            const repeated = writtenAs(symbol, new Set(['RepeatedTest']));
+            const count = repeated ? literalInt(repeated.members.get('value')) : null;
+            return count == null ? 'sometimes' : count <= 0 ? 'skip' : null;
+        }
+        if (!names.has('ParameterizedTest')) return null;
+        let computed = false;
+        for (const annotation of written(symbol)) {
+            if (JAVA_COMPUTED_SOURCES.has(annotation.name)) computed = true;
+            if (!JAVA_WRITTEN_SOURCES.has(annotation.name)) continue;
+            if (annotation.name === 'EnumSource') {
+                // Every constant of the type, unless names or a mode choose among them.
+                if ([...annotation.members.keys()].every(member => member === 'value')) return null;
+                computed = true;
+            } else if (annotation.name === 'ValueSource' || annotation.name === 'CsvSource') {
+                const values = [...annotation.members.entries()].filter(([member]) =>
+                    annotation.name === 'ValueSource' || member === 'value' || member === 'textBlock');
+                if (values.some(([, value]) => !emptyArray(value))) return null;
+            } else {
+                return null;
+            }
+        }
+        // A source this does not see written on the method: one carried
+        // by an annotation of the project, or an annotation that is none
+        // of JUnit's and may be a source. Read as computed.
+        if (!computed && [...names].some(name => !JAVA_INERT_ANNOTATIONS.has(name) ||
+            ((JAVA_WRITTEN_SOURCES.has(name) || JAVA_COMPUTED_SOURCES.has(name)) &&
+                !written(symbol).some(annotation => annotation.name === name)))) computed = true;
+        return computed ? 'sometimes' : 'skip';
+    };
+    // @Disabled (JUnit 5) and @Ignore (JUnit 4, TestNG): declared, not executed.
+    const disabled = symbol => annotationsOf(symbol).has('Disabled') || annotationsOf(symbol).has('Ignore');
+    // An annotation that is not one of those: the test may not run.
+    const unsettled = symbol => [...annotationsOf(symbol)].some(name => !JAVA_INERT_ANNOTATIONS.has(name));
+    // A method's own: what its test annotation's members and its sources add.
+    const methodOff = symbol => disabled(symbol) || testngState(symbol).skip === 'skip' || sourcesState(symbol) === 'skip';
+    const methodUnsettled = symbol => unsettled(symbol) || testngState(symbol).skip === 'sometimes' ||
+        sourcesState(symbol) === 'sometimes';
+    // A runner named on the class that is not JUnit 4's own decides how
+    // often a test runs (one with a table runs it once for each row).
+    const otherRunner = cls => annotationsOf(cls).has('RunWith');
     // Read over the lines of the method, whatever shape the tree gives
     // them: a stopping name or a throw anywhere on them.
     const stopsOn = (first, last) => {
@@ -3006,27 +3167,65 @@ function testUnits(fileEntry, helpers) {
         }
         return legacyMemo.get(cls);
     };
+    // TestNG's @Test on a class: every public method of it is a test,
+    // unless the annotation switches the class's tests off.
+    const classTestMemo = new Map();
+    const classTest = cls => {
+        if (!classTestMemo.has(cls)) {
+            const own = annotationsOf(cls).has('Test') && testFramework(cls) === 'testng';
+            classTestMemo.set(cls, own ? (testngState(cls).skip === 'skip' ? 'off' : 'on') : null);
+        }
+        return classTestMemo.get(cls);
+    };
+    const testngIgnored = cls => (cls.annotationsWithArgs || []).some(annotation =>
+        String(annotation.name).split('.').pop() === 'Ignore' && frameworkOf(annotation.name) === 'testng');
+    // A method TestNG takes as a test under a @Test on its class or on a
+    // class that one derives from: public, and none of TestNG's own setup.
+    const classCandidate = symbol => (symbol.modifiers || []).includes('public') &&
+        !(symbol.modifiers || []).includes('static') &&
+        ![...annotationsOf(symbol)].some(name => TESTNG_CONFIGURATION.test(name) || JAVA_TEST_ANNOTATIONS.has(name));
     for (const symbol of symbols) {
         if (!symbol.isMethod || symbol.type === 'constructor') continue;
         const chain = helpers.enclosing(symbol);
         if (chain.length === 0 || chain.some(outer => !helpers.isContainer(outer))) continue;
         const owner = chain[chain.length - 1];
         const annotated = [...annotationsOf(symbol)].some(name => JAVA_TEST_ANNOTATIONS.has(name));
-        if (!annotated && !(legacy(owner) && /^test/.test(symbol.name) &&
+        const byClass = !annotated && classTest(owner) === 'on' && classCandidate(symbol);
+        if (!annotated && !byClass && !(legacy(owner) && /^test/.test(symbol.name) &&
             (symbol.modifiers || []).includes('public'))) continue;
         // JUnit runs neither a private nor a static method as a test.
         if ((symbol.modifiers || []).includes('private') || (symbol.modifiers || []).includes('static')) continue;
-        const off = [symbol, ...chain].some(disabled);
+        const framework = byClass ? 'testng' : testFramework(symbol);
+        // What the method's own annotations say, and what the classes it
+        // stands in add for a test of theirs.
+        const ownOff = methodOff(symbol);
+        const off = ownOff || chain.some(disabled);
+        const sometimes = methodUnsettled(symbol) || chain.some(unsettled) || chain.some(guarded) ||
+            (byClass && testngState(owner).skip === 'sometimes');
+        const several = [...annotationsOf(symbol)].some(name => JAVA_TEST_ANNOTATIONS.has(name) && name !== 'Test') ||
+            testngState(symbol).several || (byClass && testngState(owner).several) || chain.some(otherRunner);
         const row = {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
             ...(off && { skipped: true }),
-            ...(!off && ([symbol, ...chain].some(unsettled) || chain.some(guarded)) && { conditional: true }),
+            ...(!off && sometimes && { conditional: true }),
             // One declaration the runner reports as several tests.
-            ...([...annotationsOf(symbol)].some(name => JAVA_TEST_ANNOTATIONS.has(name) && name !== 'Test') && { several: true }),
+            ...(several && { several: true }),
         };
         if (!declared.has(owner)) declared.set(owner, []);
-        declared.get(owner).push(row);
+        // For a class that inherits the test: the classes around this one
+        // are not around that one.
+        declared.get(owner).push({
+            // TestNG's @Ignore on a class reaches the classes deriving from it (measured).
+            ...row, skipped: ownOff || (framework === 'testng' && chain.some(testngIgnored)) || undefined,
+            conditional: (!ownOff && sometimes) || undefined,
+            // JUnit 4 and TestNG take the test from the nearest annotated
+            // declaration, whatever a class nearer redeclares without one.
+            ...((framework === 'junit4' || framework === 'testng') && annotated && { byDeclaration: true }),
+            // Maven's filter does not find a TestNG test by the name of a
+            // class that inherits it (measured): no command names it there.
+            ...(framework === 'testng' && { inheritedDynamic: 'declared-in-a-base-class' }),
+        });
         if (chain.some(cls => !concrete(cls))) continue;
         // A class inside another runs with it only when marked @Nested. A
         // static one is a test class of its own that a build's default
@@ -3042,6 +3241,8 @@ function testUnits(fileEntry, helpers) {
         });
     }
     const classes = [];
+    const methodsOf = cls => symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
+        symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine));
     for (const cls of symbols) {
         if (!helpers.isContainer(cls)) continue;
         const chain = helpers.enclosing(cls);
@@ -3058,9 +3259,18 @@ function testUnits(fileEntry, helpers) {
             ...([...chain, cls].some(guarded) && { guard: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
-            members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
-                symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine))
-                .map(symbol => symbol.name),
+            members: methodsOf(cls).map(symbol => symbol.name),
+            // Where each method's body stands, for a test it gives the body to.
+            memberRows: methodsOf(cls).map(symbol => ({
+                name: symbol.name, line: symbol.nameLine || symbol.startLine,
+                startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+                ...(symbol.type !== 'constructor' && classCandidate(symbol) && { candidate: true }),
+            })),
+            // TestNG's @Test on the class makes its public methods tests,
+            // and those of the classes deriving from it (measured); the
+            // public methods it inherits itself are tests this does not list.
+            ...(classTest(cls) === 'on' && { classMark: true }),
+            ...(classTest(cls) === 'on' && bases.length > 0 && { open: true }),
             tests: declared.get(cls) || [],
         });
         if (testsIn.get(cls) > 0) {
@@ -3071,7 +3281,7 @@ function testUnits(fileEntry, helpers) {
             });
         }
     }
-    return { units, classes };
+    return { units, classes, ...(classes.some(cls => cls.open && cls.runnable) && { inheriting: true }) };
 }
 
 /**

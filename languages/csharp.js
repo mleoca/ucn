@@ -2982,6 +2982,12 @@ const CSHARP_TEST_ATTRIBUTES = new Set(['Fact', 'Theory', 'Test', 'TestCase', 'T
     'TestMethod', 'DataTestMethod', 'SkippableFact', 'SkippableTheory']);
 // Attributes whose own arguments can leave a test, or one of its rows, out.
 const CSHARP_ROW_ATTRIBUTES = new Set(['InlineData', 'DataRow', 'TestCase', 'TestCaseSource']);
+// One row of a test's table, written out in the attribute; and what gives
+// rows that are computed when the tests are discovered.
+const CSHARP_WRITTEN_ROWS = new Set(['InlineData', 'DataRow', 'TestCase']);
+const CSHARP_COMPUTED_ROWS = new Set(['MemberData', 'ClassData', 'TestCaseSource', 'DynamicData']);
+// Named arguments of a row that leave it as it is. Any other may leave it out.
+const CSHARP_INERT_ROW_ARGUMENTS = /^(TestName|Description|Category|Author|ExpectedResult|Reason|TypeArgs|TestOf|DisplayName|ArgDisplayNames)$/;
 // Attributes of the test frameworks and of the language that leave what
 // runs alone. Any other attribute on a test or its class may not.
 const CSHARP_INERT_ATTRIBUTES = new Set([...CSHARP_TEST_ATTRIBUTES, ...CSHARP_ROW_ATTRIBUTES,
@@ -3015,6 +3021,21 @@ const CSHARP_STOPPING_NAMES = /^(Ignore|Inconclusive|Assume|Pass|Skip\w*|IgnoreE
  * elsewhere is not read: the test is conditional). [Ignore] skips; with
  * Until it does so for a time. An attribute that is none of the
  * frameworks' own may do anything: the test is conditional.
+ *
+ * A test that takes rows runs once for each: where every row written out
+ * is left out by its own arguments the body never executes, and rows that
+ * are computed (MemberData, TestCaseSource, DynamicData), or none at all,
+ * may be none. NUnit also takes rows from attributes on the parameters,
+ * repeats a test ([Repeat]) and builds a fixture once for each
+ * [TestFixture(...)] with arguments, under names that carry the arguments.
+ *
+ * What a class adds holds for the tests it runs, not for a class deriving
+ * from it ([Ignore] on a base class does not reach the derived one:
+ * measured with NUnit and MSTest): a row says what the method's own
+ * attributes say. xUnit takes a test from the nearest declaration that
+ * carries the attribute, so a class that overrides the method without it
+ * runs the test with its own body (`byDeclaration`, `memberRows`); NUnit
+ * and MSTest do not run the override.
  */
 function testUnits(fileEntry, helpers) {
     const symbols = fileEntry.symbols || [];
@@ -3029,6 +3050,7 @@ function testUnits(fileEntry, helpers) {
     // Attributes as written, by the rows a declaration starts and is named
     // on; constants of the file, by name and by `Type.Name`.
     const written = new Map();
+    const parameters = new Map(); // row of a method's name -> its parameters, each with its attributes' names and arguments
     const constants = new Map();
     const noteConstant = (key, node) => constants.set(key, constants.has(key) ? null : node);
     const readAttribute = attribute => {
@@ -3055,6 +3077,13 @@ function testUnits(fileEntry, helpers) {
                     .map(readAttribute);
                 written.set(name.startPosition.row, attributes);
                 if (!written.has(node.startPosition.row)) written.set(node.startPosition.row, attributes);
+            }
+            if (name && node.type === 'method_declaration') {
+                const list = node.childForFieldName('parameters');
+                parameters.set(name.startPosition.row, (list ? list.namedChildren : [])
+                    .filter(child => child.type === 'parameter')
+                    .map(parameter => parameter.namedChildren.filter(child => child.type === 'attribute_list')
+                        .flatMap(each => each.namedChildren.filter(child => child.type === 'attribute')).map(readAttribute)));
             }
             if (name && /^(class|struct|record|interface)_declaration$/.test(node.type)) inner = name.text;
             if (node.type === 'field_declaration' &&
@@ -3124,13 +3153,13 @@ function testUnits(fileEntry, helpers) {
                 weaker();
                 continue;
             }
+            // A row's own arguments are read with the table it is part of.
+            if (CSHARP_WRITTEN_ROWS.has(attribute.name)) continue;
             for (const argument of attribute.args) {
                 if (!argument.name) continue;
                 if (/^(Skip|Ignore|IgnoreReason|IgnoreMessage)$/.test(argument.name)) {
                     const held = textOf(argument.value, owner);
                     if (held === 'text' && makers <= 1 && !CSHARP_ROW_ATTRIBUTES.has(attribute.name)) answer = 'skip';
-                    else if (held === 'text' && makers <= 1 && attribute.name === 'TestCase' &&
-                        attributes.filter(other => other.name === 'TestCase').length === 1) answer = 'skip';
                     // Only xUnit's Skip takes null or an empty string and runs.
                     else if (held === 'text' || held == null || argument.name !== 'Skip') weaker();
                 } else if (/^(Explicit|SkipUnless|SkipWhen|SkipType|SkipExceptions)$/.test(argument.name)) {
@@ -3140,6 +3169,53 @@ function testUnits(fileEntry, helpers) {
         }
         return answer;
     };
+    /**
+     * What the rows of a test leave of it: `skip` ('skip': no row runs the
+     * body; 'sometimes': one may run it), and whether the declaration
+     * stands for several of the runner's tests.
+     */
+    const tableOf = (symbol, owner, kinds) => {
+        const attributes = attributesOf(symbol);
+        const rows = attributes.filter(attribute => CSHARP_WRITTEN_ROWS.has(attribute.name));
+        const computed = attributes.some(attribute => CSHARP_COMPUTED_ROWS.has(attribute.name));
+        const taken = parameters.get((symbol.nameLine || symbol.startLine) - 1) || [];
+        const repeated = attributes.some(attribute => attribute.name === 'Repeat');
+        if (rows.length > 0) {
+            const states = rows.map(row => {
+                let state = 'run';
+                for (const argument of row.args) {
+                    if (!argument.name || CSHARP_INERT_ROW_ARGUMENTS.test(argument.name)) continue;
+                    if (/^(Skip|Ignore|IgnoreReason|IgnoreMessage)$/.test(argument.name)) {
+                        const held = textOf(argument.value, owner);
+                        if (held === 'text') state = 'skip';
+                        // Only xUnit's Skip takes null or an empty string and runs.
+                        else if (held == null || argument.name !== 'Skip') state = state === 'skip' ? 'skip' : 'sometimes';
+                    } else if (state !== 'skip') {
+                        // Explicit, a platform, anything this does not read.
+                        state = 'sometimes';
+                    }
+                }
+                return state;
+            });
+            const skip = states.includes('run') ? null
+                : states.every(state => state === 'skip') && !computed ? 'skip' : 'sometimes';
+            return { skip, several: true };
+        }
+        if (computed) return { skip: 'sometimes', several: true };
+        if (kinds.some(name => /Theory$/.test(name) || name === 'DataTestMethod') || taken.length > 0) {
+            // NUnit takes rows from its parameters' own attributes: a
+            // list written out, a range.
+            const given = taken.length > 0 && taken.every(each => each.some(attribute =>
+                (attribute.name === 'Values' && attribute.args.length > 0) || attribute.name === 'Range'));
+            return { skip: given ? null : 'sometimes', several: true };
+        }
+        return { skip: null, several: repeated };
+    };
+    // NUnit builds a fixture once for each [TestFixture(...)] that has
+    // arguments and for each row of a [TestFixtureSource]: its tests run
+    // under names that carry the arguments.
+    const fixtureRows = cls => attributesOf(cls).some(attribute => attribute.name === 'TestFixtureSource' ||
+        (attribute.name === 'TestFixture' && attribute.args.some(argument => !argument.name)));
     const concrete = cls => cls.type !== 'interface' && !(cls.modifiers || []).includes('abstract') &&
         !(Array.isArray(cls.generics) ? cls.generics.length > 0 : !!cls.generics) &&
         !(cls.typeParameters && cls.typeParameters.length > 0);
@@ -3219,23 +3295,44 @@ function testUnits(fileEntry, helpers) {
         const xunit = attributes.some(name => /^(Fact|SkippableFact|SkippableTheory)$/.test(name)) ||
             (fileEntry.imports || []).some(name => /^Xunit(\.|$)/.test(String(name)));
         if (!xunit && !(symbol.modifiers || []).includes('public')) continue;
-        if (attributes.some(name => name === 'TestMethod' || name === 'DataTestMethod') &&
-            !attributeNames(chain[chain.length - 1]).includes('TestClass')) continue;
+        // MSTest wants the class that runs a test marked [TestClass]: the
+        // class the method stands in for a test of its own, the deriving
+        // class for one it inherits (measured: the mark is not inherited,
+        // and the base needs none).
+        const mstest = attributes.some(name => name === 'TestMethod' || name === 'DataTestMethod');
         const owner = chain[chain.length - 1];
-        const states = [stateOf(symbol, owner.name), ...chain.map((cls, i) => stateOf(cls, i > 0 ? chain[i - 1].name : null))];
+        const unmarked = mstest && !attributeNames(owner).includes('TestClass');
+        // What the method's own attributes and rows say, and what the
+        // classes it stands in add for a test of theirs.
+        const table = tableOf(symbol, owner.name, attributes);
+        const own = [stateOf(symbol, owner.name), table.skip];
+        const around = chain.map((cls, i) => stateOf(cls, i > 0 ? chain[i - 1].name : null));
+        const states = [...own, ...around];
+        const sometimes = states.includes('sometimes') || chain.some(guarded);
+        const generated = chain.some(fixtureRows);
         const row = {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
             ...(states.includes('skip') && { skipped: true }),
-            ...(!states.includes('skip') && (states.includes('sometimes') || chain.some(guarded)) && { conditional: true }),
+            ...(!states.includes('skip') && sometimes && { conditional: true }),
             // One declaration the runner reports as several tests: a
-            // theory, a method given rows of data.
-            ...(attributes.some(name => /Theory$/.test(name) || name === 'DataTestMethod' || CSHARP_ROW_ATTRIBUTES.has(name)) &&
-                { several: true }),
+            // theory, a method given rows of data, a repeated one.
+            ...((table.several || attributes.some(name => /Theory$/.test(name) || name === 'DataTestMethod' ||
+                CSHARP_ROW_ATTRIBUTES.has(name))) && { several: true }),
+            ...(generated && { dynamic: 'generated-cases' }),
         };
         if (!declared.has(owner)) declared.set(owner, []);
-        declared.get(owner).push(row);
-        if (chain.some(cls => !concrete(cls))) continue;
+        // For a class that inherits the test: the classes around this one
+        // are not around that one.
+        declared.get(owner).push({
+            ...row, skipped: own.includes('skip') || undefined,
+            conditional: (!own.includes('skip') && sometimes) || undefined, dynamic: undefined,
+            // xUnit takes the test from the nearest declaration that
+            // carries the attribute, whatever a class nearer overrides.
+            ...(xunit && { byDeclaration: true }),
+            ...(mstest && { needsClassMark: true }),
+        });
+        if (unmarked || chain.some(cls => !concrete(cls))) continue;
         for (const cls of chain) testsIn.set(cls, (testsIn.get(cls) || 0) + 1);
         units.push({
             kind: 'test', suite: chain.map(cls => cls.name), ...row,
@@ -3243,6 +3340,8 @@ function testUnits(fileEntry, helpers) {
         });
     }
     const classes = [];
+    const methodsOf = cls => symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
+        symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine));
     for (const cls of symbols) {
         if (!helpers.isContainer(cls) || cls.type === 'namespace') continue;
         const chain = helpers.enclosing(cls).filter(outer => outer.type !== 'namespace');
@@ -3260,9 +3359,14 @@ function testUnits(fileEntry, helpers) {
             ...([...chain, cls].some(guarded) && { guard: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
-            members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
-                symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine))
-                .map(symbol => symbol.name),
+            members: methodsOf(cls).map(symbol => symbol.name),
+            // Where each method's body stands, for a test it gives the body to.
+            memberRows: methodsOf(cls).map(symbol => ({
+                name: symbol.name, line: symbol.nameLine || symbol.startLine,
+                startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+            })),
+            ...([...chain, cls].some(fixtureRows) && { several: true, dynamic: 'generated-cases' }),
+            ...(attributeNames(cls).includes('TestClass') && { marked: true }),
             tests: declared.get(cls) || [],
         });
         if (testsIn.get(cls) > 0) {

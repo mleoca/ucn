@@ -1523,6 +1523,11 @@ const SELECTORS = {
         if (!unit) {
             const classes = topLevelTestClasses(model, filePath);
             if (classes.length === 0) return withheld('no-test-class');
+            // A fixture built once for each set of arguments runs under
+            // names that carry them: no filter by the class's name holds them.
+            if ((model.declared(filePath)?.classes || []).some(cls => cls.dynamic === 'generated-cases')) {
+                return withheld('generated-cases');
+            }
             const terms = classes.flatMap(name => [`FullyQualifiedName~${quoted(name)}.`, `FullyQualifiedName~${quoted(name)}+`]);
             return command(runner, ['dotnet', 'test', '--filter', shellWord(terms.join('|'))]);
         }
@@ -1560,6 +1565,7 @@ function createTestModel(index) {
         gates: new Map(),
         plugins: new Map(),
         guards: new Map(),
+        foreign: new Map(),
         readerCaches: new Map(),
         root: index.root,
         relPaths: null,
@@ -1862,10 +1868,19 @@ function createTestModel(index) {
      * test-shaped name, the first class in lookup order that declares a
      * member of that name. A test found behind a base that is not read is
      * not attributed (`withheld`): that base may declare the name itself.
+     *
+     * Where the runner takes a test from the nearest declaration that
+     * carries its mark (`byDeclaration`: JUnit 4, TestNG, xUnit), a class
+     * nearer that redeclares the member without the mark does not hide it:
+     * the test runs with that class's body (`body`).
      */
     const inheritedBy = (filePath, cls, select = null) => {
         const out = [];
         const hidden = new Set(cls.members);
+        // Names a nearer class declares as a test, and where the nearest
+        // body of each member stands.
+        const tested = new Set((cls.tests || []).map(test => test.name));
+        const bodies = new Map((cls.memberRows || []).map(row => [row.name, { row, at: { filePath, cls } }]));
         let behindUnknown = false;
         let withheldAny = false;
         for (const node of orderOf(filePath, cls).slice(1)) {
@@ -1874,43 +1889,22 @@ function createTestModel(index) {
                 continue;
             }
             for (const test of node.cls.tests) {
-                if (hidden.has(test.name)) continue;
+                const redeclared = hidden.has(test.name);
+                if (redeclared && (!test.byDeclaration || tested.has(test.name))) continue;
                 hidden.add(test.name);
+                tested.add(test.name);
                 // A member the runner does not take as a test still hides
                 // the one of that name further up.
                 if (select && !select(test)) continue;
                 if (behindUnknown) withheldAny = true;
-                else out.push({ test, base: node });
+                else out.push({ test, base: node, ...(redeclared && bodies.has(test.name) && { body: bodies.get(test.name) }) });
             }
             for (const member of node.cls.members) hidden.add(member);
+            for (const row of node.cls.memberRows || []) {
+                if (!bodies.has(row.name)) bodies.set(row.name, { row, at: node });
+            }
         }
         return { tests: out, open: behindUnknown, withheld: withheldAny };
-    };
-
-    /**
-     * Does the runner refuse a class its own declarations would let in:
-     * a class it derives from declares a member that rules a class out
-     * (`refusedIfDeclares`), or the nearest explicit switch (`enabled`) in
-     * lookup order says off. `unknown`: a base that is not read could.
-     */
-    const refusal = (filePath, cls) => {
-        const rules = cls.refusedIfDeclares ? [].concat(cls.refusedIfDeclares) : [];
-        let switchSeen = cls.enabled != null;
-        let off = cls.enabled === false;
-        let ruledOut = false;
-        let unknown = false;
-        for (const node of orderOf(filePath, cls).slice(1)) {
-            if (node.opaque) {
-                if (rules.length > 0 && !node.safe) unknown = true;
-                continue;
-            }
-            if (rules.some(name => node.cls.members.includes(name))) ruledOut = true;
-            if (!switchSeen && node.cls.enabled != null) {
-                switchSeen = true;
-                off = node.cls.enabled === false;
-            }
-        }
-        return { refused: ruledOut || off, unknown: !(ruledOut || off) && unknown };
     };
 
     /**
@@ -2024,6 +2018,43 @@ function createTestModel(index) {
     };
 
     /**
+     * Switches other modules write on the classes and functions of a
+     * module, each on a name it took from it. The object is one: a module
+     * the runner loads after the writer sees the write, so what such a
+     * class or function is depends on the order of the run. Looked for
+     * among the modules that import this one.
+     */
+    const switchedElsewhere = filePath => {
+        if (model.foreign.has(filePath)) return model.foreign.get(filePath);
+        const answer = { classes: new Map(), functions: new Map() };
+        model.foreign.set(filePath, answer);
+        const add = (map, key, write) => {
+            if (!map.has(key)) map.set(key, []);
+            map.get(key).push(write);
+        };
+        for (const importer of [...(index.exportGraph?.get(filePath) || [])].sort(codeUnitCompare)) {
+            if (importer === filePath || !index.files.has(importer)) continue;
+            let text;
+            try {
+                text = index._readFile(importer);
+            } catch (e) {
+                continue;
+            }
+            if (!text.includes('__test__')) continue;
+            const there = model.declared(importer);
+            const switches = there && there.derived && there.module ? there.module.switches || {} : {};
+            for (const name of Object.keys(switches).sort(codeUnitCompare)) {
+                const hit = resolveName(importer, name);
+                if (!hit || hit.filePath !== filePath) continue;
+                const write = { on: switches[name].on, forced: switches[name].forced, by: importer };
+                if (hit.kind === 'class') add(answer.classes, hit.cls, write);
+                else add(answer.functions, hit.fn.name, write);
+            }
+        }
+        return answer;
+    };
+
+    /**
      * Does one of the functions a file calls in other modules of the
      * project stop a test when called (it skips, raises, or calls a
      * function of its own module that does)? One module deep.
@@ -2033,9 +2064,66 @@ function createTestModel(index) {
         const there = target ? model.declared(target) : null;
         return !!there && (there.stopping || []).includes(call.name);
     });
-    /** A file's fixtures, with what the functions they call elsewhere add. */
+    /**
+     * What a name of a module is as a row of a table of parameters
+     * ('run', 'skip', 'sometimes'), read in the module that binds it and,
+     * where that module took it from another, in that one: a few modules
+     * deep. Null: the module does not bind it.
+     */
+    const readRow = (file, name, member, call, depth) => {
+        const there = file ? model.declared(file) : null;
+        if (!there || typeof there.rowNamed !== 'function') return null;
+        const state = there.rowNamed(name, member, call);
+        if (!state || typeof state !== 'object') return state;
+        if (depth >= 4) return 'sometimes';
+        if (state.via) return viaLookup(file, state.via, depth + 1) ?? 'sometimes';
+        // A name a star import brings: read in the module that binds it.
+        for (const module of state.stars || []) {
+            const found = viaLookup(file, { module, name, ...(member && { member }), call }, depth + 1);
+            if (found != null) return found;
+        }
+        return null;
+    };
+    const viaLookup = (filePath, via, depth) => {
+        const direct = moduleFile(filePath, via.module) || moduleNamed(filePath, via.module);
+        const state = readRow(direct, via.name, via.member || null, !!via.call, depth);
+        if (state != null) return state;
+        // Not a name of that module: a module of that package.
+        let inner = null;
+        if (direct && path.basename(direct) === '__init__.py') {
+            for (const tail of [`${via.name}.py`, path.join(via.name, '__init__.py')]) {
+                const candidate = path.join(path.dirname(direct), tail);
+                if (!inner && index.files.has(candidate)) inner = candidate;
+            }
+        } else if (!direct && !String(via.module).startsWith('.')) {
+            inner = moduleNamed(filePath, `${via.module}.${via.name}`);
+        }
+        if (!inner || !model.declared(inner)) return null;
+        // The module itself is a plain row; calling it is not read.
+        if (!via.member) return via.call ? 'sometimes' : 'run';
+        return readRow(inner, via.member, null, !!via.call, depth);
+    };
+    /** The same for a name written in `filePath`: what is not found may be anything. */
+    const viaState = (filePath, via) => viaLookup(filePath, via, 0) ?? 'sometimes';
+    /**
+     * What tables of parameters whose rows other modules name leave of a
+     * test written in `filePath`: 'skip' (one of them has no row that runs
+     * the body), 'sometimes' (one may have none), or null.
+     */
+    const tablesState = (filePath, tables) => {
+        let answer = null;
+        for (const table of tables || []) {
+            const states = table.via.map(via => viaState(filePath, via));
+            if (states.includes('run')) continue;
+            if (table.rest === 'skip' && states.every(state => state === 'skip')) return 'skip';
+            answer = 'sometimes';
+        }
+        return answer;
+    };
+    /** A file's fixtures, with what the functions they call and the rows they name elsewhere add. */
     const fixturesOf = (filePath, fixtures) => (fixtures || []).map(fixture =>
-        !fixture.decides && callStops(filePath, fixture.calls) ? { ...fixture, decides: true } : fixture);
+        !fixture.decides && (callStops(filePath, fixture.calls) || tablesState(filePath, fixture.tables))
+            ? { ...fixture, decides: true } : fixture);
 
     /**
      * What a file does when the runner loads it as a plugin (a conftest.py,
@@ -2110,6 +2198,10 @@ function createTestModel(index) {
         return names;
     };
 
+    /** Does a fixture every test gets have a table of parameters, its own or one it asks for? */
+    const everyTabled = (fixtures, tabled) => fixtures.some(fixture => (fixture.autouse || fixture.name == null) &&
+        (!!fixture.params || fixture.requests.some(name => tabled.has(name))));
+
     /**
      * What the code beside a test module can do to its tests before their
      * bodies run: the conftest.py files above it, the plugins those and the
@@ -2123,6 +2215,7 @@ function createTestModel(index) {
         const relativePath = index.files.get(filePath).relativePath;
         const fixtures = [];
         let gated = false;
+        let generates = false;
         // The conftest.py files a run of this file alone loads whose hooks
         // decide for the whole run.
         const wholeRun = [];
@@ -2131,6 +2224,7 @@ function createTestModel(index) {
             if (conftest === filePath || !index.files.has(conftest)) continue;
             const facts = pluginFacts(conftest);
             if (facts.decides) gated = true;
+            if (facts.generates) generates = true;
             if (facts.everywhere) wholeRun.push(index.files.get(conftest).relativePath);
             fixtures.push(...facts.fixtures);
         }
@@ -2139,6 +2233,7 @@ function createTestModel(index) {
         const own = pluginFacts(filePath);
         const runtime = model.declared(filePath)?.runtime;
         if (own.generates || (own.everywhere && !(runtime && runtime.everywhere))) gated = true;
+        if (own.generates) generates = true;
         fixtures.push(...own.fixtures);
         // A conftest.py anywhere under the runner's directory whose hook
         // is called for the whole run: it is loaded with any run that
@@ -2162,8 +2257,14 @@ function createTestModel(index) {
         const stopping = stoppingNames(fixtures);
         if (fixtures.some(fixture => (fixture.autouse || fixture.name == null) &&
             (fixture.decides || fixture.requests.some(name => stopping.has(name))))) gated = true;
+        const tabled = stoppingNames(fixtures, fixture => fixture.params);
         const answer = {
-            gated, fixtures, stopping, tabled: stoppingNames(fixtures, fixture => fixture.params),
+            gated, fixtures, stopping, tabled,
+            // A fixture every test gets that has a table of parameters, or
+            // asks for one that has: every test runs once for each row.
+            everyTabled: everyTabled(fixtures, tabled),
+            // A hook that makes tests from a test (pytest_generate_tests).
+            generates,
             wholeRun: wholeRun.sort(codeUnitCompare),
         };
         model.guards.set(filePath, answer);
@@ -2196,9 +2297,11 @@ function createTestModel(index) {
         const declaredModule = found.module || {};
         // What the module does when it is imported and before its tests,
         // with what the functions it calls in other modules add.
+        const moduleTable = tablesState(filePath, declaredModule.tables);
         const mod = {
             ...declaredModule,
             ...(!declaredModule.skip && callStops(filePath, declaredModule.skipCalls) && { skip: 'sometimes' }),
+            ...(moduleTable && declaredModule.skip !== 'skip' && { skip: moduleTable }),
             ...(!declaredModule.guard && callStops(filePath, declaredModule.guardCalls) && { guard: true }),
         };
         const guards = guardsOf(filePath);
@@ -2235,6 +2338,8 @@ function createTestModel(index) {
         // module: the class is that object, so the switch holds for every
         // class here that derives from it.
         const switchedHere = new Map();
+        // Classes taken from other modules whose constructor is written here.
+        const constructorsOpen = new Set();
         for (const entry of entries) {
             if (bound.has(entry.name)) continue;
             const from = entry.module == null ? filePath : moduleFile(filePath, entry.module);
@@ -2248,6 +2353,7 @@ function createTestModel(index) {
             // A switch written here on the name.
             const written = (mod.switches || {})[entry.name];
             if (hit.kind === 'class' && written) switchedHere.set(hit.cls, written);
+            if (hit.kind === 'class' && (mod.constructorWrites || []).includes(entry.name)) constructorsOpen.add(hit.cls);
             if (hit.kind === 'class') {
                 classesHere.push({
                     name: entry.name, suite: [], bases: [], imported: { filePath: hit.filePath, cls: hit.cls },
@@ -2285,17 +2391,44 @@ function createTestModel(index) {
                     }
                 };
                 // The nearest switch: one written here on a class taken
-                // from another module comes before that class's own.
-                const switchOf = each => switchedHere.has(each)
-                    ? { enabled: switchedHere.get(each).on, forced: switchedHere.get(each).forced }
-                    : each.enabled !== undefined ? { enabled: each.enabled, forced: each.forced } : null;
-                const switched = real.map(switchOf).find(Boolean) || null;
+                // from another module comes before that class's own. One
+                // another module writes on it holds where that module was
+                // loaded first: which, is the order of the run.
+                const switchOf = node => {
+                    const each = node.cls;
+                    if (switchedHere.has(each)) return { enabled: switchedHere.get(each).on, forced: switchedHere.get(each).forced };
+                    const others = (switchedElsewhere(node.filePath).classes.get(each) || []).filter(write => write.by !== filePath);
+                    if (others.length > 0) {
+                        // Whether it is on is not settled; it is taken
+                        // whatever it is called only where a write says so.
+                        return { enabled: 'unknown', forced: others.some(write => write.forced) ? 'unknown' : each.forced };
+                    }
+                    return each.enabled !== undefined ? { enabled: each.enabled, forced: each.forced } : null;
+                };
+                const switched = nodes.map(switchOf).find(Boolean) || null;
                 if (switched && switched.enabled === false) return NO;
                 if (!unittest) {
-                    const rules = [...new Set(real.flatMap(each => each.refusedIfDeclares || []))];
-                    if (real.some(each => (each.members || []).some(member => rules.includes(member)))) return NO;
-                    // A base that is not read may declare one.
-                    if (unread) weaken('base-not-resolved');
+                    // The runner refuses a class whose constructor is not
+                    // the language's own. Which one a class has is what its
+                    // lookup order binds first: a class that writes the
+                    // builtin's back has it again, whatever stands behind.
+                    let custom = false;
+                    for (const name of found.constructors || []) {
+                        for (const node of order) {
+                            if (node.opaque) {
+                                if (node.safe) continue;
+                                // A base that is not read may bind one.
+                                weaken('base-not-resolved');
+                                break;
+                            }
+                            const kind = constructorsOpen.has(node.cls) ? 'unknown' : (node.cls.constructs || {})[name];
+                            if (!kind) continue;
+                            if (kind === 'custom') custom = true;
+                            else if (kind === 'unknown') weaken('constructor-not-read');
+                            break;
+                        }
+                    }
+                    if (custom) return NO;
                 }
                 // Abstract members that nothing nearer implements: abc
                 // makes the class abstract and pytest leaves it out.
@@ -2329,12 +2462,16 @@ function createTestModel(index) {
                 }
                 // Each class's fixtures and setups, read in its own file.
                 const fixtures = nodes.flatMap(node => fixturesOf(node.filePath, node.cls.fixtures));
+                // Tables of parameters on the classes, their rows read where each is written.
+                const tables = nodes.map(node => tablesState(node.filePath, node.cls.tables));
                 return {
                     collected, why, regime: unittest ? 'unittest' : 'pytest',
                     // What reaches a class through its lookup order.
-                    skip: real.some(each => each.skip === 'skip') ? 'skip'
-                        : real.some(each => each.skip === 'sometimes') ? 'sometimes' : null,
+                    skip: real.some(each => each.skip === 'skip') || tables.includes('skip') ? 'skip'
+                        : real.some(each => each.skip === 'sometimes') || tables.includes('sometimes') ? 'sometimes' : null,
                     guard: nodes.some(node => node.cls.guard || callStops(node.filePath, node.cls.guardCalls)),
+                    // A class's own hook that makes tests from a test.
+                    generates: real.some(each => each.generates),
                     fixtures,
                     usefixtures: real.flatMap(each => each.usefixtures || []),
                     usefixturesOpen: real.some(each => each.usefixturesOpen),
@@ -2348,26 +2485,36 @@ function createTestModel(index) {
         const classesOf = new Map(); // unit -> the classes around it, for the runner's mark expression
         let units = [];
         /** A unit with what reaches it: its own state, its classes', the module's, the code beside it. */
-        const finish = (base, row, around, alsoOpen = null) => {
+        const finish = (base, row, around, alsoOpen = null, rowFile = filePath) => {
             const states = around.map(standingOf);
             const dynamic = row.dynamic || alsoOpen || states.map(each => each.collected === 'maybe' ? each.why : null).find(Boolean) ||
                 (mod.unsettled ? 'collection-switch' : null);
             const classFixtures = states.flatMap(each => each.fixtures);
-            const stopping = classFixtures.length > 0 ? stoppingNames([...guards.fixtures, ...classFixtures]) : guards.stopping;
+            const scoped = classFixtures.length > 0 ? [...guards.fixtures, ...classFixtures] : guards.fixtures;
+            const stopping = classFixtures.length > 0 ? stoppingNames(scoped) : guards.stopping;
             const requests = [...(row.requests || []), ...(mod.usefixtures || []), ...(naming.usefixtures || []),
                 ...states.flatMap(each => each.usefixtures)];
-            const skipped = !!row.skipped || mod.skip === 'skip' || states.some(each => each.skip === 'skip');
-            const sometimes = !!row.conditional || !!dynamic || mod.skip === 'sometimes' || !!mod.guard || guards.gated ||
-                states.some(each => each.skip === 'sometimes' || each.guard || each.usefixturesOpen) ||
-                !!row.requestsOpen || !!mod.usefixturesOpen || requests.some(name => stopping.has(name));
+            // The rows of the test's own table that other modules name,
+            // read from the file the test is written in.
+            const rowTable = tablesState(rowFile, row.tables);
             // One declaration the runner reports as several tests: a
-            // table of parameters, its own, its classes', its module's or
-            // a fixture's.
-            const tabled = classFixtures.length > 0
-                ? stoppingNames([...guards.fixtures, ...classFixtures], fixture => fixture.params) : guards.tabled;
+            // table of parameters, its own, its classes', its module's, a
+            // fixture's (one it asks for, or one every test gets), or a
+            // hook that makes tests from it.
+            const tabled = classFixtures.length > 0 ? stoppingNames(scoped, fixture => fixture.params) : guards.tabled;
+            const byFixture = requests.some(name => tabled.has(name)) ||
+                (classFixtures.length > 0 ? everyTabled(scoped, tabled) : guards.everyTabled);
             const several = (row.marks || []).includes('parametrize') || (found.marks || []).includes('parametrize') ||
                 around.some(cls => orderOf(filePath, cls).some(node => !node.opaque && (node.cls.marks || []).includes('parametrize'))) ||
-                requests.some(name => tabled.has(name));
+                byFixture || guards.generates || states.some(each => each.generates);
+            const skipped = !!row.skipped || rowTable === 'skip' || mod.skip === 'skip' || states.some(each => each.skip === 'skip');
+            const sometimes = !!row.conditional || !!dynamic || rowTable === 'sometimes' || mod.skip === 'sometimes' ||
+                !!mod.guard || guards.gated ||
+                states.some(each => each.skip === 'sometimes' || each.guard || each.usefixturesOpen || each.generates) ||
+                !!row.requestsOpen || !!mod.usefixturesOpen || requests.some(name => stopping.has(name)) ||
+                // A test of unittest takes no parameters: under a
+                // fixture's table the runner reports an error for it.
+                (byFixture && states.some(each => each.regime === 'unittest'));
             const unit = {
                 ...base,
                 ...(skipped && { skipped: true }),
@@ -2382,17 +2529,33 @@ function createTestModel(index) {
         // A function the runner takes only by a switch that is not settled.
         const byForce = row => !row.named && row.forced === 'unknown' ? 'collection-switch' : null;
 
+        // Functions of this module whose switch another module writes.
+        const switchedBy = switchedElsewhere(filePath).functions;
         for (const row of found.units) {
             if (row.kind !== 'test') continue;
             finish({ kind: 'test', name: row.name, suite: [], line: row.line, startLine: row.startLine, endLine: row.endLine },
-                row, [], byForce(row));
+                row, [], byForce(row) || (switchedBy.has(row.name) ? 'collection-switch' : null));
+        }
+        // One the module leaves switched off, or under a name the runner
+        // does not take, that another module switches on.
+        for (const fn of switchedBy.size > 0 ? found.functions || [] : []) {
+            if (found.units.some(row => row.kind === 'test' && row.name === fn.name && row.line === fn.line)) continue;
+            if (!switchedBy.get(fn.name)?.some(write => write.on !== false && (fn.named || write.forced))) continue;
+            finish({ kind: 'test', name: fn.name, suite: [], line: fn.line, startLine: fn.startLine, endLine: fn.endLine },
+                fn, [], 'collection-switch');
         }
         for (const cls of classesHere) {
             const standing = standingOf(cls);
             if (standing.collected === 'no') continue;
             // unittest takes the methods its loader names; pytest the
             // names its patterns take and the ones switched on.
-            const select = standing.regime === 'unittest' ? row => row.prefixed : row => row.named || !!row.forced;
+            // A member its class switches off is none, unless a switch
+            // this module writes in a way that is not read may have
+            // turned it on again.
+            const live = row => !row.off || !!found.switchesOpen;
+            const select = standing.regime === 'unittest' ? row => live(row) && row.prefixed
+                : row => live(row) && (row.named || !!row.forced);
+            const reopened = row => row.off ? 'collection-switch' : null;
             const inherited = cls.bases.length > 0 || cls.imported
                 ? inheritedBy(filePath, cls, select) : { tests: [], open: false, withheld: false };
             const rows = (cls.tests || []).filter(select);
@@ -2400,6 +2563,12 @@ function createTestModel(index) {
             if (standing.regime === 'unittest' && rows.length === 0 && inherited.tests.length === 0) {
                 const fallback = (cls.tests || []).find(row => row.name === 'runTest');
                 if (fallback) rows.push(fallback);
+                // The nearest one in the lookup order, where the class has none.
+                else if (cls.bases.length > 0 || cls.imported) {
+                    const above = inheritedBy(filePath, cls, row => row.name === 'runTest');
+                    inherited.tests.push(...above.tests);
+                    if (above.withheld) inherited.withheld = true;
+                }
             }
             // A base that is not read may bring tests of its own.
             if (inherited.withheld || standing.open) more = true;
@@ -2407,7 +2576,7 @@ function createTestModel(index) {
             const suite = [...cls.suite, cls.name];
             const before = units.length;
             for (const row of rows) {
-                const open = standing.regime === 'unittest' ? null : byForce(row);
+                const open = reopened(row) || (standing.regime === 'unittest' ? null : byForce(row));
                 if (row.alias) {
                     // Another name for a test of the class: its body stands where that test is.
                     finish({
@@ -2430,7 +2599,7 @@ function createTestModel(index) {
                         ownerLine: base.cls.startLine, line: test.alias ? test.of : test.line,
                         startLine: test.startLine, endLine: test.endLine,
                     },
-                }, test, around, standing.regime === 'unittest' ? null : byForce(test));
+                }, test, around, reopened(test) || (standing.regime === 'unittest' ? null : byForce(test)), base.filePath);
             }
             if (units.length > before) {
                 units.push({
@@ -2440,16 +2609,28 @@ function createTestModel(index) {
             }
         }
         for (const { entry, fn, target, written } of taken) {
-            const row = { ...fn, named: named(naming.functions, ['test'], entry.name) };
-            if (!row.named && !row.forced) continue;
-            if (written && written.on === false) continue;
+            // The switch is the function's own, whoever holds it: a write
+            // made here comes after the ones of the module it is taken from.
+            // Without one, a third module's write holds where that module
+            // was loaded first.
+            const others = written ? [] : (switchedElsewhere(target).functions.get(fn.name) || [])
+                .filter(write => write.by !== filePath);
+            // And where a switch this module writes is not read, one its
+            // own module switched off may be on again, under any name.
+            const reopened = !written && !!fn.off && !!found.switchesOpen;
+            const on = written ? written.on : others.length > 0 || reopened ? 'unknown' : fn.off ? false : true;
+            const row = {
+                ...fn, named: named(naming.functions, ['test'], entry.name),
+                forced: written ? written.forced : others.some(write => write.forced) || reopened ? 'unknown' : fn.forced,
+            };
+            if ((!row.named && !row.forced) || on === false) continue;
             finish({
                 kind: 'test', name: entry.name, suite: [], line: entry.line, startLine: entry.line, endLine: entry.line,
                 inherited: {
                     file: relativeOf(target), filePath: target, owner: null, ownerLine: 0,
                     line: fn.line, startLine: fn.startLine, endLine: fn.endLine,
                 },
-            }, row, [], (written && written.on === 'unknown' ? 'collection-switch' : null) || byForce(row));
+            }, row, [], (on === 'unknown' ? 'collection-switch' : null) || byForce(row), target);
         }
 
         // The runner's configured options: a mark expression and tests
@@ -2511,60 +2692,31 @@ function createTestModel(index) {
         } else if (found.derived) {
             facts = derivedFacts(filePath, found);
         } else {
-            // A class its runner refuses holds no test, whatever it declares.
             const relativePath = index.files.get(filePath).relativePath;
             const runner = model.runnerOf(filePath) || {};
-            const naming = runner.collection || {};
-            const named = (patterns, fallback, name) => (patterns && patterns.length > 0 ? patterns : fallback)
-                .some(pattern => /[*?[]/.test(pattern) ? globMatches(pattern, name) : name.startsWith(pattern));
-            // Names the module takes from other modules of the project:
-            // a test class or function among them is collected here too.
-            const taken = [];
             const classesHere = [...(found.classes || [])];
-            for (const entry of found.imports || []) {
-                const from = (index.files.get(filePath).moduleResolved || {})[entry.module];
-                const target = from ? path.join(index.root, from) : null;
-                const there = target && target !== filePath && index.files.has(target) ? model.declared(target) : null;
-                if (!there) continue;
-                const cls = (there.classes || []).find(other => other.name === entry.original && other.suite.length === 0);
-                if (cls && (cls.unittest || named(naming.classes, ['Test'], entry.name))) {
-                    classesHere.push({
-                        name: entry.name, suite: [], bases: [], runnable: true, imported: { filePath: target, cls },
-                        ...(cls.refusedIfDeclares && { refusedIfDeclares: cls.refusedIfDeclares }),
-                        line: entry.line, startLine: entry.line, endLine: entry.line,
-                        members: [], tests: [], marks: [], marksOpen: false,
-                    });
-                }
-                const fn = (there.functions || []).find(other => other.name === entry.original);
-                if (fn && named(naming.functions, ['test'], entry.name)) taken.push({ entry, fn, target });
-            }
-            const refusedClasses = classesHere.filter(cls => cls.runnable && refusal(filePath, cls).refused);
-            // Whether the runner takes a class that derives from one the
-            // project does not declare cannot be read here: its tests are
-            // listed as collected only sometimes, with no command.
-            const unsettled = classesHere.filter(cls => cls.runnable && cls.refusedIfDeclares &&
-                !refusedClasses.includes(cls) && refusal(filePath, cls).unknown);
             const within = (unit, cls) => unit.startLine >= cls.startLine && unit.endLine <= cls.endLine;
             // A setup that can stop a test, in a class the test's class
             // derives from: the test runs only sometimes.
             const guardedAbove = cls => cls.bases.length > 0 &&
                 orderOf(filePath, cls).slice(1).some(node => !node.opaque && node.cls.guard);
-            const guarded = classesHere.filter(cls => cls.runnable && !cls.imported && guardedAbove(cls));
+            const guarded = classesHere.filter(cls => cls.runnable && guardedAbove(cls));
             // A focus leaves other tests of the file declared and not
             // executed, by the rule of the runner that runs the file.
             const left = found.focus ? focusedOut(found.units, model.runnerOf(filePath).id) : new Set();
-            let units = found.units.filter(unit => !refusedClasses.some(cls => !cls.imported && within(unit, cls)))
-                .map(unit => {
-                    let out = unit;
-                    if (unit.kind === 'test' && unsettled.some(cls => !cls.imported && within(unit, cls))) {
-                        out = { ...out, conditional: true, dynamic: unit.dynamic || 'base-not-resolved' };
-                    }
-                    if (unit.kind === 'test' && !unit.conditional && guarded.some(cls => within(unit, cls))) {
-                        out = { ...out, conditional: true };
-                    }
-                    if (left.has(unit)) out = { ...out, skipped: true };
-                    return out;
-                });
+            let units = found.units.map(unit => {
+                let out = unit;
+                if (unit.kind === 'test' && !unit.conditional && guarded.some(cls => within(unit, cls))) {
+                    out = { ...out, conditional: true };
+                }
+                if (left.has(unit)) out = { ...out, skipped: true };
+                return out;
+            });
+            // jest refuses a file that gives a table of cases no row
+            // (measured): none of its tests runs.
+            if (found.emptyTable && runner.id === 'jest') {
+                units = units.map(unit => unit.kind === 'test' && !unit.skipped ? { ...unit, conditional: true } : unit);
+            }
             // `open`: the file calls through a name that may be its
             // runner's declaring function, or hands that function on.
             let inheriting = !!found.inheriting || !!found.open;
@@ -2578,94 +2730,80 @@ function createTestModel(index) {
             if (found.units.length === 0 && runner.id === 'node-test' &&
                 nodeRunsFile(runner, relativeTo(runner.dir, relativePath))) inheriting = true;
             for (const cls of classesHere) {
-                if (!cls.runnable || (cls.bases.length === 0 && !cls.imported) || refusedClasses.includes(cls)) continue;
+                if (!cls.runnable || cls.bases.length === 0) continue;
                 const inherited = inheritedBy(filePath, cls);
                 const own = units.some(unit => unit.kind === 'test' && within(unit, cls));
                 // A base that is not read may bring tests of its own.
                 if (inherited.withheld || inherited.open) inheriting = true;
-                if (inherited.tests.length > 0 && !own) {
+                if (inherited.tests.some(({ test }) => !test.needsClassMark || cls.marked) && !own) {
                     units.push({
                         kind: 'suite', name: cls.name, suite: cls.suite,
                         line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
                     });
                 }
-                // Whether the class or the test exists at all is not
-                // settled: no command names it. A condition on running
-                // it leaves the command.
-                const identity = cls.unsettled ? 'collection-switch'
-                    : unsettled.includes(cls) ? 'base-not-resolved' : null;
-                for (const { test, base } of inherited.tests) {
-                    units.push({
-                        kind: 'test', name: test.name, suite: [...cls.suite, cls.name],
-                        ...(cls.namespace && { namespace: cls.namespace }),
-                        line: cls.line, startLine: cls.line, endLine: cls.line,
+                for (const { test, base, body } of inherited.tests) {
+                    // A runner that wants the class that runs a test
+                    // marked takes none through one that is not.
+                    if (test.needsClassMark && !cls.marked) continue;
+                    // No command names a test whose runner cannot be told
+                    // which one it is under the class that inherits it.
+                    const unnamed = test.dynamic || cls.dynamic || test.inheritedDynamic;
+                    const state = {
                         ...((test.skipped || cls.skipped) && { skipped: true }),
-                        ...((identity || cls.sometimes || test.conditional || cls.guard || guardedAbove(cls)) && { conditional: true }),
-                        ...((identity || test.dynamic) && { dynamic: identity || test.dynamic }),
-                        ...(test.several && { several: true }),
-                        ...(test.marks && { marks: test.marks, marksOpen: !!test.marksOpen }),
+                        ...((cls.sometimes || test.conditional || cls.guard || guardedAbove(cls)) && { conditional: true }),
+                        ...(unnamed && { dynamic: unnamed }),
+                        ...((test.several || cls.several) && { several: true }),
+                    };
+                    const suite = [...cls.suite, cls.name];
+                    // The class redeclares the member without the mark:
+                    // the test is the inherited one, its body the class's own.
+                    if (body && body.at.cls === cls) {
+                        units.push({
+                            kind: 'test', name: test.name, suite, ...(cls.namespace && { namespace: cls.namespace }),
+                            line: body.row.line, startLine: body.row.startLine, endLine: body.row.endLine, ...state,
+                        });
+                        continue;
+                    }
+                    // Where the body stands: the declaration that makes the
+                    // test, or the nearest class that redeclares the member.
+                    const at = body ? body.at : base;
+                    const where = body ? body.row : test;
+                    units.push({
+                        kind: 'test', name: test.name, suite, ...(cls.namespace && { namespace: cls.namespace }),
+                        line: cls.line, startLine: cls.line, endLine: cls.line, ...state,
                         inherited: {
-                            file: index.files.get(base.filePath).relativePath,
-                            filePath: base.filePath, owner: base.cls.name,
-                            ownerLine: base.cls.startLine, line: test.line,
-                            startLine: test.startLine, endLine: test.endLine,
+                            file: index.files.get(at.filePath).relativePath,
+                            filePath: at.filePath, owner: at.cls.name,
+                            ownerLine: at.cls.startLine, line: where.line,
+                            startLine: where.startLine, endLine: where.endLine,
                         },
                     });
                 }
-            }
-            for (const { entry, fn, target } of taken) {
-                units.push({
-                    kind: 'test', name: entry.name, suite: [],
-                    line: entry.line, startLine: entry.line, endLine: entry.line,
-                    ...(fn.skipped && { skipped: true }),
-                    ...(fn.conditional && { conditional: true }),
-                    ...(fn.dynamic && { dynamic: fn.dynamic }),
-                    ...(fn.marks && { marks: fn.marks, marksOpen: !!fn.marksOpen }),
-                    inherited: {
-                        file: index.files.get(target).relativePath, filePath: target, owner: null, ownerLine: 0,
-                        line: fn.line, startLine: fn.startLine, endLine: fn.endLine,
-                    },
-                });
-            }
-            // The runner's configured options: a mark expression and
-            // tests left out by name apply to a test however it is named
-            // on the command line (measured).
-            const options = naming.options;
-            if (options && (options.markExpr || options.deselect.length > 0)) {
-                const file = relativeTo(runner.dir, relativePath);
-                units = units.map(unit => {
-                    if (unit.kind !== 'test' || unit.skipped) return unit;
-                    const id = [file, ...unit.suite, unit.name].join('::');
-                    let selected = file != null && options.deselect.some(prefix => id.startsWith(prefix)) ? false : true;
-                    if (selected && options.markExpr) {
-                        const marks = new Set([...(unit.marks || []), ...(found.marks || [])]);
-                        let open = !!unit.marksOpen || !!found.marksOpen;
-                        // Marks of the classes around the test, and of
-                        // every class those derive from.
-                        const around = unit.inherited
-                            ? classesHere.filter(cls => cls.line === unit.line && cls.name === unit.suite[unit.suite.length - 1])
-                            : classesHere.filter(cls => !cls.imported && within(unit, cls));
-                        const holders = new Set(around);
-                        for (const cls of around) {
-                            for (const outer of classesHere) {
-                                if (!outer.imported && outer !== cls && outer.startLine <= cls.startLine && outer.endLine >= cls.endLine) holders.add(outer);
-                            }
-                        }
-                        for (const cls of holders) {
-                            for (const node of orderOf(filePath, cls)) {
-                                if (node.opaque) {
-                                    if (!node.safe) open = true;
-                                    continue;
-                                }
-                                for (const mark of node.cls.marks || []) marks.add(mark);
-                                if (node.cls.marksOpen) open = true;
-                            }
-                        }
-                        selected = markSelects(options.markExpr, marks, open);
+                // A mark on a class that makes its methods tests holds for
+                // the classes deriving from it (`classMark`): the methods
+                // this class declares that such a mark takes (`candidate`).
+                if (!cls.classMark && orderOf(filePath, cls).slice(1).some(node => !node.opaque && node.cls.classMark)) {
+                    let added = false;
+                    for (const row of cls.memberRows || []) {
+                        if (!row.candidate || units.some(unit => unit.kind === 'test' && unit.name === row.name &&
+                            unit.startLine === row.startLine)) continue;
+                        added = true;
+                        units.push({
+                            kind: 'test', name: row.name, suite: [...cls.suite, cls.name],
+                            ...(cls.namespace && { namespace: cls.namespace }),
+                            line: row.line, startLine: row.startLine, endLine: row.endLine,
+                            ...(cls.skipped && { skipped: true }),
+                            ...((cls.sometimes || cls.guard || guardedAbove(cls)) && { conditional: true }),
+                            dynamic: 'declared-in-a-base-class',
+                        });
                     }
-                    if (selected === false) return { ...unit, skipped: true, deselected: true };
-                    return selected == null ? { ...unit, conditional: true } : unit;
-                });
+                    if (added && !own && inherited.tests.length === 0) {
+                        units.push({
+                            kind: 'suite', name: cls.name, suite: cls.suite,
+                            line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
+                        });
+                    }
+                }
             }
             // Code the runner hands the decision to: what it does is not
             // read, so a test under it runs only sometimes.
@@ -2700,7 +2838,8 @@ function createTestModel(index) {
         // A module that writes a switch on a name it took from another
         // module changes that object for every module loaded after it:
         // it is run by itself.
-        const alone = Object.keys((found.module && found.module.switches) || {}).length > 0
+        const alone = Object.keys((found.module && found.module.switches) || {}).length > 0 ||
+            ((found.module && found.module.constructorWrites) || []).length > 0
             ? `\0switches:${index.files.get(filePath).relativePath}` : '';
         return guardsOf(filePath).wholeRun.join('\0') + alone;
     };
