@@ -1066,6 +1066,7 @@ function checkTarget(index, options, repoRoot) {
                 line: fn.startLine || undefined,
                 className: fn.className || undefined,
                 _callerCache: callerCache,
+                _testModel: model,
             });
         } catch (e) {
             t = null;

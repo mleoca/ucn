@@ -280,6 +280,16 @@ function owns(unit, id) {
     return within(unit.inherited ? unit.origin : unit) || (unit.alternatives || []).some(within);
 }
 
+/**
+ * A line of a body several classes share, owned in a file only by tests
+ * the engine calls conditional there: the whole run does not say which
+ * class executed it, so the file's own command is not held to it. Each
+ * such test's own identity (its run-time label) is held to as before.
+ */
+function sharedBodyOnly(units, id) {
+    return units.length > 0 && units.every(unit => unit.conditional && unit.inherited && id !== unit.id);
+}
+
 function fileOf(id) {
     return (/^(.*):(\d+)$/.exec(id) || /^(.*?)::/.exec(id) || [])[1];
 }
@@ -466,6 +476,7 @@ function main() {
                 if (got.ran.length === 0) empty.push(file.file);
                 const lost = mine.filter(id => !got.ran.includes(id)).filter(id => {
                     const units = answer.units.filter(unit => unit.file === file.file && owns(unit, id));
+                    if (sharedBodyOnly(units, id)) return false;
                     if (!orderOnly.has(id) || !units.every(unit => unit.conditional)) return true;
                     orderLost.add(id);
                     return false;
@@ -560,4 +571,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { answerOf, materialize, judgeWholeRun, judgeJoined, namedIdentities, RUNNERS };
+module.exports = { answerOf, materialize, judgeWholeRun, judgeJoined, namedIdentities, sharedBodyOnly, RUNNERS };

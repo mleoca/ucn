@@ -29,7 +29,7 @@ const {
     shellSplit, configArguments, pytestOptions, markSelects, nodeRunsFile,
 } = require('../core/test-units');
 const { CASES } = require('../eval/test-unit-matrix-cases');
-const { answerOf, judgeWholeRun, judgeJoined, namedIdentities } = require('../eval/run-test-unit-matrix');
+const { answerOf, judgeWholeRun, judgeJoined, namedIdentities, materialize, sharedBodyOnly } = require('../eval/run-test-unit-matrix');
 const PINNED = require('../eval/test-unit-matrix-answers.json');
 
 function git(dir, ...args) {
@@ -897,6 +897,19 @@ describe('test units: the judge rejects what the runner contradicts', () => {
         const answer = { units: [inherited], files: [{ file: 'child.py', role: 'tests', run: 'x', tests: 1 }] };
         assert.deepStrictEqual(kinds({}, answer, ['child.py::TestLeaf > test_shared', 'base.py:11']), []);
         assert.deepStrictEqual(kinds({}, answer, ['child.py::TestLeaf > test_shared', 'base.py:4']), ['UNDECLARED']);
+    });
+
+    it('a file command is not held to a shared body only its conditional tests own, and is held to their own identities', () => {
+        const inherited = more => unit(3, { id: 'Child.cs::Child > Plain', file: 'Child.cs', inherited: true,
+            origin: { file: 'Base.cs', startLine: 10, endLine: 12 }, ...more });
+        // Another class ran the body: the whole run does not say this one did.
+        assert.strictEqual(sharedBodyOnly([inherited({ conditional: true })], 'Base.cs:11'), true);
+        // The test's own label, a test that is said to run, a test that stands in the file: held to.
+        assert.strictEqual(sharedBodyOnly([inherited({ conditional: true })], 'Child.cs::Child > Plain'), false);
+        assert.strictEqual(sharedBodyOnly([inherited({ conditional: false })], 'Base.cs:11'), false);
+        assert.strictEqual(sharedBodyOnly([inherited({ conditional: true }), inherited({ conditional: false })], 'Base.cs:11'), false);
+        assert.strictEqual(sharedBodyOnly([unit(3, { conditional: true })], 'a.test.js:3'), false);
+        assert.strictEqual(sharedBodyOnly([], 'Base.cs:11'), false);
     });
 
     it('a test the engine says may run one of several bodies owns each of them, and no other', () => {
@@ -2506,7 +2519,8 @@ describe('test units: a method is the inherited one when its parameters are the 
         assert.strictEqual(under(five, '    public void typed(String value) { }\n'), '1 typed:conditional:signature-not-resolved@Typed.java:7');
         assert.strictEqual(under(five, '    public void typed(Integer value) { }\n'), '1 typed:conditional:signature-not-resolved@Typed.java:7');
         assert.strictEqual(under(five, '    @Override\n    public void typed(String value) { }\n'), '0 ');
-        assert.strictEqual(under(five, '    public void typed(String value, int more) { }\n'), '1 typed:runs@Typed.java:7');
+        // Another number of parameters is another method. (A parameter of a plain @Test needs something to supply it: conditional.)
+        assert.strictEqual(under(five, '    public void typed(String value, int more) { }\n'), '1 typed:conditional@Typed.java:7');
         // A method's own type parameter is its bound where the language compares signatures.
         const bounded = 'package com.x;\n\nimport org.testng.annotations.Test;\n\npublic abstract class Bounded {\n    @Test(dataProvider = "rows")\n    public <N extends Number> void bounded(N value) { }\n}\n';
         const below = body => java({ 'com/x/Bounded.java': bounded, 'com/x/ChildTest.java': child(body, '', 'ChildTest', 'Bounded') }, 'com/x/ChildTest.java');
@@ -2571,7 +2585,10 @@ describe('test units: a method is the inherited one when its parameters are the 
     });
 
     const PROJ = name => `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="${name}" Version="1.0.0" /></ItemGroup></Project>\n`;
-    const CS_TYPES = 'namespace P.Tests\n{\n    public class Left { public enum Kind { A } }\n    public class Right { public enum Kind { A } }\n    public class LeftBelow : Left { }\n    public struct Point { }\n    public class Shape { }\n}\nnamespace P.A\n{\n    public enum Mode { One }\n}\nnamespace P.B\n{\n    public enum Mode { One }\n}\n';
+    const CS_TYPES = 'namespace P.Tests\n{\n    public class Left { public enum Kind { A } }\n    public class Right { public enum Kind { A } }\n    public class LeftBelow : Left { }\n    public struct Point { }\n    public class Shape { }\n' +
+        // Two types of one name that differ in how many type arguments they take, on one line.
+        '    public class Outer<T> { public class Inner<U> { } public class Plain { } } public class Outer<T, U> { public class Inner { } }\n' +
+        '    public class Below : Outer<int> { }\n}\nnamespace P.A\n{\n    public enum Mode { One }\n}\nnamespace P.B\n{\n    public enum Mode { One }\n}\n';
     /**
      * An NUnit base with a test `M(first)` and a second virtual method
      * `M(System.Guid)`, so that an override is no proof by itself; a class
@@ -2656,6 +2673,27 @@ describe('test units: a method is the inherited one when its parameters are the 
         assert.strictEqual(nunit('int*', 'long*'), 'different');
     });
 
+    it('C#: a type inside generic types is the nesting it is written in, each type with its own arguments', () => {
+        // Two nestings of one name: the type arguments are no flat list.
+        assert.strictEqual(nunit('Outer<int>.Inner<string>', 'Outer<int, string>.Inner'), 'different');
+        assert.strictEqual(nunit('Outer<int, string>.Inner', 'Outer<int, string>.Inner'), 'same');
+        assert.strictEqual(nunit('Outer<int>.Inner<string>', 'Outer<System.Int32>.Inner<System.String>'), 'same');
+        assert.strictEqual(nunit('Outer<int>.Inner<string>', 'Outer<string>.Inner<int>'), 'different');
+        assert.strictEqual(nunit('Outer<int>.Inner<string>', 'Outer<int>.Inner<long>'), 'different');
+        // The arguments of the type around it are part of the type.
+        assert.strictEqual(nunit('Outer<int>.Plain', 'Outer<string>.Plain'), 'different');
+        assert.strictEqual(nunit('Outer<int>.Plain', 'P.Tests.Outer<int>.Plain'), 'same');
+        // Written through a class that inherits it, the arguments of the declaring type are not written.
+        assert.strictEqual(nunit('Outer<int>.Plain', 'Below.Plain'), 'unknown:signature-not-resolved');
+        // A type of a package outside the project, by the same rule.
+        const generic = { baseUsings: 'using System.Collections.Generic;\n', childUsings: 'using System.Collections.Generic;\n' };
+        assert.strictEqual(nunit('Dictionary<string, int>.KeyCollection', 'Dictionary<int, string>.KeyCollection', generic), 'different');
+        assert.strictEqual(nunit('Dictionary<string, int>.KeyCollection', 'Dictionary<string, int>.KeyCollection', generic), 'same');
+        assert.strictEqual(nunit('Dictionary<string, int>.KeyCollection', 'Dictionary<string, int>.ValueCollection', generic), 'different');
+        // A type that takes no argument is not one of its name that takes some.
+        assert.strictEqual(nunit('Outer<int, string>.Inner', 'Outer<int>.Inner<string>'), 'different');
+    });
+
     it('C#: a name is the type its namespaces, using directives and classes say', () => {
         assert.strictEqual(nunit('Left.Kind', 'Right.Kind'), 'different');
         assert.strictEqual(nunit('Left.Kind', 'P.Tests.Left.Kind'), 'same');
@@ -2725,6 +2763,227 @@ describe('test units: a method is the inherited one when its parameters are the 
         assert.strictEqual(under('', 'P.B.Support'), '1 FromB:runs');
         assert.strictEqual(under('using Helper = P.A.Support;\n', 'Helper'), '1 FromA:runs');
         assert.strictEqual(under('using P.A;\nusing P.B;\n', 'Support'), '0+ ');
+    });
+});
+
+describe('test units: what a method\'s modifiers do to its mark is each framework\'s rule', () => {
+    const stateOf = unit => unit.skipped ? 'skipped' : unit.conditional ? 'conditional' : 'runs';
+    const POM = '<project><modelVersion>4.0.0</modelVersion><groupId>com.x</groupId><artifactId>m</artifactId><version>1</version></project>\n';
+    const J = 'src/test/java/';
+    const shown = found => `${found.facts.tests}${found.facts.moreTests ? '+' : ''} ${found.units.map(unit =>
+        `${unit.label.split(' > ').pop()}:${stateOf(unit)}${unit.inheritedFrom ? `@${unit.inheritedFrom.split('/').pop()}` : ''}`).join(' ')}`;
+    const java = (files, name) => shown(answerFor({
+        'pom.xml': POM, ...Object.fromEntries(Object.entries(files).map(([file, text]) => [`${J}${file}`, text])),
+    }, `${J}${name}`));
+    const modifiers = pkg => `package com.x;\n\nimport ${pkg}.Test;\n\npublic class ModifiersTest {\n    @Test\n    private void privateCase() { }\n\n    @Test\n    public static void staticCase() { }\n\n    @Test\n    void packageCase() { }\n\n    @Test\n    protected void protectedCase() { }\n\n    @Test\n    public void publicCase() { }\n}\n`;
+    const base = pkg => `package com.x;\n\nimport ${pkg}.Test;\n\npublic abstract class Base {\n    @Test\n    private void hidden() { }\n\n    @Test\n    public static void fixed() { }\n\n    @Test\n    public void open() { }\n}\n`;
+    const far = pkg => `package com.a;\n\nimport ${pkg}.Test;\n\npublic abstract class Far {\n    @Test\n    void distant() { }\n}\n`;
+    const sameNames = 'package com.x;\n\npublic class ChildTest extends Base {\n    public void hidden() { }\n\n    public static void fixed() { }\n\n    public void open() { }\n}\n';
+    const farChild = body => `package com.x;\n\nimport com.a.Far;\n\npublic class ChildTest extends Far {\n${body}}\n`;
+
+    it('TestNG runs a marked method of any visibility and a static one', () => {
+        const pkg = 'org.testng.annotations';
+        assert.strictEqual(java({ 'com/x/ModifiersTest.java': modifiers(pkg) }, 'com/x/ModifiersTest.java'),
+            '5 privateCase:runs staticCase:runs packageCase:runs protectedCase:runs publicCase:runs');
+        // The mark on a class: its public methods, a static one too; a method with a mark of its own whatever it is.
+        assert.strictEqual(java({ 'com/x/ClassLevelTest.java': `package com.x;\n\nimport ${pkg}.Test;\n\n@Test\npublic class ClassLevelTest {\n    public void publicCase() { }\n\n    public static void staticCase() { }\n\n    void packageCase() { }\n\n    private void privateCase() { }\n\n    @Test\n    private void markedPrivate() { }\n}\n` },
+        'com/x/ClassLevelTest.java'), '3 publicCase:runs staticCase:runs markedPrivate:runs');
+    });
+
+    it('TestNG lets a deriving class replace a test only where the language lets it override the method', () => {
+        const pkg = 'org.testng.annotations';
+        // A private and a static test keep their bodies; the public one takes the class's.
+        assert.strictEqual(java({ 'com/x/Base.java': base(pkg), 'com/x/ChildTest.java': sameNames }, 'com/x/ChildTest.java'),
+            '3 fixed:runs@Base.java:10 hidden:runs@Base.java:7 open:runs');
+        assert.strictEqual(java({ 'com/x/Base.java': base(pkg), 'com/x/ChildTest.java': 'package com.x;\n\npublic class ChildTest extends Base {\n}\n' }, 'com/x/ChildTest.java'),
+            '3 fixed:runs@Base.java:10 hidden:runs@Base.java:7 open:runs@Base.java:13');
+        // A marked method of the class under the private test's signature is the class's test of that signature (measured: the base's does not run there).
+        assert.strictEqual(java({ 'com/x/Base.java': base(pkg), 'com/x/ChildTest.java': `package com.x;\n\nimport ${pkg}.Test;\n\npublic class ChildTest extends Base {\n    @Test\n    public void hidden() { }\n}\n` }, 'com/x/ChildTest.java'),
+            '3 fixed:runs@Base.java:10 open:runs@Base.java:13 hidden:runs');
+        // A test without a visibility is replaced from its own package only.
+        assert.strictEqual(java({ 'com/a/Far.java': far(pkg), 'com/x/ChildTest.java': farChild('    void distant() { }\n') }, 'com/x/ChildTest.java'),
+            '1 distant:runs@Far.java:7');
+        assert.strictEqual(java({ 'com/a/Far.java': far(pkg), 'com/a/NearTest.java': 'package com.a;\n\npublic class NearTest extends Far {\n    void distant() { }\n}\n' }, 'com/a/NearTest.java'),
+            '1 distant:runs');
+    });
+
+    it('JUnit 5 runs neither a private nor a static method, and runs the others', () => {
+        const pkg = 'org.junit.jupiter.api';
+        assert.strictEqual(java({ 'com/x/ModifiersTest.java': modifiers(pkg) }, 'com/x/ModifiersTest.java'),
+            '3 packageCase:runs protectedCase:runs publicCase:runs');
+        assert.strictEqual(java({ 'com/x/Base.java': base(pkg), 'com/x/ChildTest.java': 'package com.x;\n\npublic class ChildTest extends Base {\n}\n' }, 'com/x/ChildTest.java'),
+            '1 open:runs@Base.java:13');
+    });
+
+    it('what a marked method takes and gives back: each framework\'s rule', () => {
+        const shapes = pkg => `package com.x;\n\nimport ${pkg}.Test;\n\npublic class ShapesTest {\n    @Test\n    public void withParameter(int value) { }\n\n    @Test\n    public int withResult() { return 1; }\n\n    @Test\n    public void plain() { }\n}\n`;
+        // JUnit 5: a result makes it no test; a parameter needs something that supplies it.
+        assert.strictEqual(java({ 'com/x/ShapesTest.java': shapes('org.junit.jupiter.api') }, 'com/x/ShapesTest.java'), '2 withParameter:conditional plain:runs');
+        // TestNG: parameters come from a data provider or the suite, a result runs where the suite allows it.
+        assert.strictEqual(java({ 'com/x/ShapesTest.java': shapes('org.testng.annotations') }, 'com/x/ShapesTest.java'),
+            '3 withParameter:conditional withResult:conditional plain:runs');
+        // JUnit 4 refuses the class for either.
+        assert.strictEqual(java({ 'com/x/ShapesTest.java': shapes('org.junit') }, 'com/x/ShapesTest.java'), '0 plain:skipped');
+        // JUnit 3 takes a public method named test with no parameter and no result.
+        assert.strictEqual(java({ 'com/x/LegacyTest.java': 'package com.x;\n\nimport junit.framework.TestCase;\n\npublic class LegacyTest extends TestCase {\n    public void testPlain() { }\n\n    public void testWithParameter(int value) { }\n\n    public int testWithResult() { return 1; }\n}\n' },
+        'com/x/LegacyTest.java'), '1 testPlain:runs');
+    });
+
+    it('JUnit 4 refuses a class for one marked method that is not public or is static: none of its tests runs', () => {
+        const pkg = 'org.junit';
+        const one = modifier => `package com.x;\n\nimport org.junit.Test;\n\npublic class OneTest {\n    @Test\n    ${modifier} void odd() { }\n\n    @Test\n    public void publicCase() { }\n}\n`;
+        assert.strictEqual(java({ 'com/x/OneTest.java': one('public') }, 'com/x/OneTest.java'), '2 odd:runs publicCase:runs');
+        for (const modifier of ['private', 'protected', '', 'public static']) {
+            assert.strictEqual(java({ 'com/x/OneTest.java': one(modifier) }, 'com/x/OneTest.java'), '0 publicCase:skipped', modifier);
+        }
+        // The class that derives from one, and its own tests with the inherited ones.
+        assert.strictEqual(java({ 'com/x/Base.java': base(pkg), 'com/x/ChildTest.java': 'package com.x;\n\nimport org.junit.Test;\n\npublic class ChildTest extends Base {\n    @Test\n    public void own() { }\n}\n' }, 'com/x/ChildTest.java'),
+            '0 open:skipped@Base.java:13 own:skipped');
+        // Another runner named on the class has its own rules: not read.
+        assert.strictEqual(java({ 'com/x/OneTest.java': one('private').replace('public class OneTest', '@org.junit.runner.RunWith(Other.class)\npublic class OneTest') }, 'com/x/OneTest.java'),
+            '1+ publicCase:conditional');
+        // A runner that takes parameters: the method is a test of its, as it was before the class could be refused.
+        const injected = 'package com.x;\n\nimport org.junit.Test;\nimport org.junit.runner.RunWith;\n\n@RunWith(Injector.class)\npublic class InjectedTest {\n    @Test\n    public void given(int value) { }\n\n    @Test\n    public void plain() { }\n}\n';
+        assert.strictEqual(java({ 'com/x/InjectedTest.java': injected }, 'com/x/InjectedTest.java'), '2+ given:conditional plain:conditional');
+        // The runner is inherited from a class of the project.
+        const runnerBase = 'package com.x;\n\nimport org.junit.runner.RunWith;\n\n@RunWith(Injector.class)\npublic abstract class RunnerBase {\n}\n';
+        const below = base => `package com.x;\n\nimport org.junit.Test;\n\npublic class BelowTest extends ${base} {\n    @Test\n    public void given(int value) { }\n\n    @Test\n    public void plain() { }\n}\n`;
+        assert.strictEqual(java({ 'com/x/RunnerBase.java': runnerBase, 'com/x/BelowTest.java': below('RunnerBase') }, 'com/x/BelowTest.java'),
+            '2 given:conditional plain:runs');
+        // A base that is not read may name one: the class may be refused or not.
+        assert.strictEqual(java({ 'com/x/BelowTest.java': below('org.lib.Outside') }, 'com/x/BelowTest.java'), '2+ given:conditional plain:conditional');
+        // A class that names a runner over a base JUnit 4 would refuse.
+        assert.strictEqual(java({ 'com/x/Base.java': base(pkg), 'com/x/ChildTest.java': 'package com.x;\n\nimport org.junit.Test;\nimport org.junit.runner.RunWith;\n\n@RunWith(Injector.class)\npublic class ChildTest extends Base {\n    @Test\n    public void own() { }\n}\n' }, 'com/x/ChildTest.java'),
+            '2+ open:conditional@Base.java:13 own:conditional');
+    });
+
+    const PROJ = name => `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="${name}" Version="1.0.0" /></ItemGroup></Project>\n`;
+    const cs = (framework, using, attribute, mark = '') => shown(answerFor({
+        'App.Tests.csproj': PROJ(framework),
+        'Tests.cs': `using ${using};\n\nnamespace P.Tests\n{\n    ${mark}public class ModifiersTests\n    {\n        [${attribute}]\n        private void PrivateCase() { }\n\n        [${attribute}]\n        public static void StaticCase() { }\n\n        [${attribute}]\n        public void PublicCase() { }\n    }\n\n    ${mark}public abstract class Base\n    {\n        [${attribute}]\n        public static void Fixed() { }\n\n        [${attribute}]\n        public void Open() { }\n    }\n\n    ${mark}public class Child : Base\n    {\n    }\n}\n`,
+    }, 'Tests.cs'));
+
+    it('a marked method under the name of an inherited test: an override is the test, one that hides it is another', () => {
+        const body = (using, attribute, mark = '') => answerFor({
+            'App.Tests.csproj': PROJ(using === 'NUnit.Framework' ? 'NUnit' : 'MSTest.TestFramework'),
+            'Tests.cs': `using ${using};\n\nnamespace P.Tests\n{\n    ${mark}public abstract class Base\n    {\n        [${attribute}]\n        public virtual void Open() { }\n    }\n\n    ${mark}public class Hides : Base\n    {\n        [${attribute}]\n        public new void Open() { }\n    }\n\n    ${mark}public class Overrides : Base\n    {\n        [${attribute}]\n        public override void Open() { }\n    }\n}\n`,
+        }, 'Tests.cs');
+        const rows = found => found.units.map(unit => `${unit.label}:${stateOf(unit)}${unit.inheritedFrom ? `@${unit.inheritedFrom}` : ''}${unit.selector ? '' : `:${unit.selectorWithheld}`}`).join(' ');
+        // NUnit runs both under the class that hides: two tests of one name, no command for either.
+        assert.strictEqual(rows(body('NUnit.Framework', 'Test')),
+            'Hides > Open:runs@Tests.cs:8:name-not-unique Hides > Open:runs:name-not-unique Overrides > Open:runs');
+        // MSTest reports the inherited one again with the hiding method's body: a test that runs only sometimes.
+        const mstest = body('Microsoft.VisualStudio.TestTools.UnitTesting', 'TestMethod', '[TestClass]\n    ');
+        assert.strictEqual(rows(mstest),
+            'Hides > Open:conditional@Tests.cs:16:reported-again Hides > Open:runs:name-not-unique Overrides > Open:runs');
+        assert.deepStrictEqual([mstest.facts.tests, !!mstest.facts.moreTests], [3, false]);
+    });
+
+    it('a static test: xUnit runs it and lets a deriving class inherit it, NUnit runs it in its own class, MSTest does not run it', () => {
+        assert.strictEqual(cs('xunit', 'Xunit', 'Fact'), '5 PrivateCase:runs StaticCase:runs PublicCase:runs Fixed:runs@Tests.cs:20 Open:runs@Tests.cs:23');
+        assert.strictEqual(cs('NUnit', 'NUnit.Framework', 'Test'), '3 StaticCase:runs PublicCase:runs Open:runs@Tests.cs:23');
+        assert.strictEqual(cs('MSTest.TestFramework', 'Microsoft.VisualStudio.TestTools.UnitTesting', 'TestMethod', '[TestClass]\n    '),
+            '2 PublicCase:runs Open:runs@Tests.cs:25');
+    });
+});
+
+describe('test units: the gate that spares reading a file never changes an answer', () => {
+    it('on every matrix case the lines a test executes are the same with the gate and without it', () => {
+        for (const testCase of CASES) {
+            const dir = projectOf(Object.fromEntries(Object.entries(testCase.files).map(([name, content]) => [name, materialize(name, content)])));
+            try {
+                const index = idx(dir);
+                index._beginOp();
+                try {
+                    const gated = createTestModel(index);
+                    const read = createTestModel(index, { ungated: true });
+                    for (const [filePath, entry] of index.files) {
+                        assert.deepStrictEqual(gated.testRangesOf(filePath), read.testRangesOf(filePath), `${testCase.id} ${entry.relativePath}`);
+                    }
+                } finally {
+                    index._endOp();
+                }
+            } finally {
+                rm(dir);
+            }
+        }
+    });
+});
+
+describe('test units: what a test executes is test code whatever its file is called', () => {
+    const PROJ = '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="NUnit" Version="1.0.0" /></ItemGroup></Project>\n';
+    const APP = 'namespace P.Tests\n{\n    public static class App\n    {\n        public static void Target() { }\n    }\n}\n';
+    const answers = (files, name = 'Target') => {
+        const dir = projectOf(files);
+        try {
+            const index = idx(dir);
+            const affected = index.affectedTests(name, { depth: 2 });
+            const direct = index.tests(name, {});
+            const held = rows => (rows || []).filter(file => (file.units || []).some(unit => unit.kind === 'test'))
+                .map(file => `${file.file}:${file.units.filter(unit => unit.kind === 'test').map(unit => unit.name).join(',')}`);
+            return { affected: held(affected.testFiles), tests: affected.summary.totalTests, commands: affected.commands.length, direct: held(direct) };
+        } finally {
+            rm(dir);
+        }
+    };
+    const csBase = attribute => `using NUnit.Framework;\n\nnamespace P.Tests\n{\n    public abstract class Base\n    {\n        ${attribute}\n        public void Works${attribute.includes('TestCase') ? '(int value)' : '()'}\n        {\n            App.Target();\n        }\n    }\n}\n`;
+    const leaf = 'namespace P.Tests\n{\n    public class Leaf : Base\n    {\n    }\n}\n';
+
+    it('the body of a test a class inherits, in a base class of a file with any name', () => {
+        for (const attribute of ['[Test]', '[TestCase(1)]']) {
+            for (const [baseFile, leafFile] of [['Base.cs', 'LeafTests.cs'], ['Base.cs', 'Leaf.cs'], ['BaseTests.cs', 'LeafTests.cs']]) {
+                assert.deepStrictEqual(answers({ 'App.Tests.csproj': PROJ, 'App.cs': APP, [baseFile]: csBase(attribute), [leafFile]: leaf }),
+                    { affected: [`${leafFile}:Works`], tests: 1, commands: 1, direct: [`${leafFile}:Works`] }, `${attribute} ${baseFile} ${leafFile}`);
+            }
+        }
+        // pytest: the class of a module its naming rule does not collect, inherited by one it does.
+        const base = 'from app import target\n\nclass Base:\n    def test_works(self):\n        target()\n';
+        for (const module of ['base', 'test_base']) {
+            assert.deepStrictEqual(answers({
+                'pytest.ini': '[pytest]\n', 'app.py': 'def target():\n    pass\n', [`${module}.py`]: base,
+                'test_child.py': `from ${module} import Base\n\nclass TestChild(Base):\n    pass\n`,
+            }, 'target'), { affected: ['test_child.py:test_works'], tests: 1, commands: 1, direct: ['test_child.py:test_works'] }, module);
+        }
+        // A function of a plain module another module imports under a test's name.
+        assert.deepStrictEqual(answers({
+            'pytest.ini': '[pytest]\n', 'app.py': 'def target():\n    pass\n',
+            'helpers.py': 'from app import target\n\ndef check_it():\n    target()\n', 'test_named.py': 'from helpers import check_it as test_it\n',
+        }, 'target'), { affected: ['test_named.py:test_it'], tests: 1, commands: 1, direct: ['test_named.py:test_it'] });
+    });
+
+    it('a property a test reads is still found: accessor references stay with the files named like test files', () => {
+        const dir = projectOf({
+            'pytest.ini': '[pytest]\n',
+            'client.py': 'class Client:\n    def __init__(self):\n        self._jar = {}\n\n    @property\n    def cookies(self):\n        return self._jar\n',
+            'tests/__init__.py': '',
+            'tests/test_client.py': 'from client import Client\n\ndef test_reads():\n    client = Client()\n    assert client.cookies == {}\n',
+        });
+        try {
+            const found = idx(dir).tests('cookies', {});
+            assert.deepStrictEqual(found.map(file => `${file.file}:${file.tests}`), ['tests/test_client.py:1']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a test of its own in a file with any name, and only the code a test executes', () => {
+        const fixture = 'using NUnit.Framework;\n\nnamespace P.Tests\n{\n    public class Fixture\n    {\n        [Test]\n        public void Direct()\n        {\n            App.Target();\n        }\n    }\n}\n';
+        assert.deepStrictEqual(answers({ 'App.Tests.csproj': PROJ, 'App.cs': APP, 'Fixture.cs': fixture }),
+            { affected: ['Fixture.cs:Direct'], tests: 1, commands: 1, direct: ['Fixture.cs:Direct'] });
+        // A module pytest's configuration collects under another name.
+        assert.deepStrictEqual(answers({
+            'pytest.ini': '[pytest]\npython_files = checks.py\n', 'app.py': 'def target():\n    pass\n',
+            'checks.py': 'from app import target\n\ndef test_direct():\n    target()\n',
+        }, 'target'), { affected: ['checks.py:test_direct'], tests: 1, commands: 1, direct: ['checks.py:test_direct'] });
+        // Code no test executes stays what it was: a caller in a plain file is no test.
+        assert.deepStrictEqual(answers({
+            'App.Tests.csproj': PROJ, 'App.cs': APP,
+            'Service.cs': 'namespace P.Tests\n{\n    public class Service\n    {\n        public void Run()\n        {\n            App.Target();\n        }\n    }\n}\n',
+        }), { affected: [], tests: 0, commands: 0, direct: [] });
+        assert.deepStrictEqual(answers({
+            'pytest.ini': '[pytest]\n', 'app.py': 'def target():\n    pass\n',
+            'plain.py': 'from app import target\n\ndef test_looks_like_one():\n    target()\n',
+        }, 'target'), { affected: [], tests: 0, commands: 0, direct: [] });
     });
 });
 

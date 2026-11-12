@@ -125,9 +125,13 @@ function compareOpen(a, b) {
             // `T?` of a type of unknown kind may be T itself.
             if (other.maybe) return compareTypes(open, other.nullable) === DIFFERENT ? DIFFERENT : UNKNOWN;
             return DIFFERENT;
+        case 'generic':
+            // A name written without type arguments is no type that takes
+            // some; one that takes none may be the type inside generic
+            // types that this one is.
+            return open.last !== other.generic.last ? DIFFERENT : UNKNOWN;
         default:
-            // A declared type is no array, tuple, pointer, type parameter
-            // or constructed generic type.
+            // A declared type is no array, tuple, pointer or type parameter.
             return DIFFERENT;
     }
 }
@@ -162,9 +166,26 @@ function compareTypes(a, b) {
         case 'tuple':
             if (a.tuple.length !== b.tuple.length) return DIFFERENT;
             return every(a.tuple.map((each, i) => compareTypes(each, b.tuple[i])));
-        case 'generic':
-            if (a.args.length !== b.args.length) return DIFFERENT;
-            return every([compareTypes(a.generic, b.generic), ...a.args.map((each, i) => compareTypes(each, b.args[i]))]);
+        case 'generic': {
+            const head = compareTypes(a.generic, b.generic);
+            if (head === DIFFERENT) return DIFFERENT;
+            // The type's own arguments, then those of the types around it.
+            const ownA = a.args.slice(a.args.length - a.own);
+            const ownB = b.args.slice(b.args.length - b.own);
+            if (ownA.length !== ownB.length) return DIFFERENT;
+            const own = every(ownA.map((each, i) => compareTypes(each, ownB[i])));
+            if (own === DIFFERENT) return DIFFERENT;
+            const aroundA = a.args.slice(0, a.args.length - a.own);
+            const aroundB = b.args.slice(0, b.args.length - b.own);
+            // Two names that may be one type through a class that inherits
+            // it, or a name that leaves the surrounding arguments unsaid:
+            // those arguments cannot be set side by side.
+            if (head !== SAME || !a.exact || !b.exact) {
+                return a.exact && b.exact && aroundA.length === 0 && aroundB.length === 0 ? every([head, own]) : UNKNOWN;
+            }
+            if (aroundA.length !== aroundB.length) return UNKNOWN;
+            return every([own, ...aroundA.map((each, i) => compareTypes(each, aroundB[i]))]);
+        }
         default: return UNKNOWN;
     }
 }
@@ -195,25 +216,39 @@ function createSignatures(index, world) {
         (index.symbols.get(name) || []).filter(def => def && def.name === name && TYPE_KINDS.has(def.type) &&
             def.file && languageOf(def.file) === language));
 
-    /** Names of the types a declaration stands in, outermost first. */
+    const identity = language => !!langTraits(language)?.genericArityIsIdentity;
+    const arityOf = def => def.typeArity || 0;
+    /** `Name` or, where arity is part of a type's identity and it takes type arguments, `Name\`2`. */
+    const spelled = (name, arity, language) => (identity(language) && arity ? `${name}\`${arity}` : name);
+    /** Does one declaration stand inside another (by offsets where both have them: two can share a line)? */
+    const inside = (inner, outer) => (inner.sourceSpan && outer.sourceSpan
+        ? outer.sourceSpan.start <= inner.sourceSpan.start && outer.sourceSpan.end >= inner.sourceSpan.end
+        : outer.startLine <= inner.startLine && (outer.endLine ?? outer.startLine) >= (inner.endLine ?? inner.startLine));
+    /** The type declarations a declaration stands in, outermost first (a name alone where one is not read). */
     const ownersOf = def => {
         if (!def.enclosingType) return [];
-        return remember(`owners\0${def.file}\0${def.startLine}\0${def.name}`, () => {
-            const end = def.endLine ?? def.startLine;
+        return remember(`owners\0${def.file}\0${def.startLine}\0${def.sourceSpan ? def.sourceSpan.start : ''}\0${def.name}`, () => {
             const around = (index.symbols.get(def.enclosingType) || [])
-                .filter(other => other !== def && TYPE_KINDS.has(other.type) && other.file === def.file &&
-                    other.startLine <= def.startLine && (other.endLine ?? other.startLine) >= end)
-                .sort((a, b) => b.startLine - a.startLine)[0];
-            return around ? [...ownersOf(around), around.name] : [def.enclosingType];
+                .filter(other => other !== def && TYPE_KINDS.has(other.type) && other.file === def.file && inside(def, other))
+                .sort((a, b) => (b.sourceSpan && a.sourceSpan ? b.sourceSpan.start - a.sourceSpan.start : b.startLine - a.startLine))[0];
+            return around ? [...ownersOf(around), around] : [{ name: def.enclosingType }];
         });
     };
-    /** A declaration's canonical name: namespace (package), the types around it, its name. */
-    const fqOf = def => [def.namespace, ...ownersOf(def), def.name].filter(Boolean).join('.');
-    const arityOf = def => def.typeArity || 0;
+    /**
+     * A declaration's canonical name: namespace (package), the types around
+     * it, its name; each type with its arity where that is part of its
+     * identity (`N.Outer\`1.Inner\`1` is not `N.Outer\`2.Inner`).
+     */
+    const ownerFqOf = def => {
+        const language = languageOf(def.file);
+        return [def.namespace, ...ownersOf(def).map(owner => spelled(owner.name, arityOf(owner), language))].filter(Boolean).join('.');
+    };
+    const fqOf = def => [ownerFqOf(def), spelled(def.name, arityOf(def), languageOf(def.file))].filter(Boolean).join('.');
+    /** How many type arguments the types around a declaration take together. */
+    const outerArityOf = def => ownersOf(def).reduce((sum, owner) => sum + arityOf(owner), 0);
     /** Does a declaration take as many type arguments as were written? Compared only where arity is identity. */
-    const arityFits = (def, arity, language) => arity == null ||
-        !langTraits(language)?.genericArityIsIdentity || arityOf(def) === arity;
-    const distinct = defs => [...new Map(defs.map(def => [`${fqOf(def)}\0${arityOf(def)}`, def])).values()];
+    const arityFits = (def, arity, language) => arity == null || !identity(language) || arityOf(def) === arity;
+    const distinct = defs => [...new Map(defs.map(def => [fqOf(def), def])).values()];
 
     const defOfRow = (filePath, cls) => (index.symbols.get(cls.name) || []).find(def =>
         def.file === filePath && def.startLine === cls.startLine && TYPE_KINDS.has(def.type)) || null;
@@ -228,21 +263,21 @@ function createSignatures(index, world) {
      */
     const memberTypes = (def, name, trail = new Set()) => {
         const language = languageOf(def.file);
-        const key = `members\0${fqOf(def)}\0${arityOf(def)}\0${name}`;
+        const key = `members\0${fqOf(def)}\0${name}`;
         if (memo.has(key)) return memo.get(key);
         if (trail.has(key)) return { found: [], tags: [] };
-        const mine = `${fqOf(def)}.${name}`;
-        const own = typeDefs(name, language).filter(other => other.enclosingType === def.name && fqOf(other) === mine);
+        const mine = fqOf(def);
+        const own = typeDefs(name, language).filter(other => other.enclosingType === def.name && ownerFqOf(other) === mine);
         let answer;
         if (own.length > 0) {
-            answer = { found: distinct(own), tags: [] };
+            answer = { found: distinct(own), tags: [], own: true };
         } else {
             const found = [];
             const tags = new Set();
             const next = new Set(trail).add(key);
             const interfacesPass = langTraits(language)?.typeNameScoping === 'package-on-demand';
             // Every part of a partial type writes bases of its own.
-            const parts = typeDefs(def.name, language).filter(other => fqOf(other) === fqOf(def) && arityOf(other) === arityOf(def));
+            const parts = typeDefs(def.name, language).filter(other => fqOf(other) === fqOf(def));
             for (const part of parts) {
                 const row = rowOfDef(part);
                 if (!row) {
@@ -277,8 +312,9 @@ function createSignatures(index, world) {
     const byCanonical = (fq, language) => typeDefs(lastOf(fq), language).find(def => fqOf(def) === fq) || null;
 
     /** Walk the member types a qualified name goes through after its head. */
-    const descend = (def, rest, language) => {
+    const descend = (def, rest, language, implicit = false) => {
         let current = def;
+        let through = implicit;
         const tags = new Set();
         for (const segment of rest) {
             const below = memberTypes(current, segment.name);
@@ -287,9 +323,12 @@ function createSignatures(index, world) {
                 for (const tag of below.tags) tags.add(tag);
                 return { open: true, tags: [...tags] };
             }
+            // Written through a class that inherits it: the type arguments
+            // written on that class are not the declaring type's.
+            if (!below.own) through = true;
             current = fits[0];
         }
-        return { def: current };
+        return { def: current, ...(through && { implicit: true }) };
     };
 
     /**
@@ -308,7 +347,8 @@ function createSignatures(index, world) {
         return null;
     };
 
-    const dotted = segments => segments.map(segment => segment.name).join('.');
+    /** A written name, each part with the number of type arguments written on it where arity is identity. */
+    const dotted = (segments, language) => segments.map(segment => spelled(segment.name, segment.arity || 0, language)).join('.');
 
     /** The roots a qualified name can start at without naming a type: the platform's, the project's packages, the file's imports. */
     const rootsOf = (filePath, language) => remember(`roots\0${filePath}`, () => {
@@ -330,7 +370,7 @@ function createSignatures(index, world) {
         const traits = langTraits(language);
         const finish = hit => {
             if (hit.def) return rest.length > 0 ? descend(hit.def, rest, language) : hit;
-            if (hit.ext) return rest.length > 0 ? { ext: `${hit.ext}.${dotted(rest)}`, canonical: false } : hit;
+            if (hit.ext) return rest.length > 0 ? { ext: `${hit.ext}.${dotted(rest, language)}`, canonical: false } : hit;
             return hit;
         };
         // The compilation unit's own types.
@@ -386,7 +426,7 @@ function createSignatures(index, world) {
         if (rest.length > 0) {
             const absolute = fromRoot(segments, language);
             if (absolute) return absolute;
-            if (rootsOf(site.filePath, language).has(name)) return { ext: dotted(segments), canonical: false };
+            if (rootsOf(site.filePath, language).has(name)) return { ext: dotted(segments, language), canonical: false };
         }
         const packages = projectNamespaces(index, language);
         const providers = onDemand.map(each => each.module);
@@ -436,7 +476,7 @@ function createSignatures(index, world) {
             const text = String(syntax || '').replace(/^global::/, '');
             if (!/^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$/.test(text)) return unread;
             const segments = [...text.split('.').map(part => ({ name: part })), ...rest];
-            return fromRoot(segments, language) || { ext: dotted(segments), canonical: false };
+            return fromRoot(segments, language) || { ext: dotted(segments, language), canonical: false };
         }
         const term = world.aliasTerm ? world.aliasTerm(directive.filePath, directive.line) : null;
         if (!term || (site.aliasDepth || 0) >= 4) return unread;
@@ -477,7 +517,7 @@ function createSignatures(index, world) {
             if (rest.length > 0 && declared.namespaces.has(nested)) {
                 if (behind) return { open: true, named: true };
                 const absolute = [...(level ? level.split('.').map(part => ({ name: part })) : []), ...segments];
-                return fromRoot(absolute, language) || { ext: dotted(absolute), canonical: false };
+                return fromRoot(absolute, language) || { ext: dotted(absolute, language), canonical: false };
             }
             if (site.skipAliasesAt !== level && scope.aliases.has(name) &&
                 ((scope.aliasScopes && scope.aliasScopes.get(name)) || '') === level) {
@@ -506,7 +546,7 @@ function createSignatures(index, world) {
         // No type of the project in scope under that name. A qualified
         // name that starts at a namespace is read from the root.
         if (rest.length > 0 && !behind && rootsOf(site.filePath, language).has(name)) {
-            return { ext: dotted(segments), canonical: false };
+            return { ext: dotted(segments, language), canonical: false };
         }
         return {
             open: true, named: !scope.unreadable,
@@ -528,7 +568,7 @@ function createSignatures(index, world) {
         const language = languageOf(site.filePath);
         const scoping = langTraits(language)?.typeNameScoping;
         if (!scoping) return { open: true, named: false };
-        if (fromRootOnly) return fromRoot(segments, language) || { ext: dotted(segments), canonical: false };
+        if (fromRootOnly) return fromRoot(segments, language) || { ext: dotted(segments, language), canonical: false };
         const [head, ...rest] = segments;
         const variable = (site.typeParams || []).findIndex(each => each.name === head.name);
         if (variable !== -1 && rest.length === 0 && !head.arity) return { variable, bound: site.typeParams[variable].bound || null };
@@ -544,7 +584,9 @@ function createSignatures(index, world) {
             const inside = memberTypes(def, head.name);
             const fits = inside.found.filter(other => arityFits(other, head.arity, language));
             if (fits.length === 1) {
-                const hit = rest.length > 0 ? descend(fits[0], rest, language) : { def: fits[0] };
+                // Named from inside the classes around it: the type
+                // arguments of those classes are not written.
+                const hit = rest.length > 0 ? descend(fits[0], rest, language, true) : { def: fits[0], implicit: true };
                 return { ...hit, tags: [...new Set([...tags, ...(hit.tags || [])])].sort() };
             }
             if (fits.length > 1) return { open: true, named: true };
@@ -568,7 +610,7 @@ function createSignatures(index, world) {
         if (!term.path || term.path.length === 0) return { open: true, named: false, last: null, text: '', scope: null };
         const segments = term.path.map(segment => ({ name: segment.name, arity: (segment.args || []).length || 0 }));
         const args = term.path.flatMap(segment => segment.args || []);
-        const text = dotted(segments);
+        const text = dotted(segments, language);
         const hit = lookup(site, segments, term.global === true);
         // An alias of a type that is no plain name: the type itself.
         if (hit.term) return args.length === 0 ? hit.term : { open: true, named: false, last: null, text, scope: null };
@@ -585,18 +627,36 @@ function createSignatures(index, world) {
             return top ? { fq: top, last: lastOf(top), value: false, canonical: true, unit }
                 : { open: true, named: false, last: null, text, scope: null };
         }
+        // The type arguments written on the name's last part are the
+        // type's own; the ones before it belong to the types around it.
+        const ownCount = (term.path[term.path.length - 1].args || []).length;
+        const resolved = args.map(each => resolve(each, site));
+        const own = resolved.slice(resolved.length - ownCount);
+        const around = resolved.slice(0, resolved.length - ownCount);
         if (hit.def) {
             head = {
-                fq: fqOf(hit.def), last: hit.def.name, canonical: true, project: true, text, unit,
+                fq: fqOf(hit.def), last: spelled(hit.def.name, arityOf(hit.def), language), canonical: true, project: true, text, unit,
                 ...(VALUE_KINDS.has(hit.def.type) && { value: true }),
                 ...(REFERENCE_KINDS.has(hit.def.type) && { value: false }),
                 ...(unless && { unless }),
             };
-        } else if (hit.ext) {
+            if (!identity(language)) return head;
+            // The types around a declared type take arguments too. They
+            // are compared where each is written on the type that
+            // declares it; a name written from inside those types, or
+            // through a class that inherits the member, leaves them
+            // unsaid (`exact` false).
+            const needed = outerArityOf(hit.def);
+            if (own.length === 0 && needed === 0) return head;
+            const exact = needed === 0 || (!hit.implicit && around.length === needed);
+            return { generic: head, args: [...(needed > 0 && exact ? around : []), ...own], own: own.length, exact };
+        }
+        if (hit.ext) {
             head = { fq: hit.ext, last: lastOf(hit.ext), canonical: hit.canonical !== false, text, unit, ...(unless && { unless }) };
         } else {
             head = {
-                open: true, named: hit.named === true, last: segments[segments.length - 1].name, text,
+                open: true, named: hit.named === true,
+                last: spelled(segments[segments.length - 1].name, segments[segments.length - 1].arity, language), text,
                 simple: segments.length === 1,
                 scope: hit.scope ? {
                     base: `${hit.scope.base}\0${unless || ''}`, usings: hit.scope.usings,
@@ -604,16 +664,17 @@ function createSignatures(index, world) {
                 } : null,
             };
         }
-        if (args.length === 0) return head;
-        const resolved = args.map(each => resolve(each, site));
+        if (resolved.length === 0) return head;
         // The platform's generic types a language has a syntax of its own
         // for: `System.Nullable<T>` is `T?`, `System.ValueTuple<A, B>` is `(A, B)`.
         const forms = langTraits(language)?.platformTypeForms;
-        if (forms && head.fq && !head.project && !head.unless) {
-            if (head.fq === forms.nullable && resolved.length === 1) return nullableOf(resolved[0]);
-            if (head.fq === forms.tuple && resolved.length >= 2 && resolved.length <= 7) return { tuple: resolved };
+        if (forms && head.fq && !head.unless && around.length === 0) {
+            if (head.fq === spelled(forms.nullable, 1, language) && own.length === 1) return nullableOf(own[0]);
+            if (head.fq === spelled(forms.tuple, own.length, language) && own.length >= 2 && own.length <= 7) return { tuple: own };
         }
-        return { generic: head, args: resolved };
+        // Two spellings of one name in one scope put the same arguments
+        // on the same parts.
+        return { generic: head, args: resolved, own: own.length, exact: true };
     };
 
     /** `T?`: another type over a value type, T itself over a reference type (the mark is an annotation there). */
@@ -698,7 +759,7 @@ function createSignatures(index, world) {
         if ((cls.typeParams || []).includes(segments[0].name) && segments.length === 1) return null;
         const hit = lookup(site, segments, term.global === true);
         if (!hit.def || (hit.tags && hit.tags.length > 0)) return null;
-        const parts = typeDefs(hit.def.name, language).filter(other => fqOf(other) === fqOf(hit.def) && arityOf(other) === arityOf(hit.def));
+        const parts = typeDefs(hit.def.name, language).filter(other => fqOf(other) === fqOf(hit.def));
         if (parts.length !== 1) return null;
         const row = rowOfDef(hit.def);
         return row ? { filePath: hit.def.file, cls: row } : null;

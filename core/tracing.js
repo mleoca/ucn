@@ -907,6 +907,16 @@ function affectedTests(index, name, options = {}) {
         const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
         const includeMethods = options.includeMethods ?? true;
         const possiblyNames = new Set();
+        // The one model of what a test is (core/test-units.js); a caller
+        // that asks about several names hands in its own.
+        const model = options._testModel || createTestModel(index);
+        // Code a test executes in a file whose name is no test file's: the
+        // lines the model says so (a test of its own, the body of a test a
+        // class of another file inherits), or null.
+        const modelRanges = filePath => {
+            const ranges = model.testRangesOf(filePath);
+            return ranges.length > 0 ? ranges : null;
+        };
         // Test FILES containing an unverified call site of an affected name
         // (relativePath → funcName → Set(lines)) — merged into
         // possiblyAffectedTests after the scan (fix #244).
@@ -961,6 +971,11 @@ function affectedTests(index, name, options = {}) {
                             const ranges = inlineTestRanges(cfe);
                             if (ranges.length > 0 && lineInRanges(fe.line, ranges)) isTestCaller = true;
                         }
+                        if (!isTestCaller && fe.line != null) {
+                            // A line the test model says a test executes.
+                            const ranges = modelRanges(siteFile);
+                            if (ranges && lineInRanges(fe.line, ranges)) isTestCaller = true;
+                        }
                         if (isTestCaller &&
                             (excludeArr.length === 0 || index.matchesFilters(cfe.relativePath, { exclude: excludeArr }))) {
                             const affName = fe.atNode?.name || name;
@@ -998,12 +1013,26 @@ function affectedTests(index, name, options = {}) {
         // Step 3: Scan test files for all affected names using AST
         // Only count call and test-case matches as real coverage — not imports or bare references.
         const className = options.className || null;
-        const model = createTestModel(index);
         const absoluteOf = new Map(); // relative test path -> absolute
         const results = [];
         const possibleResults = [];
         const scanNames = [...affectedNames, ...possiblyNames];
         const dispatchNamesCache = new Map(); // `${class}:${name}` → Set(classNames)
+        // Files whose name is no test file's that hold a call of a scanned
+        // name: a confirmed edge of the engine, or (a name whose callers
+        // the engine did not search) a call by that name. Only these are
+        // asked of the test model.
+        const callSiteFiles = new Set();
+        for (const byFile of confirmedSitesByName.values()) {
+            for (const relativePath of byFile.keys()) callSiteFiles.add(relativePath);
+        }
+        for (const funcName of scanNames) {
+            if (expandedNames.has(funcName)) continue;
+            for (const calling of index.getCalleeFiles(funcName) || []) {
+                const entry = index.files.get(calling);
+                if (entry) callSiteFiles.add(entry.relativePath);
+            }
+        }
         for (const [filePath, fileEntry] of index.files) {
             let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
             // Rust inline #[cfg(test)] modules: source files with #[test]-marked symbols
@@ -1014,6 +1043,17 @@ function affectedTests(index, name, options = {}) {
             if (!isTest && fileEntry.language === 'rust') {
                 const ranges = inlineTestRanges(fileEntry);
                 if (ranges.length > 0) {
+                    isTest = true;
+                    testRanges = ranges;
+                }
+            }
+            // A file's name does not decide what a test executes: the body
+            // of a test a class inherits stands where its base class is,
+            // and a runner takes tests from files of any name. Such a file
+            // is test code within the lines the test model names.
+            if (!isTest && callSiteFiles.has(fileEntry.relativePath)) {
+                const ranges = modelRanges(filePath);
+                if (ranges) {
                     isTest = true;
                     testRanges = ranges;
                 }
@@ -1380,11 +1420,16 @@ function affectedTests(index, name, options = {}) {
             // functions (#[test] fns in Rust's #[cfg(test)] mods, Go Test*)
             // live in production-path FILES but are tests themselves — the
             // language's getEntryPointKind says so; they need no coverage.
-            for (const [, fe] of index.files) {
+            for (const [filePath, fe] of index.files) {
                 if (isTestFile(fe.relativePath, fe.language)) continue;
                 const langModule = getLanguageAdapter(fe.language);
                 const kindOf = langModule?.getEntryPointKind;
-                if (fe.symbols?.some(s => s.name === n && (!kindOf || kindOf(s) !== 'test'))) {
+                // A declaration the test model found test code in (asked
+                // above, where the file held a call): a test, not a
+                // production symbol.
+                const ranges = model.ranges.get(filePath) || [];
+                if (fe.symbols?.some(s => s.name === n && (!kindOf || kindOf(s) !== 'test') &&
+                    !(ranges.length > 0 && lineInRanges(s.startLine, ranges)))) {
                     return true;
                 }
             }

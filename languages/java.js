@@ -3019,6 +3019,12 @@ function javaBases(node) {
  *   method, and the inherited test runs as it stands. Each row carries
  *   its parameters' types as they are written (`params`); what the names
  *   in them denote is resolved where two methods are compared.
+ * - A method's modifiers: TestNG runs a marked method of any visibility
+ *   and a static one, and lets a deriving class replace a test only
+ *   where the language lets it override the method (`sealed`,
+ *   `sealedOutside`); JUnit 5 runs neither a private nor a static one;
+ *   JUnit 4 refuses the whole class for one marked method that is not
+ *   public or is static (`refused`).
  * - @Disabled and @Ignore on a class hold for that class and the classes
  *   inside it, not for a class that derives from it: a row says what the
  *   method's own annotations say, a class what its own do.
@@ -3332,10 +3338,35 @@ function testUnits(fileEntry, helpers) {
     const testngIgnored = cls => (cls.annotationsWithArgs || []).some(annotation =>
         String(annotation.name).split('.').pop() === 'Ignore' && frameworkOf(annotation.name) === 'testng');
     // A method TestNG takes as a test under a @Test on its class or on a
-    // class that one derives from: public, and none of TestNG's own setup.
+    // class that one derives from: public (a static one too: measured),
+    // and none of TestNG's own setup.
     const classCandidate = symbol => (symbol.modifiers || []).includes('public') &&
-        !(symbol.modifiers || []).includes('static') &&
         ![...annotationsOf(symbol)].some(name => TESTNG_CONFIGURATION.test(name) || JAVA_TEST_ANNOTATIONS.has(name));
+    // Classes JUnit 4 refuses whole (see below), and classes it may.
+    const refused = new Set();
+    const maybeRefused = new Set();
+    const ownerOf = new Map();
+    // Is the runner that takes a class JUnit 4's own? 'own': no @RunWith
+    // on the class, the classes around it, or a class it derives from
+    // (the annotation is inherited). 'other': one of them names a runner,
+    // which has rules of its own. 'unknown': a type it derives from is
+    // not read.
+    const runnerMemo = new Map();
+    const junit4Runner = (cls, chain) => {
+        if (!runnerMemo.has(cls)) {
+            let answer = [...chain, cls].some(otherRunner) ? 'other' : 'own';
+            for (const name of answer === 'own' ? helpers.ancestors(cls.name) : []) {
+                const carried = helpers.metaAnnotations ? helpers.metaAnnotations(name) : null;
+                if (!carried) answer = 'unknown';
+                else if (carried.includes('RunWith')) {
+                    answer = 'other';
+                    break;
+                }
+            }
+            runnerMemo.set(cls, answer);
+        }
+        return runnerMemo.get(cls);
+    };
     for (const symbol of symbols) {
         if (!symbol.isMethod || symbol.type === 'constructor') continue;
         const chain = helpers.enclosing(symbol);
@@ -3345,14 +3376,58 @@ function testUnits(fileEntry, helpers) {
         const byClass = !annotated && classTest(owner) === 'on' && classCandidate(symbol);
         if (!annotated && !byClass && !(legacy(owner) && /^test/.test(symbol.name) &&
             (symbol.modifiers || []).includes('public'))) continue;
-        // JUnit runs neither a private nor a static method as a test.
-        if ((symbol.modifiers || []).includes('private') || (symbol.modifiers || []).includes('static')) continue;
         const framework = byClass ? 'testng' : testFramework(symbol);
+        // What a method's modifiers do to its mark is each framework's
+        // rule (measured with each):
+        // - TestNG runs a method that carries its mark whatever its
+        //   visibility, and a static one.
+        // - JUnit 5 runs neither a private nor a static method, and runs
+        //   the other tests of the class.
+        // - JUnit 4 wants every method marked @Test public and not
+        //   static: one that is not makes its runner refuse the class,
+        //   and no test of the class runs, its own or inherited, in the
+        //   class and in every class deriving from it. Another runner
+        //   (named on the class or on one it derives from) has rules of
+        //   its own, which are not read: the method is listed as it
+        //   always was, a test that runs only sometimes.
+        const modifiers = symbol.modifiers || [];
+        const fixed = modifiers.includes('private') || modifiers.includes('static');
+        // What the method takes and gives back decides too (measured):
+        // - JUnit 4 wants a marked method without parameters and without
+        //   a result, and refuses the class for one that has either;
+        //   JUnit 3 takes neither as a test.
+        // - JUnit 5 does not run a method that gives a result back (a
+        //   @TestFactory has to); a parameter of a plain @Test needs
+        //   something that supplies it, which is not read.
+        // - TestNG runs a method with parameters through a data provider
+        //   or its suite's parameters, and one with a result only where
+        //   its suite allows it: neither is read.
+        const takes = (signatureOf(symbol).params || symbol.paramsStructured || []).length > 0;
+        const gives = !!symbol.returnType && String(symbol.returnType).trim() !== 'void';
+        const names = annotationsOf(symbol);
+        const plain = names.has('Test') && ![...names].some(name => JAVA_TEST_ANNOTATIONS.has(name) && name !== 'Test');
+        // A shape JUnit 4's own runner does not accept.
+        const odd = framework === 'junit4' && annotated && (fixed || !modifiers.includes('public') || takes || gives);
+        const runner = odd ? junit4Runner(owner, chain.slice(0, -1)) : null;
+        if (runner === 'own') {
+            refused.add(owner);
+            continue;
+        }
+        if (runner === 'unknown') maybeRefused.add(owner);
+        if (!annotated && !byClass && (takes || gives)) continue;
+        if (fixed && framework !== 'testng') continue;
+        // A mark only JUnit 5 has, or its @Test.
+        const jupiter = framework === 'junit5' || (annotated && !plain);
+        if (gives && jupiter && !names.has('TestFactory')) continue;
+        const unsupplied = framework === 'testng'
+            ? gives || (takes && !written(symbol).some(annotation => annotation.name === 'Test' &&
+                (annotation.members.has('dataProvider') || annotation.members.has('dataProviderClass'))))
+            : odd || (plain && (takes || gives));
         // What the method's own annotations say, and what the classes it
         // stands in add for a test of theirs.
         const ownOff = methodOff(symbol);
         const off = ownOff || chain.some(disabled);
-        const sometimes = methodUnsettled(symbol) || chain.some(unsettled) || chain.some(guarded) ||
+        const sometimes = methodUnsettled(symbol) || unsupplied || chain.some(unsettled) || chain.some(guarded) ||
             (byClass && testngState(owner).skip === 'sometimes');
         const several = [...annotationsOf(symbol)].some(name => JAVA_TEST_ANNOTATIONS.has(name) && name !== 'Test') ||
             testngState(symbol).several || (byClass && testngState(owner).several) || chain.some(otherRunner);
@@ -3385,6 +3460,14 @@ function testUnits(fileEntry, helpers) {
             // Maven's filter does not find a TestNG test by the name of a
             // class that inherits it (measured): no command names it there.
             ...(framework === 'testng' && { inheritedDynamic: 'declared-in-a-base-class' }),
+            // TestNG follows the language: a method a deriving class
+            // cannot override keeps its own body whatever that class
+            // declares under its signature (measured): a private or a
+            // static one always, one without a visibility for a class of
+            // another package.
+            ...(framework === 'testng' && fixed && { sealed: true }),
+            ...(framework === 'testng' && !fixed && !modifiers.includes('public') && !modifiers.includes('protected') &&
+                { sealedOutside: symbol.namespace || '' }),
         });
         if (chain.some(cls => !concrete(cls))) continue;
         // A class inside another runs with it only when marked @Nested. A
@@ -3394,11 +3477,24 @@ function testUnits(fileEntry, helpers) {
             .some(annotation => String(annotation.name).split('.').pop() === 'Nested'));
         if (unmarked.some(cls => !(cls.modifiers || []).includes('static'))) continue;
         for (const cls of chain) testsIn.set(cls, (testsIn.get(cls) || 0) + 1);
-        units.push({
+        const unit = {
             kind: 'test', suite: chain.map(cls => cls.name), ...row,
             ...(symbol.namespace && { namespace: symbol.namespace }),
             ...(unmarked.length > 0 && { conditional: true, notInEveryBuild: true }),
-        });
+        };
+        units.push(unit);
+        ownerOf.set(unit, owner);
+    }
+    // A class JUnit 4 may refuse (a marked method its own runner does not
+    // accept, under a runner that is not read): every test of the class
+    // runs only sometimes, the ones declared before that method too.
+    for (const [unit, owner] of ownerOf) {
+        if (maybeRefused.has(owner) && !unit.skipped) unit.conditional = true;
+    }
+    for (const owner of maybeRefused) {
+        for (const test of declared.get(owner) || []) {
+            if (!test.skipped) test.conditional = true;
+        }
     }
     const classes = [];
     const methodsOf = cls => symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&
@@ -3424,8 +3520,13 @@ function testUnits(fileEntry, helpers) {
             plainBases: bases.filter(name => /(^|\.)TestCase$/.test(name.replace(/<.*$/, '')) && !helpers.declaresType(name)),
             runnable: [...chain, cls].every(concrete),
             ...([...chain, cls].some(disabled) && { skipped: true }),
-            ...([...chain, cls].some(unsettled) && { sometimes: true }),
+            ...(([...chain, cls].some(unsettled) || maybeRefused.has(cls)) && { sometimes: true }),
             ...([...chain, cls].some(guarded) && { guard: true }),
+            // A class its runner refuses runs none of its tests, and
+            // neither does a class deriving from it; one that names a
+            // runner of its own is taken by that runner's rules.
+            ...(refused.has(cls) && { refused: true }),
+            ...([...chain, cls].some(otherRunner) && { runner: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
             members: methodsOf(cls).map(symbol => symbol.name),
@@ -3451,6 +3552,35 @@ function testUnits(fileEntry, helpers) {
         }
     }
     return { units, classes, ...(classes.some(cls => cls.open && cls.runnable) && { inheriting: true }) };
+}
+
+/**
+ * Can this file hold test code, from what the index keeps of it, with no
+ * tree read? `marked`: one of its declarations carries a mark that can
+ * make a test (one of the frameworks' annotations, or an annotation the
+ * project declares itself, which may stand for one), or one of its classes
+ * derives from a type named TestCase (JUnit 3). `bases`: the names of the
+ * types its classes derive from: a class of the project among them may
+ * bring tests, and that is asked of its own file. A file that is neither
+ * marked nor derives from one that is declares no test and holds the
+ * body of none.
+ */
+function testCodeGate(fileEntry, projectDeclaresType) {
+    let marked = false;
+    const bases = new Set();
+    for (const symbol of fileEntry.symbols || []) {
+        for (const annotation of symbol.annotationsWithArgs || []) {
+            const name = String(annotation.name).split('.').pop();
+            if (JAVA_TEST_ANNOTATIONS.has(name) || projectDeclaresType(name)) marked = true;
+        }
+        for (const written of [symbol.extends, symbol.implements].flat().filter(Boolean).flatMap(value => String(value).split(','))) {
+            const name = written.replace(/<.*$/, '').trim().split('.').pop().trim();
+            if (!name) continue;
+            if (/TestCase$/.test(name)) marked = true;
+            bases.add(name);
+        }
+    }
+    return { marked, bases: [...bases] };
 }
 
 /**
@@ -3507,5 +3637,6 @@ module.exports = {
     isEntryPoint,
     getEntryPointKind,
     testUnits,
+    testCodeGate,
     parse
 };

@@ -1363,6 +1363,23 @@ function tests(index, nameOrFile, options = {}) {
         }
     }
 
+    // A file's name does not decide what a test executes: the body of a
+    // test a class inherits stands where its base class is, and a runner
+    // takes tests from files of any name. A call site the caller engine
+    // finds in such a file is a test's where the test model says a test
+    // executes that line (core/test-units.js): the file joins the test
+    // files, test code within those lines.
+    const testInfoByPath = new Map(testFiles.map(info => [info.path, info]));
+    const testInfoOf = filePath => {
+        if (testInfoByPath.has(filePath)) return testInfoByPath.get(filePath);
+        const entry = index.files.get(filePath);
+        const ranges = entry ? model.testRangesOf(filePath) : [];
+        const info = ranges.length > 0 ? { path: filePath, entry, testRanges: ranges } : null;
+        testInfoByPath.set(filePath, info);
+        if (info) testFiles.push(info);
+        return info;
+    };
+
     const searchTerm = isFilePath
         ? path.basename(nameOrFile, path.extname(nameOrFile))
         : nameOrFile;
@@ -1393,7 +1410,6 @@ function tests(index, nameOrFile, options = {}) {
     // module-level coverage remain visible.
     const fileTargetCallerSites = new Map(); // absolute test file → tiered sites
     if (isFilePath && targetRels) {
-        const testFileInfo = new Map(testFiles.map(info => [info.path, info]));
         const fileTargetDefs = [];
         for (const [, fe] of index.files) {
             if (!targetRels.has(fe.relativePath)) continue;
@@ -1415,7 +1431,7 @@ function tests(index, nameOrFile, options = {}) {
                 })) : []),
             ];
             for (const site of sites) {
-                const info = testFileInfo.get(site.file);
+                const info = testInfoOf(site.file);
                 if (!info) continue;
                 if (info.testRanges && !lineInRanges(site.line, info.testRanges)) continue;
                 let rows = fileTargetCallerSites.get(site.file);
@@ -1709,7 +1725,6 @@ function tests(index, nameOrFile, options = {}) {
     // command must not silently drop. Repeated names never receive that broad
     // supplement because it would leak sibling classes/files.
     if (!isFilePath && targetDefs.length > 0) {
-        const testInfo = new Map(testFiles.map(t => [t.path, t]));
         const callerSites = [];
         // A pinned definition's unverified sites were adjudicated against it
         // alone, like a globally unique name's (fix #430).
@@ -1729,7 +1744,7 @@ function tests(index, nameOrFile, options = {}) {
         }
 
         for (const site of callerSites) {
-            const info = testInfo.get(site.file);
+            const info = testInfoOf(site.file);
             if (!info) continue;
             if (info.testRanges && !lineInRanges(site.line, info.testRanges)) continue;
             // Every site here was adjudicated against the exact target
@@ -1801,7 +1816,8 @@ function tests(index, nameOrFile, options = {}) {
                         ? refs.unverified.map(r => ({ ...r, tierName: 'unverified' })) : []),
                 ];
                 for (const ref of rows) {
-                    const info = testInfo.get(ref.absoluteFile);
+                    // Accessor and type references are looked for in the test files (`testPaths` above).
+                    const info = testInfoByPath.get(ref.absoluteFile);
                     if (!info) continue;
                     if (info.testRanges && !lineInRanges(ref.line, info.testRanges)) continue;
                     if (excludeArr.length > 0 &&

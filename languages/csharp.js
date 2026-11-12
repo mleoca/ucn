@@ -3451,11 +3451,16 @@ function testUnits(fileEntry, helpers) {
         const xunit = attributes.some(name => /^(Fact|SkippableFact|SkippableTheory)$/.test(name)) ||
             (fileEntry.imports || []).some(name => /^Xunit(\.|$)/.test(String(name)));
         if (!xunit && !(symbol.modifiers || []).includes('public')) continue;
+        // A static method (measured with each): xUnit runs it, in its
+        // class and in every class deriving from it; NUnit runs it in its
+        // own class only; MSTest does not run it.
+        const isStatic = (symbol.modifiers || []).includes('static');
         // MSTest wants the class that runs a test marked [TestClass]: the
         // class the method stands in for a test of its own, the deriving
         // class for one it inherits (measured: the mark is not inherited,
         // and the base needs none).
         const mstest = attributes.some(name => name === 'TestMethod' || name === 'DataTestMethod');
+        if (mstest && isStatic) continue;
         const owner = chain[chain.length - 1];
         const unmarked = mstest && !attributeNames(owner).includes('TestClass');
         // What the method's own attributes and rows say, and what the
@@ -3494,6 +3499,10 @@ function testUnits(fileEntry, helpers) {
             // carries the attribute, whatever a class nearer overrides.
             ...(xunit && { byDeclaration: true }),
             ...(mstest && { needsClassMark: true }),
+            // MSTest reports an inherited test again under a test of its
+            // name that hides it by `new` (measured), with that test's body.
+            ...(mstest && { againUnderHiding: true }),
+            ...(!xunit && isStatic && { ownOnly: true }),
         });
         if (unmarked || chain.some(cls => !concrete(cls))) continue;
         for (const cls of chain) testsIn.set(cls, (testsIn.get(cls) || 0) + 1);
@@ -3555,6 +3564,32 @@ function testUnits(fileEntry, helpers) {
         return { name: name.text, line: node.startPosition.row + 1, term: csharpTypeTerm(target, declaresDynamic) };
     });
     return { units, classes, ...(aliases.length > 0 && { aliases }) };
+}
+
+/**
+ * Can this file hold test code, from what the index keeps of it, with no
+ * tree read? `marked`: one of its declarations carries an attribute that
+ * can make a test (one of the frameworks', or one whose class the project
+ * declares, which may derive from one). `bases`: the names of the types
+ * its classes derive from: a class of the project among them may bring
+ * tests, and that is asked of its own file. A file that is neither marked
+ * nor derives from one that is declares no test and holds the body of
+ * none.
+ */
+function testCodeGate(fileEntry, projectDeclaresType) {
+    let marked = false;
+    const bases = new Set();
+    for (const symbol of fileEntry.symbols || []) {
+        for (const written of symbol.decorators || []) {
+            const name = String(written).replace(/<.*$/, '').split('.').pop().replace(/Attribute$/, '');
+            if (CSHARP_TEST_ATTRIBUTES.has(name) || projectDeclaresType(name) || projectDeclaresType(`${name}Attribute`)) marked = true;
+        }
+        for (const written of [symbol.extends, symbol.implements].flat().filter(Boolean).flatMap(value => String(value).split(','))) {
+            const name = written.replace(/<.*$/, '').trim().split('.').pop().trim();
+            if (name) bases.add(name);
+        }
+    }
+    return { marked, bases: [...bases] };
 }
 
 function getEntryPointKind(symbol) {
@@ -3762,5 +3797,6 @@ module.exports = {
     isEntryPoint,
     getEntryPointKind,
     testUnits,
+    testCodeGate,
     parse,
 };

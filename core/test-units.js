@@ -42,6 +42,7 @@ const path = require('path');
 const { langTraits, getParser, safeParse, getLanguageAdapter } = require('../languages');
 const { codeUnitCompare, escapeRegExp } = require('./shared');
 const { createSignatures } = require('./member-signatures');
+const { csharpUsings } = require('./type-denotation');
 
 const CONTAINER_KINDS = new Set(['class', 'struct', 'module', 'namespace', 'interface', 'impl',
     'record', 'enum', 'trait', 'object']);
@@ -1555,7 +1556,7 @@ function topLevelTestClasses(model, filePath) {
  * @param {object} index - ProjectIndex
  * @returns {object} per-operation test model
  */
-function createTestModel(index) {
+function createTestModel(index, options = {}) {
     const model = {
         manifests: createManifests(index),
         byFile: new Map(),
@@ -1567,6 +1568,7 @@ function createTestModel(index) {
         plugins: new Map(),
         guards: new Map(),
         foreign: new Map(),
+        ranges: new Map(),
         readerCaches: new Map(),
         root: index.root,
         relPaths: null,
@@ -1984,18 +1986,34 @@ function createTestModel(index) {
                 continue;
             }
             for (const test of node.cls.tests) {
+                // A test its runner runs in the declaring class only.
+                if (test.ownOnly) continue;
                 const rule = test.hiddenBy || 'name';
                 const mine = { filePath: node.filePath, cls: node.cls, row: test };
                 let body = null;
                 let uncertain = false;
                 const maybe = [];
+                let again = false;
                 if (rule === 'name') {
                     // A nearer class declares the same test.
-                    if (testedNames.has(test.name)) continue;
-                    testedNames.add(test.name);
-                    tested.push({ row: test, at: node });
-                    // A nearer class declares the same member without the mark.
-                    if (names.has(test.name) && !test.byDeclaration) continue;
+                    if (testedNames.has(test.name)) {
+                        // A runner that takes one method of each name
+                        // reports the inherited test too under a test
+                        // that hides it without overriding it, and runs
+                        // the nearer body for it (`againUnderHiding`:
+                        // measured with one version of MSTest, so the
+                        // test is listed as one that runs only sometimes).
+                        const nearer = tested.find(other => other.row.name === test.name);
+                        if (!test.againUnderHiding || !nearer || nearer.row.overrides || nearer.again) continue;
+                        body = nearer;
+                        again = true;
+                        tested.push({ row: test, at: node, again: true });
+                    } else {
+                        testedNames.add(test.name);
+                        tested.push({ row: test, at: node });
+                        // A nearer class declares the same member without the mark.
+                        if (names.has(test.name) && !test.byDeclaration) continue;
+                    }
                 } else {
                     // A runner that takes a method as replaced by one whose
                     // parameters could be passed to it: another signature
@@ -2005,10 +2023,20 @@ function createTestModel(index) {
                         return relation === 'different' && test.replacedByAssignable &&
                             (other.row.params || []).length === (test.params || []).length ? 'unknown' : relation;
                     };
-                    // A nearer class declares the same test.
+                    // A method the language does not let a class override
+                    // (`sealed`: always; `sealedOutside`: from another
+                    // package) is not replaced by an unmarked one of its
+                    // signature: the two are two methods, and the test
+                    // keeps its body. (A marked one is the class's test of
+                    // that signature: measured.)
+                    const overrides = other => !test.sealed &&
+                        (test.sealedOutside == null || (other.at.cls.namespace || '') === test.sealedOutside);
+                    // A nearer class declares the same test. (Where only a
+                    // declared override takes a test away, a test that
+                    // hides it by another declaration runs beside it.)
                     let hidden = false;
                     for (const other of tested) {
-                        if (other.row.name !== test.name) continue;
+                        if (other.row.name !== test.name || (rule === 'override' && !other.row.overrides)) continue;
                         const relation = relate(other);
                         if (relation === 'same') {
                             hidden = true;
@@ -2023,7 +2051,7 @@ function createTestModel(index) {
                     // mark: the nearest that is it for certain, and the
                     // nearer ones that may be.
                     for (const other of members) {
-                        if (other.row.name !== test.name || (rule === 'override' && !other.row.overrides)) continue;
+                        if (other.row.name !== test.name || (rule === 'override' && !other.row.overrides) || !overrides(other)) continue;
                         let relation = relate(other);
                         if (relation === 'unknown' && other.row.overrides && onlySlot(other, test, node)) relation = 'same';
                         if (relation === 'same') {
@@ -2047,8 +2075,9 @@ function createTestModel(index) {
                 else {
                     out.push({
                         test, base: node,
-                        ...(test.byDeclaration && body && { body }),
+                        ...((test.byDeclaration || again) && body && { body }),
                         ...(uncertain && { uncertain: true, maybe }),
+                        ...(again && { again: true }),
                     });
                 }
             }
@@ -2852,6 +2881,16 @@ function createTestModel(index) {
             const guardedAbove = cls => cls.bases.length > 0 &&
                 orderOf(filePath, cls).slice(1).some(node => !node.opaque && node.cls.guard);
             const guarded = classesHere.filter(cls => cls.runnable && guardedAbove(cls));
+            // A class its runner refuses (one of its marked methods is one
+            // the runner does not accept), or a class deriving from one:
+            // none of its tests runs, its own or inherited.
+            const refusedAbove = cls => cls.bases.length > 0 &&
+                orderOf(filePath, cls).slice(1).some(node => !node.opaque && node.cls.refused);
+            const refusedHere = cls => !cls.runner && (!!cls.refused || refusedAbove(cls));
+            // Under a runner the class names itself, what its base's
+            // runner refuses may be accepted: not read.
+            const maybeRefused = cls => !!cls.runner && refusedAbove(cls);
+            const runsIn = unit => classesHere.filter(cls => within(unit, cls)).sort((a, b) => b.startLine - a.startLine)[0];
             // A focus leaves other tests of the file declared and not
             // executed, by the rule of the runner that runs the file.
             const left = found.focus ? focusedOut(found.units, model.runnerOf(filePath).id) : new Set();
@@ -2861,6 +2900,11 @@ function createTestModel(index) {
                     out = { ...out, conditional: true };
                 }
                 if (left.has(unit)) out = { ...out, skipped: true };
+                if (unit.kind === 'test' && !out.skipped) {
+                    const holder = runsIn(unit);
+                    if (holder && refusedHere(holder)) out = { ...out, skipped: true };
+                    else if (holder && maybeRefused(holder) && !out.conditional) out = { ...out, conditional: true };
+                }
                 return out;
             });
             // jest refuses a file that gives a table of cases no row
@@ -2892,7 +2936,7 @@ function createTestModel(index) {
                         line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
                     });
                 }
-                for (const { test, base, body, uncertain, maybe } of inherited.tests) {
+                for (const { test, base, body, uncertain, maybe, again } of inherited.tests) {
                     // A runner that wants the class that runs a test
                     // marked takes none through one that is not.
                     if (test.needsClassMark && !cls.marked) continue;
@@ -2901,10 +2945,10 @@ function createTestModel(index) {
                     // one that a method of the class may have replaced
                     // (their parameter types are not resolved).
                     const unnamed = test.dynamic || cls.dynamic || test.inheritedDynamic ||
-                        (uncertain && 'signature-not-resolved');
+                        (uncertain && 'signature-not-resolved') || (again && 'reported-again');
                     const state = {
-                        ...((test.skipped || cls.skipped) && { skipped: true }),
-                        ...((cls.sometimes || test.conditional || cls.guard || guardedAbove(cls) || uncertain) && { conditional: true }),
+                        ...((test.skipped || cls.skipped || refusedHere(cls)) && { skipped: true }),
+                        ...((cls.sometimes || test.conditional || cls.guard || guardedAbove(cls) || uncertain || again || maybeRefused(cls)) && { conditional: true }),
                         ...(unnamed && { dynamic: unnamed }),
                         ...((test.several || cls.several) && { several: true }),
                         // The bodies of the methods that may be the test's
@@ -2922,7 +2966,7 @@ function createTestModel(index) {
                     const suite = [...cls.suite, cls.name];
                     // The class redeclares the member without the mark:
                     // the test is the inherited one, its body the class's own.
-                    if (body && body.at.cls === cls && !uncertain) {
+                    if (body && body.at.cls === cls && !uncertain && !again) {
                         units.push({
                             kind: 'test', name: test.name, suite, ...(cls.namespace && { namespace: cls.namespace }),
                             line: body.row.line, startLine: body.row.startLine, endLine: body.row.endLine, ...state,
@@ -3037,6 +3081,16 @@ function createTestModel(index) {
      */
     model.runsAt = (filePath, line) => {
         const out = [];
+        // The units of a file that may run this code. A module its runner
+        // does not collect by its name declares none: it is not read for
+        // the answer.
+        const unitsIn = file => {
+            if (!model.byFile.has(file)) {
+                const entry = index.files.get(file);
+                if (entry && collectionFor(file, entry).collected === false) return [];
+            }
+            return model.unitsOf(file).units;
+        };
         const unit = model.unitAt(filePath, line);
         if (unit && unit.kind === 'test') out.push({ filePath, unit });
         const holder = (model.declared(filePath)?.classes || [])
@@ -3051,7 +3105,7 @@ function createTestModel(index) {
             const held = from => !!from && from.filePath === filePath && from.ownerLine === holder.startLine &&
                 from.startLine === template.startLine && from.endLine === template.endLine;
             for (const file of [...new Set([...descendantFiles(holder.name), ...importers, filePath])].sort(codeUnitCompare)) {
-                for (const candidate of model.unitsOf(file).units) {
+                for (const candidate of unitsIn(file)) {
                     // Every test whose body this is: the one a deriving
                     // class inherits, another name for it in its class;
                     // and every test whose body it may be.
@@ -3067,7 +3121,7 @@ function createTestModel(index) {
             .find(other => other.startLine <= line && other.endLine >= line);
         if (fn) {
             for (const file of [...new Set([...importers, filePath])].sort(codeUnitCompare)) {
-                for (const candidate of model.unitsOf(file).units) {
+                for (const candidate of unitsIn(file)) {
                     const from = candidate.inherited;
                     if (from && from.filePath === filePath && from.owner == null && from.startLine === fn.startLine) {
                         out.push({ filePath: file, unit: candidate });
@@ -3077,6 +3131,98 @@ function createTestModel(index) {
         }
         if (out.length === 0 && unit) out.push({ filePath, unit });
         return out;
+    };
+
+    /**
+     * Can a file hold test code at all? Asked before a file is read for
+     * the tests in it. A language says so from what the index keeps
+     * (`testCodeGate`): whether a declaration of the file carries a mark
+     * that can make a test, and which types its classes derive from. No
+     * mark here and none in the file of a class of the project one of its
+     * classes derives from: no test, and no body of one. A language
+     * without the gate is read. (`options.ungated` reads every file: the
+     * gate must never change an answer.)
+     */
+    const gates = new Map();
+    const projectDeclaresType = name => (index.symbols.get(name) || []).some(def => CONTAINER_KINDS.has(def.type));
+    model.mayHoldTests = (filePath, trail = new Set()) => {
+        if (options.ungated) return true;
+        if (gates.has(filePath)) return gates.get(filePath);
+        const entry = index.files.get(filePath);
+        const gate = entry && langTraits(entry.language)?.testCodeGate;
+        if (typeof gate !== 'function') return true;
+        if (trail.has(filePath)) return false;
+        let answer;
+        try {
+            const facts = gate(entry, projectDeclaresType);
+            answer = !!facts.marked;
+            // A base written under a using alias is the type the alias
+            // names (the file's own, a global one, a project file's).
+            const aliases = !answer && langTraits(entry.language)?.typeNameScoping === 'namespace-usings'
+                ? csharpUsings(index, filePath) : null;
+            if (aliases && aliases.unreadable) answer = true;
+            const next = new Set(trail).add(filePath);
+            for (const base of answer ? [] : facts.bases || []) {
+                const names = [base];
+                if (aliases && aliases.aliases.has(base)) names.push(String(aliases.aliases.get(base)).split('.').pop());
+                for (const def of names.flatMap(name => index.symbols.get(name) || [])) {
+                    if (!CONTAINER_KINDS.has(def.type) || !def.file || def.file === filePath) continue;
+                    if (model.mayHoldTests(def.file, next)) {
+                        answer = true;
+                        break;
+                    }
+                }
+                if (answer) break;
+            }
+        } catch (e) {
+            answer = true;
+        }
+        // An answer reached inside a cycle of classes is not kept: it may
+        // be 'no' only because the walk came back to its start.
+        if (answer || trail.size === 0) gates.set(filePath, answer);
+        return answer;
+    };
+
+    /**
+     * The lines of a file a test executes, as [start, end] ranges: its own
+     * tests and suites, and the methods and functions a test another file
+     * lists runs as its body (a base class's test a deriving class
+     * inherits, a method that gives an inherited test its body, a function
+     * another module imports under a test's name). This is what makes code
+     * test code, whatever its file is called: a base class in a file whose
+     * name is no test file's holds the bodies of the tests that inherit
+     * from it. Empty for a file the model knows no test in.
+     */
+    model.testRangesOf = filePath => {
+        if (model.ranges.has(filePath)) return model.ranges.get(filePath);
+        model.ranges.set(filePath, []);
+        const ranges = [];
+        const found = model.mayHoldTests(filePath) ? model.declared(filePath) : null;
+        if (found) {
+            for (const unit of model.unitsOf(filePath).units) {
+                if (!unit.inherited) ranges.push([unit.startLine, unit.endLine]);
+            }
+            const covered = row => ranges.some(([start, end]) => row.startLine >= start && row.endLine <= end);
+            const rows = [...(found.functions || [])];
+            for (const cls of found.classes || []) {
+                rows.push(...(cls.tests || []));
+                // A method that is no test gives one its body only in a
+                // class that inherits a test of its name.
+                if (cls.bases.length === 0 || (cls.memberRows || []).length === 0) continue;
+                const inherited = new Set();
+                for (const node of orderOf(filePath, cls).slice(1)) {
+                    if (!node.opaque) for (const test of node.cls.tests || []) inherited.add(test.name);
+                }
+                if (inherited.size > 0) rows.push(...cls.memberRows.filter(row => inherited.has(row.name)));
+            }
+            rows.sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+            for (const row of rows) {
+                if (row.startLine == null || row.endLine == null || covered(row)) continue;
+                if (model.runsAt(filePath, row.startLine).length > 0) ranges.push([row.startLine, row.endLine]);
+            }
+        }
+        model.ranges.set(filePath, ranges);
+        return ranges;
     };
 
     /** The innermost unit holding a line: a test before a suite. */

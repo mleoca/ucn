@@ -406,6 +406,10 @@ const STRUCTURAL_TRAITS = {
     // (fileEntry, helpers) => boolean: does this file hold code the runner
     // asks at run time that may leave tests out (a conftest hook, a TestMain).
     testGate: null,
+    // `(fileEntry, projectDeclaresType) => { marked, bases }` or null: can
+    // a file hold test code, from the index alone (no tree)? Asked before
+    // a file whose name is no test file's is read for the tests in it.
+    testCodeGate: null,
     // Which family of runners executes the language's tests; the family's
     // manifests are the evidence a runner is named on. Null: none modeled.
     testRunnerFamily: null,
@@ -736,6 +740,10 @@ const NOMINAL_TRAITS = {
     // (fileEntry, helpers) => boolean: does this file hold code the runner
     // asks at run time that may leave tests out (a conftest hook, a TestMain).
     testGate: null,
+    // `(fileEntry, projectDeclaresType) => { marked, bases }` or null: can
+    // a file hold test code, from the index alone (no tree)? Asked before
+    // a file whose name is no test file's is read for the tests in it.
+    testCodeGate: null,
     // Which family of runners executes the language's tests; the family's
     // manifests are the evidence a runner is named on. Null: none modeled.
     testRunnerFamily: null,
@@ -1236,6 +1244,7 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./java').testUnits(fileEntry, helpers),
+            testCodeGate: (fileEntry, projectDeclaresType) => require('./java').testCodeGate(fileEntry, projectDeclaresType),
             testRunnerFamily: 'java',
             testFileNames: [/^Test[^/]*\.java$/, /Tests?\.java$/, /TestCase\.java$/, /IT\.java$/],
             // A method overrides/implements every supertype's same-signature
@@ -1451,6 +1460,7 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./csharp').testUnits(fileEntry, helpers),
+            testCodeGate: (fileEntry, projectDeclaresType) => require('./csharp').testCodeGate(fileEntry, projectDeclaresType),
             testRunnerFamily: 'dotnet',
             testFileNames: [/Tests?\.cs$/],
             // Interface mapping takes inherited members (C# spec 18.6.5); a

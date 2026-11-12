@@ -9017,6 +9017,1099 @@ namespace P.Tests
 `,
         },
     },
+    // -------------------------- what a method's modifiers do to its mark
+    {
+        id: 'maven-junit5-modifiers-of-a-marked-method', runner: 'maven',
+        sometimes: ['src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > withParameter'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/ModifiersTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class ModifiersTest {
+    @Test
+    private void privateCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > privateCase"); }
+
+    @Test
+    public static void staticCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > staticCase"); }
+
+    @Test
+    void packageCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > packageCase"); }
+
+    @Test
+    protected void protectedCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > protectedCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/ControlTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class ControlTest {
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/ControlTest.java::ControlTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyProtectedTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class OnlyProtectedTest {
+    @Test
+    protected void protectedCase() { Rec.mark("src/test/java/com/x/OnlyProtectedTest.java::OnlyProtectedTest > protectedCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyProtectedTest.java::OnlyProtectedTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyPrivateTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class OnlyPrivateTest {
+    @Test
+    private void privateCase() { Rec.mark("src/test/java/com/x/OnlyPrivateTest.java::OnlyPrivateTest > privateCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyPrivateTest.java::OnlyPrivateTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyStaticTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class OnlyStaticTest {
+    @Test
+    public static void staticCase() { Rec.mark("src/test/java/com/x/OnlyStaticTest.java::OnlyStaticTest > staticCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyStaticTest.java::OnlyStaticTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyPackageTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class OnlyPackageTest {
+    @Test
+    void packageCase() { Rec.mark("src/test/java/com/x/OnlyPackageTest.java::OnlyPackageTest > packageCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyPackageTest.java::OnlyPackageTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public abstract class Base {
+    @Test
+    private void hidden() {
+        Rec.mark("src/test/java/com/x/Base.java::hidden body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > hidden");
+    }
+
+    @Test
+    public static void fixed() {
+        Rec.mark("src/test/java/com/x/Base.java::fixed body");
+    }
+
+    @Test
+    public void open() {
+        Rec.mark("src/test/java/com/x/Base.java::open body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > open");
+    }
+}
+`,
+            'src/test/java/com/x/PlainChildTest.java': `package com.x;
+
+public class PlainChildTest extends Base {
+}
+`,
+            'src/test/java/com/x/SameNamesTest.java': `package com.x;
+
+public class SameNamesTest extends Base {
+    public void hidden() { Rec.mark("src/test/java/com/x/SameNamesTest.java::hidden of the child"); }
+
+    public static void fixed() { Rec.mark("src/test/java/com/x/SameNamesTest.java::fixed of the child"); }
+}
+`,
+            'src/test/java/com/x/MarkedSameNamesTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class MarkedSameNamesTest extends Base {
+    @Test
+    public void hidden() { Rec.mark("src/test/java/com/x/MarkedSameNamesTest.java::MarkedSameNamesTest > hidden of its own"); }
+}
+`,
+            'src/test/java/com/x/OnlyParameterTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class OnlyParameterTest {
+    @Test
+    public void withParameter(int value) { Rec.mark("src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > withParameter"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyResultTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class OnlyResultTest {
+    @Test
+    public int withResult() { Rec.mark("src/test/java/com/x/OnlyResultTest.java::OnlyResultTest > withResult"); return 1; }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyResultTest.java::OnlyResultTest > publicCase"); }
+}
+`,
+            'src/test/java/com/a/Far.java': `package com.a;
+
+import org.junit.jupiter.api.Test;
+
+public abstract class Far {
+    @Test
+    void distant() {
+        com.x.Rec.mark("src/test/java/com/a/Far.java::distant body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > distant");
+    }
+}
+`,
+            'src/test/java/com/x/FarChildTest.java': `package com.x;
+
+import com.a.Far;
+
+public class FarChildTest extends Far {
+}
+`,
+            'src/test/java/com/x/FarSameNameTest.java': `package com.x;
+
+import com.a.Far;
+
+public class FarSameNameTest extends Far {
+    void distant() { Rec.mark("src/test/java/com/x/FarSameNameTest.java::distant of the child"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-junit4-a-class-refused-for-one-marked-method', runner: 'maven',
+        emptyTestFiles: ['src/test/java/com/x/MarkedSameNamesTest.java', 'src/test/java/com/x/ModifiersTest.java', 'src/test/java/com/x/OnlyPackageTest.java', 'src/test/java/com/x/OnlyParameterTest.java', 'src/test/java/com/x/OnlyPrivateTest.java', 'src/test/java/com/x/OnlyProtectedTest.java', 'src/test/java/com/x/OnlyResultTest.java', 'src/test/java/com/x/OnlyStaticTest.java', 'src/test/java/com/x/PlainChildTest.java', 'src/test/java/com/x/SameNamesTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUNIT4),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/LegacyTest.java': `package com.x;
+
+import junit.framework.TestCase;
+
+public class LegacyTest extends TestCase {
+    public void testPlain() { Rec.mark("src/test/java/com/x/LegacyTest.java::LegacyTest > testPlain"); }
+
+    public void testWithParameter(int value) { Rec.mark("src/test/java/com/x/LegacyTest.java::LegacyTest > testWithParameter"); }
+
+    public int testWithResult() { Rec.mark("src/test/java/com/x/LegacyTest.java::LegacyTest > testWithResult"); return 1; }
+}
+`,
+            'src/test/java/com/x/ModifiersTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class ModifiersTest {
+    @Test
+    private void privateCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > privateCase"); }
+
+    @Test
+    public static void staticCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > staticCase"); }
+
+    @Test
+    void packageCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > packageCase"); }
+
+    @Test
+    protected void protectedCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > protectedCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/ControlTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class ControlTest {
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/ControlTest.java::ControlTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyProtectedTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class OnlyProtectedTest {
+    @Test
+    protected void protectedCase() { Rec.mark("src/test/java/com/x/OnlyProtectedTest.java::OnlyProtectedTest > protectedCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyProtectedTest.java::OnlyProtectedTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyPrivateTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class OnlyPrivateTest {
+    @Test
+    private void privateCase() { Rec.mark("src/test/java/com/x/OnlyPrivateTest.java::OnlyPrivateTest > privateCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyPrivateTest.java::OnlyPrivateTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyStaticTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class OnlyStaticTest {
+    @Test
+    public static void staticCase() { Rec.mark("src/test/java/com/x/OnlyStaticTest.java::OnlyStaticTest > staticCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyStaticTest.java::OnlyStaticTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyPackageTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class OnlyPackageTest {
+    @Test
+    void packageCase() { Rec.mark("src/test/java/com/x/OnlyPackageTest.java::OnlyPackageTest > packageCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyPackageTest.java::OnlyPackageTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.junit.Test;
+
+public abstract class Base {
+    @Test
+    private void hidden() {
+        Rec.mark("src/test/java/com/x/Base.java::hidden body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > hidden");
+    }
+
+    @Test
+    public static void fixed() {
+        Rec.mark("src/test/java/com/x/Base.java::fixed body");
+    }
+
+    @Test
+    public void open() {
+        Rec.mark("src/test/java/com/x/Base.java::open body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > open");
+    }
+}
+`,
+            'src/test/java/com/x/PlainChildTest.java': `package com.x;
+
+public class PlainChildTest extends Base {
+}
+`,
+            'src/test/java/com/x/SameNamesTest.java': `package com.x;
+
+public class SameNamesTest extends Base {
+    public void hidden() { Rec.mark("src/test/java/com/x/SameNamesTest.java::hidden of the child"); }
+
+    public static void fixed() { Rec.mark("src/test/java/com/x/SameNamesTest.java::fixed of the child"); }
+}
+`,
+            'src/test/java/com/x/MarkedSameNamesTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class MarkedSameNamesTest extends Base {
+    @Test
+    public void hidden() { Rec.mark("src/test/java/com/x/MarkedSameNamesTest.java::MarkedSameNamesTest > hidden of its own"); }
+}
+`,
+            'src/test/java/com/x/OnlyParameterTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class OnlyParameterTest {
+    @Test
+    public void withParameter(int value) { Rec.mark("src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > withParameter"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyResultTest.java': `package com.x;
+
+import org.junit.Test;
+
+public class OnlyResultTest {
+    @Test
+    public int withResult() { Rec.mark("src/test/java/com/x/OnlyResultTest.java::OnlyResultTest > withResult"); return 1; }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyResultTest.java::OnlyResultTest > publicCase"); }
+}
+`,
+            'src/test/java/com/a/Far.java': `package com.a;
+
+import org.junit.Test;
+
+public abstract class Far {
+    @Test
+    void distant() {
+        com.x.Rec.mark("src/test/java/com/a/Far.java::distant body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > distant");
+    }
+}
+`,
+            'src/test/java/com/x/FarChildTest.java': `package com.x;
+
+import com.a.Far;
+
+public class FarChildTest extends Far {
+}
+`,
+            'src/test/java/com/x/FarSameNameTest.java': `package com.x;
+
+import com.a.Far;
+
+public class FarSameNameTest extends Far {
+    void distant() { Rec.mark("src/test/java/com/x/FarSameNameTest.java::distant of the child"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-testng-modifiers-of-a-marked-method', runner: 'maven',
+        sometimes: ['src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > withParameter', 'src/test/java/com/x/OnlyResultTest.java::OnlyResultTest > withResult'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', TESTNG),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/ModifiersTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class ModifiersTest {
+    @Test
+    private void privateCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > privateCase"); }
+
+    @Test
+    public static void staticCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > staticCase"); }
+
+    @Test
+    void packageCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > packageCase"); }
+
+    @Test
+    protected void protectedCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > protectedCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/ModifiersTest.java::ModifiersTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/ControlTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class ControlTest {
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/ControlTest.java::ControlTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyProtectedTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class OnlyProtectedTest {
+    @Test
+    protected void protectedCase() { Rec.mark("src/test/java/com/x/OnlyProtectedTest.java::OnlyProtectedTest > protectedCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyProtectedTest.java::OnlyProtectedTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyPrivateTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class OnlyPrivateTest {
+    @Test
+    private void privateCase() { Rec.mark("src/test/java/com/x/OnlyPrivateTest.java::OnlyPrivateTest > privateCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyPrivateTest.java::OnlyPrivateTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyStaticTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class OnlyStaticTest {
+    @Test
+    public static void staticCase() { Rec.mark("src/test/java/com/x/OnlyStaticTest.java::OnlyStaticTest > staticCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyStaticTest.java::OnlyStaticTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyPackageTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class OnlyPackageTest {
+    @Test
+    void packageCase() { Rec.mark("src/test/java/com/x/OnlyPackageTest.java::OnlyPackageTest > packageCase"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyPackageTest.java::OnlyPackageTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public abstract class Base {
+    @Test
+    private void hidden() {
+        Rec.mark("src/test/java/com/x/Base.java::hidden body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > hidden");
+    }
+
+    @Test
+    public static void fixed() {
+        Rec.mark("src/test/java/com/x/Base.java::fixed body");
+    }
+
+    @Test
+    public void open() {
+        Rec.mark("src/test/java/com/x/Base.java::open body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > open");
+    }
+}
+`,
+            'src/test/java/com/x/PlainChildTest.java': `package com.x;
+
+public class PlainChildTest extends Base {
+}
+`,
+            'src/test/java/com/x/SameNamesTest.java': `package com.x;
+
+public class SameNamesTest extends Base {
+    public void hidden() { Rec.mark("src/test/java/com/x/SameNamesTest.java::hidden of the child"); }
+
+    public static void fixed() { Rec.mark("src/test/java/com/x/SameNamesTest.java::fixed of the child"); }
+}
+`,
+            'src/test/java/com/x/MarkedSameNamesTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class MarkedSameNamesTest extends Base {
+    @Test
+    public void hidden() { Rec.mark("src/test/java/com/x/MarkedSameNamesTest.java::MarkedSameNamesTest > hidden of its own"); }
+}
+`,
+            'src/test/java/com/x/OnlyParameterTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class OnlyParameterTest {
+    @Test
+    public void withParameter(int value) { Rec.mark("src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > withParameter"); }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyParameterTest.java::OnlyParameterTest > publicCase"); }
+}
+`,
+            'src/test/java/com/x/OnlyResultTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public class OnlyResultTest {
+    @Test
+    public int withResult() { Rec.mark("src/test/java/com/x/OnlyResultTest.java::OnlyResultTest > withResult"); return 1; }
+
+    @Test
+    public void publicCase() { Rec.mark("src/test/java/com/x/OnlyResultTest.java::OnlyResultTest > publicCase"); }
+}
+`,
+            'src/test/java/com/a/Far.java': `package com.a;
+
+import org.testng.annotations.Test;
+
+public abstract class Far {
+    @Test
+    void distant() {
+        com.x.Rec.mark("src/test/java/com/a/Far.java::distant body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > distant");
+    }
+}
+`,
+            'src/test/java/com/x/FarChildTest.java': `package com.x;
+
+import com.a.Far;
+
+public class FarChildTest extends Far {
+}
+`,
+            'src/test/java/com/x/FarSameNameTest.java': `package com.x;
+
+import com.a.Far;
+
+public class FarSameNameTest extends Far {
+    void distant() { Rec.mark("src/test/java/com/x/FarSameNameTest.java::distant of the child"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-testng-class-mark-and-modifiers', runner: 'maven',
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', TESTNG),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/ClassLevelTest.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+@Test
+public class ClassLevelTest {
+    public void publicCase() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > publicCase"); }
+
+    public static void staticCase() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > staticCase"); }
+
+    void packageCase() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > packageCase"); }
+
+    protected void protectedCase() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > protectedCase"); }
+
+    private void privateCase() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > privateCase"); }
+
+    @Test
+    private void markedPrivate() { Rec.mark("src/test/java/com/x/ClassLevelTest.java::ClassLevelTest > markedPrivate"); }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-modifiers-of-a-marked-method', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'ModifiersTests.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class ModifiersTests
+    {
+        [Test]
+        private void PrivateCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > PrivateCase"); }
+
+        [Test]
+        internal void InternalCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > InternalCase"); }
+
+        [Test]
+        protected void ProtectedCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > ProtectedCase"); }
+
+        [Test]
+        public static void StaticCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > StaticCase"); }
+
+        [Test]
+        public void PublicCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > PublicCase"); }
+    }
+
+    public abstract class Base
+    {
+        [Test]
+        public static void Fixed() { Rec.Mark("ModifiersTests.cs::fixed body"); }
+
+        [Test]
+        public void Open()
+        {
+            Rec.Mark("ModifiersTests.cs::open body");
+            Rec.Mark("ModifiersTests.cs::" + GetType().Name + " > Open");
+        }
+    }
+
+    public class PlainChild : Base
+    {
+    }
+
+    public class HidesMarked : Base
+    {
+        [Test]
+        public new void Open() { Rec.Mark("ModifiersTests.cs::HidesMarked > Open of its own"); }
+    }
+
+    public abstract class Virtual
+    {
+        [Test]
+        public virtual void Twice()
+        {
+            Rec.Mark("ModifiersTests.cs::twice body");
+            Rec.Mark("ModifiersTests.cs::" + GetType().Name + " > Twice");
+        }
+    }
+
+    public class OverridesMarked : Virtual
+    {
+        [Test]
+        public override void Twice() { Rec.Mark("ModifiersTests.cs::OverridesMarked > Twice of its own"); }
+    }
+
+    public class KeepsVirtual : Virtual
+    {
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-xunit-modifiers-of-a-marked-method', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'ModifiersTests.cs': `using Xunit;
+
+namespace P.Tests
+{
+    public class ModifiersTests
+    {
+        [Fact]
+        private void PrivateCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > PrivateCase"); }
+
+        [Fact]
+        internal void InternalCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > InternalCase"); }
+
+        [Fact]
+        protected void ProtectedCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > ProtectedCase"); }
+
+        [Fact]
+        public static void StaticCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > StaticCase"); }
+
+        [Fact]
+        public void PublicCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > PublicCase"); }
+    }
+
+    public abstract class Base
+    {
+        [Fact]
+        public static void Fixed() { Rec.Mark("ModifiersTests.cs::fixed body"); }
+
+        [Fact]
+        public void Open()
+        {
+            Rec.Mark("ModifiersTests.cs::open body");
+            Rec.Mark("ModifiersTests.cs::" + GetType().Name + " > Open");
+        }
+    }
+
+    public class PlainChild : Base
+    {
+    }
+
+    public abstract class Virtual
+    {
+        [Fact]
+        public virtual void Twice()
+        {
+            Rec.Mark("ModifiersTests.cs::twice body");
+            Rec.Mark("ModifiersTests.cs::" + GetType().Name + " > Twice");
+        }
+    }
+
+    public class OverridesMarked : Virtual
+    {
+        [Fact]
+        public override void Twice() { Rec.Mark("ModifiersTests.cs::OverridesMarked > Twice of its own"); }
+    }
+
+    public class KeepsVirtual : Virtual
+    {
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-mstest-modifiers-of-a-marked-method', runner: 'dotnet-test',
+        sometimes: ['ModifiersTests.cs::HidesMarked > Open'],
+        files: {
+            'App.Tests.csproj': CSPROJ(MSTEST),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'ModifiersTests.cs': `using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace P.Tests
+{
+    [TestClass]
+    public class ModifiersTests
+    {
+        [TestMethod]
+        private void PrivateCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > PrivateCase"); }
+
+        [TestMethod]
+        internal void InternalCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > InternalCase"); }
+
+        [TestMethod]
+        protected void ProtectedCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > ProtectedCase"); }
+
+        [TestMethod]
+        public static void StaticCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > StaticCase"); }
+
+        [TestMethod]
+        public void PublicCase() { Rec.Mark("ModifiersTests.cs::ModifiersTests > PublicCase"); }
+    }
+
+    [TestClass]
+    public abstract class Base
+    {
+        [TestMethod]
+        public static void Fixed() { Rec.Mark("ModifiersTests.cs::fixed body"); }
+
+        [TestMethod]
+        public void Open()
+        {
+            Rec.Mark("ModifiersTests.cs::open body");
+            Rec.Mark("ModifiersTests.cs::" + GetType().Name + " > Open");
+        }
+    }
+
+    [TestClass]
+    public class PlainChild : Base
+    {
+    }
+
+    [TestClass]
+    public class HidesMarked : Base
+    {
+        [TestMethod]
+        public new void Open() { Rec.Mark("ModifiersTests.cs::HidesMarked > Open of its own"); }
+    }
+
+    [TestClass]
+    public abstract class Virtual
+    {
+        [TestMethod]
+        public virtual void Twice()
+        {
+            Rec.Mark("ModifiersTests.cs::twice body");
+            Rec.Mark("ModifiersTests.cs::" + GetType().Name + " > Twice");
+        }
+    }
+
+    [TestClass]
+    public class OverridesMarked : Virtual
+    {
+        [TestMethod]
+        public override void Twice() { Rec.Mark("ModifiersTests.cs::OverridesMarked > Twice of its own"); }
+    }
+
+    [TestClass]
+    public class KeepsVirtual : Virtual
+    {
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'pytest-static-and-class-methods', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/rec.py': `${PY}`,
+            'tests/test_modifiers.py': `import unittest
+from tests.rec import mark
+
+
+class TestModifiers:
+    @staticmethod
+    def test_static():
+        mark("tests/test_modifiers.py::TestModifiers > test_static")
+
+    @classmethod
+    def test_cls(cls):
+        mark("tests/test_modifiers.py::TestModifiers > test_cls")
+
+    @property
+    def test_prop(self):
+        mark("tests/test_modifiers.py::TestModifiers > test_prop")
+        return 1
+
+    def test_plain(self):
+        mark("tests/test_modifiers.py::TestModifiers > test_plain")
+
+
+class Legacy(unittest.TestCase):
+    @staticmethod
+    def test_static():
+        mark("tests/test_modifiers.py::Legacy > test_static")
+
+    @classmethod
+    def test_cls(cls):
+        mark("tests/test_modifiers.py::Legacy > test_cls")
+
+    def test_plain(self):
+        mark("tests/test_modifiers.py::Legacy > test_plain")
+`,
+        },
+    },
+    // ------- a type inside generic types is the nesting it is written in
+    {
+        id: 'dotnet-nunit-types-inside-generic-types', runner: 'dotnet-test',
+        sometimes: ['Through.cs::Through > Plain'],
+        atLeast: ['Firsts.cs', 'Own.cs', 'Seconds.cs', 'Through.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Types.cs': `namespace P.Tests
+{
+    public class Outer<T>
+    {
+        public class Inner<U> { }
+        public class Plain { }
+    }
+
+    public class Outer<T, U>
+    {
+        public class Inner { }
+    }
+
+    public class Below : Outer<int> { }
+}
+`,
+            'Base.cs': `using System.Collections.Generic;
+using NUnit.Framework;
+
+namespace P.Tests
+{
+    public abstract class Base
+    {
+        [TestCase(null)]
+        public virtual void Works(Outer<int>.Inner<string> value)
+        {
+            Rec.Mark("Base.cs::inner of one body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Works");
+        }
+
+        [TestCase(null)]
+        public virtual void Works(Outer<int, string>.Inner value)
+        {
+            Rec.Mark("Base.cs::inner of two body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Works");
+        }
+
+        [TestCase(null)]
+        public virtual void Plain(Outer<int>.Plain value)
+        {
+            Rec.Mark("Base.cs::plain of int body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Plain");
+        }
+
+        [TestCase(null)]
+        public virtual void Plain(Outer<string>.Plain value)
+        {
+            Rec.Mark("Base.cs::plain of string body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Plain");
+        }
+
+        [TestCase(null)]
+        public virtual void Keys(Dictionary<string, int>.KeyCollection value)
+        {
+            Rec.Mark("Base.cs::keys of string body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Keys");
+        }
+
+        [TestCase(null)]
+        public virtual void Keys(Dictionary<int, string>.KeyCollection value)
+        {
+            Rec.Mark("Base.cs::keys of int body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Keys");
+        }
+    }
+
+    public abstract class Single
+    {
+        [TestCase(null)]
+        public virtual void Works(Outer<int>.Inner<string> value)
+        {
+            Rec.Mark("Base.cs::single body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Works");
+        }
+    }
+}
+`,
+            'Firsts.cs': `using System.Collections.Generic;
+using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class Firsts : Base
+    {
+        public override void Works(Outer<System.Int32>.Inner<System.String> value) { Rec.Mark("Firsts.cs::never"); }
+
+        public override void Plain(Outer<int>.Plain value) { Rec.Mark("Firsts.cs::never"); }
+
+        public override void Keys(Dictionary<string, int>.KeyCollection value) { Rec.Mark("Firsts.cs::never"); }
+    }
+}
+`,
+            'Seconds.cs': `using System.Collections.Generic;
+using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class Seconds : Base
+    {
+        public override void Works(Outer<int, string>.Inner value) { Rec.Mark("Seconds.cs::never"); }
+
+        public override void Plain(Outer<string>.Plain value) { Rec.Mark("Seconds.cs::never"); }
+
+        public override void Keys(Dictionary<int, string>.KeyCollection value) { Rec.Mark("Seconds.cs::never"); }
+    }
+}
+`,
+            'Through.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class Through : Base
+    {
+        public override void Plain(Below.Plain value) { Rec.Mark("Through.cs::never"); }
+    }
+}
+`,
+            'Own.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class Own : Single
+    {
+        [TestCase(null)]
+        public void Works(Outer<int, string>.Inner value) { Rec.Mark("Own.cs::Own > Works of its own"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-xunit-types-inside-generic-types', runner: 'dotnet-test',
+        atLeast: ['Spelled.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Types.cs': `namespace P.Tests
+{
+    public class Outer<T>
+    {
+        public class Inner<U> { }
+        public class Plain { }
+    }
+
+    public class Outer<T, U>
+    {
+        public class Inner { }
+    }
+
+    public class Below : Outer<int> { }
+}
+`,
+            'Base.cs': `using Xunit;
+
+namespace P.Tests
+{
+    public abstract class Base
+    {
+        [Theory]
+        [InlineData(null)]
+        public virtual void Works(Outer<int>.Inner<string> value)
+        {
+            Rec.Mark("Base.cs::works body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Works");
+        }
+
+        [Theory]
+        [InlineData(null)]
+        public virtual void Plain(Outer<int>.Plain value)
+        {
+            Rec.Mark("Base.cs::plain body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Plain");
+        }
+    }
+}
+`,
+            'Spelled.cs': `namespace P.Tests
+{
+    public class Spelled : Base
+    {
+        public override void Works(Outer<System.Int32>.Inner<System.String> value)
+        {
+            Rec.Mark("Spelled.cs::works body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Works");
+        }
+
+        public override void Plain(Below.Plain value)
+        {
+            Rec.Mark("Spelled.cs::plain body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Plain");
+        }
+    }
+}
+`,
+        },
+    },
 ];
 
 module.exports = { CASES };
