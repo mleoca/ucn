@@ -135,6 +135,8 @@ const budgets = {
         '--min-query-class-delta-ms', DEFAULT_BUDGETS.minQueryClassDeltaMs),
     maxSlowQueryClassRatio: positiveNumber(
         '--max-slow-query-class-ratio', DEFAULT_BUDGETS.maxSlowQueryClassRatio),
+    minSlowQueryClassDeltaMs: positiveNumber(
+        '--min-slow-query-class-delta-ms', DEFAULT_BUDGETS.minSlowQueryClassDeltaMs),
     maxQueryClassDeltaMs: positiveNumber(
         '--max-query-class-delta-ms', DEFAULT_BUDGETS.maxQueryClassDeltaMs),
     // Release and PR runs gate the query classes against the pinned release
@@ -1002,8 +1004,9 @@ async function main() {
         'Per handle the best of the isolated process samples, host-normalized; p50/p95 over the ' +
             'class\'s pinned handles, compared with the same handles measured on the release ' +
             `engine on this host class. Below one second, blocking requires over ${budgets.maxQueryClassRatio}x and ` +
-            `+${budgets.minQueryClassDeltaMs}ms; once either time reaches one second, the ratio limit is ` +
-            `${budgets.maxSlowQueryClassRatio}x. Adding ${budgets.maxQueryClassDeltaMs}ms always blocks. ` +
+            `+${budgets.minQueryClassDeltaMs}ms; once either time reaches one second, the limits are ` +
+            `${budgets.maxSlowQueryClassRatio}x and +${budgets.minSlowQueryClassDeltaMs}ms. ` +
+            `Adding ${budgets.maxQueryClassDeltaMs}ms always blocks. ` +
             'Smaller increases over 1.15x and +5ms are warnings. ' +
             'Queries with a new reference band or declaration inventory retain their raw ' +
             'release comparison and gate the following capability cohorts against the first working ' +

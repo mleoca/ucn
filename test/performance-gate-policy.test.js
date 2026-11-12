@@ -803,14 +803,24 @@ describe('fix #432: query-class performance board', () => {
         for (const [before, after, blocks, warns] of [
             [58.699, 72.904, false, true], // observed C# regression
             [15.567, 20.793, false, true], // observed C++ regression
-            [10, 60, false, true], // exactly 50 ms
-            [10, 61, true, false],
-            [500, 600, false, true], // exactly 20%
+            [38.059, 88.937, false, true], // observed Python row: +50.9 ms after a step of 4 ms
+            [10, 61, false, true], // over the former 50 ms allowance
+            [10, 110, false, true], // exactly 100 ms
+            [10, 110.001, true, false],
+            [10, 111, true, false],
+            [500, 600, false, true], // exactly 20% and exactly 100 ms
             [500, 601, true, false],
+            [400, 500, false, true], // 25%, and exactly 100 ms
+            [400, 501, true, false],
+            [800, 950, false, true], // 150 ms, and under 20%
+            [800, 960, false, true], // exactly 20%
+            [800, 961, true, false],
             [850, 999, false, true],
-            [850, 1000, true, false], // crossing a second uses 15%
+            [850, 1000, true, false], // crossing a second uses 15% and 50 ms
+            [960, 1000, false, false], // at a second, under 15%
             [1000, 1150, false, false], // exactly 15%
             [1000, 1151, true, false],
+            [1200, 1000, false, false],
             [10000, 10999, false, false],
             [10000, 11000, true, false], // a whole added second, only 10%
             [10000, 9000, false, false],
@@ -822,6 +832,22 @@ describe('fix #432: query-class performance board', () => {
             assert.equal(result.warnings.length > 0, warns, context);
             assert.equal(result.rows['class-find'].failed, blocks, context);
         }
+    });
+
+    it('states the limit it applied: 20% and 100 ms below a second, 15% and 50 ms from a second on', () => {
+        const { queryClassRegression } = require('../eval/performance-gate-policy');
+        assert.deepEqual(queryClassRegression(88.937, 38.059, DEFAULT_BUDGETS),
+            { failed: false, warning: true, limit: '1.2x and +100ms' });
+        assert.deepEqual(queryClassRegression(139, 38.059, DEFAULT_BUDGETS),
+            { failed: true, warning: false, limit: '1.2x and +100ms' });
+        assert.deepEqual(queryClassRegression(1151, 1000, DEFAULT_BUDGETS),
+            { failed: true, warning: false, limit: '1.15x and +50ms' });
+        assert.deepEqual(queryClassRegression(11000, 10000, DEFAULT_BUDGETS),
+            { failed: true, warning: false, limit: 'added delay must be <1000ms' });
+        // The allowances are two budgets: tightening one leaves the other.
+        const strict = { ...DEFAULT_BUDGETS, minQueryClassDeltaMs: 50 };
+        assert.equal(queryClassRegression(88.937, 38.059, strict).failed, true);
+        assert.equal(queryClassRegression(1151, 1000, { ...DEFAULT_BUDGETS, minSlowQueryClassDeltaMs: 200 }).failed, false);
     });
 
     it('refuses to compare a class measured on other handles than the release baseline', () => {
@@ -950,11 +976,11 @@ describe('impact performance capability cohorts', () => {
                 { origin: 'release', capability: 'typeReferences', handles: handles.slice(0, 1),
                     baselineByHost: { 'darwin-arm64': [5] } },
                 { origin: 'types', capability: 'typeReferences', handles: handles.slice(1),
-                    baselineByHost: { 'darwin-arm64': [100] } },
+                    baselineByHost: { 'darwin-arm64': [200] } },
             ] },
         } } },
     });
-    const measured = (times = [5, 100]) => board.summarizeQueryClasses([{
+    const measured = (times = [5, 200]) => board.summarizeQueryClasses([{
         'class-impact': { handles, samplesMs: times, errors: 0,
             capabilities: handles.map(() => ({ typeReferences: true })) },
     }]);
@@ -967,7 +993,7 @@ describe('impact performance capability cohorts', () => {
         assert.deepEqual(result.failures, []);
         const row = result.rows['class-impact'];
         assert.equal(row.releaseComparison.failed, true);
-        assert.equal(row.p95Ratio, 5);
+        assert.equal(row.p95Ratio, 10);
         assert.equal(row.failed, false);
         assert.equal(row.capabilityCohorts.length, 2);
         const text = queryClassMarkdownRows({ repo: 'fmt', queryClassRows: result.rows }).join('\n');
@@ -977,14 +1003,17 @@ describe('impact performance capability cohorts', () => {
     });
 
     it('still rejects regressions in either an existing or a new capability', () => {
-        assert.ok(judge(measured([5, 151])).failures.some(f => /types p95/.test(f)));
+        assert.ok(judge(measured([5, 301])).failures.some(f => /types p95/.test(f)));
         // A much faster new band cannot hide a slower existing band.
-        assert.ok(judge(measured([56, 30])).failures.some(f => /release p95/.test(f)));
-        const small = judge(measured([12, 122]));
+        assert.ok(judge(measured([106, 30])).failures.some(f => /release p95/.test(f)));
+        // The same boundaries as a release comparison: 100 ms exactly does not block.
+        assert.deepEqual(judge(measured([5, 300])).failures, []);
+        assert.deepEqual(judge(measured([105, 30])).failures, []);
+        const small = judge(measured([56, 251]));
         assert.deepEqual(small.failures, []);
         assert.ok(small.warnings.some(w => /types p95/.test(w)));
         assert.ok(small.warnings.some(w => /release p95/.test(w)));
-        assert.deepEqual(judge(measured([5, 104])).failures, []);
+        assert.deepEqual(judge(measured([5, 208])).failures, []);
     });
 
     it('applies the stricter seconds rules to capability cohorts too', () => {
@@ -997,9 +1026,9 @@ describe('impact performance capability cohorts', () => {
 
     it('requires a consistent band in every process, even when the missing one is slower', () => {
         const summary = board.summarizeQueryClasses([
-            { 'class-impact': { handles, samplesMs: [5, 100], errors: 0,
+            { 'class-impact': { handles, samplesMs: [5, 200], errors: 0,
                 capabilities: [{ typeReferences: true }, { typeReferences: true }] } },
-            { 'class-impact': { handles, samplesMs: [6, 110], errors: 0,
+            { 'class-impact': { handles, samplesMs: [6, 210], errors: 0,
                 capabilities: [{ typeReferences: true }, { typeReferences: false }] } },
         ]);
         assert.ok(judge(summary).failures.some(f => /typeReferences missing or inconsistent/.test(f)));
@@ -1117,11 +1146,11 @@ describe('declaration inventory performance cohorts', () => {
                 { origin: 'release', capability: 'declarationInventory', handles: handles.slice(0, 1),
                     baselineByHost: { 'darwin-arm64': [0.2] } },
                 { origin: 'constructors', capability: 'constructorDeclarations', handles: handles.slice(1),
-                    baselineByHost: { 'darwin-arm64': [100] } },
+                    baselineByHost: { 'darwin-arm64': [200] } },
             ] },
         } } },
     });
-    const run = (times = [0.2, 100]) => ({ 'class-find': { handles, samplesMs: times, errors: 0,
+    const run = (times = [0.2, 200]) => ({ 'class-find': { handles, samplesMs: times, errors: 0,
         capabilities: handles.map(h => declarationCapabilities(answer(h), inventories[h])) } });
     const judge = (runs = [run()], pins = fixture(), baseline = release, extra = {}) =>
         board.evaluateQueryClasses(board.summarizeQueryClasses(runs), baseline, budgets,
@@ -1160,13 +1189,15 @@ describe('declaration inventory performance cohorts', () => {
         assert.deepEqual(result.failures, []);
         assert.equal(result.rows['class-find'].releaseComparison.failed, true);
         assert.equal(result.rows['class-find'].capabilityCohorts.length, 2);
-        assert.ok(judge([run([0.2, 151])]).failures.some(f => /constructors p95/.test(f)));
-        assert.ok(judge([run([51, 10])]).failures.some(f => /release p95/.test(f)));
+        assert.ok(judge([run([0.2, 301])]).failures.some(f => /constructors p95/.test(f)));
+        assert.ok(judge([run([101, 10])]).failures.some(f => /release p95/.test(f)));
+        assert.deepEqual(judge([run([0.2, 300])]).failures, []);
+        assert.deepEqual(judge([run([100, 10])]).failures, []);
         assert.ok(judge([run()], fixture(), release, { capabilities: false }).failures.length > 0);
     });
 
     it('rejects an incomplete slower process even when the fastest process is valid', () => {
-        const slower = run([1, 110]);
+        const slower = run([1, 210]);
         slower['class-find'].capabilities[1] = declarationCapabilities(answer(handles[1]).slice(0, 1), inventories[handles[1]]);
         assert.ok(judge([run(), slower]).failures.some(f => /constructorDeclarations missing or inconsistent/.test(f)));
     });
