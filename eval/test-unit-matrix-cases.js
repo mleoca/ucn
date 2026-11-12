@@ -17,8 +17,10 @@
  * engine calls conditional: each must be meant), `emptyTestFiles` (files
  * the engine calls test files, with a command, from which nothing runs),
  * `repeats` (bodies that execute more often than the tests listed for
- * them: a table of cases, a second name for one function). `undeclared`
- * and `repeats` name a mark as it is written (`<file>::<label>`), a line
+ * them: a table of cases), `atLeast` (files whose count the engine gives
+ * as a lower bound: every file from which the runner executes something
+ * the engine does not list has to be one). `undeclared` and `repeats`
+ * name a mark as it is written (`<file>::<label>`), a line
  * (`<file>:<line>`) or a run-time label.
  *
  * Two consumers share this data: eval/run-test-unit-matrix.js runs the
@@ -63,9 +65,10 @@ const CASES = [
     // ------------------------------------------------------------------ pytest
     {
         id: 'pytest-what-is-collected', runner: 'pytest',
+        // Counts given as lower bounds.
+        atLeast: ['tests/test_a.py'],
         // A definition inside a branch exists only where the branch runs.
         sometimes: ['tests/test_a.py::test_cond'],
-        repeats: ['tests/test_a.py::test_p'],
         files: {
             'pyproject.toml': '[tool.pytest.ini_options]\n',
             'tests/test_a.py': `${PY}import unittest
@@ -211,6 +214,8 @@ class TestOld:
     },
     {
         id: 'pytest-inherited-tests', runner: 'pytest',
+        // Counts given as lower bounds.
+        atLeast: ['tests/test_outside.py'],
         emptyTestFiles: ['tests/test_outside.py'],
         files: {
             'pytest.ini': '[pytest]\n',
@@ -288,6 +293,8 @@ class TestPlain:
     },
     {
         id: 'pytest-base-from-outside-the-project', runner: 'pytest',
+        // Counts given as lower bounds.
+        atLeast: ['tests/test_o.py'],
         sometimes: ['tests/test_o.py::TestOnDict > test_never'],
         files: {
             'pytest.ini': '[pytest]\n',
@@ -306,6 +313,8 @@ class TestOnAbc(abc.ABC):
     },
     {
         id: 'pytest-what-is-not-collected', runner: 'pytest',
+        // Counts given as lower bounds.
+        atLeast: ['tests/test_switch_elsewhere.py'],
         sometimes: ['tests/test_switch_elsewhere.py::test_decorated_off', 'tests/test_switch_elsewhere.py::test_plain'],
         emptyTestFiles: ['tests/test_marked.py'],
         files: {
@@ -401,6 +410,8 @@ def test_plain():
     },
     {
         id: 'pytest-method-resolution-order', runner: 'pytest',
+        // Counts given as lower bounds.
+        atLeast: ['tests/test_leaf.py'],
         // A class behind a base that is not read runs the same bodies (named below).
         repeats: ['tests/base.py::the only body', 'tests/base.py::the body in Right'],
         files: {
@@ -564,6 +575,8 @@ def test_under_an_annotated_switch():
     // --------------------------------------------------------------- node:test
     {
         id: 'node-test-script', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/helpers.js'],
         // node looks for every file under test/: a helper there is run as a test of its own.
         emptyTestFiles: ['test/helpers.js'],
         files: {
@@ -649,6 +662,8 @@ nodeTest.describe('on default', () => {
     },
     {
         id: 'node-test-binding-not-followed', runner: 'node-test', full: 'node --test test/computed.js',
+        // Counts given as lower bounds.
+        atLeast: ['test/computed.js', 'test/hooks-only.js'],
         emptyTestFiles: ['test/hooks-only.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
@@ -682,6 +697,8 @@ describe('group', () => {
     },
     {
         id: 'node-test-skipped-and-unregistered', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/unregistered.test.js'],
         sometimes: ['test/unregistered.test.js::never registered'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
@@ -713,6 +730,8 @@ test('not left out', () => { mark('test/focus.test.js::not left out'); });
     },
     {
         id: 'node-test-binding-at-the-call', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/bound.test.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'helper.js': 'function it(name, callback) { return name; }\nmodule.exports = { it };\n',
@@ -754,6 +773,8 @@ fake('a function of the module', () => { mark('test/through.test.mjs::a function
     },
     {
         id: 'node-test-names-of-inner-scopes', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/scopes.test.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/scopes.test.js': `${CJS}const { test, describe, it } = require('node:test');
@@ -815,6 +836,8 @@ describe('typed group', () => {
     },
     {
         id: 'node-test-names-not-written', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/e.test.js'],
         sometimes: ['test/e.test.js::from helper', 'test/e.test.js::in callback'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
@@ -839,6 +862,8 @@ describe('uses helper', () => { shared(); });
     // -------------------------------------------------------------------- jest
     {
         id: 'jest-script', runner: 'jest',
+        // Counts given as lower bounds.
+        atLeast: ['src/sum.test.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
             'src/sum.test.js': `${CJS}
@@ -1104,6 +1129,8 @@ describe('stack', function () {
 
     {
         id: 'mocha-shared-behaviour', runner: 'mocha',
+        // Counts given as lower bounds.
+        atLeast: ['test/fifo.test.js', 'test/shared.js'],
         sometimes: ['test/shared.js::pushes'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "mocha --recursive" } }\n',
@@ -1428,6 +1455,8 @@ mod extra {
     },
     {
         id: 'cargo-attribute-macros', runner: 'cargo-test',
+        // Counts given as lower bounds.
+        atLeast: ['src/lib.rs'],
         files: {
             'Cargo.toml': `${CARGO('case_macros')}\n[dev-dependencies]\ntokio = { version = "1", features = ["macros", "rt"] }\nrstest = "0.23"\n`,
             'src/lib.rs': `${RS}
@@ -1468,7 +1497,8 @@ mod tests {
     // ------------------------------------------------------------------ dotnet
     {
         id: 'dotnet-xunit', runner: 'dotnet-test',
-        repeats: ['FooTests.cs::FooTests > Rows'],
+        // Counts given as lower bounds.
+        atLeast: ['FooTests.cs'],
         files: {
             'App.Tests.csproj': CSPROJ(XUNIT),
             'FooTests.cs': `using Xunit;
@@ -1656,7 +1686,8 @@ ${CS}
     },
     {
         id: 'dotnet-mstest', runner: 'dotnet-test',
-        repeats: ['CalcTests.cs::CalcTests > Rows'],
+        // Counts given as lower bounds.
+        atLeast: ['CalcTests.cs'],
         files: {
             'App.Tests.csproj': CSPROJ([['Microsoft.NET.Test.Sdk', '17.12.0'], ['MSTest.TestAdapter', '1.2.1'], ['MSTest.TestFramework', '1.2.1']]),
             'CalcTests.cs': `using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -1684,7 +1715,8 @@ ${CS}
 
     {
         id: 'dotnet-nunit', runner: 'dotnet-test',
-        repeats: ['QueueTests.cs::QueueTests > Rows'],
+        // Counts given as lower bounds.
+        atLeast: ['QueueTests.cs'],
         files: {
             'App.Tests.csproj': CSPROJ([['Microsoft.NET.Test.Sdk', '17.12.0'], ['NUnit', '3.12.0'], ['NUnit3TestAdapter', '4.6.0']]),
             'QueueTests.cs': `using NUnit.Framework;
@@ -1713,7 +1745,8 @@ ${CS}
     // ------------------------------------------------------------------- maven
     {
         id: 'maven-junit5', runner: 'maven',
-        repeats: ['src/test/java/com/x/FooTest.java::FooTest > rows'],
+        // Counts given as lower bounds.
+        atLeast: ['src/test/java/com/x/FooTest.java'],
         files: {
             'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
             'src/test/java/com/x/FooTest.java': `package com.x;
@@ -1859,6 +1892,8 @@ ${JAVA}
     // ------------------------------------------- what a later write leaves
     {
         id: 'node-test-body-given-as-an-expression', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/b.test.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/b.test.js': `${CJS}const { test } = require('node:test');
@@ -1880,6 +1915,8 @@ test(...['spread title', () => { mark('test/b.test.js::spread'); }]);
     },
     {
         id: 'node-test-names-written-again', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/block.test.js', 'test/r.test.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/r.test.js': `${CJS}const { test } = require('node:test');
@@ -1916,6 +1953,8 @@ declare('assigned once', () => { mark('test/once.test.js::assigned once'); });
     },
     {
         id: 'node-test-names-no-scope-settles', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/w.test.js'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
             'test/w.test.js': `${CJS}const { test } = require('node:test');
@@ -1956,6 +1995,8 @@ test('computed key', { ['skip']: true }, () => { mark('test/o.test.js::computed 
     {
         // node runs a file that declares no test as one test.
         id: 'node-test-files-the-script-names', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/smoke.js'],
         full: 'npm test --silent',
         undeclared: ['test/smoke.js::the script'],
         files: {
@@ -1973,6 +2014,8 @@ module.exports = {};
     },
     {
         id: 'node-test-files-node-looks-for', runner: 'node-test',
+        // Counts given as lower bounds.
+        atLeast: ['test/tools/setup.js'],
         undeclared: ['test/tools/setup.js::the script'],
         files: {
             'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
@@ -2119,9 +2162,11 @@ test('left out by the config', () => { mark('test/b.test.js::left out by the con
         },
     },
     {
-        // Code the runner asks: a hook of a conftest.py, a TestMain.
+        // Code the runner asks: a hook of a conftest.py, a TestMain. The
+        // hook here is one pytest calls once for the whole run, with every
+        // test collected: it holds for the tests of the other directory too.
         id: 'pytest-hooks-decide-at-run-time', runner: 'pytest',
-        sometimes: ['tests/test_h.py::test_kept', 'tests/test_h.py::test_left_out'],
+        sometimes: ['other/test_free.py::test_no_hook_above', 'tests/test_h.py::test_kept', 'tests/test_h.py::test_left_out'],
         files: {
             'pytest.ini': '[pytest]\n',
             'tests/__init__.py': '',
@@ -2171,7 +2216,6 @@ def test_kept():
             'tests/test_rebound.py::test_never',
         ],
         // A second name for one function is a second test.
-        repeats: ['tests/test_rebound.py::test_kept', 'tests/test_rebound.py::TestBody > test_m'],
         emptyTestFiles: ['tests/test_marks_branch.py', 'tests/test_marks_grown.py'],
         files: {
             'pytest.ini': '[pytest]\n',
@@ -2282,6 +2326,8 @@ class TestBody:
     },
     {
         id: 'pytest-options-deselect', runner: 'pytest',
+        // Counts given as lower bounds.
+        atLeast: ['tests/test_marked.py'],
         sometimes: [
             'tests/test_marked.py::test_decorated_elsewhere',
             'tests/test_marked.py::test_some_cases',
@@ -2451,6 +2497,8 @@ def test_unreached():
     // ------------------------------------- marks whose argument is a value
     {
         id: 'dotnet-xunit-skip-is-a-value', runner: 'dotnet-test',
+        // Counts given as lower bounds.
+        atLeast: ['SkipValues.cs'],
         sometimes: ['SkipValues.cs::SkipValues > ConstantElsewhere', 'SkipValues.cs::SkipValues > UnderAnAttributeOfTheProject'],
         files: {
             'App.Tests.csproj': CSPROJ(XUNIT),
@@ -2609,6 +2657,2245 @@ mod tests {
     #[ignore = "takes long"]
     fn ignored_with_a_reason() { mark("src/lib.rs::tests > ignored_with_a_reason"); }
 }
+`,
+        },
+    },
+    // ----- pytest: a switch through the lookup order and through imports
+    {
+        id: 'pytest-switch-not-a-literal-over-a-base-switched-off', runner: 'pytest',
+        sometimes: ['tests/test_a.py::TestActual > test_actual'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class Base:
+    __test__ = False
+    def test_actual(self):
+        mark(rid())
+
+class TestActual(Base):
+    __test__ = bool(1)
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-not-a-literal-base-in-another-file', runner: 'pytest',
+        sometimes: ['tests/test_a.py::TestActual > test_actual'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/base.py': `${PY}${RID}class Base:
+    __test__ = False
+    def test_actual(self):
+        mark(rid())
+`,
+            'tests/test_a.py': `from tests.base import Base
+
+class TestActual(Base):
+    __test__ = bool(1)
+`,
+        },
+    },
+    {
+        id: 'pytest-base-switch-not-a-literal-false', runner: 'pytest',
+        sometimes: ['tests/test_a.py::Base > test_inherited', 'tests/test_a.py::TestX > test_inherited', 'tests/test_a.py::TestX > test_own'],
+        emptyTestFiles: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class Base:
+    __test__ = bool(0)
+    def test_inherited(self):
+        mark(rid())
+
+class TestX(Base):
+    def test_own(self):
+        mark(rid())
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-base-switch-not-a-literal-true', runner: 'pytest',
+        sometimes: ['tests/test_a.py::Base > test_inherited', 'tests/test_a.py::TestX > test_inherited', 'tests/test_a.py::TestX > test_own'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class Base:
+    __test__ = bool(1)
+    def test_inherited(self):
+        mark(rid())
+
+class TestX(Base):
+    def test_own(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-nearest-in-the-lookup-order', runner: 'pytest',
+        sometimes: ['tests/test_a.py::TestC > test_own'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class A:
+    __test__ = False
+
+class B(A):
+    __test__ = bool(1)
+
+class TestC(B):
+    def test_own(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-module-switch-holds-for-imported-tests', runner: 'pytest',
+        sometimes: ['tests/test_b.py::test_x'],
+        emptyTestFiles: ['tests/test_b.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def test_x():
+    mark(rid())
+`,
+            'tests/test_b.py': 'from tests.test_a import test_x\n__test__ = bool(0)\n',
+        },
+    },
+    {
+        id: 'pytest-module-mark-holds-for-imported-tests', runner: 'pytest',
+        emptyTestFiles: ['tests/test_b.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def test_x():
+    mark(rid())
+
+class TestK:
+    def test_m(self):
+        mark(rid())
+`,
+            'tests/test_b.py': `import pytest
+from tests.test_a import test_x, TestK
+pytestmark = pytest.mark.skip
+`,
+        },
+    },
+    {
+        id: 'pytest-module-skip-holds-for-imported-tests', runner: 'pytest',
+        sometimes: ['tests/test_b.py::TestK > test_m', 'tests/test_b.py::test_x'],
+        emptyTestFiles: ['tests/test_b.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def test_x():
+    mark(rid())
+
+class TestK:
+    def test_m(self):
+        mark(rid())
+`,
+            'tests/test_b.py': `import pytest
+from tests.test_a import test_x, TestK
+pytest.importorskip("no_such_module_ucn")
+`,
+        },
+    },
+    {
+        id: 'pytest-mark-of-a-base-class', runner: 'pytest',
+        emptyTestFiles: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}import pytest
+
+@pytest.mark.skip
+class Base:
+    def test_inherited(self):
+        mark(rid())
+
+class TestX(Base):
+    def test_own(self):
+        mark(rid())
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-pytestmark-of-a-base-class-in-another-file', runner: 'pytest',
+        emptyTestFiles: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/base.py': `${PY}${RID}import pytest
+
+class Base:
+    pytestmark = pytest.mark.skip
+    def test_inherited(self):
+        mark(rid())
+`,
+            'tests/test_a.py': `${PY}${RID}from tests.base import Base
+
+class TestX(Base):
+    def test_own(self):
+        mark(rid())
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-mark-of-a-base-module-stays-there', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/base.py': `${PY}${RID}import pytest
+pytestmark = pytest.mark.skip
+
+class Base:
+    def test_inherited(self):
+        mark(rid())
+`,
+            'tests/test_a.py': `from tests.base import Base
+
+class TestX(Base):
+    pass
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-written-on-an-imported-class', runner: 'pytest',
+        emptyTestFiles: ['tests/test_b.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class TestA:
+    def test_m(self):
+        mark(rid())
+`,
+            'tests/test_b.py': 'from tests.test_a import TestA\nTestA.__test__ = False\n',
+        },
+    },
+    {
+        id: 'pytest-switch-written-through-a-string', runner: 'pytest',
+        sometimes: ['tests/test_a.py::TestX > test_m', 'tests/test_a.py::test_f'],
+        atLeast: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}class TestX:
+    def test_m(self):
+        mark("tests/test_a.py::TestX > test_m")
+
+setattr(TestX, "__test__", False)
+
+def test_f():
+    mark("tests/test_a.py::test_f")
+
+globals()["__test__"] = True
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-set-by-a-decorator', runner: 'pytest',
+        sometimes: ['tests/test_a.py::TestX > test_m'],
+        emptyTestFiles: ['tests/test_a.py'],
+        atLeast: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}def nottest(c):
+    c.__test__ = False
+    return c
+
+@nottest
+class TestX:
+    def test_m(self):
+        mark("tests/test_a.py::TestX > test_m")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-set-by-a-base-for-its-subclasses', runner: 'pytest',
+        sometimes: ['tests/test_a.py::TestX > test_m'],
+        emptyTestFiles: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/base.py': `class Base:
+    def __init_subclass__(cls, **kw):
+        cls.__test__ = False
+`,
+            'tests/test_a.py': `${PY}from tests.base import Base
+
+class TestX(Base):
+    def test_m(self):
+        mark("tests/test_a.py::TestX > test_m")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-class-of-the-project-named-testcase', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class BaseTestCase:
+    def test_x(self):
+        mark(rid())
+
+class MyChecks(BaseTestCase):
+    def test_y(self):
+        mark(rid())
+
+class TestReal(BaseTestCase):
+    def test_z(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-unittest-switches', runner: 'pytest',
+        sometimes: ['tests/test_a.py::Computed > test_shared'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}import unittest
+
+class Base(unittest.TestCase):
+    __test__ = False
+    def test_shared(self):
+        mark(rid())
+
+class Real(Base):
+    __test__ = True
+
+class Computed(Base):
+    __test__ = bool(1)
+
+class Inherits(Base):
+    pass
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-written-on-an-imported-function', runner: 'pytest',
+        emptyTestFiles: ['tests/test_b.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def test_x():
+    mark(rid())
+`,
+            'tests/test_b.py': 'from tests.test_a import test_x\ntest_x.__test__ = False\n',
+        },
+    },
+    {
+        id: 'pytest-switch-in-a-branch-over-a-base-switched-off', runner: 'pytest',
+        sometimes: ['tests/test_a.py::TestActual > test_actual'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}import sys
+
+class Base:
+    __test__ = False
+    def test_actual(self):
+        mark(rid())
+
+class TestActual(Base):
+    if sys.version_info > (3,):
+        __test__ = True
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-deleted-leaves-the-base-switch', runner: 'pytest',
+        emptyTestFiles: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class Base:
+    __test__ = False
+    def test_actual(self):
+        mark(rid())
+
+class TestActual(Base):
+    __test__ = True
+    del __test__
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-written-through-another-name', runner: 'pytest',
+        sometimes: ['tests/test_a.py::Base > test_actual', 'tests/test_a.py::TestActual > test_actual'],
+        emptyTestFiles: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/base.py': `${PY}${RID}class Base:
+    def test_actual(self):
+        mark(rid())
+
+for c in (Base,):
+    c.__test__ = False
+`,
+            'tests/test_a.py': `from tests.base import Base
+
+class TestActual(Base):
+    pass
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-module-skips-through-another-name', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}import pytest
+skip = pytest.skip
+skip("x", allow_module_level=True)
+
+def test_a():
+    mark("tests/test_x.py::test_a")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-module-skips-in-a-function-it-calls', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}import pytest
+
+def need():
+    pytest.skip("x", allow_module_level=True)
+
+need()
+
+def test_a():
+    mark("tests/test_x.py::test_a")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-switch-on-collects-whatever-the-name', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class Helper:
+    __test__ = True
+    def test_m(self):
+        mark(rid())
+
+class Truthy:
+    __test__ = 1
+    def test_m(self):
+        mark(rid())
+
+class Base2:
+    __test__ = True
+    def test_b(self):
+        mark(rid())
+
+class Derived(Base2):
+    def test_d(self):
+        mark(rid())
+
+def helper():
+    mark(rid())
+helper.__test__ = True
+
+def truthy():
+    mark(rid())
+truthy.__test__ = 1
+
+class TestMeth:
+    def check(self):
+        mark(rid())
+    check.__test__ = True
+    def test_off(self):
+        mark(rid())
+    test_off.__test__ = False
+`,
+        },
+    },
+    // ------------------------------ pytest: code that runs before a test
+    {
+        id: 'pytest-hook-changes-items-through-another-name', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': `def pytest_collection_modifyitems(items):
+    selected = items
+    selected.clear()
+`,
+        },
+    },
+    {
+        id: 'pytest-hook-changes-items-in-place', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': 'def pytest_collection_modifyitems(items):\n    items *= 0\n',
+        },
+    },
+    {
+        id: 'pytest-hook-calls-a-method-that-is-not-read', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': 'def pytest_collection_modifyitems(items):\n    items.__delitem__(slice(None))\n',
+        },
+    },
+    {
+        id: 'pytest-hook-sets-an-option', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': 'def pytest_configure(config):\n    config.option.markexpr = "nope"\n',
+        },
+    },
+    {
+        id: 'pytest-hook-bound-by-an-import', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/plugin.py': 'def pytest_collection_modifyitems(items):\n    items.clear()\n',
+            'tests/conftest.py': 'from tests.plugin import pytest_collection_modifyitems\n',
+        },
+    },
+    {
+        id: 'pytest-hook-brought-by-a-star-import', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/plugin.py': 'def pytest_collection_modifyitems(items):\n    items.clear()\n',
+            'tests/conftest.py': 'from tests.plugin import *\n',
+        },
+    },
+    {
+        id: 'pytest-hook-bound-by-an-assignment', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': 'pytest_collection_modifyitems = lambda items: items.clear()\n',
+        },
+    },
+    {
+        id: 'pytest-hook-of-a-registered-object', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': `class P:
+    def pytest_collection_modifyitems(self, items):
+        items.clear()
+
+def pytest_configure(config):
+    config.pluginmanager.register(P())
+`,
+        },
+    },
+    {
+        id: 'pytest-fixture-every-test-gets-skips', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': `import pytest
+
+@pytest.fixture(autouse=True)
+def guard():
+    pytest.skip("no")
+`,
+        },
+    },
+    {
+        id: 'pytest-fixture-asked-for-skips', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_c', 'tests/test_x.py::test_d'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}import pytest
+
+def test_a(db):
+    mark("tests/test_x.py::test_a")
+
+def test_b(plain):
+    mark("tests/test_x.py::test_b")
+
+def test_c(client):
+    mark("tests/test_x.py::test_c")
+
+@pytest.mark.usefixtures("db")
+def test_d():
+    mark("tests/test_x.py::test_d")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': `import pytest
+
+@pytest.fixture
+def db():
+    pytest.skip("no db")
+
+@pytest.fixture
+def client(db):
+    return 1
+
+@pytest.fixture
+def plain():
+    return 1
+`,
+        },
+    },
+    {
+        id: 'pytest-setup-of-the-module-skips', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}import pytest
+
+def setup_module(module):
+    pytest.skip("x")
+
+def test_a():
+    mark("tests/test_x.py::test_a")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-setup-of-a-class-skips', runner: 'pytest',
+        sometimes: ['tests/test_x.py::TestK > test_a', 'tests/test_x.py::K > test_b', 'tests/test_x.py::TestDerived > test_c'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}import pytest, unittest
+from tests.base import Base
+
+class TestK:
+    def setup_method(self):
+        pytest.skip("x")
+    def test_a(self):
+        mark("tests/test_x.py::TestK > test_a")
+
+class K(unittest.TestCase):
+    def setUp(self):
+        self.skipTest("x")
+    def test_b(self):
+        mark("tests/test_x.py::K > test_b")
+
+class TestDerived(Base):
+    def test_c(self):
+        mark("tests/test_x.py::TestDerived > test_c")
+
+class TestFree:
+    def setup_method(self):
+        self.ready = True
+    def test_d(self):
+        mark("tests/test_x.py::TestFree > test_d")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/base.py': `import pytest
+class Base:
+    def setup_method(self):
+        pytest.skip("x")
+`,
+        },
+    },
+    {
+        id: 'pytest-hook-answers-for-the-call', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': 'def pytest_pyfunc_call(pyfuncitem):\n    return True\n',
+        },
+    },
+    {
+        id: 'pytest-hook-after-collection-clears', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': 'def pytest_collection_finish(session):\n    session.items.clear()\n',
+        },
+    },
+    {
+        id: 'pytest-fixture-of-a-class-skips', runner: 'pytest',
+        sometimes: ['tests/test_x.py::TestK > test_a'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}import pytest
+
+class TestK:
+    @pytest.fixture(autouse=True)
+    def guard(self):
+        pytest.skip("no")
+    def test_a(self):
+        mark("tests/test_x.py::TestK > test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-no-parameter-to-run-with', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a'],
+        atLeast: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}import pytest
+
+NONE = []
+
+@pytest.fixture(params=[])
+def p(request):
+    return request.param
+
+def test_a(p):
+    mark("tests/test_x.py::test_a")
+
+@pytest.mark.parametrize("v", [])
+def test_b(v):
+    mark("tests/test_x.py::test_b")
+
+@pytest.mark.parametrize("v", NONE)
+def test_c(v):
+    mark("tests/test_x.py::test_c")
+
+@pytest.mark.parametrize("v", [1])
+def test_d(v):
+    mark("tests/test_x.py::test_d")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-hook-of-the-module-generates', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a'],
+        emptyTestFiles: ['tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def pytest_generate_tests(metafunc):
+    metafunc.parametrize("x", [])
+
+def test_a(x):
+    mark("tests/test_x.py::test_a")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+        },
+    },
+    {
+        id: 'pytest-plugin-named-by-a-conftest', runner: 'pytest',
+        sometimes: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b', 'free/test_free.py::test_free'],
+        emptyTestFiles: ['free/test_free.py', 'tests/test_x.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/plugin.py': 'def pytest_collection_modifyitems(items):\n    items.clear()\n',
+            'conftest.py': 'pytest_plugins = ["tests.plugin"]\n',
+        },
+    },
+    {
+        id: 'pytest-code-beside-tests-that-decides-nothing', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def setup_module(module):
+    module.ready = True
+
+def test_a(number):
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+
+if __name__ == "__main__":
+    raise SystemExit(1)
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': `import gc
+import pytest
+
+def pytest_addoption(parser):
+    group = parser.getgroup("mine")
+    group.addoption("--mine", action="store_true")
+    parser.addini("mine_value", "help")
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: slow tests")
+    if config.getoption("--mine"):
+        gc.collect()
+
+def pytest_runtest_setup():
+    gc.collect()
+
+def pytest_collection():
+    gc.disable()
+
+def pytest_report_header():
+    return "a header"
+
+def pytest_sessionfinish():
+    gc.enable()
+
+@pytest.fixture(autouse=True)
+def clean_environ(monkeypatch):
+    monkeypatch.delenv("UCN_NOT_SET", raising=False)
+    yield
+
+@pytest.fixture
+def number():
+    return 3
+`,
+        },
+    },
+    {
+        id: 'pytest-conftest-leaves-a-file-out-of-the-default-run', runner: 'pytest',
+        notRunByDefault: ['tests/test_x.py::test_a', 'tests/test_x.py::test_b'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_x.py': `${PY}def test_a():
+    mark("tests/test_x.py::test_a")
+
+def test_b():
+    mark("tests/test_x.py::test_b")
+`,
+            'free/__init__.py': '',
+            'free/test_free.py': `${PY}def test_free():
+    mark("free/test_free.py::test_free")
+`,
+            'tests/conftest.py': 'collect_ignore = ["test_x.py"]\n',
+        },
+    },
+    // -------------- pytest: tests under names bound without a definition
+    {
+        id: 'pytest-another-name-for-a-function', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def test_actual():
+    mark(rid())
+
+test_alias = test_actual
+helper_alias = test_actual
+`,
+        },
+    },
+    {
+        id: 'pytest-another-name-for-a-class-and-a-method', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class TestK:
+    def test_m(self):
+        mark(rid())
+    test_n = test_m
+    other = test_m
+
+TestAlias = TestK
+NotATest = TestK
+`,
+        },
+    },
+    {
+        id: 'pytest-another-name-for-an-import', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/helpers.py': `${PY}${RID}def check():
+    mark(rid())
+
+class Checks:
+    def test_c(self):
+        mark(rid())
+`,
+            'tests/test_a.py': `from tests.helpers import check, Checks
+
+test_check = check
+TestChecks = Checks
+`,
+        },
+    },
+    {
+        id: 'pytest-import-of-an-import', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def test_x():
+    mark(rid())
+`,
+            'tests/test_b.py': 'from tests.test_a import test_x\n',
+            'tests/test_c.py': 'from tests.test_b import test_x\n',
+        },
+    },
+    {
+        id: 'pytest-star-import', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/shared.py': `${PY}${RID}def test_shared():
+    mark(rid())
+
+def _test_private():
+    mark(rid())
+
+class TestShared:
+    def test_m(self):
+        mark(rid())
+`,
+            'tests/test_a.py': 'from tests.shared import *\n',
+        },
+    },
+    {
+        id: 'pytest-star-import-of-a-listed-module', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/shared.py': `${PY}${RID}__all__ = ["test_listed"]
+
+def test_listed():
+    mark(rid())
+
+def test_unlisted():
+    mark(rid())
+`,
+            'tests/test_a.py': 'from tests.shared import *\n',
+        },
+    },
+    {
+        id: 'pytest-star-import-of-a-module-whose-list-is-computed', runner: 'pytest',
+        atLeast: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/shared.py': `${PY}${RID}__all__ = [name for name in dir() if name.startswith("test")]
+
+def test_late():
+    mark(rid())
+`,
+            'tests/test_a.py': `${PY}from tests.shared import *
+
+def test_own():
+    mark("tests/test_a.py::test_own")
+`,
+        },
+    },
+    {
+        id: 'pytest-names-bound-without-an-assignment', runner: 'pytest',
+        atLeast: ['tests/test_a.py', 'tests/test_b.py', 'tests/test_c.py'],
+        undeclared: ['tests/test_a.py::test_made', 'tests/test_b.py::test_dynamic', 'tests/test_c.py::test_set'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def make():
+    def inner():
+        mark(rid())
+    return inner
+
+test_made = make()
+
+def test_plain():
+    mark("tests/test_a.py::test_plain")
+`,
+            'tests/test_b.py': `${PY}${RID}def body():
+    mark(rid())
+
+globals()["test_dynamic"] = body
+
+def test_plain():
+    mark("tests/test_b.py::test_plain")
+`,
+            'tests/test_c.py': `${PY}${RID}import sys
+
+def body():
+    mark(rid())
+
+setattr(sys.modules[__name__], "test_set", body)
+
+def test_plain():
+    mark("tests/test_c.py::test_plain")
+`,
+        },
+    },
+    {
+        id: 'pytest-lambda-and-values-under-test-names', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}test_lambda = lambda: mark("tests/test_a.py::test_lambda")
+test_data = [1, 2, 3]
+test_text = "a"
+test_none = None
+
+def test_plain():
+    mark("tests/test_a.py::test_plain")
+`,
+        },
+    },
+    {
+        id: 'pytest-abstract-classes', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}import abc
+import unittest
+
+class TestAbs(abc.ABC):
+    @abc.abstractmethod
+    def make(self): ...
+    def test_x(self):
+        mark(rid())
+
+class TestImpl(TestAbs):
+    def make(self):
+        return 1
+
+class TestNoMeta:
+    @abc.abstractmethod
+    def make(self): ...
+    def test_x(self):
+        mark(rid())
+
+class UTAbs(unittest.TestCase, abc.ABC):
+    @abc.abstractmethod
+    def make(self): ...
+    def test_x(self):
+        mark(rid())
+
+class UTImpl(UTAbs):
+    def make(self):
+        return 1
+`,
+        },
+    },
+    {
+        id: 'pytest-unittest-loader-rules', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}import unittest
+
+class UT(unittest.TestCase):
+    def test_a(self):
+        mark(rid())
+    test_a.__test__ = False
+    def test_b(self):
+        mark(rid())
+    def check(self):
+        mark(rid())
+
+class UTRun(unittest.TestCase):
+    def runTest(self):
+        mark(rid())
+
+class TestHolder(unittest.TestCase):
+    class TestInner:
+        def test_i(self):
+            mark(rid())
+    def test_o(self):
+        mark(rid())
+
+class Child(UT):
+    test_b = None
+    def test_c(self):
+        mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-class-inside-a-class-not-collected', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class Outer:
+    class TestInner:
+        def test_i(self):
+            mark(rid())
+
+class TestOuterOff:
+    __test__ = False
+    class TestInner2:
+        def test_i(self):
+            mark(rid())
+
+class TestOuter:
+    class TestInner3:
+        def test_i(self):
+            mark(rid())
+`,
+        },
+    },
+    {
+        id: 'pytest-counts-of-parametrized-tests', runner: 'pytest',
+        atLeast: ['tests/test_a.py', 'tests/test_b.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}import pytest
+
+@pytest.fixture(params=[1, 2])
+def twice(request):
+    return request.param
+
+def test_fixture_table(twice):
+    mark("tests/test_a.py::test_fixture_table")
+
+def test_plain():
+    mark("tests/test_a.py::test_plain")
+`,
+            'tests/test_b.py': `${PY}import pytest
+
+pytestmark = pytest.mark.parametrize("v", [1, 2])
+
+def test_module_table(v):
+    mark("tests/test_b.py::test_module_table")
+`,
+            'tests/test_c.py': `${PY}def test_exact():
+    mark("tests/test_c.py::test_exact")
+`,
+        },
+    },
+    // ------------------- tests a file runs and does not declare in place
+    {
+        id: 'node-test-call-not-read-beside-tests', runner: 'node-test',
+        atLeast: ['test/a.test.js'],
+        undeclared: ['test/a.test.js::through a name that is not read'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/a.test.js': `${CJS}const { test, it } = require('node:test');
+const maybe = process.env.UCN_NEVER ? it.skip : it;
+maybe('through a name that is not read', () => { mark('test/a.test.js::through a name that is not read'); });
+test('read', () => { mark('test/a.test.js::read'); });
+`,
+        },
+    },
+    {
+        id: 'node-test-runner-function-handed-on', runner: 'node-test',
+        atLeast: ['test/a.test.js', 'test/b.test.js', 'test/c.test.js'],
+        undeclared: ['test/a.test.js::through a parameter', 'test/b.test.js::through a list', 'test/c.test.js::through call'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "node --test" } }\n',
+            'test/a.test.js': `${CJS}const { test } = require('node:test');
+function define(fn) { fn('through a parameter', () => { mark('test/a.test.js::through a parameter'); }); }
+define(test);
+test('read', () => { mark('test/a.test.js::read'); });
+`,
+            'test/b.test.js': `${CJS}const { test } = require('node:test');
+[test].forEach(each => each('through a list', () => { mark('test/b.test.js::through a list'); }));
+test('read', () => { mark('test/b.test.js::read'); });
+`,
+            'test/c.test.js': `${CJS}const { test } = require('node:test');
+test.call(null, 'through call', () => { mark('test/c.test.js::through call'); });
+test('read', () => { mark('test/c.test.js::read'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-function-of-another-module-declares', runner: 'mocha',
+        sometimes: ['test/shared.js::behaves'],
+        atLeast: ['test/a.test.js', 'test/b.test.js', 'test/shared.js'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            'test/shared.js': `${CJS}module.exports = function behaves(name) {
+    it('behaves', function () { mark('test/shared.js::behaves'); });
+};
+`,
+            'test/through.js': 'const behaves = require(\'./shared\');\nmodule.exports = function again(name) { behaves(name); };\n',
+            'test/a.test.js': `${CJS}const behaves = require('./shared');
+describe('a', function () {
+    behaves('a');
+    it('own', function () { mark('test/a.test.js::a > own'); });
+});
+`,
+            'test/b.test.js': `${CJS}const again = require('./through');
+describe('b', function () {
+    again('b');
+    it('own', function () { mark('test/b.test.js::b > own'); });
+});
+`,
+            'test/c.test.js': `${CJS}const path = require('path');
+describe('c', function () {
+    it('own', function () { mark('test/c.test.js::c > own'); path.join('a', 'b'); });
+});
+`,
+        },
+    },
+    {
+        id: 'cargo-tests-a-macro-makes', runner: 'cargo-test',
+        atLeast: ['src/lib.rs'],
+        undeclared: ['src/lib.rs::made by a macro'],
+        repeats: ['src/lib.rs::made by a macro'],
+        files: {
+            'Cargo.toml': `[package]
+name = "case_macro_tests"
+version = "0.1.0"
+edition = "2021"
+`,
+            'src/lib.rs': `${RS}
+macro_rules! cases {
+    ($($name:ident),*) => {
+        $(
+            #[test]
+            fn $name() { crate::mark("src/lib.rs::made by a macro"); }
+        )*
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    cases!(first, second);
+
+    #[test]
+    fn written() { crate::mark("src/lib.rs::tests > written"); }
+}
+`,
+        },
+    },
+    // ---------------- setup code and names of the project, other runners
+    {
+        id: 'mocha-setup-hook-skips', runner: 'mocha',
+        sometimes: ['test/a.test.js::each > never runs either', 'test/a.test.js::needs a service > never runs'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            'test/a.test.js': `${CJS}describe('needs a service', function () {
+    before(function () { this.skip(); });
+    it('never runs', function () { mark('test/a.test.js::needs a service > never runs'); });
+});
+describe('each', function () {
+    beforeEach(function () { this.skip(); });
+    it('never runs either', function () { mark('test/a.test.js::each > never runs either'); });
+});
+describe('free', function () {
+    before(function () { this.timeout(1000); });
+    it('runs', function () { mark('test/a.test.js::free > runs'); });
+});
+`,
+        },
+    },
+    {
+        id: 'vitest-setup-hook-skips', runner: 'vitest',
+        sometimes: ['test/a.test.js::each > never runs'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'test/a.test.js': `${ESM}import { describe, it, beforeEach } from 'vitest';
+describe('each', () => {
+    beforeEach(context => { context.skip(); });
+    it('never runs', () => { mark('test/a.test.js::each > never runs'); });
+});
+describe('free', () => {
+    it('runs', () => { mark('test/a.test.js::free > runs'); });
+});
+`,
+        },
+    },
+    {
+        id: 'maven-names-of-the-project-like-junits', runner: 'maven',
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Test.java': `package com.x;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Test {}
+`,
+            'src/test/java/com/x/Disabled.java': `package com.x;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Disabled {}
+`,
+            'src/test/java/com/x/BaseTestCase.java': `package com.x;
+
+public class BaseTestCase {
+}
+`,
+            'src/test/java/com/x/OwnAnnotationTest.java': `package com.x;
+
+class OwnAnnotationTest {
+${JAVA}
+    @Test
+    void notJunits() { mark("src/test/java/com/x/OwnAnnotationTest.java::OwnAnnotationTest > notJunits"); }
+
+    @org.junit.jupiter.api.Test
+    void junits() { mark("src/test/java/com/x/OwnAnnotationTest.java::OwnAnnotationTest > junits"); }
+
+    @org.junit.jupiter.api.Test
+    @Disabled
+    void ownDisabledRuns() { mark("src/test/java/com/x/OwnAnnotationTest.java::OwnAnnotationTest > ownDisabledRuns"); }
+}
+`,
+            'src/test/java/com/x/LooksLegacyTest.java': `package com.x;
+
+public class LooksLegacyTest extends BaseTestCase {
+${JAVA}
+    public void testNotJunit3() { mark("src/test/java/com/x/LooksLegacyTest.java::LooksLegacyTest > testNotJunit3"); }
+
+    @org.junit.jupiter.api.Test
+    void real() { mark("src/test/java/com/x/LooksLegacyTest.java::LooksLegacyTest > real"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-setup-assumes', runner: 'maven',
+        sometimes: ['src/test/java/com/x/AssumeTest.java::AssumeTest > neverRuns'],
+        emptyTestFiles: ['src/test/java/com/x/AssumeTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/AssumeTest.java': `package com.x;
+
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+class AssumeTest {
+${JAVA}
+    @BeforeEach
+    void needs() { Assumptions.assumeTrue(System.getenv("UCN_NEVER_SET") != null); }
+
+    @Test
+    void neverRuns() { mark("src/test/java/com/x/AssumeTest.java::AssumeTest > neverRuns"); }
+}
+`,
+            'src/test/java/com/x/FreeTest.java': `package com.x;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+class FreeTest {
+${JAVA}
+    int ready;
+
+    @BeforeEach
+    void prepare() { ready = 1; }
+
+    @Test
+    void runs() { mark("src/test/java/com/x/FreeTest.java::FreeTest > runs"); }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-names-of-the-project-like-xunits', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Own.cs': `namespace Own
+{
+    public class FactAttribute : System.Attribute { }
+}
+`,
+            'Tests.cs': `namespace Own.Tests
+{
+${CS}
+    public class Lookalike
+    {
+        [Own.Fact]
+        public void NotXunits() { Rec.Mark("Tests.cs::Lookalike > NotXunits"); }
+
+        [Xunit.Fact]
+        public void Xunits() { Rec.Mark("Tests.cs::Lookalike > Xunits"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-setup-ignores', runner: 'dotnet-test',
+        sometimes: ['Tests.cs::Guarded > NeverRuns'],
+        files: {
+            'App.Tests.csproj': `<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><IsPackable>false</IsPackable><Nullable>disable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit" Version="3.12.0" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+  </ItemGroup>
+</Project>
+`,
+            'Tests.cs': `using NUnit.Framework;
+
+namespace N.Tests
+{
+${CS}
+    public class Guarded
+    {
+        [SetUp]
+        public void Needs() { Assert.Ignore("not here"); }
+
+        [Test]
+        public void NeverRuns() { Rec.Mark("Tests.cs::Guarded > NeverRuns"); }
+    }
+
+    public class Free
+    {
+        [SetUp]
+        public void Prepare() { }
+
+        [Test]
+        public void Runs() { Rec.Mark("Tests.cs::Free > Runs"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'go-test-main-hands-m-on', runner: 'go-test',
+        sometimes: ['a_test.go::TestBehind'],
+        emptyTestFiles: ['a_test.go'],
+        files: {
+            'go.mod': `module example.com/alias
+
+go 1.21
+`,
+            'mark.go': GO('alias'),
+            'main_test.go': `package alias
+
+import (
+	"os"
+	"testing"
+)
+
+func run(m *testing.M) int {
+	if os.Getenv("UCN_NEVER_SET") == "" {
+		return 0
+	}
+	return m.Run()
+}
+
+func TestMain(m *testing.M) {
+	os.Exit(run(m))
+}
+`,
+            'a_test.go': `package alias
+
+import "testing"
+
+func TestBehind(t *testing.T) { mark("a_test.go::TestBehind") }
+`,
+        },
+    },
+    {
+        id: 'go-test-main-keeps-run-and-does-not-call-it', runner: 'go-test',
+        sometimes: ['a_test.go::TestBehind'],
+        emptyTestFiles: ['a_test.go'],
+        files: {
+            'go.mod': `module example.com/kept
+
+go 1.21
+`,
+            'mark.go': GO('kept'),
+            'main_test.go': `package kept
+
+import (
+	"os"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	run := m.Run
+	_ = run
+	os.Exit(0)
+}
+`,
+            'a_test.go': `package kept
+
+import "testing"
+
+func TestBehind(t *testing.T) { mark("a_test.go::TestBehind") }
+`,
+        },
+    },
+    // -------------------------------------- a configuration that is code
+    {
+        id: 'jest-config-written-out-selects-nothing', runner: 'jest',
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': `const path = require('path');
+
+module.exports = {
+    verbose: false,
+    coverageDirectory: path.join(__dirname, 'coverage'),
+    moduleNameMapper: { '^@/(.*)$': '<rootDir>/src/$1' },
+};
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-export-written-again', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': 'module.exports = {};\nmodule.exports.testPathIgnorePatterns = [\'case.test.js\'];\n',
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-object-under-a-name-used-again', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': `const config = {};
+config.testPathIgnorePatterns = ['case.test.js'];
+module.exports = config;
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-through-a-function-of-the-file', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': 'function defineConfig(config) { return { ...config, testPathIgnorePatterns: [\'case.test.js\'] }; }\nmodule.exports = defineConfig({});\n',
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-list-filled-after', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': `const config = { testPathIgnorePatterns: [] };
+config.testPathIgnorePatterns.push('case.test.js');
+module.exports = config;
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-object-assign-on-the-export', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': 'module.exports = {};\nObject.assign(module.exports, { testPathIgnorePatterns: [\'case.test.js\'] });\n',
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-module-under-another-name', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': `module.exports = {};
+const m = module;
+m.exports.testPathIgnorePatterns = ['case.test.js'];
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-esm-written-after-the-export', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.mjs': `const config = {};
+export default config;
+config.testPathIgnorePatterns = ['case.test.js'];
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-changed-by-a-function-called', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': `const config = {};
+function tune(c) { c.testPathIgnorePatterns = ['case.test.js']; }
+tune(config);
+module.exports = config;
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-value-under-a-name-used-again', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': `const ignored = [];
+ignored.push('case.test.js');
+module.exports = { testPathIgnorePatterns: ignored };
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-exported-twice', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': 'module.exports = {};\nif (true) { module.exports = { testPathIgnorePatterns: [\'case.test.js\'] }; }\n',
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-written-in-a-value', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': 'module.exports = { verbose: (() => { module.exports.testPathIgnorePatterns = [\'case.test.js\']; return false; })() };\n',
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-define-property', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': `const config = {};
+Object.defineProperty(config, 'testPathIgnorePatterns', { value: ['case.test.js'], enumerable: true });
+module.exports = config;
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-through-the-module-cache', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.js': 'module.exports = {};\nrequire.cache[__filename].exports.testPathIgnorePatterns = [\'case.test.js\'];\n',
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'jest-config-json-with-comments', runner: 'jest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n',
+            'jest.config.json': `{
+  // unit tests only
+  "testPathIgnorePatterns": ["/a/*", "/b*/", "case.test.js"]
+}
+`,
+            'test/case.test.js': `${CJS}test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${CJS}test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-config-written-out-selects-nothing', runner: 'vitest',
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': `import { resolve } from 'node:path';
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+    resolve: { alias: { '@': resolve('./src') } },
+    test: { globals: false, reporters: process.env.CI ? ['dot'] : ['default'] },
+});
+`,
+            'test/case.test.js': `${ESM}import { test } from 'vitest';
+test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${ESM}import { test } from 'vitest';
+test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-config-written-after-define', runner: 'vitest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': `import { defineConfig } from 'vitest/config';
+const config = defineConfig({ test: {} });
+config.test.exclude = ['**/case.test.js'];
+export default config;
+`,
+            'test/case.test.js': `${ESM}import { test } from 'vitest';
+test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${ESM}import { test } from 'vitest';
+test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-config-define-config-of-the-file', runner: 'vitest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': 'function defineConfig(config) { return { test: { exclude: [\'**/case.test.js\'] } }; }\nexport default defineConfig({ test: {} });\n',
+            'test/case.test.js': `${ESM}import { test } from 'vitest';
+test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${ESM}import { test } from 'vitest';
+test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-config-define-config-of-another-file', runner: 'vitest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'define.js': 'export function defineConfig(config) { return { test: { exclude: [\'**/case.test.js\'] } }; }\n',
+            'vitest.config.js': 'import { defineConfig } from \'./define.js\';\nexport default defineConfig({ test: {} });\n',
+            'test/case.test.js': `${ESM}import { test } from 'vitest';
+test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${ESM}import { test } from 'vitest';
+test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-config-plugin-written-in-the-file', runner: 'vitest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': 'import { defineConfig } from \'vitest/config\';\nexport default defineConfig({ plugins: [{ name: \'x\', config: () => ({ test: { exclude: [\'**/case.test.js\'] } }) }], test: {} });\n',
+            'test/case.test.js': `${ESM}import { test } from 'vitest';
+test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${ESM}import { test } from 'vitest';
+test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-config-test-object-under-a-name-used-again', runner: 'vitest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': `import { defineConfig } from 'vitest/config';
+const settings = {};
+settings.exclude = ['**/case.test.js'];
+export default defineConfig({ test: settings });
+`,
+            'test/case.test.js': `${ESM}import { test } from 'vitest';
+test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${ESM}import { test } from 'vitest';
+test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'vitest-config-define-config-shadowed', runner: 'vitest',
+        notRunByDefault: ['test/case.test.js::left out'],
+        files: {
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n',
+            'vitest.config.js': `import { defineConfig as defineProject } from 'vitest/config';
+const defineConfig = c => ({ test: { exclude: ['**/case.test.js'] } });
+export default defineConfig(defineProject({ test: {} }));
+`,
+            'test/case.test.js': `${ESM}import { test } from 'vitest';
+test('left out', () => { mark('test/case.test.js::left out'); });
+`,
+            'test/kept.test.js': `${ESM}import { test } from 'vitest';
+test('kept', () => { mark('test/kept.test.js::kept'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-written-out-selects-nothing', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['other/extra.js::where the configuration points'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.js': 'module.exports = { timeout: 4000 };\n',
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-export-written-again', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.js': 'module.exports = {};\nmodule.exports.spec = [\'other/extra.js\'];\n',
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-object-under-a-name-used-again', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.cjs': `const config = { timeout: 4000 };
+config.spec = ['other/extra.js'];
+module.exports = config;
+`,
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-yaml-on-one-line', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.yml': '{ spec: [other/extra.js] }\n',
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-yaml-keys-indented', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.yml': '  spec: other/extra.js\n  timeout: 4000\n',
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-yaml-key-written-apart', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.yml': '? spec\n: other/extra.js\n',
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-yaml-merged-keys', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.yml': `base: &base
+  spec: other/extra.js
+<<: *base
+`,
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-yaml-key-escaped', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.yml': '"sp\\u0065c": other/extra.js\n',
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    {
+        id: 'mocha-config-json-with-comments', runner: 'mocha',
+        full: 'npx mocha',
+        notRunByDefault: ['test/case.test.js::in the default place'],
+        files: {
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            '.mocharc.jsonc': `{
+  // extra files
+  "spec": ["other/extra.js"] /* trailing */
+}
+`,
+            'test/case.test.js': `${CJS}it('in the default place', function () { mark('test/case.test.js::in the default place'); });
+`,
+            'other/extra.js': `${CJS}it('where the configuration points', function () { mark('other/extra.js::where the configuration points'); });
+`,
+        },
+    },
+    // --------------------------------------- pytest: options of the ini file
+    {
+        id: 'pytest-fixtures-the-ini-file-gives-every-test', runner: 'pytest',
+        sometimes: ['tests/test_a.py::test_x'],
+        emptyTestFiles: ['tests/test_a.py'],
+        files: {
+            'pytest.ini': '[pytest]\nusefixtures = db\n',
+            'conftest.py': 'import pytest\n\n@pytest.fixture\ndef db():\n    pytest.skip("no db")\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}def test_x():
+    mark("tests/test_a.py::test_x")
+`,
+        },
+    },
+    {
+        id: 'pytest-imported-tests-the-ini-file-leaves-out', runner: 'pytest',
+        files: {
+            'pytest.ini': '[pytest]\ncollect_imported_tests = false\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}def test_x():
+    mark(rid())
+
+class TestK:
+    def test_m(self):
+        mark(rid())
+`,
+            'tests/test_b.py': `${PY}${RID}from tests.test_a import test_x, TestK
+from tests.test_a import *
+
+def test_own():
+    mark(rid())
+
+test_alias = test_own
+test_alias_of_import = test_x
+TestAlias = TestK
+`,
+        },
+    },
+    {
+        // The call that stops a test stands in another module of the
+        // project: followed one module deep from a fixture, a setup, a
+        // hook and the module's own statements.
+        id: 'pytest-stopping-call-in-another-module', runner: 'pytest',
+        sometimes: [
+            'stopped/test_s.py::test_under_a_hook_that_calls_a_skip',
+            'tests/test_a.py::test_needs',
+            'tests/test_b.py::test_behind_the_module',
+            'tests/test_c.py::TestNeeds > test_m',
+        ],
+        emptyTestFiles: ['stopped/test_s.py', 'tests/test_b.py'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'hooked/__init__.py': '',
+            'stopped/__init__.py': '',
+            'stopped/conftest.py': 'from tests.helpers import need_service\n\ndef pytest_runtest_setup(item):\n    need_service()\n',
+            'stopped/test_s.py': `${PY}def test_under_a_hook_that_calls_a_skip():
+    mark("stopped/test_s.py::test_under_a_hook_that_calls_a_skip")
+`,
+            'tests/helpers.py': 'import pytest\n\ndef need_service():\n    pytest.skip("no service", allow_module_level=True)\n\ndef make():\n    return 1\n',
+            'tests/conftest.py': 'import pytest\nfrom tests.helpers import need_service, make\n\n@pytest.fixture\ndef service():\n    need_service()\n\n@pytest.fixture\ndef thing():\n    return make()\n',
+            'tests/test_a.py': `${PY}def test_needs(service):
+    mark("tests/test_a.py::test_needs")
+
+def test_plain(thing):
+    mark("tests/test_a.py::test_plain")
+`,
+            'tests/test_b.py': `${PY}from tests import helpers
+
+helpers.need_service()
+
+def test_behind_the_module():
+    mark("tests/test_b.py::test_behind_the_module")
+`,
+            'tests/test_c.py': `${PY}from tests.helpers import need_service, make
+
+class TestNeeds:
+    def setup_method(self):
+        need_service()
+
+    def test_m(self):
+        mark("tests/test_c.py::TestNeeds > test_m")
+
+class TestFree:
+    def setup_method(self):
+        self.thing = make()
+
+    def test_m(self):
+        mark("tests/test_c.py::TestFree > test_m")
+`,
+            'hooked/conftest.py': 'from tests.helpers import make\n\ndef pytest_runtest_setup(item):\n    make()\n',
+            'hooked/test_h.py': `${PY}def test_under_a_hook_that_calls_the_project():
+    mark("hooked/test_h.py::test_under_a_hook_that_calls_the_project")
+`,
+        },
+    },
+    {
+        // A switch written on a class taken from another module: it holds
+        // for the classes of the writing module that derive from it, and
+        // (measured) for every module pytest loads after that one, which
+        // is why the writing module is never joined with another file.
+        id: 'pytest-switch-written-on-an-imported-base', runner: 'pytest',
+        notRunByDefault: ['tests/test_c.py::TestLater > test_m'],
+        files: {
+            'pytest.ini': '[pytest]\n',
+            'tests/__init__.py': '',
+            'tests/test_a.py': `${PY}${RID}class Base:
+    def test_m(self):
+        mark(rid())
+
+class TestHome(Base):
+    pass
+`,
+            'tests/test_b.py': `${PY}from tests.test_a import Base
+
+Base.__test__ = False
+
+class TestDerivedHere(Base):
+    def test_own(self):
+        mark("tests/test_b.py::TestDerivedHere > test_own")
+
+def test_free():
+    mark("tests/test_b.py::test_free")
+`,
+            'tests/test_c.py': `from tests.test_a import Base
+
+class TestLater(Base):
+    pass
 `,
         },
     },

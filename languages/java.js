@@ -2879,6 +2879,12 @@ function findUsagesInCode(code, name, parser, tree) {
 
 
 const JAVA_TEST_ANNOTATIONS = new Set(['Test', 'ParameterizedTest', 'RepeatedTest', 'TestFactory', 'TestTemplate']);
+// The packages the test frameworks' own annotations are written under.
+const JAVA_TEST_PACKAGES = /^(org\.junit|junit|org\.testng)(\.|$)/;
+// Methods a framework calls before a test, and the names by which one
+// stops the test there (an assumption that fails aborts it).
+const JAVA_SETUP_ANNOTATIONS = new Set(['BeforeEach', 'BeforeAll', 'Before', 'BeforeClass', 'BeforeMethod', 'BeforeSuite']);
+const JAVA_STOPPING_NAMES = /^(assum\w*|Assum\w*|abort|TestAbortedException|AssumptionViolatedException|SkipException)$/;
 // Annotations of JUnit and of the language that leave what runs alone.
 // Any other on a test or its class may disable it (a condition of
 // JUnit's, an extension, an annotation of the project that carries one).
@@ -2908,6 +2914,20 @@ function testUnits(fileEntry, helpers) {
     // The annotations on a declaration, an annotation the project declares
     // standing for the ones it carries itself (JUnit's composed
     // annotations): @Flaky declared with @Disabled disables.
+    // Is an annotation written with one of the frameworks' names a type
+    // of the project instead: one written under another package, imported
+    // by name from one, or declared in the package of the file (which
+    // comes before anything an import of a whole package brings).
+    const ofTheProject = (written, symbol) => {
+        const parts = String(written).split('.');
+        const simple = parts.pop();
+        const declared = helpers.typesNamed ? helpers.typesNamed(simple) : [];
+        if (declared.length === 0) return false;
+        if (parts.length > 0) return !JAVA_TEST_PACKAGES.test(parts.join('.'));
+        const byName = (fileEntry.imports || []).map(String).find(name => name.endsWith(`.${simple}`));
+        if (byName) return !JAVA_TEST_PACKAGES.test(byName);
+        return declared.some(type => type.namespace === (symbol.namespace || ''));
+    };
     const annotationMemo = new Map();
     const annotationsOf = symbol => {
         if (annotationMemo.has(symbol)) return annotationMemo.get(symbol);
@@ -2926,6 +2946,18 @@ function testUnits(fileEntry, helpers) {
             const name = String(annotation.name).split('.').pop();
             // @RunWith(JUnit4.class) names the runner JUnit uses anyway.
             if (name === 'RunWith' && /^(org\.junit\.runners\.)?(JUnit4|BlockJUnit4ClassRunner)\.class$/.test(String(annotation.args || '').trim())) continue;
+            if (JAVA_INERT_ANNOTATIONS.has(name) || JAVA_SETUP_ANNOTATIONS.has(name)) {
+                // One of the frameworks' names: theirs by where it comes
+                // from, never by the spelling.
+                if (!ofTheProject(annotation.name, symbol)) {
+                    out.add(name);
+                    continue;
+                }
+                const meta = helpers.metaAnnotations ? helpers.metaAnnotations(name) : null;
+                if (meta) for (const inner of meta) add(inner, 1);
+                else out.add(`${name} (of the project)`);
+                continue;
+            }
             add(name, 0);
         }
         annotationMemo.set(symbol, out);
@@ -2935,11 +2967,42 @@ function testUnits(fileEntry, helpers) {
     const disabled = symbol => annotationsOf(symbol).has('Disabled') || annotationsOf(symbol).has('Ignore');
     // An annotation that is not one of those: the test may not run.
     const unsettled = symbol => [...annotationsOf(symbol)].some(name => !JAVA_INERT_ANNOTATIONS.has(name));
+    // A setup method of a class whose body can stop the test (it names an
+    // assumption, an abort): the class's tests run only sometimes.
+    const tree = helpers.tree();
+    // Read over the lines of the method, whatever shape the tree gives
+    // them: a stopping name or a throw anywhere on them.
+    const stopsOn = (first, last) => {
+        // A throw inside a lambda or a class written in the method is not
+        // the method's own.
+        const visit = (node, nested) => {
+            if (node.endPosition.row < first || node.startPosition.row > last) return false;
+            const inside = node.startPosition.row >= first && node.endPosition.row <= last;
+            if (inside && ((/identifier$/.test(node.type) && JAVA_STOPPING_NAMES.test(node.text)) ||
+                (node.type === 'throw_statement' && !nested))) return true;
+            const deeper = nested || (inside && (node.type === 'lambda_expression' || node.type === 'class_body'));
+            return node.namedChildren.some(child => visit(child, deeper));
+        };
+        return !tree || visit(tree.rootNode, false);
+    };
+    const guardMemo = new Map();
+    const guarded = cls => {
+        if (!guardMemo.has(cls)) {
+            guardMemo.set(cls, symbols.some(symbol => symbol.isMethod && symbol.className === cls.name &&
+                symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine) &&
+                [...annotationsOf(symbol)].some(name => JAVA_SETUP_ANNOTATIONS.has(name)) &&
+                stopsOn(symbol.startLine - 1, (symbol.endLine ?? symbol.startLine) - 1)));
+        }
+        return guardMemo.get(cls);
+    };
     const legacyMemo = new Map();
     const legacy = cls => {
         if (!legacyMemo.has(cls)) {
+            // JUnit's own TestCase: a class of that name the project
+            // declares itself is not it.
             const names = [...String(cls.extends || '').split(','), ...helpers.ancestors(cls.name)];
-            legacyMemo.set(cls, names.some(name => /(^|\.)TestCase$/.test(String(name).trim().replace(/<.*$/, ''))));
+            legacyMemo.set(cls, names.some(name => /(^|\.)TestCase$/.test(String(name).trim().replace(/<.*$/, '')) &&
+                !helpers.declaresType(name)));
         }
         return legacyMemo.get(cls);
     };
@@ -2958,7 +3021,9 @@ function testUnits(fileEntry, helpers) {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
             ...(off && { skipped: true }),
-            ...(!off && [symbol, ...chain].some(unsettled) && { conditional: true }),
+            ...(!off && ([symbol, ...chain].some(unsettled) || chain.some(guarded)) && { conditional: true }),
+            // One declaration the runner reports as several tests.
+            ...([...annotationsOf(symbol)].some(name => JAVA_TEST_ANNOTATIONS.has(name) && name !== 'Test') && { several: true }),
         };
         if (!declared.has(owner)) declared.set(owner, []);
         declared.get(owner).push(row);
@@ -2985,9 +3050,12 @@ function testUnits(fileEntry, helpers) {
             .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases,
+            // JUnit's TestCase brings no test of its own.
+            plainBases: bases.filter(name => /(^|\.)TestCase$/.test(name.replace(/<.*$/, '')) && !helpers.declaresType(name)),
             runnable: [...chain, cls].every(concrete),
             ...([...chain, cls].some(disabled) && { skipped: true }),
             ...([...chain, cls].some(unsettled) && { sometimes: true }),
+            ...([...chain, cls].some(guarded) && { guard: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
             members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&

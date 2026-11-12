@@ -830,7 +830,9 @@ describe('test units: check names nothing to run that would not run', () => {
             assert.strictEqual(action.message, 'Run tests: src/direct.test.js');
             assert.strictEqual(action.commands, undefined);
             const text = output.formatAffectedTests(idx(dir).affectedTests('target', { depth: 2 }));
-            assert.match(text, /src\/indirect\.test\.js \(links: [^)]*\) · 1 test · no command: declared-indirectly/);
+            // One declaration that exists once for every call of its
+            // function: a lower bound, and a test that runs only sometimes.
+            assert.match(text, /src\/indirect\.test\.js \(links: [^)]*\) · at least 1 test \(1 conditional\) · no command: declared-indirectly/);
         } finally {
             rm(dir);
         }
@@ -866,9 +868,25 @@ describe('test units: the judge rejects what the runner contradicts', () => {
 
     it('an execution no listed unit owns is undeclared, and makes a support label false', () => {
         assert.deepStrictEqual(kinds({}, { units: [unit(3)], files: files(1) }, ['a.test.js:3', 'a.test.js:9']),
-            ['UNDECLARED']);
+            ['UNDECLARED', 'INEXACT-COUNT']);
         const support = { units: [], files: [{ file: 'helper.js', role: 'support', run: null, tests: 0 }] };
         assert.deepStrictEqual(kinds({}, support, ['helper.js:2']), ['FALSE-SUPPORT', 'UNDECLARED']);
+    });
+
+    it('a count is exact only where the runner executes nothing more from the file', () => {
+        const lower = [{ file: 'a.test.js', role: 'tests', run: 'run a.test.js', tests: 1, more: true }];
+        const ran = ['a.test.js:3', 'a.test.js:9'];
+        // Naming the test the engine does not list does not excuse the count.
+        assert.deepStrictEqual(kinds({ undeclared: ['a.test.js:9'] }, { units: [unit(3)], files: files(1) }, ran), ['INEXACT-COUNT']);
+        // A lower bound is the weaker claim, and has to be deliberate.
+        assert.deepStrictEqual(kinds({ undeclared: ['a.test.js:9'] }, { units: [unit(3)], files: lower }, ran), ['LOWER-BOUND']);
+        assert.deepStrictEqual(kinds({ undeclared: ['a.test.js:9'], atLeast: ['a.test.js'] }, { units: [unit(3)], files: lower }, ran), []);
+        assert.deepStrictEqual(kinds({ atLeast: ['a.test.js'] }, { units: [unit(3)], files: files(1) }, ['a.test.js:3']), ['LOWER-BOUND']);
+        // What the commands print (every line of the file linked) is the file's own answer.
+        const printed = linked => [{ file: 'a.test.js', role: 'tests', run: 'run a.test.js', tests: 1, more: false, linked }];
+        assert.deepStrictEqual(kinds({}, { units: [unit(3)], files: printed({ tests: 1, more: false }) }, ['a.test.js:3']), []);
+        assert.deepStrictEqual(kinds({}, { units: [unit(3)], files: printed({ tests: 2, more: false }) }, ['a.test.js:3']), ['COUNT']);
+        assert.deepStrictEqual(kinds({}, { units: [unit(3)], files: printed({ tests: 1, more: true }) }, ['a.test.js:3']), ['COUNT']);
     });
 
     it('an inherited test is the body the engine names: another body running is not it', () => {
@@ -1425,12 +1443,33 @@ describe('test units: a decorator, an attribute and an annotation are read by wh
             'tests/test_x.py': 'def test_a():\n    pass\n', 'other/test_y.py': 'def test_b():\n    pass\n',
         };
         assert.deepStrictEqual(answerFor(hooked, 'tests/test_x.py').units.map(stateOf), ['conditional']);
-        assert.deepStrictEqual(answerFor(hooked, 'other/test_y.py').units.map(stateOf), ['runs']);
+        // pytest calls that hook once, with every test of the run: it
+        // holds for the other directory too. A hook it calls for one test
+        // holds below its conftest.py only.
+        assert.deepStrictEqual(answerFor(hooked, 'other/test_y.py').units.map(stateOf), ['conditional']);
+        const perTest = { ...hooked, 'tests/conftest.py': 'import pytest\n\ndef pytest_runtest_setup(item):\n    pytest.skip("no")\n' };
+        assert.deepStrictEqual(answerFor(perTest, 'tests/test_x.py').units.map(stateOf), ['conditional']);
+        assert.deepStrictEqual(answerFor(perTest, 'other/test_y.py').units.map(stateOf), ['runs']);
         const hook = body => answerFor({ ...hooked, 'tests/conftest.py': body }, 'tests/test_x.py').units.map(stateOf)[0];
         assert.strictEqual(hook('import gc\n\ndef pytest_runtest_setup():\n    gc.collect()\n\ndef pytest_collection():\n    gc.disable()\n'), 'runs');
         assert.strictEqual(hook('import pytest\n\ndef pytest_runtest_setup(item):\n    if "slow" in item.keywords:\n        pytest.skip("slow")\n'), 'conditional');
         assert.strictEqual(hook('def pytest_ignore_collect(collection_path, config):\n    return collection_path.name.startswith("legacy")\n'), 'conditional');
         assert.strictEqual(hook('from helpers import reorder\n\ndef pytest_collection_modifyitems(config, items):\n    reorder(items)\n'), 'conditional');
+        // What a hook is handed reaches it under any name; only the calls
+        // that read leave the run alone.
+        assert.strictEqual(hook('def pytest_collection_modifyitems(items):\n    selected = items\n    selected.clear()\n'), 'conditional');
+        assert.strictEqual(hook('def pytest_collection_modifyitems(items):\n    items *= 0\n'), 'conditional');
+        assert.strictEqual(hook('def pytest_configure(config):\n    config.option.markexpr = "none"\n'), 'conditional');
+        assert.strictEqual(hook('def pytest_configure(config):\n    config.addinivalue_line("markers", "slow: slow")\n    if config.getoption("verbose"):\n        print("verbose")\n'), 'runs');
+        assert.strictEqual(hook('def pytest_addoption(parser):\n    group = parser.getgroup("mine")\n    group.addoption("--mine", action="store_true")\n'), 'runs');
+        assert.strictEqual(hook('pytest_collection_modifyitems = lambda items: items.clear()\n'), 'conditional');
+        assert.strictEqual(hook('pytest_plugins = [name for name in ("a", "b")]\n'), 'conditional');
+        // A fixture every test gets, and a fixture a test asks for.
+        assert.strictEqual(hook('import pytest\n\n@pytest.fixture(autouse=True)\ndef guard():\n    pytest.skip("no")\n'), 'conditional');
+        assert.strictEqual(hook('import pytest\n\n@pytest.fixture(autouse=True)\ndef clean(monkeypatch):\n    monkeypatch.delenv("X", raising=False)\n    yield\n'), 'runs');
+        const asks = { ...hooked, 'tests/conftest.py': 'import pytest\n\n@pytest.fixture\ndef db():\n    pytest.skip("no db")\n\n@pytest.fixture\ndef client(db):\n    return 1\n',
+            'tests/test_x.py': 'def test_a(client):\n    pass\n\ndef test_b():\n    pass\n' };
+        assert.deepStrictEqual(answerFor(asks, 'tests/test_x.py').units.map(stateOf), ['conditional', 'runs']);
     });
 
     it('Java: an annotation of the project stands for the ones it carries', () => {
@@ -1543,8 +1582,11 @@ describe('test units: the judge counts runs and holds joined commands to the fil
 
     it('a body that runs more often than the tests listed for it is a test not listed, unless the case says so', () => {
         const answer = { units: [unit(3)], files: files(1) };
-        assert.deepStrictEqual(kinds({}, answer, ['a.test.js:3'], { 'a.test.js:3': 2 }), ['REPEATED']);
-        assert.deepStrictEqual(kinds({ repeats: ['a.test.js:3'] }, answer, ['a.test.js:3'], { 'a.test.js:3': 2 }), []);
+        const lower = { units: [unit(3)], files: [{ ...files(1)[0], more: true }] };
+        assert.deepStrictEqual(kinds({}, answer, ['a.test.js:3'], { 'a.test.js:3': 2 }), ['INEXACT-COUNT', 'REPEATED']);
+        // Named by the case, the count still has to be given as a lower bound.
+        assert.deepStrictEqual(kinds({ repeats: ['a.test.js:3'] }, answer, ['a.test.js:3'], { 'a.test.js:3': 2 }), ['INEXACT-COUNT']);
+        assert.deepStrictEqual(kinds({ repeats: ['a.test.js:3'], atLeast: ['a.test.js'] }, lower, ['a.test.js:3'], { 'a.test.js:3': 2 }), []);
         assert.deepStrictEqual(kinds({ repeats: ['a.test.js:3'] }, answer, ['a.test.js:3'], { 'a.test.js:3': 1 }), ['REPEATED']);
         assert.deepStrictEqual(kinds({}, { units: [unit(3, { generated: true })], files: files(1) }, ['a.test.js:3'], { 'a.test.js:3': 4 }), []);
     });
@@ -1561,5 +1603,352 @@ describe('test units: the judge counts runs and holds joined commands to the fil
             repeats: ['tests/test_a.py::test_p'], undeclared: ['tests/test_a.py:9', 'tests/x.py::T > m'],
         });
         assert.deepStrictEqual([named.repeats, named.undeclared], [['tests/test_a.py:2'], ['tests/test_a.py:9', 'tests/x.py::T > m']]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// A count is exact only where every test is listed
+// ---------------------------------------------------------------------------
+
+describe('test units: a count the commands print is exact, or says it is a lower bound', () => {
+    const PYTEST = { 'pytest.ini': '[pytest]\n', 'tests/__init__.py': '', 'app.py': 'def target():\n    return 1\n' };
+    const head = 'from app import target\n\n';
+    const surfaces = files => {
+        const dir = projectOf({ ...PYTEST, ...files });
+        try {
+            git(dir, 'init', '-q');
+            git(dir, 'add', '-A');
+            git(dir, 'commit', '-q', '-m', 'base');
+            fs.writeFileSync(path.join(dir, 'app.py'), 'def target():\n    return 2\n');
+            const index = idx(dir);
+            const affected = index.affectedTests('target', { depth: 2 });
+            const tests = execute(index, 'tests', { name: 'target' });
+            const check = execute(idx(dir), 'check', {});
+            assert.ok(tests.ok && check.ok, tests.error || check.error);
+            return {
+                affected, tests: tests.result, check: check.result,
+                affectedText: output.formatAffectedTests(affected),
+                testsText: output.formatTests(tests.result, 'target'),
+                checkText: output.formatCheck(check.result),
+            };
+        } finally {
+            rm(dir);
+        }
+    };
+
+    it('another name for a test is a test of its own, counted and listed', () => {
+        const found = surfaces({ 'tests/test_case.py': `${head}def test_actual():\n    target()\n\ntest_alias = test_actual\n` });
+        assert.strictEqual(found.affected.summary.totalTests, 2);
+        assert.strictEqual(found.affected.summary.moreTests, undefined);
+        assert.match(found.affectedText, /Test files to run \(1\), 2 tests:/);
+        assert.match(found.affectedText, /test_alias \(from tests\/test_case\.py:3\)\s+\[inherited-test\]/);
+        assert.strictEqual(found.tests[0].tests, 2);
+        assert.match(found.testsText, /tests\/test_case\.py {2}\(2 tests\)/);
+        assert.strictEqual(found.check.totalTests, 2);
+        assert.match(found.checkText, /Tests potentially affected: 2 in 1 file/);
+    });
+
+    it('a name bound to something that is not read leaves a lower bound on all three commands', () => {
+        const found = surfaces({
+            'tests/test_case.py': `${head}def make():\n    return lambda: target()\n\ndef test_actual():\n    target()\n\ntest_made = make()\n`,
+        });
+        assert.strictEqual(found.affected.summary.totalTests, 1);
+        assert.strictEqual(found.affected.summary.moreTests, true);
+        assert.strictEqual(found.affected.testFiles[0].moreTests, true);
+        assert.match(found.affectedText, /Test files to run \(1\), at least 1 test:/);
+        assert.match(found.affectedText, /tests\/test_case\.py \(links: [^)]*\) · at least 1 test/);
+        assert.match(found.affectedText, /Summary: .*\(at least 1 test\)/);
+        assert.strictEqual(found.tests[0].moreTests, true);
+        assert.match(found.testsText, /tests\/test_case\.py {2}\(at least 1 test\)/);
+        assert.strictEqual(found.check.moreTests, true);
+        assert.strictEqual(found.check.testFiles[0].moreTests, true);
+        assert.match(found.checkText, /Tests potentially affected: at least 1 in 1 file/);
+        assert.match(found.checkText, /tests\/test_case\.py \(at least 1\)/);
+    });
+
+    it('a parametrized test is one declaration the runner reports as several: a lower bound', () => {
+        const found = surfaces({
+            'tests/test_case.py': `import pytest\n${head}@pytest.mark.parametrize("v", [1, 2])\ndef test_table(v):\n    target()\n`,
+        });
+        assert.strictEqual(found.affected.summary.totalTests, 1);
+        assert.strictEqual(found.affected.summary.moreTests, true);
+        assert.match(found.affectedText, /at least 1 test/);
+        // A file with a parametrized test the link does not reach keeps an exact count.
+        const apart = surfaces({
+            'tests/test_case.py': `import pytest\n${head}@pytest.mark.parametrize("v", [1, 2])\ndef test_table(v):\n    pass\n\ndef test_linked():\n    target()\n`,
+        });
+        assert.strictEqual(apart.affected.summary.moreTests, undefined);
+        assert.match(apart.affectedText, /Test files to run \(1\), 1 test:/);
+    });
+
+    it('a test that runs only sometimes is counted, and said to be conditional', () => {
+        const found = surfaces({
+            'tests/conftest.py': 'import pytest\n\n@pytest.fixture\ndef db():\n    pytest.skip("no db")\n',
+            'tests/test_case.py': `${head}def test_needs_db(db):\n    target()\n\ndef test_plain():\n    target()\n`,
+        });
+        assert.strictEqual(found.affected.summary.totalTests, 2);
+        assert.strictEqual(found.affected.summary.conditionalTests, 1);
+        assert.match(found.affectedText, /Test files to run \(1\), 2 tests \(1 conditional\):/);
+        assert.strictEqual(found.tests[0].conditionalTests, 1);
+        assert.match(found.testsText, /\(2 tests \(1 conditional\)\)/);
+        assert.strictEqual(found.check.conditionalTests, 1);
+        assert.match(found.checkText, /Tests potentially affected: 2 in 1 file \(1 conditional\)/);
+    });
+
+    it('a JavaScript file that hands the runner\'s function on, or calls a function that declares, holds more', () => {
+        const node = files => {
+            const dir = projectOf({ ...NODE, ...files });
+            try {
+                const index = idx(dir);
+                index._beginOp();
+                try {
+                    const model = createTestModel(index);
+                    return Object.fromEntries(Object.keys(files).filter(name => /\.js$/.test(name))
+                        .map(name => [name, model.fileFacts(path.join(index.root, name))]));
+                } finally {
+                    index._endOp();
+                }
+            } finally {
+                rm(dir);
+            }
+        };
+        const facts = node({
+            'test/a.test.js': `${NODE_HEAD}function define(fn) { fn('via', () => {}); }\ndefine(test);\ntest('read', () => {});\n`,
+            'test/b.test.js': `${NODE_HEAD}const shared = require('./shared');\nshared('b');\ntest('read', () => {});\n`,
+            'test/c.test.js': `${NODE_HEAD}const path = require('node:path');\npath.join('a', 'b');\ntest('read', () => {});\n`,
+            'test/d.test.js': `${NODE_HEAD}test('read', context => { context.skip(); });\n`,
+            'test/shared.js': `${NODE_HEAD}module.exports = function shared(name) { test('shared ' + name, () => {}); };\n`,
+        });
+        assert.deepStrictEqual(Object.entries(facts).map(([name, fact]) => [name, fact.tests, !!fact.moreTests]), [
+            ['test/a.test.js', 1, true], ['test/b.test.js', 1, true], ['test/c.test.js', 1, false],
+            ['test/d.test.js', 1, false], ['test/shared.js', 1, true],
+        ]);
+    });
+});
+
+describe('test units: a framework\'s name is the framework\'s by where it comes from', () => {
+    const stateOf = unit => unit.skipped ? 'skipped' : unit.conditional ? 'conditional' : 'runs';
+
+    it('Java: an annotation of the project named like JUnit\'s is not JUnit\'s, and JUnit\'s written in full is', () => {
+        const own = name => `package com.x;\nimport java.lang.annotation.*;\n@Retention(RetentionPolicy.RUNTIME)\npublic @interface ${name} {}\n`;
+        const { units } = answerFor({
+            'pom.xml': '<project></project>\n',
+            'src/test/java/com/x/Test.java': own('Test'),
+            'src/test/java/com/x/Disabled.java': own('Disabled'),
+            'src/test/java/com/x/BaseTestCase.java': 'package com.x;\npublic class BaseTestCase {}\n',
+            'src/test/java/com/x/ATest.java': 'package com.x;\npublic class ATest extends BaseTestCase {\n    @Test\n    void notJunits() { }\n    @org.junit.jupiter.api.Test\n    void junits() { }\n    @org.junit.jupiter.api.Test\n    @Disabled\n    void ownDisabledRuns() { }\n    public void testNotJunit3() { }\n}\n',
+        }, 'src/test/java/com/x/ATest.java');
+        assert.deepStrictEqual(units.map(unit => [unit.name, stateOf(unit)]), [['junits', 'runs'], ['ownDisabledRuns', 'runs']]);
+        // Imported by name from JUnit, the same spelling is JUnit's.
+        const imported = answerFor({
+            'pom.xml': '<project></project>\n',
+            'src/test/java/com/y/Test.java': own('Test').replace('com.x', 'com.y'),
+            'src/test/java/com/x/BTest.java': 'package com.x;\nimport org.junit.jupiter.api.Test;\nclass BTest {\n    @Test\n    void junits() { }\n}\n',
+        }, 'src/test/java/com/x/BTest.java');
+        assert.deepStrictEqual(imported.units.map(unit => unit.name), ['junits']);
+    });
+
+    it('Java: a setup method that assumes makes the tests of its class, and of the classes deriving from it, conditional', () => {
+        const files = {
+            'pom.xml': '<project></project>\n',
+            'src/test/java/com/x/Base.java': 'package com.x;\nimport org.junit.jupiter.api.*;\nabstract class Base {\n    @BeforeEach\n    void needs() { Assumptions.assumeTrue(System.getenv("X") != null); }\n}\n',
+            'src/test/java/com/x/ATest.java': 'package com.x;\nimport org.junit.jupiter.api.*;\nclass ATest extends Base {\n    @Test\n    void behindTheBase() { }\n}\n',
+            'src/test/java/com/x/BTest.java': 'package com.x;\nimport org.junit.jupiter.api.*;\nclass BTest {\n    int ready;\n    @BeforeEach\n    void prepare() { ready = 1; }\n    @Test\n    void free() { }\n}\n',
+        };
+        assert.deepStrictEqual(answerFor(files, 'src/test/java/com/x/ATest.java').units.map(stateOf), ['conditional']);
+        assert.deepStrictEqual(answerFor(files, 'src/test/java/com/x/BTest.java').units.map(stateOf), ['runs']);
+    });
+
+    it('C#: an attribute class of the project named like xUnit\'s is not xUnit\'s; a setup that ignores is read', () => {
+        const xunit = answerFor({
+            'App.Tests.csproj': '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="xunit" Version="2.9.3" /></ItemGroup></Project>\n',
+            'Own.cs': 'namespace Own\n{\n    public class FactAttribute : System.Attribute { }\n}\n',
+            'Tests.cs': 'namespace Own.Tests\n{\n    public class Lookalike\n    {\n        [Own.Fact]\n        public void NotXunits() { }\n\n        [Xunit.Fact]\n        public void Xunits() { }\n\n        [Fact]\n        public void TheNearerOne() { }\n    }\n}\n',
+        }, 'Tests.cs');
+        assert.deepStrictEqual(xunit.units.map(unit => unit.name), ['Xunits']);
+        const nunit = answerFor({
+            'App.Tests.csproj': '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="NUnit" Version="3.12.0" /></ItemGroup></Project>\n',
+            'Tests.cs': 'using NUnit.Framework;\n\nnamespace N.Tests\n{\n    public class Guarded\n    {\n        [SetUp]\n        public void Needs() { Assert.Ignore("not here"); }\n\n        [Test]\n        public void NeverRuns() { }\n    }\n\n    public class Free\n    {\n        [SetUp]\n        public void Prepare() { }\n\n        [Test]\n        public void Runs() { }\n    }\n}\n',
+        }, 'Tests.cs');
+        assert.deepStrictEqual(nunit.units.map(unit => [unit.name, stateOf(unit)]), [['NeverRuns', 'conditional'], ['Runs', 'runs']]);
+    });
+
+    it('JavaScript: a setup hook that can skip makes the tests of its suite conditional, however deep', () => {
+        const { units } = answerFor({
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n',
+            'test/a.test.js': "describe('outer', function () {\n    before(function () { this.skip(); });\n    it('direct', function () {});\n    describe('inner', function () {\n        it('deep', function () {});\n    });\n});\ndescribe('free', function () {\n    before(function () { this.timeout(1000); });\n    it('runs', function () {});\n});\ndescribe('named', function () {\n    beforeEach(prepare);\n    it('behind a function not written here', function () {});\n});\n",
+        }, 'test/a.test.js');
+        assert.deepStrictEqual(units.map(unit => [unit.name, stateOf(unit)]),
+            [['direct', 'conditional'], ['deep', 'conditional'], ['runs', 'runs'], ['behind a function not written here', 'conditional']]);
+    });
+
+    it('Rust: tests a macro makes are not listed, and the count says so', () => {
+        const facts = source => answerFor({ 'Cargo.toml': '[package]\nname = "m"\nversion = "0.1.0"\nedition = "2021"\n', 'src/lib.rs': source }, 'src/lib.rs').facts;
+        const made = 'macro_rules! cases {\n    ($($name:ident),*) => { $( #[test] fn $name() {} )* };\n}\n\n#[cfg(test)]\nmod tests {\n    cases!(first, second);\n\n    #[test]\n    fn written() {}\n}\n';
+        assert.deepStrictEqual([facts(made).tests, facts(made).moreTests], [1, true]);
+        const inBody = '#[cfg(test)]\nmod tests {\n    proptest! {\n        #[test]\n        fn generated(x in 0..3) {}\n    }\n\n    #[test]\n    fn written() {}\n}\n';
+        // A function written inside an invocation is read where it parses as one; the file still holds more.
+        assert.deepStrictEqual([facts(inBody).tests, facts(inBody).moreTests], [2, true]);
+        const plain = 'lazy_static! { static ref X: u8 = 1; }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn written() {}\n}\n';
+        assert.deepStrictEqual([facts(plain).tests, facts(plain).moreTests], [1, undefined]);
+    });
+});
+
+describe('test units: a configuration that is code is read only where nothing else can change it', () => {
+    const jest = config => answerFor({
+        'package.json': '{ "name": "x", "scripts": { "test": "jest" } }\n', ...config,
+        'test/a.test.js': "test('a', () => {});\n",
+    }, 'test/a.test.js').facts;
+    const run = fact => fact.run ? 'command' : fact.runWithheld;
+
+    it('one object written out, with what packages and the language provide', () => {
+        for (const source of [
+            'module.exports = {};\n',
+            "'use strict';\n\n/** @type {import('jest').Config} */\nconst config = { verbose: true };\n\nmodule.exports = config;\n",
+            "const path = require('path');\nconst { join } = require('node:path');\nmodule.exports = { coverageDirectory: path.join(__dirname, 'c'), cacheDirectory: join(process.cwd(), '.c'), bail: process.env.CI ? 1 : 0 };\n",
+            "const pkg = JSON.parse(require('fs').readFileSync('./package.json', 'utf8'));\nmodule.exports = { displayName: pkg.name };\n",
+            'module.exports = { globals: { fn: () => 1 }, testTimeout: 10 * 1000 };\n',
+        ]) assert.strictEqual(run(jest({ 'jest.config.js': source })), 'command', source);
+        assert.strictEqual(run(jest({ 'jest.config.mjs': 'export default { verbose: true };\n' })), 'command');
+        assert.strictEqual(run(jest({ 'jest.config.ts': "import type { Config } from 'jest';\n\nconst config: Config = { verbose: true };\n\nexport default config;\n" })), 'command');
+    });
+
+    it('anything that can change the object, or act on the run, leaves the configuration unread', () => {
+        for (const source of [
+            'module.exports = {};\nmodule.exports.verbose = true;\n',
+            'const config = {};\nconfig.verbose = true;\nmodule.exports = config;\n',
+            'const config = {};\nconst copy = config;\nmodule.exports = config;\n',
+            'function defineConfig(c) { return c; }\nmodule.exports = defineConfig({});\n',
+            'const defineConfig = c => c;\nmodule.exports = defineConfig({});\n',
+            "const { defineConfig } = require('./define');\nmodule.exports = defineConfig({});\n",
+            'module.exports = {};\nexports.verbose = true;\n',
+            "module.exports = { ...require('./base') };\n",
+            'module.exports = { get verbose() { return true; } };\n',
+            'module.exports = { ["verbose"]: true };\n',
+            'module.exports = { __proto__: { verbose: true } };\n',
+            "require('./setup-env');\nmodule.exports = {};\n",
+            "import './setup-env';\nexport default {};\n",
+            "process.chdir('..');\nmodule.exports = {};\n",
+            "const moved = process.chdir('..');\nmodule.exports = {};\n",
+            "const made = require('fs').writeFileSync('x', '');\nmodule.exports = {};\n",
+            'module.exports = { verbose: (() => true)() };\n',
+            'module.exports = async () => ({});\n',
+            'if (process.env.CI) { module.exports = {}; } else { module.exports = { verbose: true }; }\n',
+            'const m = module;\nmodule.exports = {};\n',
+            'module.exports = {};\nrequire.cache[__filename].exports.verbose = true;\n',
+            'module.exports = { unknownKeyOfSomePlugin: true };\n',
+            'module.exports = { testSequencer: "./sequencer.js" };\n',
+        ]) assert.strictEqual(run(jest({ 'jest.config.js': source })), 'runner-config-not-read', source);
+    });
+
+    it('the function that passes a configuration through is the runner\'s own by its import', () => {
+        const vitest = config => run(answerFor({
+            'package.json': '{ "name": "x", "type": "module", "scripts": { "test": "vitest run" } }\n', 'vitest.config.js': config,
+            'test/a.test.js': "import { test } from 'vitest';\ntest('a', () => {});\n",
+        }, 'test/a.test.js').facts);
+        assert.strictEqual(vitest("import { defineConfig } from 'vitest/config';\nexport default defineConfig({ test: { globals: true } });\n"), 'command');
+        assert.strictEqual(vitest("import { defineConfig as define } from 'vite';\nexport default define({ test: {} });\n"), 'command');
+        assert.strictEqual(vitest("import react from '@vitejs/plugin-react';\nimport { defineConfig } from 'vitest/config';\nexport default defineConfig({ plugins: [react()], test: {} });\n"), 'command');
+        assert.strictEqual(vitest("import { defineConfig } from './define.js';\nexport default defineConfig({ test: {} });\n"), 'runner-config-not-read');
+        assert.strictEqual(vitest("import { defineConfig } from 'vitest/config';\nexport default defineConfig({ plugins: [{ name: 'x', config: () => ({}) }], test: {} });\n"), 'runner-config-not-read');
+        assert.strictEqual(vitest("import { defineConfig, mergeConfig } from 'vitest/config';\nexport default mergeConfig({}, defineConfig({ test: {} }));\n"), 'runner-config-not-read');
+        assert.strictEqual(vitest("import { defineConfig } from 'vitest/config';\nexport default defineConfig({ test: { typecheck: { only: true } } });\n"), 'runner-config-not-read');
+        assert.strictEqual(vitest("import { defineConfig } from 'vitest/config';\nexport default defineConfig({ root: 'packages/a', test: {} });\n"), 'runner-config-not-read');
+    });
+
+    it('JSON keeps what its strings hold when comments are taken out; YAML is read one key to a line or not at all', () => {
+        const withComments = jest({ 'jest.config.json': '{\n  // comment\n  "testPathIgnorePatterns": ["/zz/*", "/yy*/"] /* after */\n}\n' });
+        assert.strictEqual(run(withComments), 'command');
+        const ignored = jest({ 'jest.config.json': '{\n  // comment\n  "testPathIgnorePatterns": ["/zz/*", "/yy*/", "a.test.js"]\n}\n' });
+        assert.strictEqual(run(ignored), 'outside-runner-config');
+        const mocha = config => run(answerFor({
+            'package.json': '{ "name": "x", "scripts": { "test": "mocha" } }\n', ...config,
+            'test/a.test.js': "it('a', function () {});\n",
+        }, 'test/a.test.js').facts);
+        assert.strictEqual(mocha({ '.mocharc.yml': 'timeout: 4000\nreporter: dot\nrequire:\n  - ./setup.js\n' }), 'command');
+        assert.strictEqual(mocha({ '.mocharc.yml': '---\n"timeout": 4000\n# a comment\nrequire:\n- ./setup.js\n' }), 'command');
+        for (const yaml of ['{ timeout: 4000 }\n', '  timeout: 4000\n', '? timeout\n: 4000\n', 'base: &b\n  timeout: 1\n<<: *b\n',
+            'timeout: 4000\nspec: other\n', 'timeout: 4000\n---\nspec: other\n', 'unknown-option: 1\n']) {
+            assert.strictEqual(mocha({ '.mocharc.yml': yaml }), 'runner-config-not-read', yaml);
+        }
+    });
+});
+
+describe('test units: pytest collects by what a name holds, not by how a class is spelled', () => {
+    const stateOf = unit => unit.skipped ? 'skipped' : unit.conditional ? 'conditional' : 'runs';
+    const pytest = (files, name = 'tests/test_a.py') => answerFor({ 'pytest.ini': '[pytest]\n', 'tests/__init__.py': '', ...files }, name);
+    const shape = found => found.units.map(unit => `${unit.label}:${stateOf(unit)}`);
+
+    it('the nearest switch in the lookup order decides: off, the literal True, or a value that is not read', () => {
+        const base = 'class Base:\n    __test__ = False\n    def test_m(self):\n        pass\n\n';
+        assert.deepStrictEqual(shape(pytest({ 'tests/test_a.py': `${base}class TestX(Base):\n    pass\n` })), []);
+        assert.deepStrictEqual(shape(pytest({ 'tests/test_a.py': `${base}class TestX(Base):\n    __test__ = True\n` })), ['TestX > test_m:runs']);
+        assert.deepStrictEqual(shape(pytest({ 'tests/test_a.py': `${base}class TestX(Base):\n    __test__ = bool(1)\n` })), ['TestX > test_m:conditional']);
+        assert.deepStrictEqual(shape(pytest({ 'tests/test_a.py': `${base}class Mid(Base):\n    __test__ = bool(1)\n\nclass TestX(Mid):\n    pass\n` })),
+            ['Mid > test_m:conditional', 'TestX > test_m:conditional']);
+        // The literal True collects a class or a function whatever it is called; a truthy value does not.
+        assert.deepStrictEqual(shape(pytest({ 'tests/test_a.py': 'class Helper:\n    __test__ = True\n    def test_m(self):\n        pass\n\nclass Other:\n    __test__ = 1\n    def test_m(self):\n        pass\n\ndef check():\n    pass\ncheck.__test__ = True\n' })),
+            ['Helper > test_m:runs', 'check:runs']);
+    });
+
+    it('a switch written on a class taken from another module holds for the classes here that derive from it', () => {
+        const files = {
+            'tests/test_a.py': 'class Base:\n    def test_m(self):\n        pass\n\nclass TestHome(Base):\n    pass\n',
+            'tests/test_b.py': 'from tests.test_a import Base\n\nBase.__test__ = False\n\nclass TestHere(Base):\n    def test_own(self):\n        pass\n\ndef test_free():\n    pass\n',
+            'tests/test_c.py': 'from tests.test_a import Base\n\nBase.__test__ = bool(1)\n\nclass TestHere(Base):\n    def test_own(self):\n        pass\n',
+        };
+        assert.deepStrictEqual(shape(pytest(files)), ['TestHome > test_m:runs']);
+        assert.deepStrictEqual(shape(pytest(files, 'tests/test_b.py')), ['test_free:runs']);
+        assert.deepStrictEqual(shape(pytest(files, 'tests/test_c.py')),
+            ['Base > test_m:conditional', 'TestHere > test_m:conditional', 'TestHere > test_own:conditional']);
+    });
+
+    it('a class of the project named like a TestCase is no unittest class; one deriving from unittest\'s is, through the project', () => {
+        const found = pytest({
+            'tests/base.py': 'import unittest\n\nclass ProjectCase(unittest.TestCase):\n    pass\n\nclass BaseTestCase:\n    def test_x(self):\n        pass\n',
+            'tests/test_a.py': 'from tests.base import ProjectCase, BaseTestCase\n\nclass Checks(BaseTestCase):\n    def test_y(self):\n        pass\n\nclass Real(ProjectCase):\n    def test_z(self):\n        pass\n',
+        });
+        assert.deepStrictEqual(shape(found), ['Real > test_z:runs']);
+    });
+
+    it('marks, setups and fixtures of the classes a class derives from reach its tests; a module\'s reach the tests it imports', () => {
+        const files = {
+            'tests/base.py': 'import pytest\n\n@pytest.mark.skip\nclass Skipped:\n    def test_s(self):\n        pass\n\nclass Guarded:\n    def setup_method(self):\n        pytest.skip("no")\n    def test_g(self):\n        pass\n\ndef test_fn():\n    pass\n',
+            'tests/test_a.py': 'from tests.base import Skipped, Guarded\n\nclass TestS(Skipped):\n    def test_own(self):\n        pass\n\nclass TestG(Guarded):\n    def test_own(self):\n        pass\n',
+            'tests/test_b.py': 'import pytest\nfrom tests.base import test_fn\npytestmark = pytest.mark.skip\n',
+            'tests/test_c.py': 'from tests.base import test_fn\n__test__ = bool(0)\n',
+        };
+        assert.deepStrictEqual(shape(pytest(files)),
+            ['TestS > test_s:skipped', 'TestS > test_own:skipped', 'TestG > test_g:conditional', 'TestG > test_own:conditional']);
+        assert.deepStrictEqual(shape(pytest(files, 'tests/test_b.py')), ['test_fn:skipped']);
+        assert.deepStrictEqual(shape(pytest(files, 'tests/test_c.py')), ['test_fn:conditional']);
+    });
+
+    it('a module that stops when it is imported: through another name, in a function it calls, never under __main__', () => {
+        const module = source => shape(pytest({ 'tests/test_a.py': `import pytest\n${source}\ndef test_a():\n    pass\n` }));
+        assert.deepStrictEqual(module('skip = pytest.skip\nskip("x", allow_module_level=True)\n'), ['test_a:conditional']);
+        assert.deepStrictEqual(module('def need():\n    pytest.skip("x", allow_module_level=True)\n\nneed()\n'), ['test_a:conditional']);
+        assert.deepStrictEqual(module('def need():\n    pytest.skip("x", allow_module_level=True)\n'), ['test_a:runs']);
+        assert.deepStrictEqual(module('requires = pytest.mark.skipif(True, reason="x")\n'), ['test_a:runs']);
+        assert.deepStrictEqual(module('if __name__ == "__main__":\n    raise SystemExit(pytest.main([__file__]))\n'), ['test_a:runs']);
+        assert.deepStrictEqual(module('if __name__ != "__main__":\n    raise RuntimeError("x")\n'), ['test_a:conditional']);
+    });
+
+    it('a stopping call in another module of the project is followed one module deep, from a fixture, a setup, a hook and the module', () => {
+        const helpers = 'import pytest\n\ndef need():\n    pytest.skip("no")\n\ndef make():\n    return 1\n';
+        const files = {
+            'tests/helpers.py': helpers,
+            'tests/conftest.py': 'import pytest\nfrom tests.helpers import need, make\n\n@pytest.fixture\ndef service():\n    need()\n\n@pytest.fixture\ndef thing():\n    return make()\n',
+            'tests/test_a.py': 'from tests import helpers\n\ndef test_needs(service):\n    pass\n\ndef test_plain(thing):\n    pass\n\nclass TestNeeds:\n    def setup_method(self):\n        helpers.need()\n    def test_m(self):\n        pass\n\nclass TestFree:\n    def setup_method(self):\n        helpers.make()\n    def test_m(self):\n        pass\n',
+            'tests/test_b.py': 'from tests.helpers import need\n\nneed()\n\ndef test_behind():\n    pass\n',
+            'tests/test_c.py': 'from tests.helpers import make\n\nvalue = make()\n\ndef test_free():\n    pass\n',
+        };
+        assert.deepStrictEqual(shape(pytest(files)),
+            ['test_needs:conditional', 'test_plain:runs', 'TestNeeds > test_m:conditional', 'TestFree > test_m:runs']);
+        assert.deepStrictEqual(shape(pytest(files, 'tests/test_b.py')), ['test_behind:conditional']);
+        assert.deepStrictEqual(shape(pytest(files, 'tests/test_c.py')), ['test_free:runs']);
+        const hooked = body => ({ ...files, 'tests/conftest.py': `from tests.helpers import make, need\n\ndef pytest_runtest_setup(item):\n    ${body}\n` });
+        assert.deepStrictEqual(shape(pytest(hooked('make()'), 'tests/test_c.py')), ['test_free:runs']);
+        assert.deepStrictEqual(shape(pytest(hooked('need()'), 'tests/test_c.py')), ['test_free:conditional']);
     });
 });

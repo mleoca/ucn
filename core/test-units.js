@@ -15,8 +15,16 @@
  * with the reason. The runner's own configuration is part of that: what
  * is data is read (pytest's options and naming rules, jest's roots and
  * path patterns, vitest's directory, the options a mocha or node script
- * passes), and a configuration that can change what a command selects and
- * is not read withholds the command. Nothing here executes anything.
+ * passes), a configuration written as code only where it is one object
+ * written out that nothing else in the file can change, and a
+ * configuration that can change what a command selects and is not read
+ * withholds the command. Nothing here executes anything.
+ *
+ * A COUNT of tests is of the units listed and not skipped. It is exact
+ * only where every test the runner would report is listed: a file that
+ * holds tests the reader does not list, or a declaration that stands for
+ * several of the runner's tests, makes it a lower bound (`moreTests`),
+ * said wherever the count is printed.
  *
  * A test-path file is SUPPORT when it declares no unit, declares no class
  * that could inherit one, and is not named the way the runner names test
@@ -403,6 +411,10 @@ function pythonRunner(model, fileEntry) {
                     classes: configWords(config.table, 'python_classes'),
                     functions: configWords(config.table, 'python_functions'),
                     options: pytestOptions(configArguments(config, 'addopts')),
+                    // Fixtures every test is given, and whether a test a
+                    // module imports is collected there too.
+                    usefixtures: configWords(config.table, 'usefixtures') || [],
+                    importedTests: !/^(false|no|off|0)$/i.test((configWords(config.table, 'collect_imported_tests') || [])[0] || ''),
                 },
             };
         }
@@ -801,8 +813,7 @@ function mochaLoadingOptions(runner) {
     return kept;
 }
 
-// Configuration files of the JavaScript runners, and the keys in them
-// that change which tests a command runs.
+// Configuration files of the JavaScript runners.
 const JS_CONFIG_NAMES = {
     jest: new Set(['jest.config.js', 'jest.config.cjs', 'jest.config.mjs', 'jest.config.ts', 'jest.config.cts',
         'jest.config.mts', 'jest.config.json']),
@@ -815,16 +826,71 @@ const JS_CONFIG_NAMES = {
         '.mocharc.yaml', '.mocharc.yml']),
 };
 const JS_CONFIG_PACKAGE_KEY = { jest: 'jest', mocha: 'mocha' };
-const JS_SELECTING_KEYS = {
-    jest: new Set(['testMatch', 'testRegex', 'testPathIgnorePatterns', 'roots', 'rootDir', 'projects', 'preset',
-        'modulePathIgnorePatterns', 'moduleFileExtensions', 'haste', 'runner', 'testRunner', 'injectGlobals']),
-    vitest: new Set(['include', 'exclude', 'includeSource', 'dir', 'root', 'projects', 'workspace', 'extends',
-        'testNamePattern', 'allowOnly', 'browser', 'shard', 'related', 'changed']),
-    mocha: new Set(['spec', 'file', 'ignore', 'exclude', 'grep', 'fgrep', 'invert', 'extension', 'ui', 'dry-run',
-        'dryRun', 'forbid-only', 'forbidOnly', 'config', 'package', 'opts']),
+// The keys of a configuration that are known to leave alone which tests a
+// command for one file runs. Every other key may select: it is evaluated
+// where it is modeled (JS_MODELED_KEYS), and the configuration is not read
+// otherwise. vitest's are the keys of `test`; mocha's are compared with
+// dashes and case folded (it takes both spellings).
+const JS_INERT_KEYS = {
+    jest: new Set(['automock', 'bail', 'cache', 'cacheDirectory', 'ci', 'clearMocks', 'collectCoverage',
+        'collectCoverageFrom', 'coverageDirectory', 'coveragePathIgnorePatterns', 'coverageProvider',
+        'coverageReporters', 'coverageThreshold', 'detectLeaks', 'detectOpenHandles', 'displayName',
+        'errorOnDeprecated', 'expand', 'extensionsToTreatAsEsm', 'fakeTimers', 'forceCoverageMatch', 'forceExit',
+        'globalSetup', 'globalTeardown', 'globals', 'json', 'logHeapUsage', 'maxConcurrency', 'maxWorkers',
+        'moduleDirectories', 'moduleNameMapper', 'modulePaths', 'noStackTrace', 'notify', 'notifyMode',
+        'openHandlesTimeout', 'outputFile', 'passWithNoTests', 'prettierPath', 'randomize', 'reporters',
+        'resetMocks', 'resetModules', 'resolver', 'restoreMocks', 'sandboxInjectedGlobals', 'setupFiles',
+        'setupFilesAfterEnv', 'showSeed', 'silent', 'slowTestThreshold', 'snapshotFormat', 'snapshotResolver',
+        'snapshotSerializers', 'testEnvironment', 'testEnvironmentOptions', 'testFailureExitCode',
+        'testLocationInResults', 'testResultsProcessor', 'testTimeout', 'transform', 'transformIgnorePatterns',
+        'unmockedModulePathPatterns', 'useStderr', 'verbose', 'watchPathIgnorePatterns', 'watchPlugins',
+        'watchman', 'workerIdleMemoryLimit', 'workerThreads', 'dependencyExtractor', 'waitForUnhandledRejections',
+        '//',
+        // Names earlier versions of jest used for keys of this list.
+        'testURL', 'timers', 'setupTestFrameworkScriptFile', 'mapCoverage', 'name', 'extraGlobals', 'browser']),
+    vitest: new Set(['alias', 'api', 'attachmentsDir', 'bail', 'benchmark', 'cache', 'chaiConfig', 'clearMocks',
+        'coverage', 'css', 'dangerouslyIgnoreUnhandledErrors', 'deps', 'diff', 'disableConsoleIntercept', 'env',
+        'environment', 'environmentMatchGlobs', 'environmentOptions', 'expandSnapshotDiff', 'expect', 'fakeTimers',
+        'fileParallelism', 'globals', 'globalSetup', 'hookTimeout', 'includeTaskLocation', 'isolate',
+        'logHeapUsage', 'maxConcurrency', 'maxWorkers', 'minWorkers', 'mockReset', 'name', 'onConsoleLog',
+        'onStackTrace', 'open', 'outputFile', 'passWithNoTests', 'pool', 'poolMatchGlobs', 'poolOptions',
+        'printConsoleTrace', 'provide', 'reporters', 'resolveSnapshotPath', 'restoreMocks', 'retry', 'sequence',
+        'server', 'setupFiles', 'silent', 'slowTestThreshold', 'snapshotFormat', 'snapshotSerializers',
+        'teardownTimeout', 'testTimeout', 'ui', 'unstubEnvs', 'unstubGlobals', 'update', 'watch']),
+    mocha: new Set(['allowuncaught', 'asynconly', 'bail', 'checkleaks', 'color', 'colors', 'diff',
+        'enablesourcemaps', 'exit', 'failzero', 'fulltrace', 'global', 'globals', 'import', 'inlinediffs', 'jobs',
+        'loader', 'nodeoption', 'nodeoptions', 'parallel', 'recursive', 'reporter', 'reporteroption',
+        'reporteroptions', 'require', 'retries', 'slow', 'sort', 'timeout', 'timeouts', 'watch', 'watchfiles',
+        'watchignore']),
+};
+const JS_MODELED_KEYS = {
+    jest: new Set(['roots', 'testRegex', 'testPathIgnorePatterns']),
+    vitest: new Set(['dir']),
+    mocha: new Set(),
+};
+// The keys of a vite configuration, beside `test` and `plugins`, that
+// leave vitest's file selection alone.
+const VITE_INERT_KEYS = new Set(['appType', 'assetsInclude', 'base', 'build', 'cacheDir', 'clearScreen', 'css',
+    'define', 'dev', 'envDir', 'envPrefix', 'environments', 'esbuild', 'experimental', 'future', 'html', 'json',
+    'legacy', 'logLevel', 'mode', 'optimizeDeps', 'oxc', 'preview', 'publicDir', 'resolve', 'server', 'ssr',
+    'worker']);
+// The functions a runner's own package gives a configuration to pass
+// through unchanged: the name alone proves nothing, the import does.
+const CONFIG_IDENTITY = {
+    jest: { modules: new Set(['jest']), names: new Set(['defineConfig']) },
+    vitest: { modules: new Set(['vitest/config', 'vite', 'vitest']), names: new Set(['defineConfig', 'defineProject']) },
 };
 const CONFIG_WRAPPERS = new Set(['parenthesized_expression', 'as_expression', 'satisfies_expression',
     'type_assertion', 'non_null_expression']);
+// Modules whose functions act on the process or the disk, and the
+// functions of them that only read.
+const CONFIG_ACTING_MODULES = new Set(['fs', 'fs/promises', 'child_process', 'module', 'vm', 'worker_threads',
+    'cluster', 'process', 'inspector', 'repl']);
+const CONFIG_READING_CALLS = new Set(['readFileSync', 'existsSync', 'readdirSync', 'statSync', 'lstatSync',
+    'realpathSync', 'createRequire']);
+const CONFIG_GLOBAL_NAMESPACES = new Set(['JSON', 'Math', 'Object', 'Array', 'String', 'Number', 'Boolean']);
+const CONFIG_CONSTRUCTORS = new Set(['URL', 'RegExp', 'Set', 'Map', 'Date']);
+const CONFIG_NAME_NODES = new Set(['identifier', 'shorthand_property_identifier', 'shorthand_property_identifier_pattern']);
 
 /** The value of a string literal node (no substitutions), or null. */
 function stringLiteralValue(node) {
@@ -840,10 +906,36 @@ function stringLiteralValue(node) {
     });
 }
 
+/** JSON text with its comments taken out; what a string holds is left as it is. */
+function withoutJsonComments(text) {
+    let out = '';
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (ch === '"') {
+            let end = i + 1;
+            while (end < text.length && text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
+            out += text.slice(i, end + 1);
+            i = end + 1;
+        } else if (ch === '/' && text[i + 1] === '/') {
+            while (i < text.length && text[i] !== '\n') i++;
+        } else if (ch === '/' && text[i + 1] === '*') {
+            const end = text.indexOf('*/', i + 2);
+            i = end === -1 ? text.length : end + 2;
+            out += ' ';
+        } else {
+            out += ch;
+            i++;
+        }
+    }
+    return out;
+}
+
 /**
- * The keys a configuration file sets, each with a reader of its value as
+ * The keys a configuration sets, each with readers of its value: as
  * strings (null when the value is not a string or a list of strings
- * written out). Null when the file's configuration object is not read.
+ * written out), as an object of keys, and whether it is a list of calls
+ * of functions that packages provide. Null when the value is no object.
  */
 function configKeysOfJson(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -853,63 +945,266 @@ function configKeysOfJson(value) {
             strings: () => typeof held === 'string' ? [held]
                 : Array.isArray(held) && held.every(item => typeof item === 'string') ? held : null,
             object: () => configKeysOfJson(held),
+            packageCalls: () => Array.isArray(held) && held.length === 0,
         });
     }
     return keys;
 }
 
-function configKeysOf(model, dir, name) {
-    const text = model.manifests.read(dir, name);
-    if (text == null) return null;
-    const fromJson = configKeysOfJson;
-    if (/\.(json|jsonc)$/.test(name)) {
-        try {
-            return fromJson(JSON.parse(text));
-        } catch (e) {
-            // Comments are allowed in these files.
-            try {
-                return fromJson(JSON.parse(text.replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')));
-            } catch (e2) {
-                return null;
-            }
+/**
+ * The top-level keys of a YAML mapping written as a block, one `key:` to
+ * a line at the left margin; their values are not read. Null for every
+ * other way of writing one (a flow mapping, indented keys, a merge key, a
+ * key that is not a plain or quoted word): what such a file sets is not
+ * read.
+ */
+function configKeysOfYaml(text) {
+    const keys = new Map();
+    let started = false;
+    for (const line of String(text).split(/\r?\n/)) {
+        if (/^\s*(#.*)?$/.test(line)) continue;
+        if (!started && keys.size === 0 && /^---\s*(#.*)?$/.test(line)) {
+            started = true;
+            continue;
         }
-    }
-    if (/\.(yaml|yml)$/.test(name)) {
-        // The top-level keys of a mapping; their values are not read.
-        const keys = new Map();
-        for (const line of text.split('\n')) {
-            const found = /^(['"]?)([A-Za-z][\w-]*)\1\s*:/.exec(line);
-            if (found) keys.set(found[2], { strings: () => null, object: () => null });
+        // The value of the key above: indented lines, or a list at the margin.
+        if (/^[ \t]/.test(line) || /^-(\s|$)/.test(line)) {
+            if (keys.size === 0) return null;
+            continue;
         }
-        return keys;
+        const found = /^([A-Za-z][\w-]*|"[A-Za-z][\w-]*"|'[A-Za-z][\w-]*')\s*:(\s|$)/.exec(line);
+        if (!found) return null;
+        keys.set(found[1].replace(/^['"]|['"]$/g, ''), { strings: () => null, object: () => null, packageCalls: () => false });
     }
-    if (!/\.[cm]?[jt]s$/.test(name)) return null;
-    const tree = safeParse(getParser(/\.[cm]?ts$/.test(name) ? 'typescript' : 'javascript'), text);
-    if (!tree) return null;
+    return keys;
+}
+
+/**
+ * The keys a configuration written as code sets, when the file is one
+ * object written out and nothing else in it can change that object or act
+ * on the run. The file may hold only: imports that bind names, variable
+ * declarations whose values are built without running code of the file
+ * (literals, names, operators, calls of functions that packages and the
+ * language provide), type declarations, and ONE export (`module.exports =`
+ * or `export default`) of an object literal: written in place, held by a
+ * variable that is named nowhere else, or passed through the function the
+ * runner's own package provides for that (proved by the import). A second
+ * statement that writes the export, a name for the object that is used
+ * again, a function of the file that is called, a write anywhere: the file
+ * is code whose effect is not read (null).
+ */
+function configKeysOfCode(text, typed, runnerId) {
+    const tree = safeParse(getParser(typed ? 'typescript' : 'javascript'), text);
+    if (!tree || tree.rootNode.hasError) return null;
     const root = tree.rootNode;
-    const declared = identifier => {
-        const found = [];
-        for (const statement of root.namedChildren) {
-            const declaration = statement.type === 'export_statement'
-                ? statement.namedChildren.find(child => /_declaration$/.test(child.type)) : statement;
-            if (!declaration || (declaration.type !== 'lexical_declaration' && declaration.type !== 'variable_declaration')) continue;
-            for (const declarator of declaration.namedChildren) {
-                const target = declarator.childForFieldName && declarator.childForFieldName('name');
-                if (target && target.type === 'identifier' && target.text === identifier) found.push(declarator.childForFieldName('value'));
-            }
-        }
-        return found.length === 1 ? found[0] : null;
+    const bindings = new Map(); // local name -> { module, imported } (imported null: the module itself)
+    const declared = new Map(); // local name -> value nodes of its declarators
+    const packaged = name => {
+        const binding = bindings.get(name);
+        return !!binding && !/^\.{0,2}\//.test(binding.module) && !/^[A-Za-z]:[\\/]/.test(binding.module);
     };
+    const moduleName = binding => binding.module.replace(/^node:/, '');
+    const requiredModule = node => {
+        if (!node || node.type !== 'call_expression') return null;
+        const callee = node.childForFieldName('function');
+        const args = node.childForFieldName('arguments');
+        if (!callee || callee.type !== 'identifier' || callee.text !== 'require' || !args || args.namedChildren.length !== 1) return null;
+        return stringLiteralValue(args.namedChildren[0]);
+    };
+    /** Is a callee a function that a package or the language provides? */
+    const calleeProvided = callee => {
+        if (!callee) return false;
+        if (CONFIG_WRAPPERS.has(callee.type)) return calleeProvided(callee.namedChildren[0]);
+        if (callee.type === 'identifier') {
+            const binding = bindings.get(callee.text);
+            return packaged(callee.text) && !CONFIG_ACTING_MODULES.has(moduleName(binding)) ||
+                (!!binding && packaged(callee.text) && CONFIG_READING_CALLS.has(binding.imported));
+        }
+        if (callee.type === 'call_expression') {
+            // require('path').join, a function a package's function returns
+            return requiredModule(callee) != null ? !CONFIG_ACTING_MODULES.has(requiredModule(callee).replace(/^node:/, ''))
+                : calleeProvided(callee.childForFieldName('function')) && inert(callee.childForFieldName('arguments'));
+        }
+        if (callee.type !== 'member_expression') return false;
+        const property = callee.childForFieldName('property');
+        let base = callee;
+        while (base && (base.type === 'member_expression' || CONFIG_WRAPPERS.has(base.type))) {
+            base = base.type === 'member_expression' ? base.childForFieldName('object') : base.namedChildren[0];
+        }
+        if (!base || !property) return false;
+        if (base.type === 'call_expression') {
+            const required = requiredModule(base);
+            if (required != null) {
+                return !CONFIG_ACTING_MODULES.has(required.replace(/^node:/, '')) || CONFIG_READING_CALLS.has(property.text);
+            }
+            return calleeProvided(base.childForFieldName('function')) && inert(base.childForFieldName('arguments'));
+        }
+        if (base.type === 'meta_property') return true;
+        if (base.type !== 'identifier') return false;
+        if (base.text === 'process') {
+            // process.cwd() and nothing else of the process is called.
+            return sameNodeText(callee.childForFieldName('object'), 'process') && property.text === 'cwd';
+        }
+        if (CONFIG_GLOBAL_NAMESPACES.has(base.text) && !bindings.has(base.text) && !declared.has(base.text)) return true;
+        const binding = bindings.get(base.text);
+        if (!binding || !packaged(base.text)) return false;
+        return !CONFIG_ACTING_MODULES.has(moduleName(binding)) || CONFIG_READING_CALLS.has(property.text);
+    };
+    const sameNodeText = (node, name) => !!node && node.type === 'identifier' && node.text === name;
+    /** Does evaluating an expression run nothing of this file and write nothing? */
+    function inert(node) {
+        if (!node) return true;
+        switch (node.type) {
+            case 'string': case 'number': case 'true': case 'false': case 'null': case 'undefined': case 'regex':
+            case 'identifier': case 'property_identifier': case 'shorthand_property_identifier':
+            case 'private_property_identifier': case 'comment': case 'meta_property': case 'this':
+            case 'string_fragment': case 'escape_sequence': case 'optional_chain':
+                return true;
+            // A function written here is not called here.
+            case 'arrow_function': case 'function_expression': case 'function': case 'generator_function':
+                return true;
+            case 'template_string': case 'template_substitution': case 'parenthesized_expression': case 'array':
+            case 'object': case 'pair': case 'spread_element': case 'binary_expression': case 'ternary_expression':
+            case 'subscript_expression': case 'member_expression': case 'computed_property_name': case 'arguments':
+            case 'as_expression': case 'satisfies_expression': case 'non_null_expression': case 'type_assertion':
+                return node.namedChildren.every(child => /(^|_)type(s|_arguments|_annotation)?$|^type_|_type$/.test(child.type) || inert(child));
+            case 'unary_expression':
+                return node.children[0].type !== 'delete' && node.namedChildren.every(inert);
+            case 'new_expression': {
+                const made = node.childForFieldName('constructor');
+                return !!made && made.type === 'identifier' && CONFIG_CONSTRUCTORS.has(made.text) &&
+                    !bindings.has(made.text) && !declared.has(made.text) && inert(node.childForFieldName('arguments'));
+            }
+            case 'call_expression': {
+                if (requiredModule(node) != null) return true;
+                return calleeProvided(node.childForFieldName('function')) && inert(node.childForFieldName('arguments'));
+            }
+            default:
+                return false;
+        }
+    }
+
+    let exported = null;
+    let exports = 0;
+    let commonJs = false;
+    const values = []; // every value a declaration evaluates
+    for (const statement of root.namedChildren) {
+        switch (statement.type) {
+            case 'comment': case 'hash_bang_line': case 'empty_statement':
+            case 'type_alias_declaration': case 'interface_declaration':
+                break;
+            case 'import_statement': {
+                const clause = statement.namedChildren.find(child => child.type === 'import_clause');
+                const source = stringLiteralValue(statement.childForFieldName('source'));
+                // An import for its effect runs code that is not read.
+                if (!clause || source == null) return null;
+                for (const part of clause.namedChildren) {
+                    if (part.type === 'identifier') bindings.set(part.text, { module: source, imported: 'default' });
+                    else if (part.type === 'namespace_import') {
+                        const name = part.namedChildren.find(child => child.type === 'identifier');
+                        if (name) bindings.set(name.text, { module: source, imported: null });
+                    } else if (part.type === 'named_imports') {
+                        for (const specifier of part.namedChildren) {
+                            if (specifier.type !== 'import_specifier') continue;
+                            const name = specifier.childForFieldName('name');
+                            const alias = specifier.childForFieldName('alias');
+                            if (name) bindings.set((alias || name).text, { module: source, imported: name.text });
+                        }
+                    }
+                }
+                break;
+            }
+            case 'lexical_declaration': case 'variable_declaration': {
+                for (const declarator of statement.namedChildren) {
+                    if (declarator.type !== 'variable_declarator') return null;
+                    const target = declarator.childForFieldName('name');
+                    const value = declarator.childForFieldName('value');
+                    const required = requiredModule(value);
+                    if (target && target.type === 'identifier') {
+                        if (required != null) bindings.set(target.text, { module: required, imported: null });
+                        else {
+                            if (!declared.has(target.text)) declared.set(target.text, []);
+                            declared.get(target.text).push(value || null);
+                            if (value) values.push(value);
+                        }
+                    } else if (target && target.type === 'object_pattern' && required != null) {
+                        for (const part of target.namedChildren) {
+                            if (part.type === 'shorthand_property_identifier_pattern') {
+                                bindings.set(part.text, { module: required, imported: part.text });
+                            } else if (part.type === 'pair_pattern') {
+                                const key = part.childForFieldName('key');
+                                const local = part.childForFieldName('value');
+                                if (!key || !local || local.type !== 'identifier' || key.type !== 'property_identifier') return null;
+                                bindings.set(local.text, { module: required, imported: key.text });
+                            } else {
+                                return null;
+                            }
+                        }
+                    } else {
+                        return null;
+                    }
+                }
+                break;
+            }
+            case 'expression_statement': {
+                const expression = statement.namedChildren[0];
+                // A directive ("use strict").
+                if (expression && expression.type === 'string') break;
+                if (!expression || expression.type !== 'assignment_expression') return null;
+                const left = expression.childForFieldName('left');
+                if (!left || left.type !== 'member_expression' || !sameNodeText(left.childForFieldName('object'), 'module') ||
+                    left.childForFieldName('property')?.text !== 'exports') return null;
+                exported = expression.childForFieldName('right');
+                commonJs = true;
+                exports++;
+                break;
+            }
+            case 'export_statement': {
+                if (!statement.children.some(child => child.type === 'default')) return null;
+                exported = statement.childForFieldName('value');
+                exports++;
+                break;
+            }
+            default:
+                return null;
+        }
+    }
+    if (exports !== 1 || !exported) return null;
+    if (!values.every(inert)) return null;
+    // The names that reach the exported object: each is used exactly as
+    // often as reading it once needs.
+    const uses = new Map();
+    const count = node => {
+        if (CONFIG_NAME_NODES.has(node.type)) uses.set(node.text, (uses.get(node.text) || 0) + 1);
+        for (const child of node.namedChildren) count(child);
+    };
+    count(root);
+    if ((uses.get('module') || 0) !== (commonJs ? 1 : 0) || uses.has('exports') || uses.has('eval') ||
+        uses.has('globalThis') || uses.has('global')) return null;
+    // `require` only as the call of one written-out module name.
+    let requires = 0;
+    const countRequires = node => {
+        if (requiredModule(node) != null) requires++;
+        for (const child of node.namedChildren) countRequires(child);
+    };
+    countRequires(root);
+    if ((uses.get('require') || 0) !== requires) return null;
+    const identity = CONFIG_IDENTITY[runnerId];
     const objectOf = (node, depth = 0) => {
         if (!node || depth > 6) return null;
         if (CONFIG_WRAPPERS.has(node.type)) return objectOf(node.namedChildren[0], depth + 1);
         if (node.type === 'object') return node;
-        if (node.type === 'identifier') return objectOf(declared(node.text), depth + 1);
-        if (node.type === 'call_expression') {
-            // defineConfig({...}) hands its argument back.
+        if (node.type === 'identifier') {
+            // One declaration, and this the only other place it is named.
+            const held = declared.get(node.text);
+            if (!held || held.length !== 1 || bindings.has(node.text) || uses.get(node.text) !== 2) return null;
+            return objectOf(held[0], depth + 1);
+        }
+        if (node.type === 'call_expression' && identity) {
             const callee = node.childForFieldName('function');
             const args = node.childForFieldName('arguments');
-            if (callee && callee.type === 'identifier' && /^define(Config|Project)$/.test(callee.text) &&
+            const binding = callee && callee.type === 'identifier' && !declared.has(callee.text) ? bindings.get(callee.text) : null;
+            if (binding && identity.modules.has(binding.module) && identity.names.has(binding.imported) &&
                 args && args.namedChildren.length === 1) return objectOf(args.namedChildren[0], depth + 1);
         }
         return null;
@@ -924,7 +1219,7 @@ function configKeysOf(model, dir, name) {
             const key = member.childForFieldName('key');
             const value = member.childForFieldName('value');
             const written = !key ? null : key.type === 'property_identifier' ? key.text : stringLiteralValue(key);
-            if (written == null) return null;
+            if (written == null || written === '__proto__' || !inert(value)) return null;
             keys.set(written, {
                 strings: () => {
                     const one = stringLiteralValue(value);
@@ -934,36 +1229,40 @@ function configKeysOf(model, dir, name) {
                     return all.every(item => item != null) ? all : null;
                 },
                 object: () => fromObject(value),
+                // A list of what functions of packages return (plugins).
+                packageCalls: () => !!value && value.type === 'array' &&
+                    value.namedChildren.every(item => item.type === 'comment' ||
+                        (item.type === 'call_expression' && requiredModule(item) == null && inert(item))),
             });
         }
         return keys;
     };
-    let exported = null;
-    let count = 0;
-    for (const statement of root.namedChildren) {
-        if (statement.type === 'expression_statement') {
-            const assignment = statement.namedChildren[0];
-            if (assignment && assignment.type === 'assignment_expression' &&
-                assignment.childForFieldName('left')?.text.replace(/\s+/g, '') === 'module.exports') {
-                exported = assignment.childForFieldName('right');
-                count++;
-            }
-        } else if (statement.type === 'export_statement' && statement.children.some(child => child.type === 'default')) {
-            exported = statement.childForFieldName('value');
-            count++;
+    return fromObject(exported);
+}
+
+function configKeysOf(model, dir, name, runnerId) {
+    const text = model.manifests.read(dir, name);
+    if (text == null) return null;
+    if (/\.(json|jsonc)$/.test(name)) {
+        try {
+            return configKeysOfJson(JSON.parse(withoutJsonComments(text)));
+        } catch (e) {
+            return null;
         }
     }
-    return count === 1 ? fromObject(exported) : null;
+    if (/\.(yaml|yml)$/.test(name)) return configKeysOfYaml(text);
+    if (!/\.[cm]?[jt]s$/.test(name)) return null;
+    return configKeysOfCode(text, /\.[cm]?ts$/.test(name), runnerId);
 }
 
 /**
  * What a JavaScript runner's configuration does to a command that names a
- * test file: `inert` (nothing the command depends on is set), `modeled`
- * (`accepts(file)` says whether the configuration leaves the file in;
- * `ownPattern`: it replaces the runner's default file pattern), or
- * `unread` (a key that selects files or tests is set and not modeled, the
- * configuration is code that is not written out as an object, or one
- * stands above the runner's directory).
+ * test file: `inert` (every key it sets is known to leave the selection
+ * alone), `modeled` (`accepts(file)` says whether the configuration
+ * leaves the file in; `ownPattern`: it replaces the runner's default file
+ * pattern), or `unread` (a key that may select is set and not modeled, the
+ * configuration is code that is not one written-out object, or one stands
+ * above the runner's directory).
  */
 function jsRunnerConfig(model, runner) {
     const memoKey = `${runner.id}\0${runner.dir || ''}`;
@@ -985,7 +1284,7 @@ function jsRunnerConfig(model, runner) {
             // vitest's own file is the one read when both are there.
             if (files.some(name => /^vitest\.config\./.test(name))) files = files.filter(name => /^vitest\.config\./.test(name));
         }
-        const sources = files.map(name => configKeysOf(model, here, name));
+        const sources = files.map(name => configKeysOf(model, here, name, runner.id));
         const manifest = packageKey ? model.manifests.json(here, 'package.json') : null;
         if (manifest && manifest[packageKey] != null) {
             const held = manifest[packageKey];
@@ -996,18 +1295,25 @@ function jsRunnerConfig(model, runner) {
         let keys = new Map();
         for (const source of sources) for (const [key, reader] of source) keys.set(key, reader);
         if (runner.id === 'vitest') {
-            // The runner's part of a vite configuration is its `test` key.
-            const root = keys.get('root');
+            // The runner's part of a vite configuration is its `test` key;
+            // a plugin can rewrite the configuration, so each one has to
+            // be what a package's function returns.
+            for (const [key, reader] of keys) {
+                if (key === 'test' || VITE_INERT_KEYS.has(key)) continue;
+                if (key === 'plugins' && reader.packageCalls()) continue;
+                return { state: 'unread' };
+            }
             const test = keys.get('test');
-            if (root) return { state: 'unread' };
             if (!test) return { state: 'inert' };
             keys = test.object();
             if (!keys) return { state: 'unread' };
         }
-        const selecting = [...keys.keys()].filter(key => JS_SELECTING_KEYS[runner.id].has(key));
+        const fold = key => runner.id === 'mocha' ? key.replace(/-/g, '').toLowerCase() : key;
+        const selecting = [...keys.keys()].filter(key => !JS_INERT_KEYS[runner.id].has(fold(key)));
         if (selecting.length === 0) return { state: 'inert', keys: new Set(keys.keys()) };
+        if (!selecting.every(key => JS_MODELED_KEYS[runner.id].has(key))) return { state: 'unread' };
         const absolute = file => path.posix.join(String(model.root).replace(/\\/g, '/'), here, file);
-        if (runner.id === 'jest' && selecting.every(key => ['roots', 'testRegex', 'testPathIgnorePatterns'].includes(key))) {
+        if (runner.id === 'jest') {
             const read = key => keys.has(key) ? keys.get(key).strings() : undefined;
             const roots = read('roots');
             const regex = read('testRegex');
@@ -1038,7 +1344,7 @@ function jsRunnerConfig(model, runner) {
                 },
             };
         }
-        if (runner.id === 'vitest' && selecting.length === 1 && selecting[0] === 'dir') {
+        if (runner.id === 'vitest') {
             const dir = keys.get('dir').strings();
             if (!dir || dir.length !== 1 || path.posix.isAbsolute(dir[0]) || dir[0].includes('..')) return { state: 'unread' };
             const under = dir[0].replace(/^\.\//, '').replace(/\/$/, '');
@@ -1252,6 +1558,8 @@ function createTestModel(index) {
         runners: new Map(),
         jsConfigs: new Map(),
         gates: new Map(),
+        plugins: new Map(),
+        guards: new Map(),
         readerCaches: new Map(),
         root: index.root,
         relPaths: null,
@@ -1370,6 +1678,13 @@ function createTestModel(index) {
                 if (defs.length !== 1) return null;
                 return (defs[0].annotationsWithArgs || []).map(annotation => String(annotation.name).split('.').pop());
             },
+            /** The types of this name the project declares: the namespace (package) and file of each. */
+            typesNamed: name => (index.symbols.get(String(name).replace(/[<[(].*$/, '').split('.').pop().trim()) || [])
+                .filter(def => CONTAINER_KINDS.has(def.type))
+                .map(def => ({ namespace: def.namespace || '', file: index.files.get(def.file)?.relativePath || null })),
+            /** Does the project declare a type of this name? */
+            declaresType: name => (index.symbols.get(String(name).replace(/[<[(].*$/, '').split('.').pop().trim()) || [])
+                .some(def => CONTAINER_KINDS.has(def.type)),
             isContainer: symbol => CONTAINER_KINDS.has(symbol.type),
             isCallable: symbol => CALLABLE_KINDS.has(symbol.type),
             /** Names of the types a class derives from, through the project. */
@@ -1548,7 +1863,7 @@ function createTestModel(index) {
      * member of that name. A test found behind a base that is not read is
      * not attributed (`withheld`): that base may declare the name itself.
      */
-    const inheritedBy = (filePath, cls) => {
+    const inheritedBy = (filePath, cls, select = null) => {
         const out = [];
         const hidden = new Set(cls.members);
         let behindUnknown = false;
@@ -1561,6 +1876,9 @@ function createTestModel(index) {
             for (const test of node.cls.tests) {
                 if (hidden.has(test.name)) continue;
                 hidden.add(test.name);
+                // A member the runner does not take as a test still hides
+                // the one of that name further up.
+                if (select && !select(test)) continue;
                 if (behindUnknown) withheldAny = true;
                 else out.push({ test, base: node });
             }
@@ -1597,9 +1915,9 @@ function createTestModel(index) {
 
     /**
      * Is there code beside a test file that the runner lets decide which
-     * tests run (the language's `testGate`): a conftest.py above it whose
-     * hooks can change what is collected or run, a TestMain in its Go
-     * package that may not run the tests.
+     * tests run (the language's `testGate`): a TestMain in its Go package
+     * that may not run the tests. (pytest's conftest.py files are read
+     * with the modules they stand above: see guardsOf.)
      */
     const gatedAtRunTime = (filePath, runner) => {
         const relativePath = index.files.get(filePath).relativePath;
@@ -1619,9 +1937,6 @@ function createTestModel(index) {
             }
             return model.gates.get(candidate);
         };
-        if (runner.id === 'pytest') {
-            return ancestorDirs(relativePath).some(dir => decides(path.join(index.root, dir, 'conftest.py')));
-        }
         if (runner.id === 'go-test') {
             if (!model.goTestFiles) {
                 model.goTestFiles = new Map();
@@ -1635,6 +1950,548 @@ function createTestModel(index) {
             return (model.goTestFiles.get(posixDir(relativePath)) || []).some(decides);
         }
         return false;
+    };
+
+    // ---- a reader that gives facts per file (`derived`): pytest ----------
+
+    /** The project file a module name written in a file resolves to, or null. */
+    const moduleFile = (filePath, moduleName) => {
+        const relative = (index.files.get(filePath)?.moduleResolved || {})[moduleName];
+        const target = relative ? path.join(index.root, relative) : null;
+        return target && index.files.has(target) ? target : null;
+    };
+
+    /** The project file a dotted module name stands for, from the runner's directory or the project's. */
+    const moduleNamed = (filePath, dotted) => {
+        const runner = model.runnerOf(filePath) || {};
+        const relative = String(dotted).replace(/\./g, '/');
+        for (const base of new Set([runner.dir || '', ''])) {
+            for (const tail of [`${relative}.py`, `${relative}/__init__.py`]) {
+                const candidate = base ? `${base}/${tail}` : tail;
+                if (model.hasFile(candidate)) return path.join(index.root, candidate);
+            }
+        }
+        return null;
+    };
+
+    /**
+     * Does a module declare tests where one of its functions is called
+     * (a declaration inside a function that is no suite's callback), itself
+     * or through the modules whose functions it calls?
+     */
+    const declaresWhenCalled = (filePath, seen = new Set()) => {
+        if (seen.has(filePath)) return false;
+        seen.add(filePath);
+        const found = model.declared(filePath);
+        if (!found) return false;
+        if ((found.units || []).some(unit => unit.kind === 'test' &&
+            (unit.indirect || unit.dynamic === 'declared-indirectly'))) return true;
+        return (found.calledWhenCalled || []).some(name => {
+            const target = moduleFile(filePath, name);
+            return !!target && declaresWhenCalled(target, seen);
+        });
+    };
+
+    /**
+     * What a name of a module is, as far as tests go: a class or a function
+     * of its top, or what another name of the module or another module
+     * gives it (an alias, an import, a star import), a few steps deep.
+     */
+    const resolveName = (filePath, name, depth = 0) => {
+        if (!filePath || depth > 6) return null;
+        const found = model.declared(filePath);
+        if (!found) return null;
+        const cls = (found.classes || []).find(other => other.name === name && other.suite.length === 0);
+        if (cls) return { kind: 'class', filePath, cls };
+        const fn = (found.functions || []).find(other => other.name === name);
+        if (fn) return { kind: 'function', filePath, fn };
+        for (const entry of found.imports || []) {
+            if (entry.name !== name) continue;
+            const from = entry.module == null ? filePath : moduleFile(filePath, entry.module);
+            if (from === filePath && entry.original === name) continue;
+            const hit = resolveName(from, entry.original, depth + 1);
+            if (hit) return hit;
+        }
+        for (const star of found.stars || []) {
+            const from = moduleFile(filePath, star.module);
+            const there = from ? model.declared(from) : null;
+            if (!there || there.exportsAll === 'unknown') continue;
+            if (there.exportsAll ? !there.exportsAll.includes(name) : name.startsWith('_')) continue;
+            const hit = resolveName(from, name, depth + 1);
+            if (hit) return hit;
+        }
+        return null;
+    };
+
+    /**
+     * Does one of the functions a file calls in other modules of the
+     * project stop a test when called (it skips, raises, or calls a
+     * function of its own module that does)? One module deep.
+     */
+    const callStops = (filePath, calls) => (calls || []).some(call => {
+        const target = moduleFile(filePath, call.module) || moduleNamed(filePath, call.module);
+        const there = target ? model.declared(target) : null;
+        return !!there && (there.stopping || []).includes(call.name);
+    });
+    /** A file's fixtures, with what the functions they call elsewhere add. */
+    const fixturesOf = (filePath, fixtures) => (fixtures || []).map(fixture =>
+        !fixture.decides && callStops(filePath, fixture.calls) ? { ...fixture, decides: true } : fixture);
+
+    /**
+     * What a file does when the runner loads it as a plugin (a conftest.py,
+     * a module another names as one), with the modules it loads in turn:
+     * whether a hook can change what is collected or run, whether it has
+     * the hook a test module may have too, and the fixtures it brings.
+     */
+    const pluginFacts = (filePath, seen = new Set()) => {
+        const top = seen.size === 0;
+        if (top && model.plugins.has(filePath)) return model.plugins.get(filePath);
+        if (seen.has(filePath)) return { decides: false, everywhere: false, generates: false, fixtures: [] };
+        seen.add(filePath);
+        const found = model.declared(filePath);
+        const runtime = found && found.runtime;
+        // A plugin that is not read may do anything.
+        const answer = {
+            decides: !runtime || runtime.decides,
+            // A hook pytest calls once for the whole run decides for
+            // every test of it, wherever the file stands.
+            everywhere: !runtime || !!runtime.everywhere,
+            generates: !runtime || !!runtime.generates,
+            fixtures: runtime ? fixturesOf(filePath, runtime.fixtures) : [],
+        };
+        // A hook that calls a function of another module of the project
+        // that can stop a test decides as if it stopped it itself.
+        for (const call of (runtime && runtime.hookCalls) || []) {
+            if (!callStops(filePath, [call])) continue;
+            answer.decides = true;
+            if (call.everywhere) answer.everywhere = true;
+            if (call.generates) answer.generates = true;
+        }
+        for (const plugin of runtime ? runtime.plugins : []) {
+            const target = plugin.by === 'import' ? moduleFile(filePath, plugin.module) : moduleNamed(filePath, plugin.module);
+            // A module outside the project is a plugin like any installed one.
+            if (!target) continue;
+            const inner = pluginFacts(target, seen);
+            answer.decides = answer.decides || inner.decides;
+            answer.generates = answer.generates || inner.generates;
+            // A module named as a plugin is one for the whole run.
+            if (inner.everywhere || (plugin.by === 'name' && inner.decides)) answer.everywhere = true;
+            answer.fixtures.push(...inner.fixtures);
+        }
+        // Fixtures taken by name from other modules of the project.
+        for (const entry of (found && found.imports) || []) {
+            const target = entry.module == null ? null : moduleFile(filePath, entry.module);
+            const there = target ? model.declared(target) : null;
+            const fixture = there && there.runtime
+                ? fixturesOf(target, there.runtime.fixtures).find(other => other.function === entry.original) : null;
+            if (fixture) answer.fixtures.push(fixture.name === fixture.function ? { ...fixture, name: entry.name } : fixture);
+        }
+        if (top) model.plugins.set(filePath, answer);
+        return answer;
+    };
+
+    /**
+     * The fixture names that can stop a test: those that decide, and those
+     * that ask for one that does. With `is`: the names that reach a
+     * fixture of that kind instead.
+     */
+    const stoppingNames = (fixtures, is = fixture => fixture.decides) => {
+        const names = new Set();
+        for (const fixture of fixtures) if (is(fixture) && fixture.name != null) names.add(fixture.name);
+        let grew = true;
+        while (grew) {
+            grew = false;
+            for (const fixture of fixtures) {
+                if (fixture.name == null || names.has(fixture.name) || !fixture.requests.some(name => names.has(name))) continue;
+                names.add(fixture.name);
+                grew = true;
+            }
+        }
+        return names;
+    };
+
+    /**
+     * What the code beside a test module can do to its tests before their
+     * bodies run: the conftest.py files above it, the plugins those and the
+     * module name, the module's own fixtures. `gated`: every test of the
+     * module runs only sometimes (a hook can change what is collected or
+     * run, a fixture every test gets can stop it). `fixtures`: the ones a
+     * test of the module can ask for.
+     */
+    const guardsOf = filePath => {
+        if (model.guards.has(filePath)) return model.guards.get(filePath);
+        const relativePath = index.files.get(filePath).relativePath;
+        const fixtures = [];
+        let gated = false;
+        // The conftest.py files a run of this file alone loads whose hooks
+        // decide for the whole run.
+        const wholeRun = [];
+        for (const dir of ancestorDirs(relativePath)) {
+            const conftest = path.join(index.root, dir, 'conftest.py');
+            if (conftest === filePath || !index.files.has(conftest)) continue;
+            const facts = pluginFacts(conftest);
+            if (facts.decides) gated = true;
+            if (facts.everywhere) wholeRun.push(index.files.get(conftest).relativePath);
+            fixtures.push(...facts.fixtures);
+        }
+        // The module itself is no plugin: of its own hooks pytest calls
+        // the one that generates tests; the modules it names are plugins.
+        const own = pluginFacts(filePath);
+        const runtime = model.declared(filePath)?.runtime;
+        if (own.generates || (own.everywhere && !(runtime && runtime.everywhere))) gated = true;
+        fixtures.push(...own.fixtures);
+        // A conftest.py anywhere under the runner's directory whose hook
+        // is called for the whole run: it is loaded with any run that
+        // collects a file below it, and decides for every test of that run.
+        const runner = model.runnerOf(filePath) || {};
+        if (!gated) {
+            if (!model.conftests) {
+                model.hasFile('');
+                model.conftests = [...model.relPaths].filter(other => path.posix.basename(other) === 'conftest.py')
+                    .sort(codeUnitCompare);
+            }
+            for (const other of model.conftests) {
+                if (relativeTo(runner.dir, other) == null) continue;
+                const conftest = path.join(index.root, other);
+                if (conftest !== filePath && pluginFacts(conftest).everywhere) {
+                    gated = true;
+                    break;
+                }
+            }
+        }
+        const stopping = stoppingNames(fixtures);
+        if (fixtures.some(fixture => (fixture.autouse || fixture.name == null) &&
+            (fixture.decides || fixture.requests.some(name => stopping.has(name))))) gated = true;
+        const answer = {
+            gated, fixtures, stopping, tabled: stoppingNames(fixtures, fixture => fixture.params),
+            wholeRun: wholeRun.sort(codeUnitCompare),
+        };
+        model.guards.set(filePath, answer);
+        return answer;
+    };
+
+    /**
+     * The units of a file whose reader gives facts (pytest): the module's
+     * own tests, the tests of every class the runner collects (its own and
+     * the ones it inherits, in the language's lookup order), and the tests
+     * the module holds under names it took from elsewhere or bound again.
+     *
+     * Whether a class is collected is settled over its lookup order: the
+     * nearest `__test__` (false: no; not a literal: sometimes; the literal
+     * True: yes whatever the class is called), a constructor anywhere in
+     * it (pytest's classes only), abstract members nothing nearer
+     * implements, a name the runner takes or a TestCase of unittest among
+     * its bases, and the classes around it. Marks, setups and fixtures of
+     * every class in that order reach its tests, as do the module's.
+     */
+    const derivedFacts = (filePath, found) => {
+        // A module switched off holds no test.
+        if (found.off) return { modeled: true, units: [], tests: 0, inheriting: false };
+        const relativePath = index.files.get(filePath).relativePath;
+        const relativeOf = other => index.files.get(other).relativePath;
+        const runner = model.runnerOf(filePath) || {};
+        const naming = runner.collection || {};
+        const named = (patterns, fallback, name) => (patterns && patterns.length > 0 ? patterns : fallback)
+            .some(pattern => /[*?[]/.test(pattern) ? globMatches(pattern, name) : name.startsWith(pattern));
+        const declaredModule = found.module || {};
+        // What the module does when it is imported and before its tests,
+        // with what the functions it calls in other modules add.
+        const mod = {
+            ...declaredModule,
+            ...(!declaredModule.skip && callStops(filePath, declaredModule.skipCalls) && { skip: 'sometimes' }),
+            ...(!declaredModule.guard && callStops(filePath, declaredModule.guardCalls) && { guard: true }),
+        };
+        const guards = guardsOf(filePath);
+        let more = !!found.inheriting;
+
+        // Names the module takes from other modules, and other names for
+        // what it holds: a test class or function among them runs here too.
+        const entries = [...(found.imports || [])];
+        const own = new Set([...(found.functions || []).map(fn => fn.name),
+            ...(found.classes || []).filter(cls => cls.suite.length === 0).map(cls => cls.name),
+            ...entries.map(entry => entry.name)]);
+        for (const star of naming.importedTests === false ? [] : found.stars || []) {
+            const from = moduleFile(filePath, star.module);
+            const there = from ? model.declared(from) : null;
+            // What a module that is not read brings is not seen.
+            if (!there || there.exportsAll === 'unknown') {
+                more = true;
+                continue;
+            }
+            if ((there.stars || []).length > 0) more = true;
+            const names = there.exportsAll || [
+                ...(there.functions || []).map(fn => fn.name),
+                ...(there.classes || []).filter(cls => cls.suite.length === 0).map(cls => cls.name),
+                ...(there.imports || []).map(entry => entry.name),
+            ].filter(name => !name.startsWith('_'));
+            for (const name of new Set(names)) {
+                if (!own.has(name)) entries.push({ name, original: name, module: star.module, line: star.line });
+            }
+        }
+        const classesHere = [...(found.classes || [])];
+        const taken = [];
+        const bound = new Set();
+        // A switch this module writes on a class it took from another
+        // module: the class is that object, so the switch holds for every
+        // class here that derives from it.
+        const switchedHere = new Map();
+        for (const entry of entries) {
+            if (bound.has(entry.name)) continue;
+            const from = entry.module == null ? filePath : moduleFile(filePath, entry.module);
+            if (!from || (from === filePath && entry.original === entry.name)) continue;
+            const hit = resolveName(from, entry.original);
+            if (!hit) continue;
+            // collect_imported_tests = false: only what the module
+            // defines itself is collected in it.
+            if (naming.importedTests === false && hit.filePath !== filePath) continue;
+            bound.add(entry.name);
+            // A switch written here on the name.
+            const written = (mod.switches || {})[entry.name];
+            if (hit.kind === 'class' && written) switchedHere.set(hit.cls, written);
+            if (hit.kind === 'class') {
+                classesHere.push({
+                    name: entry.name, suite: [], bases: [], imported: { filePath: hit.filePath, cls: hit.cls },
+                    named: named(naming.classes, ['Test'], entry.name),
+                    ...(written && { enabled: written.on }),
+                    ...(written && written.forced && { forced: written.forced }),
+                    line: entry.line, startLine: entry.line, endLine: entry.line,
+                    members: [], tests: [], marks: [], marksOpen: false,
+                });
+            } else {
+                taken.push({ entry, fn: hit.fn, target: hit.filePath, written });
+            }
+        }
+
+        // The classes around a class, outermost first.
+        const outerOf = cls => cls.imported ? [] : classesHere.filter(outer => !outer.imported && outer !== cls &&
+            outer.startLine <= cls.startLine && outer.endLine >= cls.endLine).sort((a, b) => a.startLine - b.startLine);
+        const NO = Object.freeze({ collected: 'no' });
+        const standings = new Map();
+        const standingOf = cls => {
+            if (standings.has(cls)) return standings.get(cls);
+            standings.set(cls, NO);
+            const answer = (() => {
+                const order = orderOf(filePath, cls);
+                const nodes = order.filter(node => !node.opaque);
+                const real = nodes.map(node => node.cls);
+                const unread = order.some(node => node.opaque && !node.safe);
+                const unittest = real.some(each => each.unittestBase);
+                let collected = 'yes';
+                let why = null;
+                const weaken = reason => {
+                    if (collected === 'yes') {
+                        collected = 'maybe';
+                        why = reason;
+                    }
+                };
+                // The nearest switch: one written here on a class taken
+                // from another module comes before that class's own.
+                const switchOf = each => switchedHere.has(each)
+                    ? { enabled: switchedHere.get(each).on, forced: switchedHere.get(each).forced }
+                    : each.enabled !== undefined ? { enabled: each.enabled, forced: each.forced } : null;
+                const switched = real.map(switchOf).find(Boolean) || null;
+                if (switched && switched.enabled === false) return NO;
+                if (!unittest) {
+                    const rules = [...new Set(real.flatMap(each => each.refusedIfDeclares || []))];
+                    if (real.some(each => (each.members || []).some(member => rules.includes(member)))) return NO;
+                    // A base that is not read may declare one.
+                    if (unread) weaken('base-not-resolved');
+                }
+                // Abstract members that nothing nearer implements: abc
+                // makes the class abstract and pytest leaves it out.
+                const implemented = new Set();
+                let abstractLeft = false;
+                for (const each of real) {
+                    const abstract = each.abstract || [];
+                    if (abstract.some(name => !implemented.has(name))) abstractLeft = true;
+                    for (const member of each.members || []) if (!abstract.includes(member)) implemented.add(member);
+                }
+                if (abstractLeft) {
+                    if (real.some(each => each.abc === true)) return NO;
+                    if (real.some(each => each.abc === 'unknown') || unread) weaken('base-not-resolved');
+                }
+                if (!unittest && !cls.named) {
+                    // Not the runner's by its name, nor one of unittest's
+                    // (a base from outside the project is taken to be a
+                    // TestCase where it is named like one, and not otherwise).
+                    const forced = switched ? switched.forced : undefined;
+                    if (forced === 'unknown') weaken('collection-switch');
+                    else if (forced !== true) return NO;
+                }
+                if (switched && switched.enabled === 'unknown') weaken('collection-switch');
+                if (real.some(each => each.unsettled)) weaken('defined-conditionally');
+                for (const outer of outerOf(cls)) {
+                    const around = standingOf(outer);
+                    // pytest collects a class inside a class it collects;
+                    // a class of unittest holds methods only.
+                    if (around.collected === 'no' || around.regime === 'unittest') return NO;
+                    if (around.collected === 'maybe') weaken(around.why);
+                }
+                // Each class's fixtures and setups, read in its own file.
+                const fixtures = nodes.flatMap(node => fixturesOf(node.filePath, node.cls.fixtures));
+                return {
+                    collected, why, regime: unittest ? 'unittest' : 'pytest',
+                    // What reaches a class through its lookup order.
+                    skip: real.some(each => each.skip === 'skip') ? 'skip'
+                        : real.some(each => each.skip === 'sometimes') ? 'sometimes' : null,
+                    guard: nodes.some(node => node.cls.guard || callStops(node.filePath, node.cls.guardCalls)),
+                    fixtures,
+                    usefixtures: real.flatMap(each => each.usefixtures || []),
+                    usefixturesOpen: real.some(each => each.usefixturesOpen),
+                    open: unread,
+                };
+            })();
+            standings.set(cls, answer);
+            return answer;
+        };
+
+        const classesOf = new Map(); // unit -> the classes around it, for the runner's mark expression
+        let units = [];
+        /** A unit with what reaches it: its own state, its classes', the module's, the code beside it. */
+        const finish = (base, row, around, alsoOpen = null) => {
+            const states = around.map(standingOf);
+            const dynamic = row.dynamic || alsoOpen || states.map(each => each.collected === 'maybe' ? each.why : null).find(Boolean) ||
+                (mod.unsettled ? 'collection-switch' : null);
+            const classFixtures = states.flatMap(each => each.fixtures);
+            const stopping = classFixtures.length > 0 ? stoppingNames([...guards.fixtures, ...classFixtures]) : guards.stopping;
+            const requests = [...(row.requests || []), ...(mod.usefixtures || []), ...(naming.usefixtures || []),
+                ...states.flatMap(each => each.usefixtures)];
+            const skipped = !!row.skipped || mod.skip === 'skip' || states.some(each => each.skip === 'skip');
+            const sometimes = !!row.conditional || !!dynamic || mod.skip === 'sometimes' || !!mod.guard || guards.gated ||
+                states.some(each => each.skip === 'sometimes' || each.guard || each.usefixturesOpen) ||
+                !!row.requestsOpen || !!mod.usefixturesOpen || requests.some(name => stopping.has(name));
+            // One declaration the runner reports as several tests: a
+            // table of parameters, its own, its classes', its module's or
+            // a fixture's.
+            const tabled = classFixtures.length > 0
+                ? stoppingNames([...guards.fixtures, ...classFixtures], fixture => fixture.params) : guards.tabled;
+            const several = (row.marks || []).includes('parametrize') || (found.marks || []).includes('parametrize') ||
+                around.some(cls => orderOf(filePath, cls).some(node => !node.opaque && (node.cls.marks || []).includes('parametrize'))) ||
+                requests.some(name => tabled.has(name));
+            const unit = {
+                ...base,
+                ...(skipped && { skipped: true }),
+                ...(sometimes && { conditional: true }),
+                ...(dynamic && { dynamic }),
+                ...(several && { several: true }),
+                ...(row.marks && { marks: row.marks, marksOpen: !!row.marksOpen }),
+            };
+            classesOf.set(unit, around);
+            units.push(unit);
+        };
+        // A function the runner takes only by a switch that is not settled.
+        const byForce = row => !row.named && row.forced === 'unknown' ? 'collection-switch' : null;
+
+        for (const row of found.units) {
+            if (row.kind !== 'test') continue;
+            finish({ kind: 'test', name: row.name, suite: [], line: row.line, startLine: row.startLine, endLine: row.endLine },
+                row, [], byForce(row));
+        }
+        for (const cls of classesHere) {
+            const standing = standingOf(cls);
+            if (standing.collected === 'no') continue;
+            // unittest takes the methods its loader names; pytest the
+            // names its patterns take and the ones switched on.
+            const select = standing.regime === 'unittest' ? row => row.prefixed : row => row.named || !!row.forced;
+            const inherited = cls.bases.length > 0 || cls.imported
+                ? inheritedBy(filePath, cls, select) : { tests: [], open: false, withheld: false };
+            const rows = (cls.tests || []).filter(select);
+            // unittest runs runTest when a class has no other test.
+            if (standing.regime === 'unittest' && rows.length === 0 && inherited.tests.length === 0) {
+                const fallback = (cls.tests || []).find(row => row.name === 'runTest');
+                if (fallback) rows.push(fallback);
+            }
+            // A base that is not read may bring tests of its own.
+            if (inherited.withheld || standing.open) more = true;
+            const around = [...outerOf(cls), cls];
+            const suite = [...cls.suite, cls.name];
+            const before = units.length;
+            for (const row of rows) {
+                const open = standing.regime === 'unittest' ? null : byForce(row);
+                if (row.alias) {
+                    // Another name for a test of the class: its body stands where that test is.
+                    finish({
+                        kind: 'test', name: row.name, suite, line: row.line, startLine: row.line, endLine: row.line,
+                        inherited: {
+                            file: relativePath, filePath, owner: cls.name, ownerLine: cls.startLine,
+                            line: row.of, startLine: row.startLine, endLine: row.endLine,
+                        },
+                    }, row, around, open);
+                } else {
+                    finish({ kind: 'test', name: row.name, suite, line: row.line, startLine: row.startLine, endLine: row.endLine },
+                        row, around, open);
+                }
+            }
+            for (const { test, base } of inherited.tests) {
+                finish({
+                    kind: 'test', name: test.name, suite, line: cls.line, startLine: cls.line, endLine: cls.line,
+                    inherited: {
+                        file: relativeOf(base.filePath), filePath: base.filePath, owner: base.cls.name,
+                        ownerLine: base.cls.startLine, line: test.alias ? test.of : test.line,
+                        startLine: test.startLine, endLine: test.endLine,
+                    },
+                }, test, around, standing.regime === 'unittest' ? null : byForce(test));
+            }
+            if (units.length > before) {
+                units.push({
+                    kind: 'suite', name: cls.name, suite: cls.suite,
+                    line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
+                });
+            }
+        }
+        for (const { entry, fn, target, written } of taken) {
+            const row = { ...fn, named: named(naming.functions, ['test'], entry.name) };
+            if (!row.named && !row.forced) continue;
+            if (written && written.on === false) continue;
+            finish({
+                kind: 'test', name: entry.name, suite: [], line: entry.line, startLine: entry.line, endLine: entry.line,
+                inherited: {
+                    file: relativeOf(target), filePath: target, owner: null, ownerLine: 0,
+                    line: fn.line, startLine: fn.startLine, endLine: fn.endLine,
+                },
+            }, row, [], (written && written.on === 'unknown' ? 'collection-switch' : null) || byForce(row));
+        }
+
+        // The runner's configured options: a mark expression and tests
+        // left out by name apply to a test however it is named on the
+        // command line (measured).
+        const options = naming.options;
+        if (options && (options.markExpr || options.deselect.length > 0)) {
+            const file = relativeTo(runner.dir, relativePath);
+            units = units.map(unit => {
+                if (unit.kind !== 'test' || unit.skipped) return unit;
+                const id = [file, ...unit.suite, unit.name].join('::');
+                let selected = !(file != null && options.deselect.some(prefix => id.startsWith(prefix)));
+                if (selected && options.markExpr) {
+                    const marks = new Set([...(unit.marks || []), ...(found.marks || [])]);
+                    let open = !!unit.marksOpen || !!found.marksOpen;
+                    // Marks of the classes around the test, and of every
+                    // class those derive from.
+                    for (const cls of classesOf.get(unit) || []) {
+                        for (const node of orderOf(filePath, cls)) {
+                            if (node.opaque) {
+                                if (!node.safe) open = true;
+                                continue;
+                            }
+                            for (const mark of node.cls.marks || []) marks.add(mark);
+                            if (node.cls.marksOpen) open = true;
+                        }
+                    }
+                    selected = markSelects(options.markExpr, marks, open);
+                }
+                if (selected === false) return { ...unit, skipped: true, deselected: true };
+                return selected == null ? { ...unit, conditional: true } : unit;
+            });
+        }
+        units.sort((a, b) => a.startLine - b.startLine || (b.endLine - a.endLine) ||
+            codeUnitCompare(a.name || '', b.name || ''));
+        return {
+            modeled: true,
+            units,
+            // A test that is declared and not executed is not counted.
+            tests: units.filter(unit => unit.kind === 'test' && !unit.skipped).length,
+            inheriting: more,
+        };
     };
 
     /**
@@ -1651,6 +2508,8 @@ function createTestModel(index) {
         } else if (found.notCollected) {
             // A module its runner does not collect declares no test.
             facts = { modeled: true, units: [], tests: 0, inheriting: false };
+        } else if (found.derived) {
+            facts = derivedFacts(filePath, found);
         } else {
             // A class its runner refuses holds no test, whatever it declares.
             const relativePath = index.files.get(filePath).relativePath;
@@ -1686,6 +2545,11 @@ function createTestModel(index) {
             const unsettled = classesHere.filter(cls => cls.runnable && cls.refusedIfDeclares &&
                 !refusedClasses.includes(cls) && refusal(filePath, cls).unknown);
             const within = (unit, cls) => unit.startLine >= cls.startLine && unit.endLine <= cls.endLine;
+            // A setup that can stop a test, in a class the test's class
+            // derives from: the test runs only sometimes.
+            const guardedAbove = cls => cls.bases.length > 0 &&
+                orderOf(filePath, cls).slice(1).some(node => !node.opaque && node.cls.guard);
+            const guarded = classesHere.filter(cls => cls.runnable && !cls.imported && guardedAbove(cls));
             // A focus leaves other tests of the file declared and not
             // executed, by the rule of the runner that runs the file.
             const left = found.focus ? focusedOut(found.units, model.runnerOf(filePath).id) : new Set();
@@ -1695,17 +2559,30 @@ function createTestModel(index) {
                     if (unit.kind === 'test' && unsettled.some(cls => !cls.imported && within(unit, cls))) {
                         out = { ...out, conditional: true, dynamic: unit.dynamic || 'base-not-resolved' };
                     }
+                    if (unit.kind === 'test' && !unit.conditional && guarded.some(cls => within(unit, cls))) {
+                        out = { ...out, conditional: true };
+                    }
                     if (left.has(unit)) out = { ...out, skipped: true };
                     return out;
                 });
-            // `open`: the file binds its runner's declaring function and
-            // no declaration was read.
+            // `open`: the file calls through a name that may be its
+            // runner's declaring function, or hands that function on.
             let inheriting = !!found.inheriting || !!found.open;
+            // A function of another module that declares tests when it is
+            // called: the tests are this file's, and are not listed here.
+            if ((found.calledModules || []).some(name => {
+                const target = moduleFile(filePath, name);
+                return !!target && target !== filePath && declaresWhenCalled(target);
+            })) inheriting = true;
+            // node runs a file that declares no test as one test.
+            if (found.units.length === 0 && runner.id === 'node-test' &&
+                nodeRunsFile(runner, relativeTo(runner.dir, relativePath))) inheriting = true;
             for (const cls of classesHere) {
                 if (!cls.runnable || (cls.bases.length === 0 && !cls.imported) || refusedClasses.includes(cls)) continue;
                 const inherited = inheritedBy(filePath, cls);
                 const own = units.some(unit => unit.kind === 'test' && within(unit, cls));
-                if (inherited.withheld || (inherited.open && !own && inherited.tests.length === 0)) inheriting = true;
+                // A base that is not read may bring tests of its own.
+                if (inherited.withheld || inherited.open) inheriting = true;
                 if (inherited.tests.length > 0 && !own) {
                     units.push({
                         kind: 'suite', name: cls.name, suite: cls.suite,
@@ -1723,8 +2600,9 @@ function createTestModel(index) {
                         ...(cls.namespace && { namespace: cls.namespace }),
                         line: cls.line, startLine: cls.line, endLine: cls.line,
                         ...((test.skipped || cls.skipped) && { skipped: true }),
-                        ...((identity || cls.sometimes || test.conditional) && { conditional: true }),
+                        ...((identity || cls.sometimes || test.conditional || cls.guard || guardedAbove(cls)) && { conditional: true }),
                         ...((identity || test.dynamic) && { dynamic: identity || test.dynamic }),
+                        ...(test.several && { several: true }),
                         ...(test.marks && { marks: test.marks, marksOpen: !!test.marksOpen }),
                         inherited: {
                             file: index.files.get(base.filePath).relativePath,
@@ -1808,6 +2686,25 @@ function createTestModel(index) {
         return facts;
     };
 
+    /**
+     * What has to be the same for two files to share one command: a hook
+     * that decides for a whole run is loaded with every file below its
+     * conftest.py, so a file from elsewhere joined to one of those would
+     * run under a hook its own command never loads; a module that
+     * switches a class of another module on or off does it for every
+     * module loaded after it.
+     */
+    model.joinKey = filePath => {
+        const found = model.declared(filePath);
+        if (!found || !found.derived || found.notCollected) return '';
+        // A module that writes a switch on a name it took from another
+        // module changes that object for every module loaded after it:
+        // it is run by itself.
+        const alone = Object.keys((found.module && found.module.switches) || {}).length > 0
+            ? `\0switches:${index.files.get(filePath).relativePath}` : '';
+        return guardsOf(filePath).wholeRun.join('\0') + alone;
+    };
+
     /** Classes that derive from the one named, through the project. */
     const descendantFiles = className => {
         const files = new Set();
@@ -1847,8 +2744,12 @@ function createTestModel(index) {
             for (const file of [...new Set([...descendantFiles(holder.name), ...importers, filePath])].sort(codeUnitCompare)) {
                 for (const candidate of model.unitsOf(file).units) {
                     const from = candidate.inherited;
+                    // Every test whose body this is: the one a deriving
+                    // class inherits, another name for it in its class.
                     if (from && from.filePath === filePath && from.ownerLine === holder.startLine &&
-                        candidate.name === template.name) out.push({ filePath: file, unit: candidate });
+                        from.startLine === template.startLine && from.endLine === template.endLine) {
+                        out.push({ filePath: file, unit: candidate });
+                    }
                 }
             }
         }
@@ -1856,7 +2757,7 @@ function createTestModel(index) {
         const fn = holder ? null : (model.declared(filePath)?.functions || [])
             .find(other => other.startLine <= line && other.endLine >= line);
         if (fn) {
-            for (const file of importers.sort(codeUnitCompare)) {
+            for (const file of [...new Set([...importers, filePath])].sort(codeUnitCompare)) {
                 for (const candidate of model.unitsOf(file).units) {
                     const from = candidate.inherited;
                     if (from && from.filePath === filePath && from.owner == null && from.startLine === fn.startLine) {
@@ -1961,6 +2862,10 @@ function createTestModel(index) {
         const runner = model.runnerOf(filePath);
         const facts = model.unitsOf(filePath);
         const out = { role, tests: facts.tests };
+        // The runner reports more tests than are counted: the file holds
+        // some that are not listed, or a listed one stands for several.
+        if (role === 'tests' && (facts.inheriting ||
+            facts.units.some(unit => unit.kind === 'test' && !unit.skipped && standsForSeveral(unit)))) out.moreTests = true;
         if (runner.id) out.runner = runner.id;
         if (role === 'tests') {
             const tests = facts.units.filter(unit => unit.kind === 'test');
@@ -2055,23 +2960,36 @@ function testKey(relativePath, unit) {
  * file's role and runner, the units of THIS file that execute those lines
  * (plus `extra`: units of this file that execute lines of another, handed
  * over by that file's answer), how many tests that is, and the command for
- * the file. `carried` (not enumerable) holds the units of OTHER files that
- * execute these lines: a test a class inherits runs where the class is.
+ * the file. `moreTests`: `tests` is a lower bound (the file holds tests
+ * the reader does not list, or a counted declaration stands for several
+ * of the runner's tests). `conditionalTests`: how many of the counted
+ * tests run only sometimes. `carried` (not enumerable) holds the units of
+ * OTHER files that execute these lines: a test a class inherits runs where
+ * the class is.
  * @returns {{role: string, runner?: string, run?: object, runWithheld?: string,
- *   units: object[], tests: number, testKeys: string[], carried: Array<{filePath: string, unit: object}>}}
+ *   units: object[], tests: number, moreTests?: boolean, conditionalTests?: number,
+ *   testKeys: string[], carried: Array<{filePath: string, unit: object}>}}
  */
 function linkFile(model, index, filePath, lines, extra = []) {
     const facts = model.fileFacts(filePath);
     const relativePath = index.files.get(filePath).relativePath;
     const rows = new Map();
     const tests = new Set();
+    const sometimes = new Set();
     const carried = [];
+    // Tests the file holds and does not list: which of them these lines
+    // reach is not known.
+    let more = facts.role === 'tests' && model.unitsOf(filePath).inheriting;
+    const count = test => {
+        if (test.skipped) return;
+        tests.add(testKey(relativePath, test));
+        if (test.conditional) sometimes.add(testKey(relativePath, test));
+        if (standsForSeveral(test)) more = true;
+    };
     const take = unit => {
         const key = `${unit.kind}\0${testKey(relativePath, unit)}`;
         if (!rows.has(key)) rows.set(key, model.describe(filePath, unit));
-        for (const test of model.testsWithin(filePath, unit)) {
-            if (!test.skipped) tests.add(testKey(relativePath, test));
-        }
+        for (const test of model.testsWithin(filePath, unit)) count(test);
     };
     let fileLevel = false;
     for (const line of [...new Set(lines)].sort((a, b) => a - b)) {
@@ -2088,9 +3006,7 @@ function linkFile(model, index, filePath, lines, extra = []) {
     for (const unit of extra) take(unit);
     // Code outside every unit runs with the file: all its tests count.
     if (fileLevel && facts.role === 'tests') {
-        for (const test of model.testsWithin(filePath, null)) {
-            if (!test.skipped) tests.add(testKey(relativePath, test));
-        }
+        for (const test of model.testsWithin(filePath, null)) count(test);
     }
     const units = [...rows.values()].sort((a, b) => a.line - b.line || codeUnitCompare(a.name || '', b.name || ''));
     const out = {
@@ -2100,9 +3016,15 @@ function linkFile(model, index, filePath, lines, extra = []) {
         ...(facts.runWithheld && { runWithheld: facts.runWithheld }),
         units,
         tests: tests.size,
+        // The runner reports more tests than are counted here: the
+        // count is a lower bound.
+        ...(more && { moreTests: true }),
+        // Tests counted that run only sometimes.
+        ...(sometimes.size > 0 && { conditionalTests: sometimes.size }),
         testKeys: [...tests].sort(codeUnitCompare),
     };
     Object.defineProperty(out, 'carried', { value: carried, enumerable: false });
+    Object.defineProperty(out, 'conditionalKeys', { value: [...sometimes].sort(codeUnitCompare), enumerable: false });
     return out;
 }
 
@@ -2168,7 +3090,7 @@ function commandsFor(model, filePaths) {
             continue;
         }
         const head = selector.command.slice(0, cut);
-        const key = `${selector.cwd || ''}\0${head}`;
+        const key = `${selector.cwd || ''}\0${head}\0${model.joinKey(filePath)}`;
         if (!groups.has(key)) groups.set(key, { cwd: selector.cwd, head, paths: [] });
         const group = groups.get(key);
         if (!group.paths.includes(last)) group.paths.push(last);
@@ -2194,13 +3116,36 @@ function selectorText(selector) {
     return selector.cwd ? `(cd ${shellWord(selector.cwd)} && ${selector.command})` : selector.command;
 }
 
+// Declarations whose names at run time are not the written one, or that
+// exist once for every call of the function around them.
+const SEVERAL_KINDS = new Set(['generated-cases', 'name-not-literal', 'suite-name-not-literal', 'declared-indirectly']);
+
+/**
+ * Does one declaration stand for several of the runner's tests: a table
+ * of cases, a parametrized test, a title computed at run time, a
+ * declaration inside a function that may be called more than once.
+ */
+function standsForSeveral(unit) {
+    return !!unit.several || SEVERAL_KINDS.has(unit.dynamic);
+}
+
+/**
+ * A count of tests as text: "3 tests", "at least 3 tests" when tests
+ * that are not listed may add to it, "(1 conditional)" for the ones that
+ * run only sometimes.
+ */
+function testCountText(count, more, conditional) {
+    if (!count) return more ? 'tests not listed' : '';
+    return `${more ? 'at least ' : ''}${count} test${count === 1 ? '' : 's'}${conditional ? ` (${conditional} conditional)` : ''}`;
+}
+
 /** A unit's name as people write it: `suite > suite > name`. */
 function unitLabel(unit) {
     return [...(unit.suite || []), unit.name == null ? '(computed name)' : unit.name].join(' > ');
 }
 
 module.exports = {
-    createTestModel, selectorText, unitLabel, shellWord, globMatches,
+    createTestModel, selectorText, unitLabel, shellWord, globMatches, testCountText, standsForSeveral,
     addTestCaseRows, linkFile, linkFiles, commandsFor,
     // Exposed for tests.
     scriptRunners, nodeTestOptions, configWords, tableText, namesRequirement, focusedOut,

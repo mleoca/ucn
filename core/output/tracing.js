@@ -8,6 +8,7 @@
  * conservation) lines close the arithmetic.
  */
 
+const { testCountText } = require('../test-units');
 const { unverifiedReasonLabel } = require('./shared');
 const { codeUnitCompare } = require('../shared');
 const { formatAccountLines } = require('./analysis');
@@ -566,10 +567,14 @@ function formatAffectedTests(result, options = {}) {
         const support = result.testFiles.filter(tf => tf.role === 'support');
         const displayFiles = runnable.slice(0, MAX_TEST_FILES);
         const truncatedFiles = runnable.length - displayFiles.length;
-        lines.push(`Test files to run (${runnable.length})${summary.totalTests > 0 ? `, ${summary.totalTests} test${summary.totalTests === 1 ? '' : 's'}` : ''}:`);
+        // A count is exact only where every test of the files is listed:
+        // "at least" says a file holds tests that are not.
+        const total = testCountText(summary.totalTests, summary.moreTests, summary.conditionalTests);
+        lines.push(`Test files to run (${runnable.length})${total ? `, ${total}` : ''}:`);
         lines.push('');
         for (const tf of displayFiles) {
-            const count = tf.testCount > 0 ? ` · ${tf.testCount} test${tf.testCount === 1 ? '' : 's'}` : '';
+            const counted = testCountText(tf.testCount, tf.moreTests, tf.conditionalTests);
+            const count = counted ? ` · ${counted}` : '';
             const refusal = tf.runWithheld ? ` · no command: ${tf.runWithheld}` : '';
             lines.push(`  ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})${count}${refusal}`);
             // Show up to 5 key matches per file
@@ -636,7 +641,8 @@ function formatAffectedTests(result, options = {}) {
     const pct = summary.totalAffected > 0
         ? Math.round(summary.staticallyLinkedFunctions / summary.totalAffected * 100)
         : 0;
-    let summaryLine = `Summary: ${summary.totalAffected} affected → ${summary.totalTestFiles} statically linked test files${summary.totalTests > 0 ? ` (${summary.totalTests} tests)` : ''}, ${summary.staticallyLinkedFunctions}/${summary.totalAffected} functions linked (${pct}%)`;
+    const totalTests = testCountText(summary.totalTests, summary.moreTests, summary.conditionalTests);
+    let summaryLine = `Summary: ${summary.totalAffected} affected → ${summary.totalTestFiles} statically linked test files${totalTests ? ` (${totalTests})` : ''}, ${summary.staticallyLinkedFunctions}/${summary.totalAffected} functions linked (${pct}%)`;
     if (summary.possiblyAffected > 0) {
         summaryLine += ` · ${summary.possiblyAffected} possibly affected (unverified chains)`;
     }

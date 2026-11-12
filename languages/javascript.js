@@ -5902,6 +5902,8 @@ const TEST_RUNNER_MODULES = new Map([
 ]);
 // Modules whose default export is itself the function that declares a test.
 const TEST_CALLABLE_MODULES = new Set(['node:test', 'test', 'ava', 'tape']);
+// Functions the runners call before the tests of a suite or of a file.
+const TEST_SETUP_HOOKS = new Set(['before', 'beforeEach', 'beforeAll', 'suiteSetup', 'setup']);
 // Objects every script can read the runner's globals from.
 const GLOBAL_OBJECTS = new Set(['globalThis', 'global', 'window', 'self']);
 const WRAPPERS = new Set(['parenthesized_expression', 'as_expression', 'non_null_expression',
@@ -6409,8 +6411,53 @@ function createTestBinder(helpers, root) {
         const value = resolve(base, scope);
         return !!value && !!value.unread;
     };
+    /**
+     * The modules the name a callee starts with is taken from (an import,
+     * a require, a member of one), or of a require called in place.
+     */
+    const modulesOf = (node, scope) => {
+        let base = node;
+        while (base && (base.type === 'member_expression' || WRAPPERS.has(base.type) ||
+            (base.type === 'call_expression' && requiredModule(base, scope) == null))) {
+            base = base.type === 'member_expression' ? base.childForFieldName('object')
+                : base.type === 'call_expression' ? base.childForFieldName('function') : base.namedChildren[0];
+        }
+        if (!base) return [];
+        if (base.type === 'call_expression') return [requiredModule(base, scope)];
+        if (base.type !== 'identifier') return [];
+        const found = lookup(scope, base.text);
+        const out = [];
+        for (const write of (found && found.binding ? found.binding.writes : [])) {
+            if (write.kind === 'import' && write.module != null) out.push(write.module);
+            else if ((write.kind === 'value' || write.kind === 'member') && write.node) {
+                const required = requiredModule(write.node, write.env);
+                if (required != null) out.push(required);
+            }
+        }
+        return out;
+    };
+    /**
+     * Is a callee a runner's setup hook: one of their names, bound by
+     * nothing in the file (the runner's global) or by an import from a
+     * runner's module.
+     */
+    const setupHookAt = (node, scope) => {
+        if (!node || node.type !== 'identifier' || !TEST_SETUP_HOOKS.has(node.text)) return false;
+        const found = lookup(scope, node.text);
+        if (found && found.dynamic) return true;
+        if (!found || !found.binding) return true;
+        const writes = found.binding.writes;
+        return writes.length > 0 && writes.every(write => {
+            if (write.kind === 'import') return TEST_RUNNER_MODULES.has(write.module);
+            if ((write.kind === 'value' || write.kind === 'member') && write.node) {
+                const required = requiredModule(write.node, write.env);
+                return required != null && TEST_RUNNER_MODULES.has(required);
+            }
+            return false;
+        });
+    };
     return {
-        top, resolve, fromModule, unreadAt, calls,
+        top, resolve, fromModule, unreadAt, calls, mentionsRunner, modulesOf, setupHookAt,
         /** The record of a function node: `parent` is the function around it. */
         functionOf: node => functions.get(node.id) || null,
         /** What a name declared at the top of the file holds, or undefined. */
@@ -6552,8 +6599,12 @@ function declaredSkip(values, hasCallback) {
  * object in the call may skip it. "only" is the mark as written; "parent"
  * is the index of the suite a unit stands in (-1: the file), so each
  * runner's own rule for focus can be applied. "open" says the file calls
- * through a name that may be the runner's function and is not read, and
- * no test was read: it holds tests this did not see.
+ * through a name that may be the runner's function and is not read, or
+ * hands the runner's function to something: it holds tests this did not
+ * see. "calledModules" are the modules whose functions the file calls
+ * outside a test: one that declares tests when called gives them to
+ * this file ("calledWhenCalled": from inside a function of the file, so
+ * to whoever calls that function).
  */
 function testUnits(fileEntry, helpers) {
     const tree = helpers.tree();
@@ -6563,6 +6614,20 @@ function testUnits(fileEntry, helpers) {
     // A call through a name that may be the runner's function and is not
     // read: a test this does not see.
     let unreadCall = false;
+    let handedOver = false;
+    const calledModules = new Set();
+    const calledWhenCalled = new Set();
+    const stoppedSuites = new Set(); // indexes of suites (-1: the file) a setup hook can skip
+    /** Is a callee written the way a runner's declaring function is called? */
+    const declaringShape = node => {
+        if (!node) return false;
+        if (node.type === 'identifier') return true;
+        if (node.type === 'call_expression') return declaringShape(node.childForFieldName('function'));
+        if (node.type !== 'member_expression') return false;
+        const property = node.childForFieldName('property')?.text || '';
+        return (isTestApiName(property) || TEST_API_MODIFIERS.has(property) || TEST_API_TABLES.has(property) ||
+            TEST_API_CONDITIONS.has(property)) && declaringShape(node.childForFieldName('object'));
+    };
     /** What an argument after the title is: a body, options, or neither. */
     const argumentKind = (value, scope) => {
         if (FUNCTION_NODES.has(value.type)) return 'function';
@@ -6597,7 +6662,48 @@ function testUnits(fileEntry, helpers) {
         const node = call.node;
         const api = testApiCall(node, callee => binder.resolve(callee, call.scope));
         if (!api) {
-            if (binder.unreadAt(node.childForFieldName('function'), call.scope)) unreadCall = true;
+            const callee = node.childForFieldName('function');
+            const where = contextOf(call.fn);
+            // Inside a test nothing declares a test of the file: what a
+            // runner takes there is a part of that test.
+            if (where.inTest) continue;
+            // A declaration is given a title or a body, and is called as
+            // the runners' functions are (the name, a member that is one
+            // of their names or marks): any other call through a name
+            // that is not read declares nothing.
+            if ((node.childForFieldName('arguments')?.namedChildCount || 0) > 0 && declaringShape(callee) &&
+                binder.unreadAt(callee, call.scope)) unreadCall = true;
+            // A setup hook that can skip (mocha's this.skip(), a skip of
+            // the context a runner hands it), or whose body is not
+            // written here: the tests of its suite run only sometimes.
+            if (binder.setupHookAt(callee, call.scope)) {
+                const given = (node.childForFieldName('arguments')?.namedChildren || []);
+                const bodies = given.filter(value => FUNCTION_NODES.has(value.type));
+                const unwritten = given.some(value => !FUNCTION_NODES.has(value.type) && !PLAIN_VALUES.has(value.type) &&
+                    value.type !== 'object');
+                const skips = part => ((part.type === 'property_identifier' || part.type === 'identifier' ||
+                    part.type === 'shorthand_property_identifier_pattern') && part.text === 'skip') || part.namedChildren.some(skips);
+                if (unwritten || bodies.some(skips)) {
+                    const around = where.suites;
+                    stoppedSuites.add(around.length > 0 ? around[around.length - 1].index : -1);
+                }
+                continue;
+            }
+            // The runner's function handed to something (an argument, a
+            // list it is called through, call and apply): what declares
+            // with it there is not seen.
+            const handed = [node.childForFieldName('arguments'),
+                callee && callee.type === 'member_expression' ? callee.childForFieldName('object') : null];
+            if (handed.some(part => part && part.type !== 'identifier' && binder.mentionsRunner(part, call.scope)) ||
+                (callee && callee.type === 'member_expression' && callee.childForFieldName('object').type === 'identifier' &&
+                    /^(call|apply|bind)$/.test(callee.childForFieldName('property')?.text || '') &&
+                    binder.mentionsRunner(callee.childForFieldName('object'), call.scope))) handedOver = true;
+            // A function of another module called outside a test: tests
+            // it declares when called are tests of this file, or, from a
+            // function of this file, of whoever calls that.
+            if (callee) {
+                for (const name of binder.modulesOf(callee, call.scope)) (where.indirect ? calledWhenCalled : calledModules).add(name);
+            }
             continue;
         }
         const ctx = contextOf(call.fn);
@@ -6638,6 +6744,8 @@ function testUnits(fileEntry, helpers) {
             ...((dynamic || ctx.suites.some(suite => suite.dynamic)) && {
                 dynamic: dynamic || 'suite-name-not-literal',
             }),
+            // Declared where a function of the file is called, by whoever calls it.
+            ...(ctx.indirect && { indirect: true }),
         });
         // The callback's body is where the suite's own declarations
         // are written, not a function apart.
@@ -6650,9 +6758,24 @@ function testUnits(fileEntry, helpers) {
             });
         }
     }
+    // A hook of a suite holds for every test in it, however deep.
+    if (stoppedSuites.size > 0) {
+        for (const unit of units) {
+            if (unit.kind !== 'test' || unit.conditional) continue;
+            for (let at = unit.parent; ; at = units[at].parent) {
+                if (stoppedSuites.has(at)) {
+                    unit.conditional = true;
+                    break;
+                }
+                if (at === -1) break;
+            }
+        }
+    }
     return {
         units,
-        open: unreadCall && !units.some(unit => unit.kind === 'test'),
+        open: unreadCall || handedOver,
+        ...(calledModules.size > 0 && { calledModules: [...calledModules].sort() }),
+        ...(calledWhenCalled.size > 0 && { calledWhenCalled: [...calledWhenCalled].sort() }),
         ...(units.some(unit => unit.only) && { focus: true }),
     };
 }

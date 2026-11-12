@@ -34,7 +34,20 @@
  * FALSE-SUPPORT is a file called support that the runner executes tests
  * from. UNDECLARED is a test the runner executes and the engine does not
  * list: each one must be named by its case (a measured limit), never a
- * surprise. The run fails on any of them, on an answer that differs from
+ * surprise. Naming one does not excuse the count the engine prints:
+ * INEXACT-COUNT is a file from which the runner executes a test the
+ * engine does not list (or a body more often than listed) while the
+ * engine gives the file's count as exact. A count given as a lower bound
+ * is a weaker claim and has to be deliberate too: LOWER-BOUND is a file so
+ * marked that its case does not name (`atLeast`), or one named that is not
+ * marked. The count is judged as the commands print it: what linking
+ * every line of the file answers (the path `tests`, the affected-test
+ * selection and `check` share) must be the file's own count and mark.
+ * A file's command that executes tests of another file is a
+ * WRONG-SELECTOR as well (go runs a package and cargo a module tree: both
+ * hold several files; a test declared inside a function of another file
+ * belongs to the file that calls it, whose count is a lower bound).
+ * The run fails on any of them, on an answer that differs from
  * the pin, and on a runner it could not start (a missing runner is never a
  * pass; --allow-missing permits a partial run, a run that judged nothing
  * always fails).
@@ -54,7 +67,7 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const { ProjectIndex } = require('../core/project');
-const { createTestModel, selectorText, unitLabel, commandsFor } = require('../core/test-units');
+const { createTestModel, selectorText, unitLabel, commandsFor, linkFile, standsForSeveral } = require('../core/test-units');
 const { isTestFile } = require('../core/discovery');
 const { CASES } = require('./test-unit-matrix-cases');
 
@@ -69,8 +82,8 @@ const RUNNERS = {
     'jest': { probe: ['node', ['--version']], full: 'npx jest', modules: 'jest' },
     'vitest': { probe: ['node', ['--version']], full: 'npx vitest run', modules: 'vitest' },
     'mocha': { probe: ['node', ['--version']], full: 'npx mocha --recursive', modules: 'mocha' },
-    'go-test': { probe: ['go', ['version']], full: 'go test ./...' },
-    'cargo-test': { probe: ['cargo', ['--version']], full: 'cargo test' },
+    'go-test': { probe: ['go', ['version']], full: 'go test ./...', fileIsPackage: true },
+    'cargo-test': { probe: ['cargo', ['--version']], full: 'cargo test', fileIsModuleTree: true },
     'dotnet-test': { probe: ['dotnet', ['--version']], full: 'dotnet test' },
     'maven': { probe: ['mvn', ['--version']], full: 'mvn -q test' },
 };
@@ -160,8 +173,15 @@ function answerOf(dir) {
             const runner = model.runnerOf(filePath);
             const run = facts.run ? selectorText(facts.run) : null;
             lines.push(`${entry.relativePath} [${facts.role}] ${runner.id || `no runner: ${runner.reason}`}` +
-                (facts.role === 'tests' ? `  run: ${run || `(withheld: ${facts.runWithheld})`}` : ''));
-            files.push({ file: entry.relativePath, role: facts.role, run, tests: facts.tests });
+                (facts.role === 'tests' ? `  run: ${run || `(withheld: ${facts.runWithheld})`}` : '') +
+                (facts.moreTests ? '  [holds more tests]' : ''));
+            // The count as the commands print it: every line of the file linked.
+            const lineCount = index._readFile(filePath).split('\n').length;
+            const linked = linkFile(model, index, filePath, Array.from({ length: lineCount }, (unused, i) => i + 1));
+            files.push({
+                file: entry.relativePath, role: facts.role, run, tests: facts.tests, more: !!facts.moreTests,
+                linked: { tests: linked.tests, more: !!linked.moreTests },
+            });
             for (const unit of declared.units) {
                 const label = unitLabel(unit);
                 if (unit.kind !== 'test') {
@@ -179,8 +199,7 @@ function answerOf(dir) {
                     selector, conditional: !!unit.conditional, skipped: !!unit.skipped,
                     inherited: !!unit.inherited,
                     // A declaration the engine says stands for several tests.
-                    generated: unit.dynamic === 'generated-cases' || unit.dynamic === 'name-not-literal' ||
-                        unit.dynamic === 'suite-name-not-literal' || unit.dynamic === 'declared-indirectly',
+                    generated: standsForSeveral(unit),
                     // Where the body of an inherited test stands.
                     ...(unit.inherited && {
                         origin: {
@@ -296,15 +315,33 @@ function judgeWholeRun(testCase, answer, ran, counts = {}) {
     if (!sameSet(undeclared, allowed)) {
         fail('UNDECLARED', `the runner executes [${undeclared.join(', ')}], the case names [${allowed.join(', ')}]`);
     }
-    // One declaration is one test: a body that executes more often than
-    // the tests listed for it is a test the engine does not list (a second
-    // name for one function, a class collected twice), unless the case
-    // says the declaration stands for several (a table of cases, a loop).
-    const repeated = ran.filter(id => {
+    // A body that executes more often than the tests listed for it.
+    const oftener = ran.filter(id => {
         const owners = answer.units.filter(unit => !unit.skipped && owns(unit, id));
         if (owners.some(unit => unit.conditional || unit.generated)) return false;
         return (counts[id] || 1) > Math.max(1, owners.length);
     }).sort();
+    // What the engine prints as a count is exact only where the runner
+    // executes nothing more from the file.
+    for (const file of answer.files) {
+        if (file.role !== 'tests') continue;
+        const beyond = [...undeclared, ...oftener].filter(id => fileOf(id) === file.file);
+        if (beyond.length > 0 && !file.more) {
+            fail('INEXACT-COUNT', `${file.file} is given ${file.tests} tests as an exact count and the runner executes more: ${[...new Set(beyond)].join(', ')}`);
+        }
+        if (file.linked && (file.linked.tests !== file.tests || file.linked.more !== file.more)) {
+            fail('COUNT', `${file.file}: linking every line answers ${file.linked.tests} tests${file.linked.more ? ' (a lower bound)' : ''}, the file's own answer is ${file.tests}${file.more ? ' (a lower bound)' : ''}`);
+        }
+    }
+    const lowerBounds = answer.files.filter(file => file.more).map(file => file.file).sort();
+    if (!sameSet(lowerBounds, (testCase.atLeast || []).slice().sort())) {
+        fail('LOWER-BOUND', `files whose count is given as a lower bound [${lowerBounds.join(', ')}], the case names [${(testCase.atLeast || []).slice().sort().join(', ')}]`);
+    }
+    // One declaration is one test: a body that executes more often than
+    // the tests listed for it is a test the engine does not list (a second
+    // name for one function, a class collected twice), unless the case
+    // says the declaration stands for several (a table of cases, a loop).
+    const repeated = oftener;
     if (!sameSet(repeated, (testCase.repeats || []).slice().sort())) {
         fail('REPEATED', `executed more often than the tests listed for them [${repeated.map(id => `${id} x${counts[id]}`).join(', ')}], the case names [${(testCase.repeats || []).slice().sort().join(', ')}]`);
     }
@@ -407,6 +444,19 @@ function main() {
                 const lost = mine.filter(id => !got.ran.includes(id));
                 if (lost.length > 0) {
                     fail('WRONG-SELECTOR', `${file.run} does not run ${lost.join(', ')} (exit ${got.status})\n${got.output.slice(-800)}`);
+                }
+                // A file's command runs that file: a test of another
+                // file it executes was never asked for.
+                // go runs a package and cargo a module with the modules
+                // under it; a test declared inside a function of another
+                // file is this file's when this file calls the function,
+                // and the file's count has to be a lower bound then.
+                const foreign = spec.fileIsModuleTree ? [] : got.ran.filter(id => fileOf(id) !== file.file &&
+                    !answer.units.some(unit => unit.file === file.file && owns(unit, id)) &&
+                    !(spec.fileIsPackage && path.posix.dirname(fileOf(id) || '') === path.posix.dirname(file.file)) &&
+                    !(file.more && answer.units.some(unit => unit.generated && owns(unit, id))));
+                if (foreign.length > 0) {
+                    fail('WRONG-SELECTOR', `${file.run} runs tests of other files: ${foreign.join(', ')}`);
                 }
             }
             empty.sort();

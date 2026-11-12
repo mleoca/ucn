@@ -1310,6 +1310,7 @@ function affectedTests(index, name, options = {}) {
         // how many tests that is.
         for (const [absFile, entry] of frontierTestHits) absoluteOf.set(entry.rel, absFile);
         const confirmedTests = new Set();
+        const conditionalTests = new Set();
         const describeBand = (rows, confirmed) => {
             const linesByFile = new Map();
             for (const row of rows) {
@@ -1353,10 +1354,15 @@ function affectedTests(index, name, options = {}) {
                 row.role = linked.role;
                 if (linked.runner) row.runner = linked.runner;
                 row.testCount = linked.tests;
+                if (linked.moreTests) row.moreTests = true;
+                if (linked.conditionalTests) row.conditionalTests = linked.conditionalTests;
                 if (linked.units.length > 0) row.units = linked.units;
                 if (linked.run) row.run = linked.run;
                 else if (linked.runWithheld) row.runWithheld = linked.runWithheld;
-                if (confirmed) for (const key of linked.testKeys) confirmedTests.add(key);
+                if (confirmed) {
+                    for (const key of linked.testKeys) confirmedTests.add(key);
+                    for (const key of linked.conditionalKeys) conditionalTests.add(key);
+                }
             }
         };
         describeBand(results, true);
@@ -1420,6 +1426,10 @@ function affectedTests(index, name, options = {}) {
                 totalAffected: namesForCoverage.size,
                 totalTestFiles: results.length,
                 totalTests: confirmedTests.size,
+                // A file among them holds tests that are not listed: the
+                // total is a lower bound.
+                ...(results.some(row => row.moreTests) && { moreTests: true }),
+                ...(conditionalTests.size > 0 && { conditionalTests: conditionalTests.size }),
                 supportFiles: results.filter(row => row.role === 'support').length,
                 staticallyLinkedFunctions: linkedSet.size,
                 notStaticallyLinkedCount: notStaticallyLinked.length,

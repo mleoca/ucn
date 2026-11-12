@@ -1050,6 +1050,8 @@ function checkTarget(index, options, repoRoot) {
     let testFiles;
     let supportFiles;
     let testCount;
+    let testsOpen = false;
+    let testsConditional;
     let testCommands;
     try {
     const model = createTestModel(index);
@@ -1094,6 +1096,7 @@ function checkTarget(index, options, repoRoot) {
     testFiles = [];
     supportFiles = [];
     const countedTests = new Set();
+    const conditionalTests = new Set();
     const runnable = [];
     for (const [absFile, linked] of linkFiles(model, index, linesOf)) {
         const rel = index.files.get(absFile).relativePath;
@@ -1108,6 +1111,8 @@ function checkTarget(index, options, repoRoot) {
             ...(linked.runner && { runner: linked.runner }),
             linkedFunctions: [...names].sort(),
             testCount: linked.tests,
+            ...(linked.moreTests && { moreTests: true }),
+            ...(linked.conditionalTests && { conditionalTests: linked.conditionalTests }),
             ...(linked.run && { run: linked.run }),
             ...(linked.runWithheld && { runWithheld: linked.runWithheld }),
         };
@@ -1118,10 +1123,13 @@ function checkTarget(index, options, repoRoot) {
         testFiles.push(row);
         runnable.push(absFile);
         for (const key of linked.testKeys) countedTests.add(key);
+        for (const key of linked.conditionalKeys) conditionalTests.add(key);
+        if (linked.moreTests) testsOpen = true;
     }
     testFiles.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
     supportFiles.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
     testCount = countedTests.size;
+    testsConditional = conditionalTests.size;
     testCommands = commandsFor(model, runnable.sort());
     } finally { index._endOp(); }
 
@@ -1300,6 +1308,10 @@ function checkTarget(index, options, repoRoot) {
         ...(supportFiles.length > 0 && { supportFiles }),
         totalTestFiles: testFiles.length,
         totalTests: testCount,
+        // A file among them holds tests that are not listed: the total
+        // is a lower bound.
+        ...(testsOpen && { moreTests: true }),
+        ...(testsConditional > 0 && { conditionalTests: testsConditional }),
         actions,
         trust: {
             status: worst === 2 ? 'BLOCKED' : worst === 1 ? 'REVIEW_REQUIRED' : 'READY_FOR_TOOLCHAIN',

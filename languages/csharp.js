@@ -2993,6 +2993,13 @@ const CSHARP_INERT_ATTRIBUTES = new Set([...CSHARP_TEST_ATTRIBUTES, ...CSHARP_RO
     'DeploymentItem', 'WorkItem', 'DoNotParallelize', 'Obsolete', 'SuppressMessage', 'DebuggerStepThrough',
     'ExcludeFromCodeCoverage', 'Ignore']);
 
+// The namespaces the test frameworks' own attributes are written under.
+const CSHARP_TEST_NAMESPACES = /^(global::)?(Xunit|NUnit\.Framework|Microsoft\.VisualStudio\.TestTools\.UnitTesting)(\.|$)/;
+// Methods a framework calls before a test, and the names by which one
+// ends the test there without running it.
+const CSHARP_SETUP_ATTRIBUTES = new Set(['SetUp', 'OneTimeSetUp', 'TestInitialize', 'ClassInitialize', 'AssemblyInitialize']);
+const CSHARP_STOPPING_NAMES = /^(Ignore|Inconclusive|Assume|Pass|Skip\w*|IgnoreException|InconclusiveException)$/;
+
 /**
  * The tests a C# file declares: a method carrying a test attribute of
  * xUnit, NUnit or MSTest, named by its namespace and the classes around
@@ -3147,11 +3154,63 @@ function testUnits(fileEntry, helpers) {
         }
         return derivedMemo.get(name);
     };
+    // Is an attribute written with one of the frameworks' names a class
+    // of the project instead: one written under another namespace, or
+    // declared in the namespace the test stands in or one around it
+    // (which comes before what a using brings), or brought by a using
+    // where no framework's namespace is used.
+    const ofTheProject = (written, symbol) => {
+        const parts = String(written).split('.');
+        const simple = parts.pop().replace(/Attribute$/, '');
+        const declared = helpers.typesNamed ? [...helpers.typesNamed(`${simple}Attribute`), ...helpers.typesNamed(simple)] : [];
+        if (declared.length === 0) return false;
+        if (parts.length > 0) return !CSHARP_TEST_NAMESPACES.test(parts.join('.'));
+        const here = symbol.namespace || '';
+        if (declared.some(type => type.namespace === here || type.namespace === '' || here.startsWith(`${type.namespace}.`))) return true;
+        const usings = (fileEntry.imports || []).map(String);
+        return declared.some(type => usings.includes(type.namespace)) && !usings.some(name => CSHARP_TEST_NAMESPACES.test(name));
+    };
+    // A setup method of a class (or, for xUnit, its constructor) whose
+    // body can end the test before it runs.
+    // Read over the lines of the method, whatever shape the tree gives
+    // them (a declaration split by #if is no single node): a stopping
+    // name or a throw anywhere on them.
+    const stopsOn = (first, last) => {
+        // A throw inside a lambda or a local function is not the method's own.
+        const visit = (node, nested) => {
+            if (node.endPosition.row < first || node.startPosition.row > last) return false;
+            const inside = node.startPosition.row >= first && node.endPosition.row <= last;
+            if (inside && ((/identifier$/.test(node.type) && CSHARP_STOPPING_NAMES.test(node.text)) ||
+                ((node.type === 'throw_statement' || node.type === 'throw_expression') && !nested))) return true;
+            const deeper = nested || (inside && (node.type === 'lambda_expression' ||
+                node.type === 'anonymous_method_expression' || node.type === 'local_function_statement'));
+            return node.namedChildren.some(child => visit(child, deeper));
+        };
+        return visit(tree.rootNode, false);
+    };
+    const guardMemo = new Map();
+    const guarded = cls => {
+        if (!guardMemo.has(cls)) {
+            guardMemo.set(cls, symbols.some(symbol => symbol.className === cls.name &&
+                symbol.startLine >= cls.startLine && (symbol.endLine ?? symbol.startLine) <= (cls.endLine ?? cls.startLine) &&
+                (symbol.type === 'constructor' || symbol.name === 'InitializeAsync' ||
+                    attributeNames(symbol).some(name => CSHARP_SETUP_ATTRIBUTES.has(name))) &&
+                stopsOn(symbol.startLine - 1, (symbol.endLine ?? symbol.startLine) - 1)));
+        }
+        return guardMemo.get(cls);
+    };
     for (const symbol of symbols) {
         if (!symbol.isMethod || symbol.type === 'constructor') continue;
-        const attributes = (symbol.decorators || [])
-            .map(name => String(name).split('.').pop().replace(/Attribute$/, ''))
-            .flatMap(name => CSHARP_TEST_ATTRIBUTES.has(name) || !derivedTest(name) ? [name] : [name, derivedTest(name)]);
+        const attributes = (symbol.decorators || []).flatMap(written => {
+            const name = String(written).split('.').pop().replace(/Attribute$/, '');
+            if (CSHARP_TEST_ATTRIBUTES.has(name) && ofTheProject(written, symbol)) {
+                // A class of the project under a framework's name: a test
+                // attribute only where it derives from one.
+                const base = derivedTest(name);
+                return base ? [`${name} (of the project)`, base] : [`${name} (of the project)`];
+            }
+            return CSHARP_TEST_ATTRIBUTES.has(name) || !derivedTest(name) ? [name] : [name, derivedTest(name)];
+        });
         if (!attributes.some(name => CSHARP_TEST_ATTRIBUTES.has(name))) continue;
         const chain = helpers.enclosing(symbol).filter(outer => outer.type !== 'namespace');
         if (chain.length === 0 || chain.some(outer => !helpers.isContainer(outer))) continue;
@@ -3168,7 +3227,11 @@ function testUnits(fileEntry, helpers) {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
             startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
             ...(states.includes('skip') && { skipped: true }),
-            ...(!states.includes('skip') && states.includes('sometimes') && { conditional: true }),
+            ...(!states.includes('skip') && (states.includes('sometimes') || chain.some(guarded)) && { conditional: true }),
+            // One declaration the runner reports as several tests: a
+            // theory, a method given rows of data.
+            ...(attributes.some(name => /Theory$/.test(name) || name === 'DataTestMethod' || CSHARP_ROW_ATTRIBUTES.has(name)) &&
+                { several: true }),
         };
         if (!declared.has(owner)) declared.set(owner, []);
         declared.get(owner).push(row);
@@ -3188,9 +3251,13 @@ function testUnits(fileEntry, helpers) {
             .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases,
+            // Only the first base written can be a class: the others are
+            // interfaces, whose members are no test of the class.
+            plainBases: bases.slice(1),
             runnable: [...chain, cls].every(concrete),
             ...([...chain, cls].some(each => stateOf(each, null) === 'skip') && { skipped: true }),
             ...([...chain, cls].some(each => stateOf(each, null) === 'sometimes') && { sometimes: true }),
+            ...([...chain, cls].some(guarded) && { guard: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
             members: symbols.filter(symbol => symbol.isMethod && symbol.className === cls.name &&

@@ -6450,7 +6450,28 @@ function testUnits(fileEntry, helpers) {
             endLine: outer.endLine ?? outer.startLine,
         });
     }
-    return { units, inheriting: false };
+    // Tests a macro makes are not listed: a function a macro of the
+    // project expands to (its attributes stand in the macro), and an
+    // invocation among the items whose tokens name a test attribute
+    // (proptest! { #[test] fn ... }).
+    let more = (fileEntry.symbols || []).some(symbol => symbol.type === 'function' && symbol.macroExpansion &&
+        !units.some(unit => unit.kind === 'test' && unit.startLine === symbol.startLine && unit.name === symbol.name));
+    const tree = more ? null : helpers.tree();
+    const namesTest = node => (node.type === 'identifier' && /(^|_)test$/.test(node.text)) || node.namedChildren.some(namesTest);
+    const items = node => {
+        for (const child of node.namedChildren) {
+            if (more) return;
+            if (child.type === 'macro_invocation') {
+                if (namesTest(child)) more = true;
+            } else if (child.type === 'expression_statement' && child.namedChildren[0]?.type === 'macro_invocation') {
+                if (namesTest(child)) more = true;
+            } else if (child.type === 'mod_item' || child.type === 'declaration_list') {
+                items(child);
+            }
+        }
+    };
+    if (tree) items(tree.rootNode);
+    return { units, inheriting: more };
 }
 
 /**

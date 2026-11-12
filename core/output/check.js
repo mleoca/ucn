@@ -124,11 +124,14 @@ function formatCheck(result) {
         const files = result.testFiles.length;
         // A count of tests is printed only when tests were counted: files
         // whose tests are not read have none to report.
+        // "at least": a file among them holds tests that are not listed.
+        const conditional = result.conditionalTests ? ` (${result.conditionalTests} conditional)` : '';
         lines.push(result.totalTests > 0
-            ? `Tests potentially affected: ${result.totalTests} in ${files} file${files === 1 ? '' : 's'}`
-            : `Test files potentially affected: ${files}`);
+            ? `Tests potentially affected: ${result.moreTests ? 'at least ' : ''}${result.totalTests} in ${files} file${files === 1 ? '' : 's'}${conditional}`
+            : `Test files potentially affected: ${files}${result.moreTests ? ' (tests not listed)' : ''}`);
         for (const tf of result.testFiles.slice(0, 8)) {
-            const cnt = tf.testCount ? ` (${tf.testCount})` : '';
+            const cnt = tf.testCount ? ` (${tf.moreTests ? 'at least ' : ''}${tf.testCount})`
+                : tf.moreTests ? ' (tests not listed)' : '';
             lines.push(`  ${tf.file}${cnt}`);
         }
         if (result.testFiles.length > 8) {

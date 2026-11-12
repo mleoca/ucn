@@ -982,7 +982,6 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             testUnits: (fileEntry, helpers) => require('./python').testUnits(fileEntry, helpers),
-            testGate: (fileEntry, helpers) => require('./python').testGate(fileEntry, helpers),
             testRunnerFamily: 'python',
             testFileNames: [/^test_[^/]*\.py$/, /_test\.py$/],
             // `yield` in the body makes the callable a generator.
