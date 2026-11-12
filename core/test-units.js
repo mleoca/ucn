@@ -1869,18 +1869,49 @@ function createTestModel(index) {
      * member of that name. A test found behind a base that is not read is
      * not attributed (`withheld`): that base may declare the name itself.
      *
+     * Which member of a nearer class is "the same member" is the
+     * language's and the runner's to say (`hiddenBy` on a test): by name
+     * where a name is all a member has (Python; and MSTest, which takes
+     * one method of each name), by signature where a language overloads
+     * (`key`: a method of the same name with other parameters is another
+     * method and hides nothing), or only a declared override of that
+     * signature (NUnit: a method that hides by `new` leaves the inherited
+     * test running).
+     *
      * Where the runner takes a test from the nearest declaration that
      * carries its mark (`byDeclaration`: JUnit 4, TestNG, xUnit), a class
-     * nearer that redeclares the member without the mark does not hide it:
+     * nearer that overrides the method without the mark does not hide it:
      * the test runs with that class's body (`body`).
      */
     const inheritedBy = (filePath, cls, select = null) => {
         const out = [];
-        const hidden = new Set(cls.members);
-        // Names a nearer class declares as a test, and where the nearest
-        // body of each member stands.
-        const tested = new Set((cls.tests || []).map(test => test.name));
-        const bodies = new Map((cls.memberRows || []).map(row => [row.name, { row, at: { filePath, cls } }]));
+        const keyOf = row => row.key || row.name;
+        // What the classes nearer than the one looked at declare: every
+        // member by name and by signature, the ones declared as overrides,
+        // the tests, and where the nearest body of each signature stands.
+        const names = new Set();
+        const keys = new Set();
+        const overriding = new Set();
+        const testedNames = new Set();
+        const testedKeys = new Set();
+        const bodies = new Map();
+        const declare = (node, each) => {
+            for (const member of each.members || []) names.add(member);
+            for (const row of each.memberRows || []) {
+                keys.add(keyOf(row));
+                if (row.overrides) overriding.add(keyOf(row));
+                if (!bodies.has(keyOf(row))) bodies.set(keyOf(row), { row, at: node });
+            }
+            // A reader that gives names only: a name is the signature.
+            if (!each.memberRows) for (const member of each.members || []) keys.add(member);
+            for (const test of each.tests || []) {
+                names.add(test.name);
+                keys.add(keyOf(test));
+                testedNames.add(test.name);
+                testedKeys.add(keyOf(test));
+            }
+        };
+        declare({ filePath, cls }, cls);
         let behindUnknown = false;
         let withheldAny = false;
         for (const node of orderOf(filePath, cls).slice(1)) {
@@ -1889,20 +1920,23 @@ function createTestModel(index) {
                 continue;
             }
             for (const test of node.cls.tests) {
-                const redeclared = hidden.has(test.name);
-                if (redeclared && (!test.byDeclaration || tested.has(test.name))) continue;
-                hidden.add(test.name);
-                tested.add(test.name);
+                const key = keyOf(test);
+                const rule = test.hiddenBy || 'name';
+                // A nearer class declares the same test.
+                if (rule === 'name' ? testedNames.has(test.name) : testedKeys.has(key)) continue;
+                // A nearer class declares the same member without the mark.
+                const redeclared = rule === 'name' ? names.has(test.name)
+                    : rule === 'override' ? overriding.has(key) : keys.has(key);
+                testedNames.add(test.name);
+                testedKeys.add(key);
+                if (redeclared && !test.byDeclaration) continue;
                 // A member the runner does not take as a test still hides
                 // the one of that name further up.
                 if (select && !select(test)) continue;
                 if (behindUnknown) withheldAny = true;
-                else out.push({ test, base: node, ...(redeclared && bodies.has(test.name) && { body: bodies.get(test.name) }) });
+                else out.push({ test, base: node, ...(test.byDeclaration && bodies.has(key) && { body: bodies.get(key) }) });
             }
-            for (const member of node.cls.members) hidden.add(member);
-            for (const row of node.cls.memberRows || []) {
-                if (!bodies.has(row.name)) bodies.set(row.name, { row, at: node });
-            }
+            declare(node, node.cls);
         }
         return { tests: out, open: behindUnknown, withheld: withheldAny };
     };

@@ -15,6 +15,7 @@ const {
     parseErrorRegions,
     genericArityOf,
     hasParameterizedQualifier,
+    overloadSignature,
 } = require('./utils');
 
 // An iterator method (`yield return` in its OWN body) returns an enumerable /
@@ -3325,6 +3326,11 @@ function testUnits(fileEntry, helpers) {
         // For a class that inherits the test: the classes around this one
         // are not around that one.
         declared.get(owner).push({
+            // The method a deriving class has to redeclare to be the same
+            // one, and what then hides the inherited test (measured with
+            // each): MSTest takes one method of each name; NUnit leaves
+            // the test only to a declared override of its signature.
+            key: overloadSignature(symbol), hiddenBy: mstest ? 'name' : xunit ? 'signature' : 'override',
             ...row, skipped: own.includes('skip') || undefined,
             conditional: (!own.includes('skip') && sometimes) || undefined, dynamic: undefined,
             // xUnit takes the test from the nearest declaration that
@@ -3362,8 +3368,9 @@ function testUnits(fileEntry, helpers) {
             members: methodsOf(cls).map(symbol => symbol.name),
             // Where each method's body stands, for a test it gives the body to.
             memberRows: methodsOf(cls).map(symbol => ({
-                name: symbol.name, line: symbol.nameLine || symbol.startLine,
+                name: symbol.name, key: overloadSignature(symbol), line: symbol.nameLine || symbol.startLine,
                 startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+                ...((symbol.modifiers || []).includes('override') && { overrides: true }),
             })),
             ...([...chain, cls].some(fixtureRows) && { several: true, dynamic: 'generated-cases' }),
             ...(attributeNames(cls).includes('TestClass') && { marked: true }),

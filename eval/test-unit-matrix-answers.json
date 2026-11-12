@@ -114,6 +114,14 @@
     "  T MarkedOverPlain > FromPlain (from LookupTests.cs:20) => dotnet test --filter FullyQualifiedName=P.Tests.MarkedOverPlain.FromPlain",
     "all: dotnet test --filter 'FullyQualifiedName~P.Tests.Marked.|FullyQualifiedName~P.Tests.Marked+|FullyQualifiedName~P.Tests.MarkedOverPlain.|FullyQualifiedName~P.Tests.MarkedOverPlain+'"
   ],
+  "dotnet-mstest-one-method-of-each-name": [
+    "Tests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Hides.|FullyQualifiedName~P.Tests.Hides+|FullyQualifiedName~P.Tests.Overrides.|FullyQualifiedName~P.Tests.Overrides+'",
+    "  S Overrides",
+    "  T Overrides > Kept (from Tests.cs:16) => dotnet test --filter FullyQualifiedName=P.Tests.Overrides.Kept",
+    "  S Hides",
+    "  T Hides > Works (from Tests.cs:9) => dotnet test --filter FullyQualifiedName=P.Tests.Hides.Works",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.Hides.|FullyQualifiedName~P.Tests.Hides+|FullyQualifiedName~P.Tests.Overrides.|FullyQualifiedName~P.Tests.Overrides+'"
+  ],
   "dotnet-mstest-rows-and-overrides": [
     "LookupTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+|FullyQualifiedName~P.Tests.ChildOfIgnored.|FullyQualifiedName~P.Tests.ChildOfIgnored+'",
     "  S ChildOfIgnored",
@@ -158,6 +166,18 @@
     "  T ChildOfExplicit > Inherited [conditional] (from LookupTests.cs:9) => dotnet test --filter FullyQualifiedName=P.Tests.ChildOfExplicit.Inherited",
     "  S ChildOfArguments",
     "  T ChildOfArguments > FromBase (from LookupTests.cs:20) => (withheld: generated-cases)"
+  ],
+  "dotnet-nunit-overload-and-hiding-are-not-overrides": [
+    "Tests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Hides.|FullyQualifiedName~P.Tests.Hides+|FullyQualifiedName~P.Tests.Overloads.|FullyQualifiedName~P.Tests.Overloads+|FullyQualifiedName~P.Tests.Overrides.|FullyQualifiedName~P.Tests.Overrides+'",
+    "  S Overloads",
+    "  T Overloads > Kept (from Tests.cs:15) => dotnet test --filter FullyQualifiedName=P.Tests.Overloads.Kept",
+    "  T Overloads > Works (from Tests.cs:8) => dotnet test --filter FullyQualifiedName=P.Tests.Overloads.Works",
+    "  S Overrides",
+    "  T Overrides > Kept (from Tests.cs:15) => dotnet test --filter FullyQualifiedName=P.Tests.Overrides.Kept",
+    "  S Hides",
+    "  T Hides > Kept (from Tests.cs:15) => dotnet test --filter FullyQualifiedName=P.Tests.Hides.Kept",
+    "  T Hides > Works (from Tests.cs:8) => dotnet test --filter FullyQualifiedName=P.Tests.Hides.Works",
+    "all: dotnet test --filter 'FullyQualifiedName~P.Tests.Hides.|FullyQualifiedName~P.Tests.Hides+|FullyQualifiedName~P.Tests.Overloads.|FullyQualifiedName~P.Tests.Overloads+|FullyQualifiedName~P.Tests.Overrides.|FullyQualifiedName~P.Tests.Overrides+'"
   ],
   "dotnet-nunit-rows-fixtures-and-overrides": [
     "LookupTests.cs [tests] dotnet-test  run: dotnet test --filter 'FullyQualifiedName~P.Tests.Child.|FullyQualifiedName~P.Tests.Child+|FullyQualifiedName~P.Tests.ChildOfIgnored.|FullyQualifiedName~P.Tests.ChildOfIgnored+'",
@@ -592,6 +612,26 @@
     "all: mvn test -Dtest=com.x.ChildTest",
     "all: mvn test -Dtest=com.x.OnlyInheritsTest"
   ],
+  "maven-junit4-overload-is-not-an-override": [
+    "src/test/java/com/x/Base.java [support] maven",
+    "src/test/java/com/x/BelowMiddleTest.java [tests] maven  run: mvn test -Dtest=com.x.BelowMiddleTest",
+    "  S BelowMiddleTest",
+    "  T BelowMiddleTest > kept (from src/test/java/com/x/Base.java:13) => mvn test '-Dtest=com.x.BelowMiddleTest#kept'",
+    "  T BelowMiddleTest > works (from src/test/java/com/x/Base.java:7) => mvn test '-Dtest=com.x.BelowMiddleTest#works'",
+    "src/test/java/com/x/Middle.java [support] maven",
+    "src/test/java/com/x/OverloadTest.java [tests] maven  run: mvn test -Dtest=com.x.OverloadTest",
+    "  S OverloadTest",
+    "  T OverloadTest > kept (from src/test/java/com/x/Base.java:13) => mvn test '-Dtest=com.x.OverloadTest#kept'",
+    "  T OverloadTest > works (from src/test/java/com/x/Base.java:7) => mvn test '-Dtest=com.x.OverloadTest#works'",
+    "src/test/java/com/x/OverrideTest.java [tests] maven  run: mvn test -Dtest=com.x.OverrideTest",
+    "  S OverrideTest",
+    "  T OverrideTest > kept (from src/test/java/com/x/Base.java:13) => mvn test '-Dtest=com.x.OverrideTest#kept'",
+    "  T OverrideTest > works => mvn test '-Dtest=com.x.OverrideTest#works'",
+    "src/test/java/com/x/Rec.java [support] maven",
+    "all: mvn test -Dtest=com.x.BelowMiddleTest",
+    "all: mvn test -Dtest=com.x.OverloadTest",
+    "all: mvn test -Dtest=com.x.OverrideTest"
+  ],
   "maven-junit4-overrides-runners-and-ignored-bases": [
     "src/test/java/com/x/Base4.java [support] maven",
     "src/test/java/com/x/Child4Test.java [tests] maven  run: mvn test -Dtest=com.x.Child4Test",
@@ -639,6 +679,25 @@
     "src/test/java/com/x/Flaky.java [support] maven",
     "src/test/java/com/x/Quick.java [support] maven",
     "all: mvn test -Dtest=com.x.ConditionsTest"
+  ],
+  "maven-junit5-overload-is-not-an-override": [
+    "src/test/java/com/x/Base.java [support] maven",
+    "src/test/java/com/x/BelowMiddleTest.java [tests] maven  run: mvn test -Dtest=com.x.BelowMiddleTest",
+    "  S BelowMiddleTest",
+    "  T BelowMiddleTest > kept (from src/test/java/com/x/Base.java:13) => mvn test '-Dtest=com.x.BelowMiddleTest#kept'",
+    "  T BelowMiddleTest > works (from src/test/java/com/x/Base.java:7) => mvn test '-Dtest=com.x.BelowMiddleTest#works'",
+    "src/test/java/com/x/Middle.java [support] maven",
+    "src/test/java/com/x/OverloadTest.java [tests] maven  run: mvn test -Dtest=com.x.OverloadTest",
+    "  S OverloadTest",
+    "  T OverloadTest > kept (from src/test/java/com/x/Base.java:13) => mvn test '-Dtest=com.x.OverloadTest#kept'",
+    "  T OverloadTest > works (from src/test/java/com/x/Base.java:7) => mvn test '-Dtest=com.x.OverloadTest#works'",
+    "src/test/java/com/x/OverrideTest.java [tests] maven  run: mvn test -Dtest=com.x.OverrideTest",
+    "  S OverrideTest",
+    "  T OverrideTest > kept (from src/test/java/com/x/Base.java:13) => mvn test '-Dtest=com.x.OverrideTest#kept'",
+    "src/test/java/com/x/Rec.java [support] maven",
+    "all: mvn test -Dtest=com.x.BelowMiddleTest",
+    "all: mvn test -Dtest=com.x.OverloadTest",
+    "all: mvn test -Dtest=com.x.OverrideTest"
   ],
   "maven-junit5-rows-and-repeats": [
     "src/test/java/com/x/Rec.java [support] maven",
@@ -758,6 +817,26 @@
     "all: mvn test -Dtest=com.x.PlainTest",
     "all: mvn test -Dtest=com.x.TAllChildTest",
     "all: mvn test -Dtest=com.x.TChildTest"
+  ],
+  "maven-testng-overload-is-not-an-override": [
+    "src/test/java/com/x/Base.java [support] maven",
+    "src/test/java/com/x/BelowMiddleTest.java [tests] maven  run: mvn test -Dtest=com.x.BelowMiddleTest",
+    "  S BelowMiddleTest",
+    "  T BelowMiddleTest > kept (from src/test/java/com/x/Base.java:13) => (withheld: declared-in-a-base-class)",
+    "  T BelowMiddleTest > works (from src/test/java/com/x/Base.java:7) => (withheld: declared-in-a-base-class)",
+    "src/test/java/com/x/Middle.java [support] maven",
+    "src/test/java/com/x/OverloadTest.java [tests] maven  run: mvn test -Dtest=com.x.OverloadTest",
+    "  S OverloadTest",
+    "  T OverloadTest > kept (from src/test/java/com/x/Base.java:13) => (withheld: declared-in-a-base-class)",
+    "  T OverloadTest > works (from src/test/java/com/x/Base.java:7) => (withheld: declared-in-a-base-class)",
+    "src/test/java/com/x/OverrideTest.java [tests] maven  run: mvn test -Dtest=com.x.OverrideTest",
+    "  S OverrideTest",
+    "  T OverrideTest > kept (from src/test/java/com/x/Base.java:13) => (withheld: declared-in-a-base-class)",
+    "  T OverrideTest > works => (withheld: declared-in-a-base-class)",
+    "src/test/java/com/x/Rec.java [support] maven",
+    "all: mvn test -Dtest=com.x.BelowMiddleTest",
+    "all: mvn test -Dtest=com.x.OverloadTest",
+    "all: mvn test -Dtest=com.x.OverrideTest"
   ],
   "mocha-config-adds-files": [
     "test/a.test.js [tests] mocha  run: (withheld: runner-config-not-read)",

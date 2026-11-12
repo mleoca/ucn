@@ -19,6 +19,7 @@ const {
     sameNode,
     parseErrorRegions,
     hasParameterizedQualifier,
+    overloadSignature,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -2918,10 +2919,12 @@ const JAVA_INERT_ANNOTATIONS = new Set([...JAVA_TEST_ANNOTATIONS, 'DisplayName',
  *
  * Which framework an annotation is of is read from where it is imported
  * from, because the three differ (measured with each):
- * - A class that redeclares a method without the annotation: JUnit 5 no
+ * - A class that overrides a method without the annotation: JUnit 5 no
  *   longer runs it as a test; JUnit 4 and TestNG run the test the nearest
  *   annotated declaration makes, with the body the class has
- *   (`byDeclaration`, `memberRows`).
+ *   (`byDeclaration`, `memberRows`). An override is a method of the same
+ *   signature (`key`): one of the same name with other parameters is
+ *   another method, and the inherited test runs as it stands.
  * - @Disabled and @Ignore on a class hold for that class and the classes
  *   inside it, not for a class that derives from it: a row says what the
  *   method's own annotations say, a class what its own do.
@@ -3216,6 +3219,8 @@ function testUnits(fileEntry, helpers) {
         // For a class that inherits the test: the classes around this one
         // are not around that one.
         declared.get(owner).push({
+            // The method a deriving class has to redeclare to be the same one.
+            key: overloadSignature(symbol), hiddenBy: 'signature',
             // TestNG's @Ignore on a class reaches the classes deriving from it (measured).
             ...row, skipped: ownOff || (framework === 'testng' && chain.some(testngIgnored)) || undefined,
             conditional: (!ownOff && sometimes) || undefined,
@@ -3262,7 +3267,7 @@ function testUnits(fileEntry, helpers) {
             members: methodsOf(cls).map(symbol => symbol.name),
             // Where each method's body stands, for a test it gives the body to.
             memberRows: methodsOf(cls).map(symbol => ({
-                name: symbol.name, line: symbol.nameLine || symbol.startLine,
+                name: symbol.name, key: overloadSignature(symbol), line: symbol.nameLine || symbol.startLine,
                 startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
                 ...(symbol.type !== 'constructor' && classCandidate(symbol) && { candidate: true }),
             })),

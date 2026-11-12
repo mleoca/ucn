@@ -2268,6 +2268,39 @@ describe('test units: Java annotations are read by each framework\'s own rule', 
         }
     });
 
+    it('a method of the same name with other parameters is another method: the inherited test runs as it stands', () => {
+        const base = pkg => `import ${pkg}.Test;\n\npublic abstract class Base {\n    @Test\n    public void works() { }\n\n    @Test\n    public void kept() { }\n}\n`;
+        const overloads = 'public class ChildTest extends Base {\n    public void works(int ignored) { }\n\n    public void kept(String other, java.util.List<String> more) { }\n}\n';
+        const below = { 'Middle.java': 'public abstract class Middle extends Base {\n    public void works(String ignored) { }\n}\n', 'ChildTest.java': 'public class ChildTest extends Middle {\n}\n' };
+        for (const [pkg, command] of [['org.junit', ''], ['org.junit.jupiter.api', ''], ['org.testng.annotations', ':no-command']]) {
+            assert.strictEqual(java({ 'Base.java': base(pkg), 'ChildTest.java': overloads }, 'ChildTest.java'),
+                `2 kept:runs${command} works:runs${command}`, pkg);
+            assert.strictEqual(java({ 'Base.java': base(pkg), ...below }, 'ChildTest.java'), `2 kept:runs${command} works:runs${command}`, pkg);
+        }
+        // The body is the base's: the unit says where it stands, and a call there reaches the deriving class.
+        const dir = projectOf({
+            'pom.xml': POM, [`${D}App.java`]: 'package com.x;\n\npublic class App {\n    public static void target() { }\n}\n',
+            [`${D}Base.java`]: 'package com.x;\n\nimport org.junit.Test;\n\npublic abstract class Base {\n    @Test\n    public void works() {\n        App.target();\n    }\n}\n',
+            [`${D}ChildTest.java`]: 'package com.x;\n\npublic class ChildTest extends Base {\n    public void works(int ignored) { }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const unit = rowsOf(index, `${D}ChildTest.java`).units.find(each => each.kind === 'test');
+            assert.strictEqual(unit.inheritedFrom, `${D}Base.java:7`);
+            const affected = index.affectedTests('target', { depth: 2 });
+            assert.strictEqual(affected.summary.totalTests, 1);
+            assert.ok(affected.testFiles.some(file => file.file === `${D}ChildTest.java`));
+            assert.ok(affected.commands.length > 0);
+        } finally {
+            rm(dir);
+        }
+        // Qualifiers and type arguments are no part of a signature: this one is an override.
+        assert.strictEqual(java({
+            'Base.java': 'import org.junit.jupiter.api.Test;\nimport org.junit.jupiter.params.ParameterizedTest;\nimport org.junit.jupiter.params.provider.NullSource;\n\npublic abstract class Base {\n    @ParameterizedTest\n    @NullSource\n    void rows(java.util.List<String> items) { }\n\n    @Test\n    void kept() { }\n}\n',
+            'ChildTest.java': 'import java.util.List;\n\npublic class ChildTest extends Base {\n    @Override\n    void rows(List<String> items) { }\n}\n',
+        }, 'ChildTest.java'), '1 kept:runs');
+    });
+
     it('a test with parameters runs through the rows its sources give', () => {
         const head = 'import org.junit.jupiter.api.RepeatedTest;\nimport org.junit.jupiter.api.Test;\nimport org.junit.jupiter.params.ParameterizedTest;\nimport org.junit.jupiter.params.provider.*;\n\nclass RowsTest {\n';
         const method = (annotations, name) => `    @ParameterizedTest\n${annotations.map(each => `    ${each}\n`).join('')}    void ${name}(int x) { }\n\n`;
@@ -2332,6 +2365,19 @@ describe('test units: C# rows, fixtures and overrides are read by each framework
         assert.strictEqual(cs('NUnit', 'NUnit.Framework', body('Test')), '1 Child > Kept:runs');
         assert.strictEqual(cs('MSTest.TestFramework', 'Microsoft.VisualStudio.TestTools.UnitTesting', body('TestMethod', '[TestClass]\n    ').replace('public abstract class Base', '[TestClass]\n    public abstract class Base')),
             '1 Child > Kept:runs');
+    });
+
+    it('what a method of a deriving class does to an inherited test of its name is each framework\'s rule', () => {
+        const body = (attribute, mark = '') => `    ${mark}public abstract class Base\n    {\n        [${attribute}]\n        public virtual void Works() { }\n\n        [${attribute}]\n        public void Kept() { }\n    }\n\n    ${mark}public class Overloads : Base\n    {\n        public void Works(int ignored) { }\n    }\n\n    ${mark}public class Hides : Base\n    {\n        public new void Kept() { }\n    }\n\n    ${mark}public class Overrides : Base\n    {\n        public override void Works() { }\n    }\n`;
+        // NUnit: only a declared override of the signature takes the test away.
+        assert.strictEqual(cs('NUnit', 'NUnit.Framework', body('Test')),
+            '5 Overloads > Kept:runs Overloads > Works:runs Hides > Kept:runs Hides > Works:runs Overrides > Kept:runs');
+        // MSTest takes one method of each name: any method of the name hides the inherited test.
+        assert.strictEqual(cs('MSTest.TestFramework', 'Microsoft.VisualStudio.TestTools.UnitTesting', body('TestMethod', '[TestClass]\n    ')),
+            '3 Overloads > Kept:runs Hides > Works:runs Overrides > Kept:runs');
+        // xUnit runs the test with the body of the override; a method of other parameters is not one.
+        assert.strictEqual(cs('xunit', 'Xunit', '    public abstract class Base\n    {\n        [Fact]\n        public virtual void Works() { }\n    }\n\n    public class Overrides : Base\n    {\n        public override void Works() { }\n\n        public void Works(int ignored) { }\n    }\n'),
+            '1 Overrides > Works:runs');
     });
 
     it('rows written out, rows left out by their own arguments, rows that are computed', () => {

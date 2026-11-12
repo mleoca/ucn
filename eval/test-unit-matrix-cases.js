@@ -7724,6 +7724,296 @@ mod tests {
 `,
         },
     },
+    // ---- a method of the same name: an overload is another method, an override the same one
+    {
+        id: 'maven-junit4-overload-is-not-an-override', runner: 'maven',
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUNIT4),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.junit.Test;
+
+public abstract class Base {
+    @Test
+    public void works() {
+        Rec.mark("src/test/java/com/x/Base.java::works body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > works");
+    }
+
+    @Test
+    public void kept() {
+        Rec.mark("src/test/java/com/x/Base.java::kept body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kept");
+    }
+}
+`,
+            'src/test/java/com/x/OverloadTest.java': `package com.x;
+
+public class OverloadTest extends Base {
+    public void works(int ignored) { Rec.mark("src/test/java/com/x/OverloadTest.java::never"); }
+
+    public void kept(String other, int more) { Rec.mark("src/test/java/com/x/OverloadTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/OverrideTest.java': `package com.x;
+
+public class OverrideTest extends Base {
+    @Override
+    public void works() {
+        Rec.mark("src/test/java/com/x/OverrideTest.java::works body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > works");
+    }
+}
+`,
+            'src/test/java/com/x/Middle.java': `package com.x;
+
+public abstract class Middle extends Base {
+    public void works(String ignored) { Rec.mark("src/test/java/com/x/Middle.java::never"); }
+}
+`,
+            'src/test/java/com/x/BelowMiddleTest.java': `package com.x;
+
+public class BelowMiddleTest extends Middle {
+}
+`,
+        },
+    },
+    {
+        id: 'maven-junit5-overload-is-not-an-override', runner: 'maven',
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public abstract class Base {
+    @Test
+    public void works() {
+        Rec.mark("src/test/java/com/x/Base.java::works body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > works");
+    }
+
+    @Test
+    public void kept() {
+        Rec.mark("src/test/java/com/x/Base.java::kept body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kept");
+    }
+}
+`,
+            'src/test/java/com/x/OverloadTest.java': `package com.x;
+
+public class OverloadTest extends Base {
+    public void works(int ignored) { Rec.mark("src/test/java/com/x/OverloadTest.java::never"); }
+
+    public void kept(String other, int more) { Rec.mark("src/test/java/com/x/OverloadTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/OverrideTest.java': `package com.x;
+
+public class OverrideTest extends Base {
+    @Override
+    public void works() {
+        Rec.mark("src/test/java/com/x/OverrideTest.java::works body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > works");
+    }
+}
+`,
+            'src/test/java/com/x/Middle.java': `package com.x;
+
+public abstract class Middle extends Base {
+    public void works(String ignored) { Rec.mark("src/test/java/com/x/Middle.java::never"); }
+}
+`,
+            'src/test/java/com/x/BelowMiddleTest.java': `package com.x;
+
+public class BelowMiddleTest extends Middle {
+}
+`,
+        },
+    },
+    {
+        id: 'maven-testng-overload-is-not-an-override', runner: 'maven',
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', TESTNG),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.testng.annotations.Test;
+
+public abstract class Base {
+    @Test
+    public void works() {
+        Rec.mark("src/test/java/com/x/Base.java::works body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > works");
+    }
+
+    @Test
+    public void kept() {
+        Rec.mark("src/test/java/com/x/Base.java::kept body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kept");
+    }
+}
+`,
+            'src/test/java/com/x/OverloadTest.java': `package com.x;
+
+public class OverloadTest extends Base {
+    public void works(int ignored) { Rec.mark("src/test/java/com/x/OverloadTest.java::never"); }
+
+    public void kept(String other, int more) { Rec.mark("src/test/java/com/x/OverloadTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/OverrideTest.java': `package com.x;
+
+public class OverrideTest extends Base {
+    @Override
+    public void works() {
+        Rec.mark("src/test/java/com/x/OverrideTest.java::works body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > works");
+    }
+}
+`,
+            'src/test/java/com/x/Middle.java': `package com.x;
+
+public abstract class Middle extends Base {
+    public void works(String ignored) { Rec.mark("src/test/java/com/x/Middle.java::never"); }
+}
+`,
+            'src/test/java/com/x/BelowMiddleTest.java': `package com.x;
+
+public class BelowMiddleTest extends Middle {
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-overload-and-hiding-are-not-overrides', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Tests.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public abstract class Base
+    {
+        [Test]
+        public virtual void Works()
+        {
+            Rec.Mark("Tests.cs::Base works body");
+            Rec.Mark("Tests.cs::" + GetType().Name + " > Works");
+        }
+
+        [Test]
+        public void Kept()
+        {
+            Rec.Mark("Tests.cs::Base kept body");
+            Rec.Mark("Tests.cs::" + GetType().Name + " > Kept");
+        }
+    }
+
+    public class Overloads : Base
+    {
+        public void Works(int ignored) { Rec.Mark("Tests.cs::never"); }
+
+        public void Kept(string other, int more) { Rec.Mark("Tests.cs::never"); }
+    }
+
+    public class Overrides : Base
+    {
+        public override void Works()
+        {
+            Rec.Mark("Tests.cs::Overrides works body");
+            Rec.Mark("Tests.cs::" + GetType().Name + " > Works");
+        }
+    }
+
+    public class Hides : Base
+    {
+        public new void Kept() { Rec.Mark("Tests.cs::Hides > Kept by new"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-mstest-one-method-of-each-name', runner: 'dotnet-test',
+        files: {
+            'App.Tests.csproj': CSPROJ(MSTEST),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Tests.cs': `using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace P.Tests
+{
+    [TestClass]
+    public abstract class Base
+    {
+        [TestMethod]
+        public virtual void Works()
+        {
+            Rec.Mark("Tests.cs::Base works body");
+            Rec.Mark("Tests.cs::" + GetType().Name + " > Works");
+        }
+
+        [TestMethod]
+        public void Kept()
+        {
+            Rec.Mark("Tests.cs::Base kept body");
+            Rec.Mark("Tests.cs::" + GetType().Name + " > Kept");
+        }
+    }
+
+    [TestClass]
+    public class Overloads : Base
+    {
+        public void Works(int ignored) { Rec.Mark("Tests.cs::never"); }
+
+        public void Kept(string other, int more) { Rec.Mark("Tests.cs::never"); }
+    }
+
+    [TestClass]
+    public class Overrides : Base
+    {
+        public override void Works()
+        {
+            Rec.Mark("Tests.cs::Overrides works body");
+            Rec.Mark("Tests.cs::" + GetType().Name + " > Works");
+        }
+    }
+
+    [TestClass]
+    public class Hides : Base
+    {
+        public new void Kept() { Rec.Mark("Tests.cs::Hides > Kept by new"); }
+    }
+}
+`,
+        },
+    },
 ];
 
 module.exports = { CASES };

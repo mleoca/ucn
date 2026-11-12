@@ -1218,6 +1218,27 @@ function extractSprintfPrefix(callNode) {
  * _indexInParent returned -1). `.id` is node-tree-sitter's stable native
  * node identity — compare that, never the wrapper reference.
  */
+/**
+ * A method's signature as a language with overloading compares methods:
+ * its name and the types of its parameters, each without type arguments,
+ * qualifier, nullability mark or spaces (`works(int,String[])`). Two
+ * methods of one name with different signatures are different methods;
+ * one in a deriving class with the same signature is the same method.
+ * Parameter names, defaults and the return type are no part of it.
+ */
+function overloadSignature(symbol) {
+    const typeKey = type => {
+        let text = String(type || '').replace(/\s+/g, '');
+        for (let before = null; before !== text;) {
+            before = text;
+            text = text.replace(/<[^<>]*>/g, '');
+        }
+        const array = (/(\[[\],]*\])+$/.exec(text) || [''])[0];
+        return text.slice(0, text.length - array.length).replace(/\?$/, '').split('.').pop() + array;
+    };
+    return `${symbol.name}(${(symbol.paramsStructured || []).map(parameter => typeKey(parameter.type)).join(',')})`;
+}
+
 function sameNode(a, b) {
     return !!a && !!b && (a === b || a.id === b.id);
 }
@@ -1414,6 +1435,7 @@ function declaredTypeParameterNames(...trees) {
 }
 
 module.exports = {
+    overloadSignature,
     TYPE_PARAMETER_PARENTS,
     TYPE_PARAMETER_NAME_TOKENS,
     declaredTypeParameterNames,
