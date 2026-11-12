@@ -3526,6 +3526,7 @@ function testUnits(fileEntry, helpers) {
             // neither does a class deriving from it; one that names a
             // runner of its own is taken by that runner's rules.
             ...(refused.has(cls) && { refused: true }),
+            ...(maybeRefused.has(cls) && { mayRefuse: true }),
             ...([...chain, cls].some(otherRunner) && { runner: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
             line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,

@@ -10110,6 +10110,59 @@ namespace P.Tests
 `,
         },
     },
+    {
+        id: 'maven-junit4-inherited-runner-over-a-refused-base', runner: 'maven',
+        sometimes: [
+            'src/test/java/com/x/DirectTest.java::DirectTest > works',
+            'src/test/java/com/x/LeafTest.java::LeafTest > works',
+        ],
+        atLeast: ['src/test/java/com/x/SelectiveRunner.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUNIT4),
+            'src/test/java/com/x/Rec.java': `package com.x;\npublic class Rec {\n${JAVA}}\n`,
+            'src/test/java/com/x/SelectiveRunner.java': `package com.x;
+import org.junit.runner.Runner;
+import org.junit.runner.Description;
+import org.junit.runner.notification.RunNotifier;
+import org.junit.runner.notification.Failure;
+public class SelectiveRunner extends Runner {
+    private final Class<?> type;
+    public SelectiveRunner(Class<?> type) { this.type = type; }
+    public Description getDescription() { return Description.createTestDescription(type, "works"); }
+    public void run(RunNotifier notifier) {
+        Description description = getDescription();
+        notifier.fireTestStarted(description);
+        try { type.getMethod("works").invoke(type.getDeclaredConstructor().newInstance()); }
+        catch (Throwable error) { notifier.fireTestFailure(new Failure(description, error)); }
+        finally { notifier.fireTestFinished(description); }
+    }
+}
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+import org.junit.Test;
+public abstract class Base {
+    @Test public int invalid() { return 1; }
+    @Test public void works() {
+        Rec.mark("src/test/java/com/x/Base.java::works body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > works");
+    }
+}
+`,
+            'src/test/java/com/x/Middle.java': `package com.x;
+import org.junit.runner.RunWith;
+@RunWith(SelectiveRunner.class)
+public abstract class Middle extends Base {}
+`,
+            'src/test/java/com/x/LeafTest.java': `package com.x;
+public class LeafTest extends Middle {}
+`,
+            'src/test/java/com/x/DirectTest.java': `package com.x;
+import org.junit.runner.RunWith;
+@RunWith(SelectiveRunner.class)
+public class DirectTest extends Base {}
+`,
+        },
+    },
 ];
 
 module.exports = { CASES };

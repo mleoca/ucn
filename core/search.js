@@ -1799,16 +1799,22 @@ function tests(index, nameOrFile, options = {}) {
         const nestedTypeDefs = targetDefs.filter(def => def.enclosingType &&
             ['class', 'struct', 'interface', 'type', 'enum', 'trait', 'record', 'union'].includes(def.type));
         if (accessorDefs.length > 0 || nestedTypeDefs.length > 0) {
-            const testPaths = new Set(testFiles.map(t => t.path));
+            // Reference-only tests have no call site to add their file to
+            // testFiles above. Let the reference engines find their sites
+            // first, then ask the same model which lines a test executes.
+            // The index-only gate spares files that cannot hold test code;
+            // filenames alone never remove a candidate.
+            const referencePaths = new Set([...index.files.keys()].filter(filePath =>
+                testInfoByPath.get(filePath) || model.mayHoldTests(filePath)));
             const globallyUnique = index.find(searchTerm, { exact: true }).length === 1;
             for (const def of [...accessorDefs, ...nestedTypeDefs]) {
                 const types = nestedTypeDefs.includes(def)
-                    ? require('./analysis').findTypeReferences(index, searchTerm, def, { files: testPaths }) : null;
+                    ? require('./analysis').findTypeReferences(index, searchTerm, def, { files: referencePaths }) : null;
                 const typeSite = site => ({ ...site, absoluteFile: path.join(index.root, site.file) });
                 const refs = types ? {
                     confirmed: types.byFile.flatMap(group => group.sites).map(typeSite),
                     unverified: types.unverifiedSites.map(typeSite),
-                } : findAccessorReferences(index, searchTerm, def, { files: testPaths });
+                } : findAccessorReferences(index, searchTerm, def, { files: referencePaths });
                 if (!refs) continue;
                 const rows = [
                     ...refs.confirmed.map(r => ({ ...r, tierName: 'confirmed' })),
@@ -1816,8 +1822,7 @@ function tests(index, nameOrFile, options = {}) {
                         ? refs.unverified.map(r => ({ ...r, tierName: 'unverified' })) : []),
                 ];
                 for (const ref of rows) {
-                    // Accessor and type references are looked for in the test files (`testPaths` above).
-                    const info = testInfoByPath.get(ref.absoluteFile);
+                    const info = testInfoOf(ref.absoluteFile);
                     if (!info) continue;
                     if (info.testRanges && !lineInRanges(ref.line, info.testRanges)) continue;
                     if (excludeArr.length > 0 &&

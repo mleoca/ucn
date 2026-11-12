@@ -2829,6 +2829,34 @@ describe('test units: what a method\'s modifiers do to its mark is each framewor
         'com/x/LegacyTest.java'), '1 testPlain:runs');
     });
 
+    it('JUnit 4 refusal uses the runner inherited through intermediate classes (fix #497)', () => {
+        const base = 'package com.x;\nimport org.junit.Test;\npublic abstract class Base {\n @Test public int invalid() { return 1; }\n @Test public void works() { }\n}\n';
+        const manifest = '<project><modelVersion>4.0.0</modelVersion><groupId>com.x</groupId><artifactId>m</artifactId><version>1</version></project>\n';
+        for (const where of ['middle', 'leaf', 'none', 'unread']) {
+            const files = {
+                'pom.xml': manifest,
+                'src/test/java/com/x/Base.java': base.replace('class Base {', where === 'unread' ? 'class Base extends outside.Parent {' : 'class Base {'),
+                'src/test/java/com/x/Middle.java': 'package com.x;\n' + (where === 'middle' ? '@org.junit.runner.RunWith(OtherRunner.class)\n' : '') + 'public abstract class Middle extends Base {}\n',
+                'src/test/java/com/x/LeafTest.java': 'package com.x;\nimport org.junit.Test;\n' + (where === 'leaf' ? '@org.junit.runner.RunWith(OtherRunner.class)\n' : '') + 'public class LeafTest extends Middle {\n @Test public void own() { }\n}\n',
+            };
+            const dir = projectOf(files);
+            try {
+                const answer = rowsOf(idx(dir), 'src/test/java/com/x/LeafTest.java');
+                const units = answer.units.filter(unit => unit.kind === 'test');
+                if (where === 'none') {
+                    assert.strictEqual(answer.facts.tests, 0);
+                    assert.ok(units.every(unit => unit.skipped));
+                } else {
+                    assert.ok(units.length >= 2, where);
+                    assert.ok(units.every(unit => !unit.skipped), where);
+                    assert.ok(units.every(unit => unit.conditional), where);
+                }
+            } finally {
+                rm(dir);
+            }
+        }
+    });
+
     it('JUnit 4 refuses a class for one marked method that is not public or is static: none of its tests runs', () => {
         const pkg = 'org.junit';
         const one = modifier => `package com.x;\n\nimport org.junit.Test;\n\npublic class OneTest {\n    @Test\n    ${modifier} void odd() { }\n\n    @Test\n    public void publicCase() { }\n}\n`;
@@ -2951,18 +2979,41 @@ describe('test units: what a test executes is test code whatever its file is cal
         }, 'target'), { affected: ['test_named.py:test_it'], tests: 1, commands: 1, direct: ['test_named.py:test_it'] });
     });
 
-    it('a property a test reads is still found: accessor references stay with the files named like test files', () => {
-        const dir = projectOf({
-            'pytest.ini': '[pytest]\n',
-            'client.py': 'class Client:\n    def __init__(self):\n        self._jar = {}\n\n    @property\n    def cookies(self):\n        return self._jar\n',
-            'tests/__init__.py': '',
-            'tests/test_client.py': 'from client import Client\n\ndef test_reads():\n    client = Client()\n    assert client.cookies == {}\n',
-        });
-        try {
-            const found = idx(dir).tests('cookies', {});
-            assert.deepStrictEqual(found.map(file => `${file.file}:${file.tests}`), ['tests/test_client.py:1']);
-        } finally {
-            rm(dir);
+    it('a reference-only test is found by its executed lines, whatever the file is called (fix #497)', () => {
+        for (const file of ['checks.py', 'tests/test_client.py']) {
+            const dir = projectOf({
+                'pytest.ini': '[pytest]\npython_files = checks.py test_*.py\n',
+                'client.py': 'class Client:\n    @property\n    def cookies(self):\n        return {}\n',
+                [file]: 'from client import Client\n\ndef test_reads():\n    client = Client()\n    assert client.cookies == {}\n',
+                'production.py': 'from client import Client\n\ndef use():\n    return Client().cookies\n',
+            });
+            try {
+                const index = idx(dir);
+                const found = index.tests('cookies', {});
+                assert.deepStrictEqual(found.map(row => `${row.file}:${row.tests}`), [`${file}:1`]);
+                assert.ok(found[0].units[0].selector);
+                assert.deepStrictEqual(index.tests('cookies', { exclude: file }), []);
+                assert.deepStrictEqual(index.tests('cookies', {}), found);
+            } finally {
+                rm(dir);
+            }
+        }
+        for (const file of ['Fixture.cs', 'FixtureTests.cs']) {
+            const dir = projectOf({
+                'App.Tests.csproj': PROJ,
+                'Types.cs': 'namespace P { public class Outer { public class Inner {} } }\n',
+                [file]: 'using NUnit.Framework;\nnamespace P {\npublic class Fixture {\n [Test]\n public void Reads() {\n  Outer.Inner value = null;\n  Assert.IsNull(value);\n }\n}\n}\n',
+                'Production.cs': 'namespace P { public class Production { public Outer.Inner Value; } }\n',
+            });
+            try {
+                const index = idx(dir);
+                const found = index.tests('Inner', {});
+                assert.deepStrictEqual(found.map(row => `${row.file}:${row.tests}`), [`${file}:1`]);
+                assert.ok(found[0].units[0].selector);
+                assert.deepStrictEqual(index.tests('Inner', { exclude: file }), []);
+            } finally {
+                rm(dir);
+            }
         }
     });
 

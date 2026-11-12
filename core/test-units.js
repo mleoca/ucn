@@ -2884,12 +2884,22 @@ function createTestModel(index, options = {}) {
             // A class its runner refuses (one of its marked methods is one
             // the runner does not accept), or a class deriving from one:
             // none of its tests runs, its own or inherited.
-            const refusedAbove = cls => cls.bases.length > 0 &&
-                orderOf(filePath, cls).slice(1).some(node => !node.opaque && node.cls.refused);
-            const refusedHere = cls => !cls.runner && (!!cls.refused || refusedAbove(cls));
-            // Under a runner the class names itself, what its base's
-            // runner refuses may be accepted: not read.
-            const maybeRefused = cls => !!cls.runner && refusedAbove(cls);
+            const refusalMemo = new Map();
+            const refusalOf = cls => {
+                if (!refusalMemo.has(cls)) {
+                    const order = orderOf(filePath, cls);
+                    const refused = order.some(node => !node.opaque && (node.cls.refused || node.cls.mayRefuse));
+                    // @RunWith is inherited, including through an
+                    // intermediate class that declares no tests. A runner
+                    // anywhere in the ancestry, or an unread base that may
+                    // name one, prevents a definite standard-runner refusal.
+                    const custom = order.some(node => node.opaque ? !node.safe : node.cls.runner || node.cls.mayRefuse);
+                    refusalMemo.set(cls, refused ? (custom ? 'conditional' : 'refused') : null);
+                }
+                return refusalMemo.get(cls);
+            };
+            const refusedHere = cls => refusalOf(cls) === 'refused';
+            const maybeRefused = cls => refusalOf(cls) === 'conditional';
             const runsIn = unit => classesHere.filter(cls => within(unit, cls)).sort((a, b) => b.startLine - a.startLine)[0];
             // A focus leaves other tests of the file declared and not
             // executed, by the rule of the runner that runs the file.

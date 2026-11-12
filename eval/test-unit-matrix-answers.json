@@ -873,6 +873,20 @@
     "all: mvn test -Dtest=com.x.ChildTest",
     "all: mvn test -Dtest=com.x.OnlyInheritsTest"
   ],
+  "maven-junit4-inherited-runner-over-a-refused-base": [
+    "src/test/java/com/x/Base.java [support] maven",
+    "src/test/java/com/x/DirectTest.java [tests] maven  run: mvn test -Dtest=com.x.DirectTest",
+    "  S DirectTest",
+    "  T DirectTest > works [conditional] (from src/test/java/com/x/Base.java:5) => mvn test '-Dtest=com.x.DirectTest#works'",
+    "src/test/java/com/x/LeafTest.java [tests] maven  run: mvn test -Dtest=com.x.LeafTest",
+    "  S LeafTest",
+    "  T LeafTest > works [conditional] (from src/test/java/com/x/Base.java:5) => mvn test '-Dtest=com.x.LeafTest#works'",
+    "src/test/java/com/x/Middle.java [support] maven",
+    "src/test/java/com/x/Rec.java [support] maven",
+    "src/test/java/com/x/SelectiveRunner.java [tests] maven  run: (withheld: no-test-class)  [holds more tests]",
+    "all: mvn test -Dtest=com.x.DirectTest",
+    "all: mvn test -Dtest=com.x.LeafTest"
+  ],
   "maven-junit4-overload-is-not-an-override": [
     "src/test/java/com/x/Base.java [support] maven",
     "src/test/java/com/x/BelowMiddleTest.java [tests] maven  run: mvn test -Dtest=com.x.BelowMiddleTest",
