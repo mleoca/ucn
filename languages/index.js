@@ -162,6 +162,10 @@ const STRUCTURAL_TRAITS = {
     // 'namespace-usings' (C#: enclosing namespaces, then using directives,
     // global usings and project-file <Using> items), or null.
     typeNameScoping: null,
+    // The platform's generic types a language writes with a syntax of its
+    // own: { nullable, tuple }, each the type's qualified name (C#:
+    // `System.Nullable<T>` is `T?`). Two spellings of one type.
+    platformTypeForms: null,
     typeNameSourceCanonical: null,
     typeNameOwnersAt: null,
     implementationOwnerSyntax: null,
@@ -527,6 +531,7 @@ const NOMINAL_TRAITS = {
     moduleTypeIdentity: false,
     standardPathRoots: [],
     typeNameScoping: null,
+    platformTypeForms: null,
     typeNameSourceCanonical: null,
     typeNameOwnersAt: null,
     implicitTypeImport: null,
@@ -1482,6 +1487,7 @@ const LANGUAGES = {
             standardPathRoots: ['System'],
             conditionalDefinitions: 'preprocessor',
             typeNameScoping: 'namespace-usings',
+            platformTypeForms: { nullable: 'System.Nullable', tuple: 'System.ValueTuple' },
             constructorArgumentNodes: { delegation: { nodeType: 'constructor_initializer', argsNodeType: 'argument_list' } },
             genericArityIsIdentity: true,
             typeArgumentsFromArgumentsOnly: true,

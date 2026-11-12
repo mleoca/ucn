@@ -199,7 +199,8 @@ function answerOf(dir) {
                 const row = model.describe(filePath, unit);
                 const selector = row.selector ? selectorText(row.selector) : null;
                 lines.push(`  T ${label}${unit.conditional ? ' [conditional]' : ''}${unit.skipped ? ' [skipped]' : ''}` +
-                    `${unit.inherited ? ` (from ${unit.inherited.file}:${unit.inherited.line})` : ''} => ` +
+                    `${unit.inherited ? ` (from ${unit.inherited.file}:${unit.inherited.line})` : ''}` +
+                    `${unit.alternatives ? ` (or ${unit.alternatives.map(body => `${body.file}:${body.startLine}`).join(', ')})` : ''} => ` +
                     (selector || `(withheld: ${row.selectorWithheld})`));
                 units.push({
                     id: `${entry.relativePath}::${label}`, file: entry.relativePath,
@@ -214,6 +215,13 @@ function answerOf(dir) {
                             file: unit.inherited.file,
                             startLine: unit.inherited.startLine, endLine: unit.inherited.endLine,
                         },
+                    }),
+                    // The bodies the engine says the test may run instead
+                    // (a method that may have replaced the inherited one).
+                    ...(unit.alternatives && {
+                        alternatives: unit.alternatives.map(body => ({
+                            file: body.file, startLine: body.startLine, endLine: body.endLine,
+                        })),
                     }),
                 });
             }
@@ -260,14 +268,16 @@ function sameSet(a, b) {
  * Is an executed identity a unit's? A unit owns the marks on its own
  * lines; a test that runs under a class it does not stand in owns its
  * run-time label, and the marks of the body the engine says it runs:
- * another body running is another test.
+ * another body running is another test. Where the engine says the test
+ * may run one of several bodies (it calls such a test conditional), the
+ * marks of each are the unit's; a body it does not name is not.
  */
 function owns(unit, id) {
     if (id === unit.id) return true;
     const at = /^(.*):(\d+)$/.exec(id);
     if (!at) return false;
-    const range = unit.inherited ? unit.origin : unit;
-    return at[1] === range.file && Number(at[2]) >= range.startLine && Number(at[2]) <= range.endLine;
+    const within = range => at[1] === range.file && Number(at[2]) >= range.startLine && Number(at[2]) <= range.endLine;
+    return within(unit.inherited ? unit.origin : unit) || (unit.alternatives || []).some(within);
 }
 
 function fileOf(id) {

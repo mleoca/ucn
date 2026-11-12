@@ -19,7 +19,6 @@ const {
     sameNode,
     parseErrorRegions,
     hasParameterizedQualifier,
-    overloadSignature,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -2908,6 +2907,99 @@ const JAVA_INERT_ANNOTATIONS = new Set([...JAVA_TEST_ANNOTATIONS, 'DisplayName',
     'FunctionalInterface', 'Execution', 'ResourceLock', 'Isolated', 'FixMethodOrder', 'Disabled', 'Ignore',
     'Retention', 'Target', 'Documented', 'Inherited', 'Repeatable']);
 
+const javaDimensions = node => (node ? node.children.filter(child => child.type === '[').length : 0);
+
+/**
+ * A type as it is written, for comparing two methods' parameters: a
+ * primitive (`id`), a name with its qualifier (`path`), an array. Type
+ * arguments are left out: two methods are the same member when their
+ * signatures are the same after erasure (JLS 8.4.2).
+ */
+function javaTypeTerm(node) {
+    if (!node) return { unread: '' };
+    switch (node.type) {
+        case 'integral_type': case 'floating_point_type': case 'boolean_type': case 'void_type':
+            return { id: node.text };
+        case 'type_identifier':
+            return { path: [{ name: node.text }] };
+        case 'scoped_type_identifier': {
+            const path = [];
+            for (const child of node.namedChildren) {
+                if (/annotation$/.test(child.type)) continue;
+                const inner = javaTypeTerm(child);
+                if (!inner.path) return { unread: node.text };
+                path.push(...inner.path);
+            }
+            return { path };
+        }
+        case 'generic_type':
+            return {
+                ...javaTypeTerm(node.namedChildren.find(child => child.type !== 'type_arguments' && !/annotation$/.test(child.type))),
+                parameterized: true,
+            };
+        case 'annotated_type':
+            return javaTypeTerm(node.namedChildren.filter(child => !/annotation$/.test(child.type)).pop());
+        case 'array_type': {
+            let term = javaTypeTerm(node.childForFieldName('element'));
+            for (let i = javaDimensions(node.childForFieldName('dimensions')); i > 0; i--) term = { array: term, rank: 1 };
+            return term;
+        }
+        default:
+            return { unread: node.text };
+    }
+}
+
+/** A method's parameter types and its own type parameters (each with its first bound), as written. */
+function javaSignature(node) {
+    const params = [];
+    const list = node.childForFieldName('parameters');
+    for (const child of list ? list.namedChildren : []) {
+        if (child.type === 'formal_parameter') {
+            let term = javaTypeTerm(child.childForFieldName('type'));
+            // `int a[]`: the brackets after the name are part of the type.
+            for (let i = javaDimensions(child.childForFieldName('dimensions')); i > 0; i--) term = { array: term, rank: 1 };
+            params.push(term);
+        } else if (child.type === 'spread_parameter') {
+            // `T... rest` is `T[] rest` where signatures are compared.
+            const type = child.namedChildren.find(each => each.type !== 'modifiers' && each.type !== 'variable_declarator');
+            params.push({ array: javaTypeTerm(type), rank: 1 });
+        } else if (child.type !== 'receiver_parameter' && !/comment$/.test(child.type)) {
+            params.push({ unread: child.text });
+        }
+    }
+    return { params, typeParams: javaTypeParameters(node), returns: javaTypeTerm(node.childForFieldName('type')) };
+}
+
+function javaTypeParameters(node) {
+    const out = [];
+    const list = node.childForFieldName('type_parameters');
+    for (const child of list ? list.namedChildren : []) {
+        if (child.type !== 'type_parameter') continue;
+        const name = child.namedChildren.find(each => each.type === 'type_identifier' || each.type === 'identifier');
+        const bound = child.namedChildren.find(each => each.type === 'type_bound');
+        const first = bound && bound.namedChildren.find(each => !/annotation$/.test(each.type));
+        out.push({ name: name ? name.text : '', ...(first && { bound: javaTypeTerm(first) }) });
+    }
+    return out;
+}
+
+/** The types a type declaration derives from, as written: the superclass, then the interfaces. */
+function javaBases(node) {
+    const out = [];
+    const take = each => {
+        if (each.type === 'type_list' || each.type === 'superclass' || each.type === 'super_interfaces' ||
+            each.type === 'extends_interfaces') {
+            for (const child of each.namedChildren) take(child);
+        } else if (!/comment$/.test(each.type)) {
+            out.push({ written: each.text.replace(/\s+/g, ' ').trim(), term: javaTypeTerm(each) });
+        }
+    };
+    for (const child of node.namedChildren) {
+        if (child.type === 'superclass' || child.type === 'super_interfaces' || child.type === 'extends_interfaces') take(child);
+    }
+    return out;
+}
+
 /**
  * The tests a Java file declares: a method annotated as a test (JUnit 4
  * and 5, TestNG), or a public "test"-prefixed method of a class deriving
@@ -2923,8 +3015,10 @@ const JAVA_INERT_ANNOTATIONS = new Set([...JAVA_TEST_ANNOTATIONS, 'DisplayName',
  *   longer runs it as a test; JUnit 4 and TestNG run the test the nearest
  *   annotated declaration makes, with the body the class has
  *   (`byDeclaration`, `memberRows`). An override is a method of the same
- *   signature (`key`): one of the same name with other parameters is
- *   another method, and the inherited test runs as it stands.
+ *   signature: one of the same name with other parameters is another
+ *   method, and the inherited test runs as it stands. Each row carries
+ *   its parameters' types as they are written (`params`); what the names
+ *   in them denote is resolved where two methods are compared.
  * - @Disabled and @Ignore on a class hold for that class and the classes
  *   inside it, not for a class that derives from it: a row says what the
  *   method's own annotations say, a class what its own do.
@@ -3024,6 +3118,61 @@ function testUnits(fileEntry, helpers) {
         for (const child of node.namedChildren) noteAnnotations(child);
     };
     if (tree) noteAnnotations(tree.rootNode);
+    // Each method's and each type's declaration, by the rows it starts
+    // and is named on: its parameter types and its bases are read as
+    // they are written.
+    const methodNodes = new Map();
+    const typeNodes = new Map();
+    const noteDeclarations = node => {
+        const name = /_declaration$/.test(node.type) ? node.childForFieldName('name') : null;
+        const into = !name ? null : node.type === 'method_declaration' ? methodNodes
+            : /^(class|interface|enum|record|annotation_type)_declaration$/.test(node.type) ? typeNodes : null;
+        if (into) {
+            for (const row of new Set([name.startPosition.row, node.startPosition.row])) {
+                const key = `${row}:${name.text}`;
+                if (!into.has(key)) into.set(key, []);
+                into.get(key).push(node);
+            }
+        }
+        for (const child of node.namedChildren) noteDeclarations(child);
+    };
+    if (tree) noteDeclarations(tree.rootNode);
+    const nodeOf = (nodes, symbol) => {
+        const found = nodes.get(`${(symbol.nameLine || symbol.startLine) - 1}:${symbol.name}`) ||
+            nodes.get(`${symbol.startLine - 1}:${symbol.name}`) || [];
+        // Several of one name on one row: the one that starts where the symbol does.
+        return (symbol.sourceSpan && found.find(node => node.startIndex === symbol.sourceSpan.start)) || found[0] || null;
+    };
+    const signatureMemo = new Map();
+    /** What a deriving class's method is compared by: the parameter types as written, the method's type parameters, a declared override. */
+    const signatureOf = symbol => {
+        if (!signatureMemo.has(symbol)) {
+            const node = nodeOf(methodNodes, symbol);
+            const read = node ? javaSignature(node)
+                : { params: (symbol.paramsStructured || []).length === 0 ? [] : null, typeParams: [] };
+            const overrides = (symbol.annotationsWithArgs || []).some(annotation =>
+                String(annotation.name).split('.').pop() === 'Override' && !ofTheProject(annotation.name, symbol));
+            // A type parameter in scope: the method's own, or one of a
+            // class the method stands in.
+            const variables = new Set(read.typeParams.map(each => each.name));
+            for (const cls of helpers.enclosing(symbol)) {
+                const header = nodeOf(typeNodes, cls);
+                for (const each of header ? javaTypeParameters(header) : []) variables.add(each.name);
+            }
+            const variable = term => !!term && !!term.path && term.path.length === 1 && variables.has(term.path[0].name);
+            // What reflection calls a generic type of a parameter: a type
+            // variable, or an array of one or of a type with arguments.
+            const generic = term => variable(term) ||
+                (!!term && !!term.array && (generic(term.array) || !!term.array.parameterized));
+            signatureMemo.set(symbol, {
+                params: read.params,
+                ...(read.typeParams.length > 0 && { typeParams: read.typeParams }),
+                ...(overrides && { overrides: true }),
+                ...((!read.params || read.params.some(generic) || variable(read.returns)) && { generic: true }),
+            });
+        }
+        return signatureMemo.get(symbol);
+    };
     const written = symbol => writtenAt.get((symbol.nameLine || symbol.startLine) - 1) ||
         writtenAt.get(symbol.startLine - 1) || [];
     /** The annotation of a declaration written under one of the names, or null. */
@@ -3220,7 +3369,13 @@ function testUnits(fileEntry, helpers) {
         // are not around that one.
         declared.get(owner).push({
             // The method a deriving class has to redeclare to be the same one.
-            key: overloadSignature(symbol), hiddenBy: 'signature',
+            ...signatureOf(symbol), hiddenBy: 'signature',
+            // JUnit 5 decides by reflection, which does not say what a type
+            // parameter stands for: a method whose parameter or result is
+            // one is taken as replaced by any method of its name a nearer
+            // class declares whose parameters could be passed to it
+            // (measured: an overload removes the inherited test).
+            ...(framework !== 'junit4' && framework !== 'testng' && signatureOf(symbol).generic && { replacedByAssignable: true }),
             // TestNG's @Ignore on a class reaches the classes deriving from it (measured).
             ...row, skipped: ownOff || (framework === 'testng' && chain.some(testngIgnored)) || undefined,
             conditional: (!ownOff && sometimes) || undefined,
@@ -3252,10 +3407,19 @@ function testUnits(fileEntry, helpers) {
         if (!helpers.isContainer(cls)) continue;
         const chain = helpers.enclosing(cls);
         if (chain.some(outer => !helpers.isContainer(outer))) continue;
-        const bases = [cls.extends, cls.implements].flat().filter(Boolean)
-            .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
+        // The bases as the declaration writes them; without its node, as
+        // the symbol records them.
+        const header = nodeOf(typeNodes, cls);
+        const derived = header ? javaBases(header) : null;
+        const bases = derived ? derived.map(each => each.written)
+            : [cls.extends, cls.implements].flat().filter(Boolean)
+                .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
+        const typeParams = header ? javaTypeParameters(header).map(each => each.name) : [];
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases,
+            // What each base denotes is resolved by the language's lookup.
+            ...(derived && { baseTerms: derived.map(each => each.term) }),
+            ...(typeParams.length > 0 && { typeParams }),
             // JUnit's TestCase brings no test of its own.
             plainBases: bases.filter(name => /(^|\.)TestCase$/.test(name.replace(/<.*$/, '')) && !helpers.declaresType(name)),
             runnable: [...chain, cls].every(concrete),
@@ -3267,7 +3431,7 @@ function testUnits(fileEntry, helpers) {
             members: methodsOf(cls).map(symbol => symbol.name),
             // Where each method's body stands, for a test it gives the body to.
             memberRows: methodsOf(cls).map(symbol => ({
-                name: symbol.name, key: overloadSignature(symbol), line: symbol.nameLine || symbol.startLine,
+                name: symbol.name, ...signatureOf(symbol), line: symbol.nameLine || symbol.startLine,
                 startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
                 ...(symbol.type !== 'constructor' && classCandidate(symbol) && { candidate: true }),
             })),

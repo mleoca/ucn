@@ -8014,6 +8014,1009 @@ namespace P.Tests
 `,
         },
     },
+    // ---- a parameter type and a base are what their names denote where they are written
+    {
+        id: 'maven-junit5-parameter-types-are-what-their-names-denote', runner: 'maven',
+        sometimes: ['src/test/java/com/x/BoundedOtherTest.java::BoundedOtherTest > bounded', 'src/test/java/com/x/TypedOverloadTest.java::TypedOverloadTest > typed', 'src/test/java/com/x/TypedUnmarkedTest.java::TypedUnmarkedTest > typed'],
+        emptyTestFiles: ['src/test/java/com/x/BoundedOtherTest.java', 'src/test/java/com/x/TypedOverloadTest.java'],
+        atLeast: ['src/test/java/com/x/BoundedOtherTest.java', 'src/test/java/com/x/ImportedTest.java', 'src/test/java/com/x/OnDemandTest.java', 'src/test/java/com/x/OtherPackageTest.java', 'src/test/java/com/x/OtherTypesTest.java', 'src/test/java/com/x/OwnMemberTest.java', 'src/test/java/com/x/ThroughBelowTest.java', 'src/test/java/com/x/TypedOverloadTest.java', 'src/test/java/com/x/TypedUnmarkedTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/Left.java': `package com.x;
+
+public class Left {
+    public enum Kind { A }
+}
+`,
+            'src/test/java/com/x/Right.java': `package com.x;
+
+public class Right {
+    public enum Kind { A }
+}
+`,
+            'src/test/java/com/x/LeftBelow.java': `package com.x;
+
+public class LeftBelow extends Left {
+}
+`,
+            'src/test/java/com/y/Kind.java': `package com.y;
+
+public enum Kind { A }
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+public abstract class Base {
+    @ParameterizedTest
+    @ValueSource(strings = { "a" })
+    void text(String value) {
+        Rec.mark("src/test/java/com/x/Base.java::text body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > text");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { 1 })
+    void number(int value) {
+        Rec.mark("src/test/java/com/x/Base.java::number body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > number");
+    }
+
+    @ParameterizedTest
+    @EnumSource
+    void kind(Left.Kind value) {
+        Rec.mark("src/test/java/com/x/Base.java::kind body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kind");
+    }
+
+    @ParameterizedTest
+    @NullSource
+    void many(String... values) {
+        Rec.mark("src/test/java/com/x/Base.java::many body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > many");
+    }
+}
+`,
+            'src/test/java/com/x/SpelledTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class SpelledTest extends Base {
+    void text(java.lang.String value) { Rec.mark("src/test/java/com/x/SpelledTest.java::never"); }
+
+    void number(final int value) { Rec.mark("src/test/java/com/x/SpelledTest.java::never"); }
+
+    void kind(com.x.Left.Kind value) { Rec.mark("src/test/java/com/x/SpelledTest.java::never"); }
+
+    void many(String[] values) { Rec.mark("src/test/java/com/x/SpelledTest.java::never"); }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/SpelledTest.java::SpelledTest > own"); }
+}
+`,
+            'src/test/java/com/x/OtherTypesTest.java': `package com.x;
+
+public class OtherTypesTest extends Base {
+    void text(CharSequence value) { Rec.mark("src/test/java/com/x/OtherTypesTest.java::never"); }
+
+    void number(Integer value) { Rec.mark("src/test/java/com/x/OtherTypesTest.java::never"); }
+
+    void kind(Right.Kind value) { Rec.mark("src/test/java/com/x/OtherTypesTest.java::never"); }
+
+    void many(String value) { Rec.mark("src/test/java/com/x/OtherTypesTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/ImportedTest.java': `package com.x;
+
+import com.x.Left.Kind;
+import org.junit.jupiter.api.Test;
+
+public class ImportedTest extends Base {
+    void kind(Kind value) { Rec.mark("src/test/java/com/x/ImportedTest.java::never"); }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/ImportedTest.java::ImportedTest > own"); }
+}
+`,
+            'src/test/java/com/x/OtherPackageTest.java': `package com.x;
+
+import com.y.Kind;
+
+public class OtherPackageTest extends Base {
+    void kind(Kind value) { Rec.mark("src/test/java/com/x/OtherPackageTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/ThroughBelowTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class ThroughBelowTest extends Base {
+    void kind(LeftBelow.Kind value) { Rec.mark("src/test/java/com/x/ThroughBelowTest.java::never"); }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/ThroughBelowTest.java::ThroughBelowTest > own"); }
+}
+`,
+            'src/test/java/com/x/OnDemandTest.java': `package com.x;
+
+import com.x.Left.*;
+import org.junit.jupiter.api.Test;
+
+public class OnDemandTest extends Base {
+    void kind(Kind value) { Rec.mark("src/test/java/com/x/OnDemandTest.java::never"); }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/OnDemandTest.java::OnDemandTest > own"); }
+}
+`,
+            'src/test/java/com/x/OwnMemberTest.java': `package com.x;
+
+public class OwnMemberTest extends Base {
+    public static class Left { public enum Kind { B } }
+
+    void kind(Left.Kind value) { Rec.mark("src/test/java/com/x/OwnMemberTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/Typed.java': `package com.x;
+
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+public abstract class Typed<T> {
+    @ParameterizedTest
+    @ValueSource(strings = { "a" })
+    void typed(T value) {
+        Rec.mark("src/test/java/com/x/Typed.java::typed body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > typed");
+    }
+}
+`,
+            'src/test/java/com/x/TypedUnmarkedTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class TypedUnmarkedTest extends Typed<String> {
+    void typed(String value) { Rec.mark("src/test/java/com/x/TypedUnmarkedTest.java::never"); }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/TypedUnmarkedTest.java::TypedUnmarkedTest > own"); }
+}
+`,
+            'src/test/java/com/x/TypedDeclaredTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class TypedDeclaredTest extends Typed<String> {
+    @Override
+    void typed(String value) { Rec.mark("src/test/java/com/x/TypedDeclaredTest.java::never"); }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/TypedDeclaredTest.java::TypedDeclaredTest > own"); }
+}
+`,
+            'src/test/java/com/x/TypedOverloadTest.java': `package com.x;
+
+public class TypedOverloadTest extends Typed<String> {
+    void typed(Integer value) { Rec.mark("src/test/java/com/x/TypedOverloadTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/Bounded.java': `package com.x;
+
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+public abstract class Bounded {
+    @ParameterizedTest
+    @ValueSource(ints = { 1 })
+    <N extends Number> void bounded(N value) {
+        Rec.mark("src/test/java/com/x/Bounded.java::bounded body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > bounded");
+    }
+}
+`,
+            'src/test/java/com/x/BoundedSameTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class BoundedSameTest extends Bounded {
+    void bounded(Number value) { Rec.mark("src/test/java/com/x/BoundedSameTest.java::never"); }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/BoundedSameTest.java::BoundedSameTest > own"); }
+}
+`,
+            'src/test/java/com/x/BoundedOtherTest.java': `package com.x;
+
+public class BoundedOtherTest extends Bounded {
+    void bounded(Integer value) { Rec.mark("src/test/java/com/x/BoundedOtherTest.java::never"); }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-testng-parameter-types-are-what-their-names-denote', runner: 'maven',
+        sometimes: ['src/test/java/com/x/BelowMiddleTest.java::BelowMiddleTest > kind', 'src/test/java/com/x/BelowMiddleTest.java::BelowMiddleTest > text', 'src/test/java/com/x/ImportedTest.java::ImportedTest > kind', 'src/test/java/com/x/ImportedTest.java::ImportedTest > text', 'src/test/java/com/x/OtherPackageTest.java::OtherPackageTest > kind', 'src/test/java/com/x/OtherPackageTest.java::OtherPackageTest > text', 'src/test/java/com/x/OtherTypesTest.java::OtherTypesTest > kind', 'src/test/java/com/x/OtherTypesTest.java::OtherTypesTest > text', 'src/test/java/com/x/SpelledTest.java::SpelledTest > kind', 'src/test/java/com/x/SpelledTest.java::SpelledTest > text', 'src/test/java/com/x/ThroughBelowTest.java::ThroughBelowTest > kind', 'src/test/java/com/x/ThroughBelowTest.java::ThroughBelowTest > text', 'src/test/java/com/x/TypedDeclaredTest.java::TypedDeclaredTest > typed', 'src/test/java/com/x/TypedUnmarkedTest.java::TypedUnmarkedTest > typed'],
+        atLeast: ['src/test/java/com/x/BelowMiddleTest.java', 'src/test/java/com/x/ImportedTest.java', 'src/test/java/com/x/OtherPackageTest.java', 'src/test/java/com/x/OtherTypesTest.java', 'src/test/java/com/x/SpelledTest.java', 'src/test/java/com/x/ThroughBelowTest.java', 'src/test/java/com/x/TypedDeclaredTest.java', 'src/test/java/com/x/TypedUnmarkedTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', TESTNG),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/x/Left.java': `package com.x;
+
+public class Left {
+    public enum Kind { A }
+}
+`,
+            'src/test/java/com/x/Right.java': `package com.x;
+
+public class Right {
+    public enum Kind { A }
+}
+`,
+            'src/test/java/com/x/LeftBelow.java': `package com.x;
+
+public class LeftBelow extends Left {
+}
+`,
+            'src/test/java/com/y/Kind.java': `package com.y;
+
+public enum Kind { A }
+`,
+            'src/test/java/com/x/Base.java': `package com.x;
+
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+public abstract class Base {
+    @DataProvider(name = "kinds")
+    public Object[][] kinds() { return new Object[][] { { Left.Kind.A } }; }
+
+    @DataProvider(name = "texts")
+    public Object[][] texts() { return new Object[][] { { "a" } }; }
+
+    @Test(dataProvider = "kinds")
+    public void kind(Left.Kind value) {
+        Rec.mark("src/test/java/com/x/Base.java::kind body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kind");
+    }
+
+    @Test(dataProvider = "texts")
+    public void text(String value) {
+        Rec.mark("src/test/java/com/x/Base.java::text body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > text");
+    }
+}
+`,
+            'src/test/java/com/x/SpelledTest.java': `package com.x;
+
+public class SpelledTest extends Base {
+    public void kind(com.x.Left.Kind value) {
+        Rec.mark("src/test/java/com/x/SpelledTest.java::kind body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kind");
+    }
+
+    public void text(java.lang.String value) {
+        Rec.mark("src/test/java/com/x/SpelledTest.java::text body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > text");
+    }
+}
+`,
+            'src/test/java/com/x/OtherTypesTest.java': `package com.x;
+
+public class OtherTypesTest extends Base {
+    public void kind(Right.Kind value) { Rec.mark("src/test/java/com/x/OtherTypesTest.java::never"); }
+
+    public void text(CharSequence value) { Rec.mark("src/test/java/com/x/OtherTypesTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/ImportedTest.java': `package com.x;
+
+import com.x.Left.Kind;
+
+public class ImportedTest extends Base {
+    public void kind(Kind value) {
+        Rec.mark("src/test/java/com/x/ImportedTest.java::kind body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kind");
+    }
+}
+`,
+            'src/test/java/com/x/OtherPackageTest.java': `package com.x;
+
+import com.y.Kind;
+
+public class OtherPackageTest extends Base {
+    public void kind(Kind value) { Rec.mark("src/test/java/com/x/OtherPackageTest.java::never"); }
+}
+`,
+            'src/test/java/com/x/ThroughBelowTest.java': `package com.x;
+
+public class ThroughBelowTest extends Base {
+    public void kind(LeftBelow.Kind value) {
+        Rec.mark("src/test/java/com/x/ThroughBelowTest.java::kind body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > kind");
+    }
+}
+`,
+            'src/test/java/com/x/Middle.java': `package com.x;
+
+public abstract class Middle extends Base {
+    public void text(java.lang.String value) {
+        Rec.mark("src/test/java/com/x/Middle.java::text body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > text");
+    }
+}
+`,
+            'src/test/java/com/x/BelowMiddleTest.java': `package com.x;
+
+public class BelowMiddleTest extends Middle {
+}
+`,
+            'src/test/java/com/x/Typed.java': `package com.x;
+
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+public abstract class Typed<T> {
+    @DataProvider(name = "rows")
+    public Object[][] rows() { return new Object[][] { { "a" } }; }
+
+    @Test(dataProvider = "rows")
+    public void typed(T value) {
+        Rec.mark("src/test/java/com/x/Typed.java::typed body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > typed");
+    }
+}
+`,
+            'src/test/java/com/x/TypedUnmarkedTest.java': `package com.x;
+
+public class TypedUnmarkedTest extends Typed<String> {
+    public void typed(String value) {
+        Rec.mark("src/test/java/com/x/TypedUnmarkedTest.java::typed body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > typed");
+    }
+}
+`,
+            'src/test/java/com/x/TypedDeclaredTest.java': `package com.x;
+
+public class TypedDeclaredTest extends Typed<String> {
+    @Override
+    public void typed(String value) {
+        Rec.mark("src/test/java/com/x/TypedDeclaredTest.java::typed body");
+        Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > typed");
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'maven-junit5-a-base-is-the-class-its-name-denotes', runner: 'maven',
+        atLeast: ['src/test/java/com/x/ShadowTest.java'],
+        files: {
+            'pom.xml': POM.replace('DEPENDENCIES', JUPITER),
+            'src/test/java/com/x/Rec.java': `package com.x;
+
+public class Rec {
+    public static void mark(String id) { try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("UCN_RAN")), id + "\\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception e) { throw new RuntimeException(e); } }
+}
+`,
+            'src/test/java/com/a/Number.java': `package com.a;
+
+import org.junit.jupiter.api.Test;
+
+public abstract class Number {
+    @Test
+    void inherited() { com.x.Rec.mark("src/test/java/com/a/Number.java::inherited body"); }
+}
+`,
+            'src/test/java/com/x/ShadowTest.java': `package com.x;
+
+import org.junit.jupiter.api.Test;
+
+public class ShadowTest extends Number {
+    public int intValue() { return 0; }
+    public long longValue() { return 0; }
+    public float floatValue() { return 0; }
+    public double doubleValue() { return 0; }
+
+    @Test
+    void own() { Rec.mark("src/test/java/com/x/ShadowTest.java::ShadowTest > own"); }
+}
+`,
+            'src/test/java/com/a/Support.java': `package com.a;
+
+import org.junit.jupiter.api.Test;
+
+public abstract class Support {
+    @Test
+    public void fromA() {
+        com.x.Rec.mark("src/test/java/com/a/Support.java::fromA body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > fromA");
+    }
+}
+`,
+            'src/test/java/com/b/Support.java': `package com.b;
+
+import org.junit.jupiter.api.Test;
+
+public abstract class Support {
+    @Test
+    public void fromB() {
+        com.x.Rec.mark("src/test/java/com/b/Support.java::fromB body");
+        com.x.Rec.mark("src/test/java/com/x/" + getClass().getSimpleName() + ".java::" + getClass().getSimpleName() + " > fromB");
+    }
+}
+`,
+            'src/test/java/com/x/ImportsATest.java': `package com.x;
+
+import com.a.Support;
+
+public class ImportsATest extends Support {
+}
+`,
+            'src/test/java/com/x/ImportsBTest.java': `package com.x;
+
+import com.b.*;
+
+public class ImportsBTest extends Support {
+}
+`,
+            'src/test/java/com/x/QualifiedBTest.java': `package com.x;
+
+public class QualifiedBTest extends com.b.Support {
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-parameter-types-are-what-their-names-denote', runner: 'dotnet-test',
+        atLeast: ['Aliased.cs', 'AliasedKeyword.cs', 'Seconds.cs', 'Spelled.cs', 'ThroughBelow.cs', 'TypedOverload.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Left.cs': `namespace P.Tests
+{
+    public class Left { public enum Kind { A } }
+    public class Right { public enum Kind { A } }
+    public class LeftBelow : Left { }
+}
+`,
+            'Spaces.cs': `namespace P.A
+{
+    public enum Mode { One }
+}
+namespace P.B
+{
+    public enum Mode { One }
+}
+`,
+            'Base.cs': `using System.Collections.Generic;
+using NUnit.Framework;
+using P.A;
+
+namespace P.Tests
+{
+    public abstract class Base
+    {
+        [TestCase(1)]
+        public virtual void Number(int value)
+        {
+            Rec.Mark("Base.cs::number body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Number");
+        }
+
+        [TestCase(null)]
+        public virtual void Number(int? value)
+        {
+            Rec.Mark("Base.cs::nullable number body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Number");
+        }
+
+        [TestCase("a")]
+        public virtual void Text(string value)
+        {
+            Rec.Mark("Base.cs::text body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Text");
+        }
+
+        [TestCase(new int[] { 1 })]
+        public virtual void Text(int[] value)
+        {
+            Rec.Mark("Base.cs::array text body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Text");
+        }
+
+        [TestCase(Left.Kind.A)]
+        public virtual void Kind(Left.Kind value)
+        {
+            Rec.Mark("Base.cs::left kind body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Kind");
+        }
+
+        [TestCase(Right.Kind.A)]
+        public virtual void Kind(Right.Kind value)
+        {
+            Rec.Mark("Base.cs::right kind body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Kind");
+        }
+
+        [TestCase(null)]
+        public virtual void Many(List<int> value)
+        {
+            Rec.Mark("Base.cs::int list body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Many");
+        }
+
+        [TestCase(null)]
+        public virtual void Many(List<string> value)
+        {
+            Rec.Mark("Base.cs::string list body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Many");
+        }
+
+        [TestCase(Mode.One)]
+        public virtual void Spaced(Mode value)
+        {
+            Rec.Mark("Base.cs::mode of A body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Spaced");
+        }
+
+        [TestCase(P.B.Mode.One)]
+        public virtual void Spaced(P.B.Mode value)
+        {
+            Rec.Mark("Base.cs::mode of B body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Spaced");
+        }
+    }
+}
+`,
+            'Spelled.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class Spelled : Base
+    {
+        public override void Number(System.Int32 value) { Rec.Mark("Spelled.cs::never"); }
+
+        public override void Text(global::System.String value) { Rec.Mark("Spelled.cs::never"); }
+
+        public override void Kind(P.Tests.Left.Kind value) { Rec.Mark("Spelled.cs::never"); }
+
+        public override void Many(System.Collections.Generic.List<System.Int32> value) { Rec.Mark("Spelled.cs::never"); }
+
+        public override void Spaced(P.A.Mode value) { Rec.Mark("Spelled.cs::never"); }
+    }
+}
+`,
+            'Seconds.cs': `using System.Collections.Generic;
+using NUnit.Framework;
+using P.B;
+
+namespace P.Tests
+{
+    public class Seconds : Base
+    {
+        public override void Number(System.Nullable<int> value) { Rec.Mark("Seconds.cs::never"); }
+
+        public override void Text(System.Int32[] value) { Rec.Mark("Seconds.cs::never"); }
+
+        public override void Kind(Right.Kind value) { Rec.Mark("Seconds.cs::never"); }
+
+        public override void Many(List<string> value) { Rec.Mark("Seconds.cs::never"); }
+
+        public override void Spaced(Mode value) { Rec.Mark("Seconds.cs::never"); }
+    }
+}
+`,
+            'Aliased.cs': `using NUnit.Framework;
+using Num = System.Int32;
+using Txt = System.String;
+using Kinds = P.Tests.Left;
+
+namespace P.Tests
+{
+    public class Aliased : Base
+    {
+        public override void Number(Num value) { Rec.Mark("Aliased.cs::never"); }
+
+        public override void Text(Txt value) { Rec.Mark("Aliased.cs::never"); }
+
+        public override void Kind(Kinds.Kind value) { Rec.Mark("Aliased.cs::never"); }
+    }
+}
+`,
+            'AliasedKeyword.cs': `using NUnit.Framework;
+using Num = int;
+using Ints = int[];
+
+namespace P.Tests
+{
+    public class AliasedKeyword : Base
+    {
+        public override void Number(Num value) { Rec.Mark("AliasedKeyword.cs::never"); }
+
+        public override void Text(Ints value) { Rec.Mark("AliasedKeyword.cs::never"); }
+    }
+}
+`,
+            'ThroughBelow.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class ThroughBelow : Base
+    {
+        public override void Kind(LeftBelow.Kind value) { Rec.Mark("ThroughBelow.cs::never"); }
+    }
+}
+`,
+            'Typed.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public abstract class Typed<T>
+    {
+        [TestCase(1)]
+        public virtual void Value(T value)
+        {
+            Rec.Mark("Typed.cs::value body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Value");
+        }
+    }
+}
+`,
+            'TypedOverride.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class TypedOverride : Typed<int>
+    {
+        public override void Value(int value) { Rec.Mark("TypedOverride.cs::never"); }
+
+        [Test]
+        public void Own() { Rec.Mark("TypedOverride.cs::TypedOverride > Own"); }
+    }
+}
+`,
+            'TypedOverload.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class TypedOverload : Typed<int>
+    {
+        public void Value(string value) { Rec.Mark("TypedOverload.cs::never"); }
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-xunit-parameter-types-are-what-their-names-denote', runner: 'dotnet-test',
+        atLeast: ['Aliased.cs', 'BelowMiddle.cs', 'Spelled.cs', 'TypedOverride.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(XUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Left.cs': `namespace P.Tests
+{
+    public class Left { public enum Kind { A } }
+    public class Right { public enum Kind { A } }
+    public class LeftBelow : Left { }
+}
+`,
+            'Spaces.cs': `namespace P.A
+{
+    public enum Mode { One }
+}
+namespace P.B
+{
+    public enum Mode { One }
+}
+`,
+            'Base.cs': `using Xunit;
+
+namespace P.Tests
+{
+    public abstract class Base
+    {
+        [Theory]
+        [InlineData(1)]
+        public virtual void Number(int value)
+        {
+            Rec.Mark("Base.cs::number body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Number");
+        }
+
+        [Theory]
+        [InlineData("a")]
+        public virtual void Text(string value)
+        {
+            Rec.Mark("Base.cs::text body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Text");
+        }
+    }
+}
+`,
+            'Spelled.cs': `namespace P.Tests
+{
+    public class Spelled : Base
+    {
+        public override void Number(System.Int32 value)
+        {
+            Rec.Mark("Spelled.cs::number body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Number");
+        }
+
+        public override void Text(global::System.String value)
+        {
+            Rec.Mark("Spelled.cs::text body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Text");
+        }
+    }
+}
+`,
+            'Aliased.cs': `using Num = System.Int32;
+
+namespace P.Tests
+{
+    public class Aliased : Base
+    {
+        public override void Number(Num value)
+        {
+            Rec.Mark("Aliased.cs::number body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Number");
+        }
+    }
+}
+`,
+            'Typed.cs': `using Xunit;
+
+namespace P.Tests
+{
+    public abstract class Typed<T>
+    {
+        [Theory]
+        [InlineData(1)]
+        public virtual void Value(T value)
+        {
+            Rec.Mark("Typed.cs::value body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Value");
+        }
+    }
+}
+`,
+            'TypedOverride.cs': `namespace P.Tests
+{
+    public class TypedOverride : Typed<int>
+    {
+        public override void Value(int value)
+        {
+            Rec.Mark("TypedOverride.cs::value body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Value");
+        }
+    }
+}
+`,
+            'Middle.cs': `namespace P.Tests
+{
+    public abstract class Middle : Base
+    {
+        public override void Text(System.String value)
+        {
+            Rec.Mark("Middle.cs::text body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Text");
+        }
+    }
+}
+`,
+            'BelowMiddle.cs': `namespace P.Tests
+{
+    public class BelowMiddle : Middle
+    {
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-a-base-is-the-class-its-name-denotes', runner: 'dotnet-test',
+        atLeast: ['Shadow.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Other.cs': `using NUnit.Framework;
+
+namespace P.Other
+{
+    public abstract class Random
+    {
+        [Test]
+        public void Inherited() { P.Tests.Rec.Mark("Other.cs::inherited body"); }
+    }
+}
+`,
+            'Shadow.cs': `using System;
+using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class Shadow : Random
+    {
+        [Test]
+        public void Own() { Rec.Mark("Shadow.cs::Shadow > Own"); }
+    }
+}
+`,
+            'Supports.cs': `using NUnit.Framework;
+
+namespace P.A
+{
+    public abstract class Support
+    {
+        [Test]
+        public void FromA()
+        {
+            P.Tests.Rec.Mark("Supports.cs::from A body");
+            P.Tests.Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > FromA");
+        }
+    }
+}
+namespace P.B
+{
+    public abstract class Support
+    {
+        [Test]
+        public void FromB()
+        {
+            P.Tests.Rec.Mark("Supports.cs::from B body");
+            P.Tests.Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > FromB");
+        }
+    }
+}
+`,
+            'UsesA.cs': `using P.A;
+
+namespace P.Tests
+{
+    public class UsesA : Support
+    {
+    }
+}
+`,
+            'UsesB.cs': `namespace P.Tests
+{
+    using P.B;
+
+    public class UsesB : Support
+    {
+    }
+}
+`,
+            'QualifiedB.cs': `namespace P.Tests
+{
+    public class QualifiedB : P.B.Support
+    {
+    }
+}
+`,
+            'AliasedA.cs': `using Helper = P.A.Support;
+
+namespace P.Tests
+{
+    public class AliasedA : Helper
+    {
+    }
+}
+`,
+        },
+    },
+    {
+        id: 'dotnet-nunit-a-test-of-the-class-under-an-inherited-name', runner: 'dotnet-test',
+        atLeast: ['ListOverload.cs', 'MarkedOverride.cs', 'NullableOverload.cs'],
+        files: {
+            'App.Tests.csproj': CSPROJ(NUNIT),
+            'Rec.cs': `namespace P.Tests
+{
+    public static class Rec { static readonly object Gate = new object(); public static void Mark(string id) { lock (Gate) { System.IO.File.AppendAllText(System.Environment.GetEnvironmentVariable("UCN_RAN"), id + "\\n"); } } }
+}
+`,
+            'Base.cs': `using System.Collections.Generic;
+using NUnit.Framework;
+
+namespace P.Tests
+{
+    public abstract class Base
+    {
+        [TestCase(1)]
+        public virtual void Works(int value)
+        {
+            Rec.Mark("Base.cs::works body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Works");
+        }
+    }
+
+    public abstract class ListBase
+    {
+        [TestCase(null)]
+        public virtual void Works(List<int> value)
+        {
+            Rec.Mark("Base.cs::list works body");
+            Rec.Mark(GetType().Name + ".cs::" + GetType().Name + " > Works");
+        }
+    }
+}
+`,
+            'NullableOverload.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class NullableOverload : Base
+    {
+        [TestCase(null)]
+        public void Works(int? value) { Rec.Mark("NullableOverload.cs::NullableOverload > Works of its own"); }
+    }
+}
+`,
+            'ListOverload.cs': `using System.Collections.Generic;
+using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class ListOverload : ListBase
+    {
+        [TestCase(null)]
+        public void Works(List<string> value) { Rec.Mark("ListOverload.cs::ListOverload > Works of its own"); }
+    }
+}
+`,
+            'AliasOverride.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class AliasOverride : Base
+    {
+        public override void Works(System.Int32 value) { Rec.Mark("AliasOverride.cs::never"); }
+
+        [Test]
+        public void Plain() { Rec.Mark("AliasOverride.cs::AliasOverride > Plain"); }
+    }
+}
+`,
+            'MarkedOverride.cs': `using NUnit.Framework;
+
+namespace P.Tests
+{
+    public class MarkedOverride : Base
+    {
+        [TestCase(2)]
+        public override void Works(System.Int32 value) { Rec.Mark("MarkedOverride.cs::MarkedOverride > Works"); }
+    }
+}
+`,
+        },
+    },
 ];
 
 module.exports = { CASES };

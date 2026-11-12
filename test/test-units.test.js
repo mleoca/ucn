@@ -898,6 +898,22 @@ describe('test units: the judge rejects what the runner contradicts', () => {
         assert.deepStrictEqual(kinds({}, answer, ['child.py::TestLeaf > test_shared', 'base.py:11']), []);
         assert.deepStrictEqual(kinds({}, answer, ['child.py::TestLeaf > test_shared', 'base.py:4']), ['UNDECLARED']);
     });
+
+    it('a test the engine says may run one of several bodies owns each of them, and no other', () => {
+        const undecided = unit(3, {
+            id: 'Child.java::Child > typed', file: 'Child.java', inherited: true, conditional: true,
+            origin: { file: 'Base.java', startLine: 10, endLine: 12 },
+            alternatives: [{ file: 'Child.java', startLine: 5, endLine: 7 }],
+        });
+        const answer = { units: [undecided], files: [{ file: 'Child.java', role: 'tests', run: 'x', tests: 1 }] };
+        const named = { sometimes: ['Child.java::Child > typed'] };
+        assert.deepStrictEqual(kinds(named, answer, ['Child.java::Child > typed', 'Base.java:11']), []);
+        assert.deepStrictEqual(kinds(named, answer, ['Child.java::Child > typed', 'Child.java:6']), []);
+        assert.deepStrictEqual(kinds(named, answer, []), []);
+        assert.deepStrictEqual(kinds(named, answer, ['Child.java::Child > typed', 'Child.java:9']), ['UNDECLARED', 'INEXACT-COUNT']);
+        // Saying so is a weaker claim: the case has to name it.
+        assert.deepStrictEqual(kinds({}, answer, ['Child.java::Child > typed', 'Child.java:6']), ['SOMETIMES']);
+    });
 });
 
 describe('test units: Python collection is read from syntax, and the last assignment is the one in effect', () => {
@@ -2294,7 +2310,7 @@ describe('test units: Java annotations are read by each framework\'s own rule', 
         } finally {
             rm(dir);
         }
-        // Qualifiers and type arguments are no part of a signature: this one is an override.
+        // A qualified name is the type its import names, and type arguments are no part of a Java signature: this one is an override.
         assert.strictEqual(java({
             'Base.java': 'import org.junit.jupiter.api.Test;\nimport org.junit.jupiter.params.ParameterizedTest;\nimport org.junit.jupiter.params.provider.NullSource;\n\npublic abstract class Base {\n    @ParameterizedTest\n    @NullSource\n    void rows(java.util.List<String> items) { }\n\n    @Test\n    void kept() { }\n}\n',
             'ChildTest.java': 'import java.util.List;\n\npublic class ChildTest extends Base {\n    @Override\n    void rows(List<String> items) { }\n}\n',
@@ -2406,6 +2422,309 @@ describe('test units: C# rows, fixtures and overrides are read by each framework
         } finally {
             rm(dir);
         }
+    });
+});
+
+describe('test units: a method is the inherited one when its parameters are the same types', () => {
+    const stateOf = unit => unit.skipped ? 'skipped' : unit.conditional ? 'conditional' : 'runs';
+    const POM = '<project><modelVersion>4.0.0</modelVersion><groupId>com.x</groupId><artifactId>m</artifactId><version>1</version></project>\n';
+    const J = 'src/test/java/';
+    const shown = (found, withLines = true) => `${found.facts.tests}${found.facts.moreTests ? '+' : ''} ${found.units.map(unit =>
+        `${unit.label.split(' > ').pop()}:${stateOf(unit)}${unit.selector ? '' : `:${unit.selectorWithheld}`}` +
+        `${withLines && unit.inheritedFrom ? `@${unit.inheritedFrom.split('/').pop()}` : ''}`).join(' ')}`;
+    // Files by their path under src/test/java, each with its own package line.
+    const java = (files, name, withLines) => shown(answerFor({
+        'pom.xml': POM, ...Object.fromEntries(Object.entries(files).map(([file, text]) => [`${J}${file}`, text])),
+    }, `${J}${name}`), withLines);
+    const TYPES = {
+        'com/x/Left.java': 'package com.x;\n\npublic class Left {\n    public enum Kind { A }\n}\n',
+        'com/x/Right.java': 'package com.x;\n\npublic class Right {\n    public enum Kind { A }\n}\n',
+        'com/x/LeftBelow.java': 'package com.x;\n\npublic class LeftBelow extends Left {\n}\n',
+        'com/y/Kind.java': 'package com.y;\n\npublic enum Kind { A }\n',
+    };
+    const JUPITER = 'import org.junit.jupiter.api.Test;\nimport org.junit.jupiter.params.ParameterizedTest;\nimport org.junit.jupiter.params.provider.*;\n';
+    const BASE5 = `package com.x;\n\n${JUPITER}\npublic abstract class Base {\n    @ParameterizedTest\n    @ValueSource(strings = { "a" })\n    void text(String value) { }\n\n    @ParameterizedTest\n    @ValueSource(ints = { 1 })\n    void number(int value) { }\n\n    @ParameterizedTest\n    @EnumSource\n    void kind(Left.Kind value) { }\n\n    @ParameterizedTest\n    @NullSource\n    void many(String... values) { }\n}\n`;
+    const child = (body, imports = '', name = 'ChildTest', base = 'Base') =>
+        `package com.x;\n\n${imports}public class ${name} extends ${base} {\n${body}}\n`;
+    const junit5 = (body, imports) => java({ ...TYPES, 'com/x/Base.java': BASE5, 'com/x/ChildTest.java': child(body, imports) }, 'com/x/ChildTest.java', false);
+
+    it('JUnit 5: another spelling of the same types is the same method, and the test is gone', () => {
+        assert.strictEqual(junit5('    void text(java.lang.String value) { }\n\n    void number(final int value) { }\n\n    void kind(com.x.Left.Kind value) { }\n\n    void many(String[] values) { }\n\n    @Test\n    void own() { }\n', JUPITER),
+            '1 own:runs');
+        // The name an import brings, every member type of a class imported, a member type written through a class that inherits it.
+        const kept = '3+ many:runs number:runs text:runs';
+        assert.strictEqual(junit5('    void kind(Kind value) { }\n', 'import com.x.Left.Kind;\n\n'), kept);
+        assert.strictEqual(junit5('    void kind(Kind value) { }\n', 'import com.x.Left.*;\n\n'), kept);
+        assert.strictEqual(junit5('    void kind(Kind value) { }\n', 'import static com.x.Left.Kind;\n\n'), kept);
+        assert.strictEqual(junit5('    void kind(LeftBelow.Kind value) { }\n'), kept);
+        assert.strictEqual(junit5('    void kind(Left.Kind value) { }\n'), kept);
+    });
+
+    it('JUnit 5: a like spelling of another type is another method, and the test runs as it stands', () => {
+        const all = '4+ kind:runs many:runs number:runs text:runs';
+        assert.strictEqual(junit5('    void text(CharSequence value) { }\n\n    void number(Integer value) { }\n\n    void kind(Right.Kind value) { }\n\n    void many(String value) { }\n'), all);
+        // The same name from another package.
+        assert.strictEqual(junit5('    void kind(Kind value) { }\n', 'import com.y.Kind;\n\n'), all);
+        assert.strictEqual(junit5('    void kind(Kind value) { }\n', 'import com.y.*;\n\n'), all);
+        // A member type of the class itself comes before the type of that name in the package.
+        assert.strictEqual(junit5('    public static class Left { public enum Kind { B } }\n\n    void kind(Left.Kind value) { }\n'), all);
+        assert.strictEqual(junit5('    void number(long value) { }\n\n    void many(String[][] values) { }\n\n    void text(String[] value) { }\n'), all);
+    });
+
+    it('a type of a package outside the project is the one its name is imported as', () => {
+        const base = imports => `package com.x;\n\n${imports}${JUPITER}\npublic abstract class Base {\n    @ParameterizedTest\n    @NullSource\n    void dated(Date value) { }\n}\n`;
+        const run = (baseImports, childImports, type) => java({
+            'com/x/Base.java': base(baseImports), 'com/x/ChildTest.java': child(`    void dated(${type} value) { }\n\n    @Test\n    void own() { }\n`, `${childImports}${JUPITER}\n`),
+        }, 'com/x/ChildTest.java', false);
+        const gone = '1 own:runs';
+        const stays = '2+ dated:runs own:runs';
+        const open = '2+ dated:conditional:signature-not-resolved own:runs';
+        assert.strictEqual(run('import java.util.Date;\n', 'import java.util.Date;\n', 'Date'), gone);
+        assert.strictEqual(run('import java.util.Date;\n', '', 'java.util.Date'), gone);
+        assert.strictEqual(run('import java.util.Date;\n', 'import java.sql.Date;\n', 'Date'), stays);
+        // On demand: the name has one provider among the packages imported.
+        assert.strictEqual(run('import java.util.*;\n', 'import java.util.Date;\n', 'Date'), gone);
+        assert.strictEqual(run('import java.util.*;\n', 'import java.util.*;\nimport java.io.*;\n', 'Date'), gone);
+        // Two files that import other packages on demand: what the name is in each is not read.
+        assert.strictEqual(run('import java.util.*;\n', 'import java.sql.*;\n', 'Date'), open);
+        // A qualified name may reach a member type through a class that inherits it: one that differs from an import's is not proof of another type.
+        assert.strictEqual(run('import java.util.Date;\n', '', 'java.sql.Date'), open);
+    });
+
+    it('a type parameter of a class is not read: the test may be the class\'s or not, unless the method says it overrides', () => {
+        const typed = pkg => `package com.x;\n\nimport ${pkg};\n\npublic abstract class Typed<T> {\n    @Test${pkg.includes('testng') ? '(dataProvider = "rows")' : ''}\n    public void typed(T value) { }\n}\n`;
+        const under = (pkg, body) => java({
+            'com/x/Typed.java': typed(pkg), 'com/x/ChildTest.java': child(body, '', 'ChildTest', 'Typed<String>'),
+        }, 'com/x/ChildTest.java');
+        // TestNG gives the test the body of the method that replaces it: both bodies are named.
+        assert.strictEqual(under('org.testng.annotations.Test', '    public void typed(String value) { }\n'),
+            '1+ typed:conditional:declared-in-a-base-class@Typed.java:7');
+        assert.strictEqual(under('org.testng.annotations.Test', '    @Override\n    public void typed(String value) { }\n'),
+            '1+ typed:conditional:declared-in-a-base-class');
+        // JUnit 5 takes a method with a type parameter as replaced by any method that could be passed its arguments.
+        const five = 'org.junit.jupiter.api.Test';
+        assert.strictEqual(under(five, '    public void typed(String value) { }\n'), '1 typed:conditional:signature-not-resolved@Typed.java:7');
+        assert.strictEqual(under(five, '    public void typed(Integer value) { }\n'), '1 typed:conditional:signature-not-resolved@Typed.java:7');
+        assert.strictEqual(under(five, '    @Override\n    public void typed(String value) { }\n'), '0 ');
+        assert.strictEqual(under(five, '    public void typed(String value, int more) { }\n'), '1 typed:runs@Typed.java:7');
+        // A method's own type parameter is its bound where the language compares signatures.
+        const bounded = 'package com.x;\n\nimport org.testng.annotations.Test;\n\npublic abstract class Bounded {\n    @Test(dataProvider = "rows")\n    public <N extends Number> void bounded(N value) { }\n}\n';
+        const below = body => java({ 'com/x/Bounded.java': bounded, 'com/x/ChildTest.java': child(body, '', 'ChildTest', 'Bounded') }, 'com/x/ChildTest.java');
+        assert.strictEqual(below('    public void bounded(Number value) { }\n'), '1+ bounded:conditional:declared-in-a-base-class');
+        assert.strictEqual(below('    public void bounded(Integer value) { }\n'), '1+ bounded:conditional:declared-in-a-base-class@Bounded.java:7');
+    });
+
+    it('a change in a body the test may run, or runs through a class between, reaches the test', () => {
+        const dir = projectOf({
+            'pom.xml': POM,
+            [`${J}com/x/App.java`]: 'package com.x;\n\npublic class App {\n    public static void between() { }\n\n    public static void maybe() { }\n}\n',
+            [`${J}com/x/Base.java`]: 'package com.x;\n\nimport org.junit.Test;\n\npublic abstract class Base {\n    @Test\n    public void works() { }\n}\n',
+            [`${J}com/x/Middle.java`]: 'package com.x;\n\npublic abstract class Middle extends Base {\n    @Override\n    public void works() {\n        App.between();\n    }\n}\n',
+            [`${J}com/x/BelowTest.java`]: 'package com.x;\n\npublic class BelowTest extends Middle {\n}\n',
+            [`${J}com/x/Typed.java`]: 'package com.x;\n\nimport org.testng.annotations.Test;\n\npublic abstract class Typed<T> {\n    @Test(dataProvider = "rows")\n    public void typed(T value) { }\n}\n',
+            [`${J}com/x/TypedTest.java`]: 'package com.x;\n\npublic class TypedTest extends Typed<String> {\n    public void typed(String value) {\n        App.maybe();\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const between = index.affectedTests('between', { depth: 2 });
+            assert.deepStrictEqual(between.testFiles.filter(file => (file.units || []).length > 0).map(file => file.file), [`${J}com/x/BelowTest.java`]);
+            assert.strictEqual(between.summary.totalTests, 1);
+            assert.ok(between.commands.length > 0);
+            const maybe = index.affectedTests('maybe', { depth: 2 });
+            assert.deepStrictEqual(maybe.testFiles.filter(file => (file.units || []).length > 0).map(file => file.file), [`${J}com/x/TypedTest.java`]);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a base is the class its name denotes where it is written, not a class of the project that shares the name', () => {
+        const support = pkg => `package ${pkg};\n\nimport org.junit.jupiter.api.Test;\n\npublic abstract class Support {\n    @Test\n    public void from${pkg.slice(-1).toUpperCase()}() { }\n}\n`;
+        const files = {
+            'com/a/Number.java': 'package com.a;\n\nimport org.junit.jupiter.api.Test;\n\npublic abstract class Number {\n    @Test\n    void inherited() { }\n}\n',
+            'com/a/Support.java': support('com.a'), 'com/b/Support.java': support('com.b'),
+        };
+        const under = (imports, base) => java({ ...files, 'com/x/ChildTest.java': `package com.x;\n\n${imports}import org.junit.jupiter.api.Test;\n\npublic class ChildTest extends ${base} {\n    @Test\n    void own() { }\n}\n` },
+            'com/x/ChildTest.java', false);
+        // java.lang's Number: what it brings is not read, and the project's class of that name is not it.
+        assert.strictEqual(under('', 'Number'), '1+ own:runs');
+        assert.strictEqual(under('import com.a.Number;\n', 'Number'), '2 inherited:runs own:runs');
+        // Two classes of one name: the import says which.
+        assert.strictEqual(under('import com.a.Support;\n', 'Support'), '2 fromA:runs own:runs');
+        assert.strictEqual(under('import com.b.*;\n', 'Support'), '2 fromB:runs own:runs');
+        assert.strictEqual(under('', 'com.b.Support'), '2 fromB:runs own:runs');
+        // Neither is in scope: the base is a type from outside.
+        assert.strictEqual(under('', 'Support'), '1+ own:runs');
+    });
+
+    it('a comparison that cannot be made is an answer too: not known, never an error', () => {
+        const { createSignatures } = require('../core/member-signatures');
+        // A Java file whose classes cannot be read: the lookup throws inside.
+        const files = new Map([['/nowhere/A.java', { language: 'java', relativePath: 'A.java', symbols: [], importDetails: [] }]]);
+        const refuse = () => { throw new Error('not read'); };
+        assert.throws(() => refuse());
+        const broken = createSignatures({ files, symbols: new Map() }, { classes: refuse, parents: refuse });
+        const side = { filePath: '/nowhere/A.java', cls: { name: 'A', startLine: 1, endLine: 9, suite: [] }, row: { name: 'm', line: 2, startLine: 2, params: [{ path: [{ name: 'T' }] }] } };
+        assert.strictEqual(broken.relate(side, { ...side, row: { ...side.row, params: [{ path: [{ name: 'U' }] }] } }), 'unknown');
+        assert.strictEqual(broken.relate(side, { ...side, row: { ...side.row, name: 'other' } }), 'different');
+        assert.strictEqual(broken.relate(side, { ...side, row: { ...side.row, params: [] } }), 'different');
+        assert.strictEqual(broken.baseOf('/nowhere/A.java', side.cls, { path: [{ name: 'Base' }] }) || null, null);
+    });
+
+    const PROJ = name => `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="${name}" Version="1.0.0" /></ItemGroup></Project>\n`;
+    const CS_TYPES = 'namespace P.Tests\n{\n    public class Left { public enum Kind { A } }\n    public class Right { public enum Kind { A } }\n    public class LeftBelow : Left { }\n    public struct Point { }\n    public class Shape { }\n}\nnamespace P.A\n{\n    public enum Mode { One }\n}\nnamespace P.B\n{\n    public enum Mode { One }\n}\n';
+    /**
+     * An NUnit base with a test `M(first)` and a second virtual method
+     * `M(System.Guid)`, so that an override is no proof by itself; a class
+     * that overrides `M(second)`. 'same': the test is gone. 'different':
+     * it runs as it stands. 'unknown': it runs only sometimes.
+     */
+    const nunit = (first, second, { baseUsings = '', childUsings = '', childInside = '', more = {} } = {}) => {
+        const found = answerFor({
+            'App.Tests.csproj': PROJ('NUnit'), 'Types.cs': CS_TYPES,
+            'Base.cs': `using NUnit.Framework;\n${baseUsings}\nnamespace P.Tests\n{\n    public abstract class Base\n    {\n        [TestCase(null)]\n        public virtual void M(${first} value) { }\n\n        public virtual void M(System.Guid value) { }\n    }\n}\n`,
+            'Child.cs': `using NUnit.Framework;\n${childUsings}\nnamespace P.Tests\n{\n${childInside}    public class Child : Base\n    {\n        public override void M(${second} value) { }\n\n        [Test]\n        public void Own() { }\n    }\n}\n`,
+            ...more,
+        }, 'Child.cs');
+        const inherited = found.units.find(unit => unit.label === 'Child > M');
+        return !inherited ? 'same' : inherited.conditional ? `unknown:${inherited.selectorWithheld}` : 'different';
+    };
+
+    it('C#: a predefined type is the type it is a keyword for, however that is written', () => {
+        assert.strictEqual(nunit('int', 'System.Int32'), 'same');
+        assert.strictEqual(nunit('int', 'global::System.Int32'), 'same');
+        assert.strictEqual(nunit('string', 'System.String'), 'same');
+        assert.strictEqual(nunit('object', 'dynamic'), 'same');
+        assert.strictEqual(nunit('object[]', 'System.Object[]'), 'same');
+        assert.strictEqual(nunit('int', 'Num', { childUsings: 'using Num = System.Int32;\n' }), 'same');
+        assert.strictEqual(nunit('int', 'Num', { childUsings: 'using Num = System.Int64;\n' }), 'different');
+        // An alias is the type its directive writes: a keyword, an array, a tuple, a constructed type.
+        assert.strictEqual(nunit('int', 'Num', { childUsings: 'using Num = int;\n' }), 'same');
+        assert.strictEqual(nunit('long', 'Num', { childUsings: 'using Num = int;\n' }), 'different');
+        assert.strictEqual(nunit('int[]', 'Ints', { childUsings: 'using Ints = int[];\n' }), 'same');
+        assert.strictEqual(nunit('int', 'Ints', { childUsings: 'using Ints = int[];\n' }), 'different');
+        assert.strictEqual(nunit('(int, string)', 'Pair', { childUsings: 'using Pair = (int Count, string Name);\n' }), 'same');
+        assert.strictEqual(nunit('int?', 'Maybe', { childUsings: 'using Maybe = int?;\n' }), 'same');
+        assert.strictEqual(nunit('List<int>', 'IntList', {
+            baseUsings: 'using System.Collections.Generic;\n', childUsings: 'using IntList = System.Collections.Generic.List<int>;\n',
+        }), 'same');
+        assert.strictEqual(nunit('List<long>', 'IntList', {
+            baseUsings: 'using System.Collections.Generic;\n', childUsings: 'using IntList = System.Collections.Generic.List<int>;\n',
+        }), 'different');
+        // One written inside the namespace, and one another file declares for the whole project.
+        assert.strictEqual(nunit('int', 'Num', { childInside: '    using Num = System.Int32;\n\n' }), 'same');
+        assert.strictEqual(nunit('int', 'Num', { more: { 'Usings.cs': 'global using Num = int;\n' } }), 'same');
+        assert.strictEqual(nunit('long', 'Num', { more: { 'Usings.cs': 'global using Num = int;\n' } }), 'different');
+        // One a project file declares is a name read from the root.
+        const item = alias => `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="NUnit" Version="1.0.0" /><Using Include="${alias}" Alias="Num" /></ItemGroup></Project>\n`;
+        assert.strictEqual(nunit('int', 'Num', { more: { 'App.Tests.csproj': item('System.Int32') } }), 'same');
+        assert.strictEqual(nunit('long', 'Num', { more: { 'App.Tests.csproj': item('System.Int32') } }), 'different');
+        assert.strictEqual(nunit('int', 'long'), 'different');
+        assert.strictEqual(nunit('int', 'System.Int64'), 'different');
+        // The bare name: the namespace a using directive brings holds the keyword's type, and a name has one provider.
+        assert.strictEqual(nunit('int', 'Int32', { childUsings: 'using System;\n' }), 'same');
+        // No directive brings it: what the name is there is not read.
+        assert.strictEqual(nunit('int', 'Int32'), 'unknown:signature-not-resolved');
+    });
+
+    it('C#: T? is another type over a value type and the same over a reference type', () => {
+        assert.strictEqual(nunit('int', 'int?'), 'different');
+        assert.strictEqual(nunit('int?', 'System.Nullable<int>'), 'same');
+        assert.strictEqual(nunit('int?', 'System.Nullable<long>'), 'different');
+        assert.strictEqual(nunit('string', 'string?'), 'same');
+        assert.strictEqual(nunit('Point', 'Point?'), 'different');
+        assert.strictEqual(nunit('Shape', 'Shape?'), 'same');
+        assert.strictEqual(nunit('int[]', 'int[]?'), 'same');
+        // Of a type from outside the kind is not read.
+        assert.strictEqual(nunit('System.DateTime', 'System.DateTime?'), 'unknown:signature-not-resolved');
+    });
+
+    it('C#: type arguments, array ranks, tuples and how a parameter is passed are part of the type', () => {
+        const generic = { baseUsings: 'using System.Collections.Generic;\n', childUsings: 'using System.Collections.Generic;\n' };
+        assert.strictEqual(nunit('List<int>', 'List<string>', generic), 'different');
+        assert.strictEqual(nunit('List<int>', 'List<System.Int32>', generic), 'same');
+        assert.strictEqual(nunit('List<int>', 'System.Collections.Generic.List<int>', { baseUsings: generic.baseUsings }), 'same');
+        assert.strictEqual(nunit('Dictionary<string, List<int>>', 'Dictionary<string, List<long>>', generic), 'different');
+        assert.strictEqual(nunit('List<int>', 'List<int>', { baseUsings: 'using System.Collections.Generic;\nusing System.Text;\n', childUsings: 'using System.Collections.Generic;\nusing System.Linq;\n' }),
+            'unknown:signature-not-resolved');
+        assert.strictEqual(nunit('int[]', 'int[,]'), 'different');
+        assert.strictEqual(nunit('int[][]', 'int[][]'), 'same');
+        assert.strictEqual(nunit('(int, string)', '(int count, string name)'), 'same');
+        assert.strictEqual(nunit('(int, string)', 'System.ValueTuple<int, string>'), 'same');
+        assert.strictEqual(nunit('(int, string)', '(int, object)'), 'different');
+        assert.strictEqual(nunit('int', 'ref int'), 'different');
+        assert.strictEqual(nunit('ref int', 'out int'), 'same');
+        assert.strictEqual(nunit('int*', 'long*'), 'different');
+    });
+
+    it('C#: a name is the type its namespaces, using directives and classes say', () => {
+        assert.strictEqual(nunit('Left.Kind', 'Right.Kind'), 'different');
+        assert.strictEqual(nunit('Left.Kind', 'P.Tests.Left.Kind'), 'same');
+        assert.strictEqual(nunit('Left.Kind', 'LeftBelow.Kind'), 'same');
+        assert.strictEqual(nunit('Left.Kind', 'Kinds.Kind', { childUsings: 'using Kinds = P.Tests.Left;\n' }), 'same');
+        assert.strictEqual(nunit('Left.Kind', 'Kind', { childUsings: 'using static P.Tests.Left;\n' }), 'same');
+        assert.strictEqual(nunit('Mode', 'Mode', { baseUsings: 'using P.A;\n', childUsings: 'using P.B;\n' }), 'different');
+        assert.strictEqual(nunit('Mode', 'P.A.Mode', { baseUsings: 'using P.A;\n' }), 'same');
+        assert.strictEqual(nunit('Mode', 'Mode', { baseUsings: 'using P.A;\n', childUsings: 'using P.A;\nusing System.Linq;\n' }), 'same');
+    });
+
+    it('C#: a change to the inherited body selects the class that still runs it, and no class that replaced it', () => {
+        const app = 'namespace P.Tests\n{\n    public static class App\n    {\n        public static void Target() { }\n    }\n}\n';
+        const base = 'using NUnit.Framework;\n\nnamespace P.Tests\n{\n    public abstract class Base\n    {\n        [TestCase(1)]\n        public virtual void Works(int value)\n        {\n            App.Target();\n        }\n    }\n}\n';
+        const under = body => {
+            const dir = projectOf({
+                'App.Tests.csproj': PROJ('NUnit'), 'App.cs': app, 'BaseTests.cs': base,
+                'ChildTests.cs': `using NUnit.Framework;\n\nnamespace P.Tests\n{\n    public class ChildTests : Base\n    {\n${body}    }\n}\n`,
+            });
+            try {
+                const index = idx(dir);
+                const affected = index.affectedTests('Target', { depth: 2 });
+                const units = rowsOf(index, 'ChildTests.cs').units.filter(unit => unit.kind === 'test');
+                return {
+                    selected: affected.testFiles.some(file => file.file === 'ChildTests.cs' && (file.units || []).some(unit => unit.kind === 'test')),
+                    commands: affected.commands.length,
+                    works: units.filter(unit => unit.name === 'Works').map(unit => `${unit.inheritedFrom || 'own'}${unit.selector ? ':command' : ''}`),
+                };
+            } finally {
+                rm(dir);
+            }
+        };
+        // Another type: the inherited test still runs, beside the class's own.
+        assert.deepStrictEqual(under('        [TestCase(null)]\n        public void Works(int? value) { }\n'),
+            { selected: true, commands: 1, works: ['BaseTests.cs:8', 'own'] });
+        assert.deepStrictEqual(under('        public void Works(long value) { }\n'), { selected: true, commands: 1, works: ['BaseTests.cs:8:command'] });
+        // The same type written another way: the override takes the test away, and no command names it.
+        assert.deepStrictEqual(under('        public override void Works(System.Int32 value) { }\n\n        [Test]\n        public void Plain() { }\n'),
+            { selected: false, commands: 0, works: [] });
+    });
+
+    it('C#: a declared override of the one method of its name is that method, whatever its types', () => {
+        const typed = (framework, using, attribute, body) => shown(answerFor({
+            'App.Tests.csproj': PROJ(framework),
+            'Typed.cs': `using ${using};\n\nnamespace P.Tests\n{\n    public abstract class Typed<T>\n    {\n        ${attribute}\n        public virtual void Value(T value) { }\n    }\n}\n`,
+            'Child.cs': `namespace P.Tests\n{\n    public class Child : Typed<int>\n    {\n${body}    }\n}\n`,
+        }, 'Child.cs'));
+        assert.strictEqual(typed('NUnit', 'NUnit.Framework', '[TestCase(1)]', '        public override void Value(int value) { }\n'), '0 ');
+        // NUnit takes the test away only by a declared override.
+        assert.strictEqual(typed('NUnit', 'NUnit.Framework', '[TestCase(1)]', '        public void Value(string value) { }\n'), '1+ Value:runs@Typed.cs:8');
+        // xUnit runs it with the body of the override.
+        assert.strictEqual(typed('xunit', 'Xunit', '[Theory]\n        [InlineData(1)]', '        public override void Value(int value) { }\n'), '1+ Value:runs');
+    });
+
+    it('C#: a base is the class its name denotes where it is written', () => {
+        const files = {
+            'App.Tests.csproj': PROJ('NUnit'),
+            'Other.cs': 'using NUnit.Framework;\n\nnamespace P.Other\n{\n    public abstract class Random\n    {\n        [Test]\n        public void Inherited() { }\n    }\n}\n',
+            'Supports.cs': 'using NUnit.Framework;\n\nnamespace P.A\n{\n    public abstract class Support\n    {\n        [Test]\n        public void FromA() { }\n    }\n}\nnamespace P.B\n{\n    public abstract class Support\n    {\n        [Test]\n        public void FromB() { }\n    }\n}\n',
+        };
+        const under = (usings, base, inside = '') => shown(answerFor({ ...files, 'Child.cs': `${usings}\nnamespace P.Tests\n{\n${inside}    public class Child : ${base}\n    {\n    }\n}\n` }, 'Child.cs'), false);
+        // System's Random: the project's class of that name in a namespace the file does not use is not it.
+        assert.strictEqual(under('using System;\n', 'Random'), '0+ ');
+        assert.strictEqual(under('using P.Other;\n', 'Random'), '1 Inherited:runs');
+        assert.strictEqual(under('using P.A;\n', 'Support'), '1 FromA:runs');
+        assert.strictEqual(under('', 'Support', '    using P.B;\n\n'), '1 FromB:runs');
+        assert.strictEqual(under('', 'P.B.Support'), '1 FromB:runs');
+        assert.strictEqual(under('using Helper = P.A.Support;\n', 'Helper'), '1 FromA:runs');
+        assert.strictEqual(under('using P.A;\nusing P.B;\n', 'Support'), '0+ ');
     });
 });
 

@@ -15,7 +15,6 @@ const {
     parseErrorRegions,
     genericArityOf,
     hasParameterizedQualifier,
-    overloadSignature,
 } = require('./utils');
 
 // An iterator method (`yield return` in its OWN body) returns an enumerable /
@@ -3007,6 +3006,116 @@ const CSHARP_TEST_NAMESPACES = /^(global::)?(Xunit|NUnit\.Framework|Microsoft\.V
 const CSHARP_SETUP_ATTRIBUTES = new Set(['SetUp', 'OneTimeSetUp', 'TestInitialize', 'ClassInitialize', 'AssemblyInitialize']);
 const CSHARP_STOPPING_NAMES = /^(Ignore|Inconclusive|Assume|Pass|Skip\w*|IgnoreException|InconclusiveException)$/;
 
+// The predefined types by the types they are keywords for, and whether
+// each is a value type (C# spec, simple types).
+const CSHARP_PREDEFINED_TYPES = {
+    bool: ['System.Boolean', true], byte: ['System.Byte', true], sbyte: ['System.SByte', true],
+    char: ['System.Char', true], decimal: ['System.Decimal', true], double: ['System.Double', true],
+    float: ['System.Single', true], int: ['System.Int32', true], uint: ['System.UInt32', true],
+    nint: ['System.IntPtr', true], nuint: ['System.UIntPtr', true], long: ['System.Int64', true],
+    ulong: ['System.UInt64', true], short: ['System.Int16', true], ushort: ['System.UInt16', true],
+    object: ['System.Object', false], string: ['System.String', false],
+};
+
+/**
+ * A type as it is written, for comparing two methods' parameters: a
+ * predefined type by the type it is a keyword for (`id`), a name with its
+ * qualifier and each part's type arguments (`path`), an array with its
+ * rank, `T?`, a pointer, a tuple by its element types (their names are
+ * no part of it). `dynamic` is object where signatures are compared.
+ */
+function csharpTypeTerm(node, declaresDynamic) {
+    if (!node) return { unread: '' };
+    const inner = each => csharpTypeTerm(each, declaresDynamic);
+    switch (node.type) {
+        case 'predefined_type': {
+            const known = CSHARP_PREDEFINED_TYPES[node.text];
+            return known ? { id: known[0], value: known[1] } : { unread: node.text };
+        }
+        case 'identifier':
+            if (node.text === 'dynamic' && !declaresDynamic) return { id: 'System.Object', value: false };
+            return { path: [{ name: node.text }] };
+        case 'generic_name': {
+            const name = node.namedChildren.find(child => child.type === 'identifier');
+            const list = node.namedChildren.find(child => child.type === 'type_argument_list');
+            return { path: [{ name: name ? name.text : '', args: (list ? list.namedChildren : []).map(inner) }] };
+        }
+        case 'qualified_name': {
+            const left = inner(node.childForFieldName('qualifier'));
+            const right = inner(node.childForFieldName('name'));
+            if (!left.path || !right.path) return { unread: node.text };
+            return { path: [...left.path, ...right.path], ...(left.global && { global: true }) };
+        }
+        case 'alias_qualified_name': {
+            // `global::N.T` is read from the root; another alias is not read.
+            const alias = node.childForFieldName('alias');
+            const name = inner(node.childForFieldName('name'));
+            if (!alias || alias.text !== 'global' || !name.path) return { unread: node.text };
+            return { path: name.path, global: true };
+        }
+        case 'array_type': {
+            const rank = node.childForFieldName('rank');
+            return {
+                array: inner(node.childForFieldName('type')),
+                rank: rank ? rank.children.filter(child => child.type === ',').length + 1 : 1,
+            };
+        }
+        case 'nullable_type':
+            return { nullable: inner(node.childForFieldName('type') || node.namedChildren[0]) };
+        case 'pointer_type':
+            return { pointer: inner(node.childForFieldName('type') || node.namedChildren[0]) };
+        case 'tuple_type':
+            return {
+                tuple: node.namedChildren.filter(child => child.type === 'tuple_element')
+                    .map(element => inner(element.childForFieldName('type') || element.namedChildren[0])),
+            };
+        default:
+            return { unread: node.text };
+    }
+}
+
+/** The names of a declaration's type parameters, in order. */
+function csharpTypeParameters(node) {
+    const list = node.childForFieldName('type_parameters') ||
+        node.namedChildren.find(child => child.type === 'type_parameter_list');
+    return (list ? list.namedChildren : []).filter(child => child.type === 'type_parameter')
+        .map(child => ({ name: (child.childForFieldName('name') || child.namedChildren[child.namedChildCount - 1] || {}).text || '' }));
+}
+
+/**
+ * A method's parameter types as written, each with how it is passed
+ * (`by`: 'ref' for ref and out, 'in' for in and ref readonly: part of the
+ * signature), and the method's type parameters.
+ */
+function csharpSignature(node, declaresDynamic) {
+    const params = [];
+    const list = node.childForFieldName('parameters');
+    for (let i = 0; list && i < list.childCount; i++) {
+        const child = list.child(i);
+        if (child.type === 'parameter') {
+            const modifiers = child.namedChildren.filter(each => each.type === 'modifier').map(each => each.text);
+            const term = csharpTypeTerm(child.childForFieldName('type'), declaresDynamic);
+            const by = modifiers.includes('out') || (modifiers.includes('ref') && !modifiers.includes('readonly')) ? 'ref'
+                : modifiers.includes('in') || modifiers.includes('ref') ? 'in' : null;
+            params.push(by ? { ...term, by } : term);
+        } else if (list.fieldNameForChild(i) === 'type') {
+            // `params T[] rest` stands in the list itself.
+            params.push(csharpTypeTerm(child, declaresDynamic));
+        }
+    }
+    return { params, typeParams: csharpTypeParameters(node) };
+}
+
+/** The types a type declaration derives from, as written. */
+function csharpBases(node, declaresDynamic) {
+    const list = node.namedChildren.find(child => child.type === 'base_list');
+    return (list ? list.namedChildren : []).filter(child => !/comment$/.test(child.type)).map(child => {
+        // `class A(int x) : Base(x)`: the base with the arguments it is built from.
+        const type = child.type === 'primary_constructor_base_type' ? (child.childForFieldName('type') || child.namedChildren[0]) : child;
+        return { written: type.text.replace(/\s+/g, ' ').trim(), term: csharpTypeTerm(type, declaresDynamic) };
+    });
+}
+
 /**
  * The tests a C# file declares: a method carrying a test attribute of
  * xUnit, NUnit or MSTest, named by its namespace and the classes around
@@ -3101,6 +3210,52 @@ function testUnits(fileEntry, helpers) {
         for (const child of node.namedChildren) visit(child, inner);
     };
     visit(tree.rootNode, null);
+    // Each method's and each type's declaration, by the rows it starts
+    // and is named on: its parameter types and its bases are read as
+    // they are written.
+    const methodNodes = new Map();
+    const typeNodes = new Map();
+    // `using N = T;`: the alias with what it is written to stand for, by
+    // the line of the directive.
+    const aliasNodes = [];
+    const noteDeclarations = node => {
+        const name = /_declaration$/.test(node.type) ? node.childForFieldName('name') : null;
+        if (node.type === 'using_directive' && node.childForFieldName('name')) aliasNodes.push(node);
+        const into = !name ? null : node.type === 'method_declaration' ? methodNodes
+            : /^(class|struct|record|record_struct|interface)_declaration$/.test(node.type) ? typeNodes : null;
+        if (into) {
+            for (const row of new Set([name.startPosition.row, node.startPosition.row])) {
+                const key = `${row}:${name.text}`;
+                if (!into.has(key)) into.set(key, []);
+                into.get(key).push(node);
+            }
+        }
+        for (const child of node.namedChildren) noteDeclarations(child);
+    };
+    noteDeclarations(tree.rootNode);
+    const nodeOf = (nodes, symbol) => {
+        const found = nodes.get(`${(symbol.nameLine || symbol.startLine) - 1}:${symbol.name}`) ||
+            nodes.get(`${symbol.startLine - 1}:${symbol.name}`) || [];
+        // Several of one name on one row: the one that starts where the symbol does.
+        return (symbol.sourceSpan && found.find(node => node.startIndex === symbol.sourceSpan.start)) || found[0] || null;
+    };
+    // A type the project declares under the name `dynamic` is that type.
+    const declaresDynamic = !!helpers.declaresType && helpers.declaresType('dynamic');
+    const signatureMemo = new Map();
+    /** What a deriving class's method is compared by: the parameter types as written, the method's type parameters, a declared override. */
+    const signatureOf = symbol => {
+        if (!signatureMemo.has(symbol)) {
+            const node = nodeOf(methodNodes, symbol);
+            const read = node ? csharpSignature(node, declaresDynamic)
+                : { params: (symbol.paramsStructured || []).length === 0 ? [] : null, typeParams: [] };
+            signatureMemo.set(symbol, {
+                params: read.params,
+                ...(read.typeParams.length > 0 && { typeParams: read.typeParams }),
+                ...((symbol.modifiers || []).includes('override') && { overrides: true }),
+            });
+        }
+        return signatureMemo.get(symbol);
+    };
     // What a string-typed constant expression holds: 'null', 'empty',
     // 'text', or null when it is not read here.
     const textOf = (node, owner, depth = 0) => {
@@ -3329,8 +3484,10 @@ function testUnits(fileEntry, helpers) {
             // The method a deriving class has to redeclare to be the same
             // one, and what then hides the inherited test (measured with
             // each): MSTest takes one method of each name; NUnit leaves
-            // the test only to a declared override of its signature.
-            key: overloadSignature(symbol), hiddenBy: mstest ? 'name' : xunit ? 'signature' : 'override',
+            // the test only to a declared override of its signature. The
+            // parameter types are carried as written (`params`): what
+            // their names denote is resolved where two methods are compared.
+            ...signatureOf(symbol), hiddenBy: mstest ? 'name' : xunit ? 'signature' : 'override',
             ...row, skipped: own.includes('skip') || undefined,
             conditional: (!own.includes('skip') && sometimes) || undefined, dynamic: undefined,
             // xUnit takes the test from the nearest declaration that
@@ -3352,10 +3509,19 @@ function testUnits(fileEntry, helpers) {
         if (!helpers.isContainer(cls) || cls.type === 'namespace') continue;
         const chain = helpers.enclosing(cls).filter(outer => outer.type !== 'namespace');
         if (chain.some(outer => !helpers.isContainer(outer))) continue;
-        const bases = [cls.extends, cls.implements].flat().filter(Boolean)
-            .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
+        // The bases as the declaration writes them; without its node, as
+        // the symbol records them.
+        const header = nodeOf(typeNodes, cls);
+        const derived = header ? csharpBases(header, declaresDynamic) : null;
+        const bases = derived ? derived.map(each => each.written)
+            : [cls.extends, cls.implements].flat().filter(Boolean)
+                .flatMap(value => String(value).split(',')).map(name => name.trim()).filter(Boolean);
+        const typeParams = header ? csharpTypeParameters(header).map(each => each.name) : [];
         classes.push({
             name: cls.name, suite: chain.map(outer => outer.name), bases,
+            // What each base denotes is resolved by the language's lookup.
+            ...(derived && { baseTerms: derived.map(each => each.term) }),
+            ...(typeParams.length > 0 && { typeParams }),
             // Only the first base written can be a class: the others are
             // interfaces, whose members are no test of the class.
             plainBases: bases.slice(1),
@@ -3368,9 +3534,8 @@ function testUnits(fileEntry, helpers) {
             members: methodsOf(cls).map(symbol => symbol.name),
             // Where each method's body stands, for a test it gives the body to.
             memberRows: methodsOf(cls).map(symbol => ({
-                name: symbol.name, key: overloadSignature(symbol), line: symbol.nameLine || symbol.startLine,
+                name: symbol.name, ...signatureOf(symbol), line: symbol.nameLine || symbol.startLine,
                 startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
-                ...((symbol.modifiers || []).includes('override') && { overrides: true }),
             })),
             ...([...chain, cls].some(fixtureRows) && { several: true, dynamic: 'generated-cases' }),
             ...(attributeNames(cls).includes('TestClass') && { marked: true }),
@@ -3384,7 +3549,12 @@ function testUnits(fileEntry, helpers) {
             });
         }
     }
-    return { units, classes };
+    const aliases = aliasNodes.map(node => {
+        const name = node.childForFieldName('name');
+        const target = node.namedChildren.filter(child => !sameNode(child, name)).pop();
+        return { name: name.text, line: node.startPosition.row + 1, term: csharpTypeTerm(target, declaresDynamic) };
+    });
+    return { units, classes, ...(aliases.length > 0 && { aliases }) };
 }
 
 function getEntryPointKind(symbol) {

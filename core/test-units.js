@@ -41,6 +41,7 @@ const fs = require('fs');
 const path = require('path');
 const { langTraits, getParser, safeParse, getLanguageAdapter } = require('../languages');
 const { codeUnitCompare, escapeRegExp } = require('./shared');
+const { createSignatures } = require('./member-signatures');
 
 const CONTAINER_KINDS = new Set(['class', 'struct', 'module', 'namespace', 'interface', 'impl',
     'record', 'enum', 'trait', 'object']);
@@ -1800,6 +1801,50 @@ function createTestModel(index) {
         return hits.length === 1 ? hits[0] : null;
     };
 
+    // What a written type name denotes and whether two methods are one
+    // member, by the language's lookup where it is modeled.
+    const signatures = createSignatures(index, {
+        classes: filePath => model.declared(filePath)?.classes || [],
+        parents: (filePath, cls) => parentsOf(filePath, cls),
+        aliasTerm: (filePath, line) => ((model.declared(filePath)?.aliases || []).find(alias => alias.line === line) || {}).term || null,
+        // Files one runner's manifest builds are compiled together.
+        unitOf: filePath => {
+            const runner = model.runnerOf(filePath);
+            return runner && runner.id && runner.dir != null ? `${runner.id}\0${runner.dir}` : null;
+        },
+    });
+    const parentMemo = new Map();
+    const resolving = new Set();
+    /**
+     * The class each base written on a class denotes, in the order
+     * written. A language whose name lookup is modeled says which class
+     * a name is at the place it is written (a class of the project that
+     * shares the spelling of a type from outside is not it); otherwise the
+     * one class of that name. A base that is no class the project declares
+     * once stands as an opaque entry, `safe` when the language's reader
+     * knows it brings neither a test nor a constructor.
+     */
+    const parentsOf = (filePath, cls) => {
+        const key = `${filePath}\0${cls.startLine}\0${cls.name}`;
+        if (parentMemo.has(key)) return parentMemo.get(key);
+        const opaque = written => ({
+            opaque: true, name: String(written).replace(/[<[(].*$/, '').split('.').pop().trim(),
+            safe: (cls.plainBases || []).includes(written),
+        });
+        // A class whose bases are being resolved inside its own
+        // resolution: the language rejects the cycle.
+        if (resolving.has(key)) return cls.bases.map(written => ({ written, node: opaque(written) }));
+        resolving.add(key);
+        const out = cls.bases.map((written, i) => {
+            const looked = signatures.baseOf(filePath, cls, (cls.baseTerms || [])[i]);
+            const base = looked === undefined ? baseClass(filePath, written) : looked;
+            return { written, node: base || opaque(written) };
+        });
+        resolving.delete(key);
+        parentMemo.set(key, out);
+        return out;
+    };
+
     const nodeKey = node => node.opaque ? `?${node.name}` : `${node.filePath}\0${node.cls.startLine}\0${node.cls.name}`;
     const linearMemo = new Map();
 
@@ -1807,9 +1852,8 @@ function createTestModel(index) {
      * The order in which a class's members are looked up: the class, then
      * the classes it derives from. `c3` is Python's method resolution
      * order; otherwise depth first in the order written (a superclass
-     * before the interfaces). A base that is not a class the project
-     * declares once stands in the order as an opaque entry, `safe` when the
-     * language's reader knows it brings neither a test nor a constructor.
+     * before the interfaces). A base that is no class of the project
+     * stands in the order as an opaque entry (`parentsOf`).
      */
     const linearize = (filePath, cls, mode, trail = new Set()) => {
         const key = `${filePath}\0${cls.startLine}\0${cls.name}`;
@@ -1823,12 +1867,7 @@ function createTestModel(index) {
             return order;
         }
         trail.add(key);
-        const parents = cls.bases.map(written => {
-            const base = baseClass(filePath, written);
-            if (base) return base;
-            const name = String(written).replace(/[<[(].*$/, '').split('.').pop().trim();
-            return { opaque: true, name, safe: (cls.plainBases || []).includes(written) };
-        });
+        const parents = parentsOf(filePath, cls).map(parent => parent.node);
         const below = parent => parent.opaque ? [parent] : linearize(parent.filePath, parent.cls, mode, trail);
         let order = [self];
         if (mode === 'c3') {
@@ -1873,10 +1912,17 @@ function createTestModel(index) {
      * language's and the runner's to say (`hiddenBy` on a test): by name
      * where a name is all a member has (Python; and MSTest, which takes
      * one method of each name), by signature where a language overloads
-     * (`key`: a method of the same name with other parameters is another
-     * method and hides nothing), or only a declared override of that
-     * signature (NUnit: a method that hides by `new` leaves the inherited
-     * test running).
+     * (a method of the same name with other parameters is another method
+     * and hides nothing), or only a declared override of that signature
+     * (NUnit: a method that hides by `new` leaves the inherited test
+     * running).
+     *
+     * Two signatures are the same when their parameters have the same
+     * types, and a type is what its name denotes where it is written
+     * (`signatures.relate`): the answer can be that this is not known.
+     * Then the test may be the class's or may not (`uncertain`): it is
+     * listed as one that runs only sometimes, under no command, with
+     * every body it may run (`maybe`).
      *
      * Where the runner takes a test from the nearest declaration that
      * carries its mark (`byDeclaration`: JUnit 4, TestNG, xUnit), a class
@@ -1885,33 +1931,51 @@ function createTestModel(index) {
      */
     const inheritedBy = (filePath, cls, select = null) => {
         const out = [];
-        const keyOf = row => row.key || row.name;
-        // What the classes nearer than the one looked at declare: every
-        // member by name and by signature, the ones declared as overrides,
-        // the tests, and where the nearest body of each signature stands.
+        // What the classes nearer than the one looked at declare, nearest
+        // first: every member by name, the methods with what they are
+        // compared by, and the tests.
         const names = new Set();
-        const keys = new Set();
-        const overriding = new Set();
         const testedNames = new Set();
-        const testedKeys = new Set();
-        const bodies = new Map();
+        const members = [];
+        const tested = [];
         const declare = (node, each) => {
             for (const member of each.members || []) names.add(member);
+            // A method that is a test is compared as one: its row among
+            // the members is the one that shares its parameter list (two
+            // methods can start on one line).
+            const lists = new Set((each.tests || []).map(test => test.params).filter(Boolean));
+            const lines = new Set((each.tests || []).filter(test => !test.params).map(test => test.startLine));
             for (const row of each.memberRows || []) {
-                keys.add(keyOf(row));
-                if (row.overrides) overriding.add(keyOf(row));
-                if (!bodies.has(keyOf(row))) bodies.set(keyOf(row), { row, at: node });
-            }
-            // A reader that gives names only: a name is the signature.
-            if (!each.memberRows) for (const member of each.members || []) keys.add(member);
-            for (const test of each.tests || []) {
-                names.add(test.name);
-                keys.add(keyOf(test));
-                testedNames.add(test.name);
-                testedKeys.add(keyOf(test));
+                if (!(row.params ? lists.has(row.params) : lines.has(row.startLine))) members.push({ row, at: node });
             }
         };
-        declare({ filePath, cls }, cls);
+        const sideOf = ({ row, at }) => ({ filePath: at.filePath, cls: at.cls, row });
+        /**
+         * A declared override overrides one method: where the classes
+         * above it are all read and declare one method of that name with
+         * as many parameters, it is that one, however its types are
+         * written.
+         */
+        const onlySlot = (member, test, node) => {
+            const order = orderOf(member.at.filePath, member.at.cls).slice(1);
+            if (order.some(above => above.opaque)) return false;
+            const arity = (member.row.params || []).length;
+            const universal = langTraits(index.files.get(member.at.filePath)?.language)?.universalSupertypeMembers || {};
+            if (universal[member.row.name] === arity) return false;
+            const slots = order.flatMap(above => (above.cls.memberRows || [])
+                .filter(row => row.name === member.row.name && (row.params || []).length === arity)
+                .map(row => ({ row, at: above })));
+            return slots.length > 0 && slots.every(slot =>
+                (slot.at.cls === node.cls && slot.row.startLine === test.startLine) ||
+                signatures.relate(sideOf(slot), { filePath: node.filePath, cls: node.cls, row: test }) === 'same');
+        };
+        const start = { filePath, cls };
+        declare(start, cls);
+        for (const test of cls.tests || []) {
+            names.add(test.name);
+            testedNames.add(test.name);
+            tested.push({ row: test, at: start });
+        }
         let behindUnknown = false;
         let withheldAny = false;
         for (const node of orderOf(filePath, cls).slice(1)) {
@@ -1920,23 +1984,76 @@ function createTestModel(index) {
                 continue;
             }
             for (const test of node.cls.tests) {
-                const key = keyOf(test);
                 const rule = test.hiddenBy || 'name';
-                // A nearer class declares the same test.
-                if (rule === 'name' ? testedNames.has(test.name) : testedKeys.has(key)) continue;
-                // A nearer class declares the same member without the mark.
-                const redeclared = rule === 'name' ? names.has(test.name)
-                    : rule === 'override' ? overriding.has(key) : keys.has(key);
-                testedNames.add(test.name);
-                testedKeys.add(key);
-                if (redeclared && !test.byDeclaration) continue;
+                const mine = { filePath: node.filePath, cls: node.cls, row: test };
+                let body = null;
+                let uncertain = false;
+                const maybe = [];
+                if (rule === 'name') {
+                    // A nearer class declares the same test.
+                    if (testedNames.has(test.name)) continue;
+                    testedNames.add(test.name);
+                    tested.push({ row: test, at: node });
+                    // A nearer class declares the same member without the mark.
+                    if (names.has(test.name) && !test.byDeclaration) continue;
+                } else {
+                    // A runner that takes a method as replaced by one whose
+                    // parameters could be passed to it: another signature
+                    // is no proof the test is still the class's.
+                    const relate = other => {
+                        const relation = signatures.relate(mine, sideOf(other));
+                        return relation === 'different' && test.replacedByAssignable &&
+                            (other.row.params || []).length === (test.params || []).length ? 'unknown' : relation;
+                    };
+                    // A nearer class declares the same test.
+                    let hidden = false;
+                    for (const other of tested) {
+                        if (other.row.name !== test.name) continue;
+                        const relation = relate(other);
+                        if (relation === 'same') {
+                            hidden = true;
+                            break;
+                        }
+                        if (relation === 'unknown') uncertain = true;
+                    }
+                    testedNames.add(test.name);
+                    tested.push({ row: test, at: node });
+                    if (hidden) continue;
+                    // A nearer class declares the same member without the
+                    // mark: the nearest that is it for certain, and the
+                    // nearer ones that may be.
+                    for (const other of members) {
+                        if (other.row.name !== test.name || (rule === 'override' && !other.row.overrides)) continue;
+                        let relation = relate(other);
+                        if (relation === 'unknown' && other.row.overrides && onlySlot(other, test, node)) relation = 'same';
+                        if (relation === 'same') {
+                            body = other;
+                            break;
+                        }
+                        if (relation === 'unknown') maybe.push(other);
+                    }
+                    if (body && !test.byDeclaration) continue;
+                    // A class declares one method of a signature: beside
+                    // the one that is it, another of that class is not.
+                    const open = maybe.filter(other => !body || other.at.cls !== body.at.cls);
+                    maybe.length = 0;
+                    maybe.push(...open);
+                    if (maybe.length > 0) uncertain = true;
+                }
                 // A member the runner does not take as a test still hides
                 // the one of that name further up.
                 if (select && !select(test)) continue;
                 if (behindUnknown) withheldAny = true;
-                else out.push({ test, base: node, ...(test.byDeclaration && bodies.has(key) && { body: bodies.get(key) }) });
+                else {
+                    out.push({
+                        test, base: node,
+                        ...(test.byDeclaration && body && { body }),
+                        ...(uncertain && { uncertain: true, maybe }),
+                    });
+                }
             }
             declare(node, node.cls);
+            for (const test of node.cls.tests) names.add(test.name);
         }
         return { tests: out, open: behindUnknown, withheld: withheldAny };
     };
@@ -2775,23 +2892,37 @@ function createTestModel(index) {
                         line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
                     });
                 }
-                for (const { test, base, body } of inherited.tests) {
+                for (const { test, base, body, uncertain, maybe } of inherited.tests) {
                     // A runner that wants the class that runs a test
                     // marked takes none through one that is not.
                     if (test.needsClassMark && !cls.marked) continue;
                     // No command names a test whose runner cannot be told
-                    // which one it is under the class that inherits it.
-                    const unnamed = test.dynamic || cls.dynamic || test.inheritedDynamic;
+                    // which one it is under the class that inherits it, or
+                    // one that a method of the class may have replaced
+                    // (their parameter types are not resolved).
+                    const unnamed = test.dynamic || cls.dynamic || test.inheritedDynamic ||
+                        (uncertain && 'signature-not-resolved');
                     const state = {
                         ...((test.skipped || cls.skipped) && { skipped: true }),
-                        ...((cls.sometimes || test.conditional || cls.guard || guardedAbove(cls)) && { conditional: true }),
+                        ...((cls.sometimes || test.conditional || cls.guard || guardedAbove(cls) || uncertain) && { conditional: true }),
                         ...(unnamed && { dynamic: unnamed }),
                         ...((test.several || cls.several) && { several: true }),
+                        // The bodies of the methods that may be the test's
+                        // instead, where the runner gives a test the body
+                        // of the method that replaces it: a change to one
+                        // of them may reach it.
+                        ...(uncertain && test.byDeclaration && maybe.length > 0 && {
+                            alternatives: maybe.map(other => ({
+                                file: index.files.get(other.at.filePath).relativePath,
+                                filePath: other.at.filePath, ownerLine: other.at.cls.startLine,
+                                startLine: other.row.startLine, endLine: other.row.endLine,
+                            })),
+                        }),
                     };
                     const suite = [...cls.suite, cls.name];
                     // The class redeclares the member without the mark:
                     // the test is the inherited one, its body the class's own.
-                    if (body && body.at.cls === cls) {
+                    if (body && body.at.cls === cls && !uncertain) {
                         units.push({
                             kind: 'test', name: test.name, suite, ...(cls.namespace && { namespace: cls.namespace }),
                             line: body.row.line, startLine: body.row.startLine, endLine: body.row.endLine, ...state,
@@ -2911,16 +3042,21 @@ function createTestModel(index) {
         const holder = (model.declared(filePath)?.classes || [])
             .filter(cls => cls.startLine <= line && cls.endLine >= line)
             .sort((a, b) => b.startLine - a.startLine)[0];
-        const template = holder && holder.tests.find(test => test.startLine <= line && test.endLine >= line);
+        // The method that holds the line: a test's declaration, or a method
+        // a deriving class's test takes its body from.
+        const template = holder && [...holder.tests, ...(holder.memberRows || [])]
+            .find(row => row.startLine <= line && row.endLine >= line);
         const importers = [...(index.exportGraph?.get(filePath) || [])];
         if (template) {
+            const held = from => !!from && from.filePath === filePath && from.ownerLine === holder.startLine &&
+                from.startLine === template.startLine && from.endLine === template.endLine;
             for (const file of [...new Set([...descendantFiles(holder.name), ...importers, filePath])].sort(codeUnitCompare)) {
                 for (const candidate of model.unitsOf(file).units) {
-                    const from = candidate.inherited;
                     // Every test whose body this is: the one a deriving
-                    // class inherits, another name for it in its class.
-                    if (from && from.filePath === filePath && from.ownerLine === holder.startLine &&
-                        from.startLine === template.startLine && from.endLine === template.endLine) {
+                    // class inherits, another name for it in its class;
+                    // and every test whose body it may be.
+                    if ((held(candidate.inherited) || (candidate.alternatives || []).some(held)) &&
+                        !out.some(seen => seen.filePath === file && seen.unit === candidate)) {
                         out.push({ filePath: file, unit: candidate });
                     }
                 }
@@ -3123,9 +3259,14 @@ function addTestCaseRows(model, index, filePath, term, matches, options) {
     matches.push(...added);
 }
 
-/** One declaration: two tests of one name on two lines are two tests. */
+/**
+ * One declaration: two tests of one name on two lines are two tests, and
+ * so are two a class inherits under one name (two methods of that name
+ * with other parameters), which stand on the class's line both.
+ */
 function testKey(relativePath, unit) {
-    return [relativePath, ...unit.suite, unit.name == null ? '' : unit.name, `@${unit.startLine}`].join('\0');
+    return [relativePath, ...unit.suite, unit.name == null ? '' : unit.name, `@${unit.startLine}`,
+        ...(unit.inherited ? [`<${unit.inherited.file}:${unit.inherited.startLine}`] : [])].join('\0');
 }
 
 /**
