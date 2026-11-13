@@ -482,7 +482,15 @@ const STRUCTURAL_TRAITS = {
     // class literals. `hintPattern` locates vocabulary spellings whose
     // enclosing call nodes are inspected (the AST decides); `namespaceLookups` are module-namespace lookups by
     // name (eval, globals()[k]). `family` groups languages sharing one
-    // runtime. null = no runtime reflection.
+    // runtime. `unnamed` are reflective calls that carry no member name and
+    // `codeExecution` calls and constructions that run code built at
+    // runtime: both are counted per file with the rest of the vocabulary
+    // (fileEntry.reflectionUses / evalUses, what `repo` and the completeness
+    // footer disclose) and never matched against names. Such a rule is
+    // `{ callee }` (the callee as written; `qualified` when it has a
+    // receiver), `{ package }` (a call qualified by a local name the file's
+    // imports bind to that module) or `{ construct }` (the constructed
+    // class). null = no runtime reflection.
     reflectionApi: null,
     // Members every class inherits from the implicit root supertype, keyed by
     // name with their parameter count (Java Object.toString/equals/...,
@@ -850,11 +858,19 @@ const JS_PROTOCOL_MEMBERS = protocolMembers([
     { pattern: /^\[Symbol\.[A-Za-z]+\]$/, member: true },
 ]);
 const JS_REFLECTION_API = {
-    hintPattern: /\bReflect\s*\.\s*(?:get|set|has|deleteProperty)\b|\beval\s*\(/,
+    hintPattern: /\bReflect\s*\.\s*\w|\beval\s*\(|\bnew\s+Function\b/,
     functions: [{ callee: /^(?:globalThis\.)?Reflect\.(?:get|set|has|deleteProperty)$/,
         nameArg: 1, receiverArg: 0, qualified: true }],
     computedMembers: true,
     namespaceLookups: { calls: /^eval$/ },
+    // Every other operation of the Reflect namespace (apply, construct,
+    // ownKeys, defineProperty, a decorator's Reflect.metadata).
+    unnamed: [{ callee: /^(?:globalThis\.)?Reflect\.\w+$/, qualified: true }],
+    // `eval` reached through the global object, and `new Function(code)`.
+    codeExecution: [
+        { callee: /^(?:globalThis|window|self)\.eval$/, qualified: true },
+        { construct: /^Function$/ },
+    ],
     family: 'javascript',
 };
 
@@ -1113,9 +1129,12 @@ const LANGUAGES = {
                     owners: ['Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag', 'ReprEnum'] },
             ]),
             reflectionApi: {
-                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval)\s*\(|\b(?:globals|vars)\s*\(\s*\)\s*\[/,
+                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval|exec)\s*\(|\b(?:globals|vars)\s*\(\s*\)\s*\[/,
                 functions: [{ callee: /^(?:getattr|setattr|hasattr|delattr)$/, nameArg: 1, receiverArg: 0 }],
                 namespaceLookups: { calls: /^eval$/, subscriptOf: /^(?:globals|vars)\(\)$/ },
+                // `exec(code)` runs statements; it names nothing a lookup
+                // could be matched against.
+                codeExecution: [{ callee: /^exec$/ }],
             },
             testFileCandidates: (base, ext) => [`test_${base}.py`, `${base}_test.py`],
             testDirs: ['tests'],
@@ -1147,6 +1166,9 @@ const LANGUAGES = {
                 members: [{ member: /^(?:MethodByName|FieldByName)$/, nameArg: 0 }],
                 membersOnly: true,
                 formatCalls: { 'fmt.Sprintf': 'percent' },
+                // Every function of the reflect package, under whatever
+                // name the file imports it.
+                unnamed: [{ package: 'reflect' }],
             },
             testFileCandidates: (base, ext) => [`${base}_test.go`],
             nameBoundTestFunctions: GO_EXAMPLE_NAMES,
@@ -1341,12 +1363,14 @@ const LANGUAGES = {
                 possibleViaExternal: { except: JAVA_LANG_NOT_SERIALIZABLE, shape: javaSerializationShape } },
             ]),
             reflectionApi: {
-                hintPattern: /\b(?:getMethod|getDeclaredMethod|getField|getDeclaredField)\b/,
+                hintPattern: /\b(?:getMethod|getDeclaredMethod|getField|getDeclaredField|forName)\b/,
                 members: [{ member: /^(?:getMethod|getDeclaredMethod|getField|getDeclaredField)$/, nameArg: 0 }],
                 membersOnly: true,
                 formatCalls: { 'String.format': 'percent' },
                 selfTypeCalls: ['getClass'],
                 typeLiteralNodes: ['class_literal'],
+                // A class loaded by its name.
+                unnamed: [{ callee: /^(?:java\.lang\.)?Class\.forName$/, qualified: true }],
             },
             bareCallReachesMethods: true,
             testFileCandidates: (base, ext) => [`${base}Test.java`, `${base}Tests.java`, `${base}TestCase.java`],

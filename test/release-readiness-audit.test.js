@@ -312,10 +312,21 @@ describe('UCN v5 release-readiness audit regressions', () => {
             assert.equal(fresh.hot.items[0].callCount, 61);
             assert.ok(fresh.hot.refined <= 2, JSON.stringify(fresh.hot));
             built.saveCache();
+            // The ranking is stored with the index; this test is about the
+            // one a loaded index computes, so the stored answer is removed.
+            const stored = path.join(require('../core/cache').getProjectCacheDir(dir), 'hot-summary.json');
+            assert.ok(fs.existsSync(stored));
+            fs.rmSync(stored);
 
             const loaded = new ProjectIndex(dir);
             assert.equal(loaded.loadCache(), true);
-            const warm = loaded.getStats({ hot: true, top: 1 });
+            const callers = require('../core/callers');
+            const findCallers = callers.findCallers;
+            let queries = 0;
+            callers.findCallers = function counted(...args) { queries++; return findCallers.apply(this, args); };
+            let warm;
+            try { warm = loaded.getStats({ hot: true, top: 1 }); } finally { callers.findCallers = findCallers; }
+            assert.ok(queries > 0, 'the loaded index ranked for itself');
             assert.deepEqual(warm.hot, fresh.hot);
         } finally { rm(dir); }
     });

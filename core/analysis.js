@@ -14,7 +14,7 @@ const { UcnError } = require('./errors');
 const { paramFact } = require('./registry');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
-const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots,
+const { NON_CALLABLE_TYPES, addTestExclusions,
     codeUnitCompare, formatSymbolHandle, isValueDefinition } = require('./shared');
 const { isTestFile } = require('./discovery');
 // Entry-point detection loads on first use (fix #375).
@@ -733,28 +733,22 @@ function detectCompleteness(index) {
         // Skip node_modules - we don't care about their patterns
         if (filePath.includes('node_modules')) continue;
 
-        try {
-            const content = index._readFile(filePath);
-
-            if (langTraits(fileEntry.language)?.hasDynamicImports) {
-                // Dynamic imports: use the parser's structural count — the SAME
-                // source `doctor` uses — instead of a text regex. The old
-                // /import\s*\(/ matched Python grouped imports `from x import
-                // (...)`, flashing a false "N dynamic imports" incompleteness
-                // warning on essentially every Python project (field-report #2,
-                // reviewer-confirmed: doctor and about now agree on one count).
-                dynamicImports += fileEntry.dynamicImports || 0;
-            }
-
-            // eval/exec and reflection: the SAME shared counter doctor uses, so
-            // the about footer and the trust report never diverge (field-report #2).
-            const bs = countTextBlindspots(content, fileEntry.language);
-            evalUsage += bs.eval;
-            reflectionUsage += bs.reflection;
-            computedDispatchUsage += computedDispatch.get(filePath)?.length || 0;
-        } catch (e) {
-            // Skip unreadable files
+        if (langTraits(fileEntry.language)?.hasDynamicImports) {
+            // Dynamic imports: use the parser's structural count — the SAME
+            // source `doctor` uses — instead of a text regex. The old
+            // /import\s*\(/ matched Python grouped imports `from x import
+            // (...)`, flashing a false "N dynamic imports" incompleteness
+            // warning on essentially every Python project (field-report #2,
+            // reviewer-confirmed: doctor and about now agree on one count).
+            dynamicImports += fileEntry.dynamicImports || 0;
         }
+
+        // eval/exec and reflection: the two numbers `doctor` reports, counted
+        // in each file's tree when it was indexed (core/reflection.js), so
+        // the footer and the trust report never diverge and no file is read.
+        evalUsage += fileEntry.evalUses || 0;
+        reflectionUsage += fileEntry.reflectionUses || 0;
+        computedDispatchUsage += computedDispatch.get(filePath)?.length || 0;
     }
 
     if (dynamicImports > 0) {

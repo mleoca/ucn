@@ -385,7 +385,7 @@ describe('analysis metadata: every non-source file analysis reads is declared', 
         // A string literal that is a bare manifest-like file name. Cache
         // files UCN writes for itself are not analysis inputs.
         const OWN_FILES = new Set(['index.json', 'calls-cache.json', 'names.json', 'manifest.json',
-            'usage-results.json', 'expandable.json', 'next.lock', 'build.lock']);
+            'usage-results.json', 'hot-summary.json', 'expandable.json', 'next.lock', 'build.lock']);
         const literal = /'((?:\.[a-z]+)?[A-Za-z_][A-Za-z0-9_.-]*\.(?:json|toml|mod|work|cfg|lock|props|targets|gradle|kts|xml|txt|exs|config)|Podfile|Cartfile|Gemfile|Makefile)'/g;
         const undeclared = new Set();
         for (const folder of ['core', 'languages']) {

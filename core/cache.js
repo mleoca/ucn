@@ -1009,7 +1009,11 @@ function clearAllCaches() {
 // v333: a JS/TS file's `moduleAssignedNames` leaves out writes to a name a
 // function or block declares itself (they never reach the module's binding);
 // a Python call whose only argument is a bare generator counts one argument.
-const CACHE_FORMAT_VERSION = 333;
+// v334: file entries carry `reflectionUses` and `evalUses`, call sites of the
+// language's reflection and code-execution vocabulary counted in the tree at
+// index time (`repo` and the completeness footer counted them by reading
+// every file's text on each query).
+const CACHE_FORMAT_VERSION = 334;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {
@@ -1151,6 +1155,12 @@ function saveCache(index, cachePath) {
     }
 
     const cacheFile = cachePath || path.join(cacheDir, 'index.json');
+
+    // HOT rankings stored for the generation in memory describe the state
+    // this save writes: read them before the generation is replaced, and
+    // store them again under the new one below.
+    const hotSummary = require('./hot-summary');
+    hotSummary.ensure(index);
 
     // A partially loaded (per-file) calls cache must be complete before it
     // is rewritten: the shard directory is replaced wholesale below.
@@ -1328,6 +1338,8 @@ function saveCache(index, cachePath) {
     const tmpFile = cacheFile + '.tmp';
     fs.writeFileSync(tmpFile, JSON.stringify(cacheData));
     fs.renameSync(tmpFile, cacheFile);
+    index._cacheDir = path.dirname(cacheFile);
+    try { hotSummary.save(index, cacheFile); } catch (_) { /* the ranking is computed again */ }
 
     // MED-1 (Round 5): clear the reachabilityDirty flag now that the set is
     // safely persisted. The cli/index.js cache-save guard checks this flag
@@ -1548,6 +1560,9 @@ function loadCache(index, cachePath) {
             ? cacheData.callsGeneration : null;
         index._callNameCache = null;
         index._callNameCacheReadGeneration = null;
+        // HOT rankings stored beside this file are read when one is asked.
+        index._cacheDir = path.dirname(cacheFile);
+        require('./hot-summary').forget(index);
 
         // Prepare lazy calls cache loading — load manifest but defer shard parsing.
         // Shards are loaded on first getCachedCalls access via ensureCallsCacheLoaded().

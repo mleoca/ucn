@@ -470,6 +470,10 @@ server.registerTool(
                 try { index.saveCache(); } catch (_) { /* best-effort */ }
                 index.callsCacheDirty = false;
             }
+            // A HOT ranking this request computed, for the next session.
+            if (index && !ep.includeBundled && !ep.maxFiles && index.hotSummaryDirty) {
+                try { index.saveHotSummaries(); } catch (_) { /* best-effort */ }
+            }
         }
     }
 );

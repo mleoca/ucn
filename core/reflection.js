@@ -762,18 +762,57 @@ function _callArgs(node) {
     return argsNode ? argsNode.namedChildren.filter(c => c.type !== 'comment') : null;
 }
 
+// Construction nodes: `new Function(..)` builds a callable from a string.
+const NEW_NODE_TYPES = ['new_expression', 'object_creation_expression'];
+const QUALIFIED_CALLEE = /^([A-Za-z_$][\w$]*)\.[\w$]+(?:\[.*\])?$/s;
+
 /**
- * Reflection sites of one parsed file.
- * Each site: { kind, line, expression, dynamic, name?, patterns?, receiver?,
- *   membersOnly? }.
+ * Local names a file's imports bind to the modules of `{ package }` rules:
+ * `reflect` for `import "reflect"`, `r` for `import r "reflect"`. An import
+ * that binds no qualifier (Go `.` and `_`) names none.
+ * @returns {Map<string, string>} local name -> module
  */
-function reflectionSitesInTree(tree, language, code = null) {
+function _packageQualifiers(rules, imports) {
+    const modules = new Set(rules.filter(rule => rule.package).map(rule => rule.package));
+    const qualifiers = new Map();
+    if (modules.size === 0) return qualifiers;
+    for (const item of imports || []) {
+        if (!item || !modules.has(item.module)) continue;
+        for (const name of item.names || []) {
+            if (name !== '_' && /^[A-Za-z_$][\w$]*$/.test(name)) qualifiers.set(name, item.module);
+        }
+    }
+    return qualifiers;
+}
+
+/**
+ * Reflection facts of one parsed file: { sites, reflectionUses, evalUses }.
+ *
+ * Each site: { kind, line, expression, dynamic, name?, patterns?, receiver?,
+ *   membersOnly? }: a reflective access that names its member by a string.
+ *
+ * The two counts are how often the file uses the language's reflection and
+ * code-execution vocabulary, whether or not a name can be read from the use.
+ * `reflectionUses`: the call-shaped sites (a `functions` or `members` call
+ * that passes its name argument) plus calls of the `unnamed` rules.
+ * `evalUses`: bare calls of `namespaceLookups.calls` that pass an argument,
+ * plus calls and constructions of the `codeExecution` rules. They count call
+ * and construction nodes of the tree, so a spelling inside a comment or a
+ * string is no use, and neither is a method or a definition that shares a
+ * name with a builtin (`self.exec(..)`, `def eval(..)`), nor a same-named
+ * method called without the name (`request.getMethod()`).
+ *
+ * `options.imports` are the file's import records: a `{ package }` rule
+ * matches a call qualified by a local name they bind to that module.
+ */
+function reflectionFactsInTree(tree, language, code = null, options = {}) {
+    const facts = { sites: [], reflectionUses: 0, evalUses: 0 };
     const traits = langTraits(language) || {};
     const api = traits.reflectionApi;
-    if (!api || !tree) return [];
+    if (!api || !tree) return facts;
     const resolve = makeResolver();
     const ctx = { formatCalls: api.formatCalls || null, resolve };
-    const sites = [];
+    const sites = facts.sites;
     const push = (node, kind, nameNode, receiverNode, receiverFact) => {
         const cls = classifyNameExpression(nameNode, ctx);
         const expression = String(node.text || '');
@@ -796,22 +835,36 @@ function reflectionSitesInTree(tree, language, code = null) {
         });
     };
     const ns = api.namespaceLookups;
+    // Vocabulary that names no member: counted, never a site.
+    const unnamed = api.unnamed || [];
+    const codeExecution = api.codeExecution || [];
+    const constructs = codeExecution.filter(rule => rule.construct);
+    const qualifiers = _packageQualifiers([...unnamed, ...codeExecution], options.imports);
     // Candidate nodes are located natively: reflective calls from the
     // vocabulary's spelling positions (descendantForIndex, walking up to the
     // enclosing call), computed member keys by node type. No JS-side walk of
     // the whole tree.
-    const hintPattern = api.hintPattern || null;
-    const useHints = code != null && hintPattern;
+    const hintSources = [];
+    if (api.hintPattern) hintSources.push(api.hintPattern.source);
+    // A package's qualifier is the file's own choice (`r "reflect"`).
+    if (qualifiers.size > 0) {
+        hintSources.push(`\\b(?:${[...qualifiers.keys()].map(name =>
+            name.replace(/[$]/g, '\\$&')).join('|')})\\s*\\.`);
+    }
+    const useHints = code != null && hintSources.length > 0;
+    const callTypes = constructs.length > 0 ? [...CALL_NODE_TYPES, ...NEW_NODE_TYPES] : CALL_NODE_TYPES;
     const types = [];
     if (!useHints) {
-        types.push(...CALL_NODE_TYPES);
+        types.push(...callTypes);
         if (ns?.subscriptOf) types.push('subscript');
     }
     if (api.computedMembers) types.push('subscript_expression');
     const wantMembers = (api.members || []).length > 0;
-    // Qualified function callees (`Reflect.get`) need the callee text of
-    // member-shaped calls; bare vocabularies (`getattr`) never do.
-    const wantQualified = (api.functions || []).some(rule => rule.qualified);
+    // Qualified callees (`Reflect.get`, a package's functions) need the
+    // callee text of member-shaped calls; bare vocabularies (`getattr`)
+    // never do.
+    const wantQualified = qualifiers.size > 0 ||
+        [...(api.functions || []), ...unnamed, ...codeExecution].some(rule => rule.qualified);
     const visitNode = node => {
         if (node.type === 'subscript_expression') {
             // obj["on" + evt] / this[`handle${t}`] (JS/TS computed member
@@ -843,6 +896,13 @@ function reflectionSitesInTree(tree, language, code = null) {
             }
             return;
         }
+        if (NEW_NODE_TYPES.includes(node.type)) {
+            // `new Function(code)`: the constructed class decides.
+            const constructed = node.childForFieldName('constructor') || node.childForFieldName('type');
+            const text = String(constructed?.text || '').replace(/\s+/g, '');
+            if (constructs.some(rule => rule.construct.test(text))) facts.evalUses++;
+            return;
+        }
         const call = _calleeParts(node, wantMembers, wantQualified);
         if (!call) return;
         // Match on the callee spelling first; arguments are read only for a
@@ -852,6 +912,7 @@ function reflectionSitesInTree(tree, language, code = null) {
             if (!rule.callee.test(calleeText())) continue;
             const args = _callArgs(node);
             if (args && args[rule.nameArg]) {
+                facts.reflectionUses++;
                 push(node, rule.kind || calleeText().split('.').pop(),
                     args[rule.nameArg], args[rule.receiverArg]);
             }
@@ -861,7 +922,10 @@ function reflectionSitesInTree(tree, language, code = null) {
             for (const rule of api.members || []) {
                 if (!rule.member.test(call.member)) continue;
                 const args = _callArgs(node);
-                if (args && args[rule.nameArg]) push(node, call.member, args[rule.nameArg], call.object);
+                if (args && args[rule.nameArg]) {
+                    facts.reflectionUses++;
+                    push(node, call.member, args[rule.nameArg], call.object);
+                }
                 return;
             }
         }
@@ -869,25 +933,54 @@ function reflectionSitesInTree(tree, language, code = null) {
         // so even a fully dynamic name is bounded to it.
         if (ns?.calls && call.bare && ns.calls.test(call.calleeText)) {
             const args = _callArgs(node);
-            if (args && args[0]) push(node, call.calleeText, args[0], null, MODULE_RECEIVER);
+            if (args && args[0]) {
+                facts.evalUses++;
+                push(node, call.calleeText, args[0], null, MODULE_RECEIVER);
+            }
+            return;
         }
+        if (unnamed.length === 0 && codeExecution.length === 0) return;
+        // The callee as written, receiver included (`Class.forName`,
+        // `reflect.ValueOf`); a bare callee is its own text.
+        let written = null;
+        const writtenCallee = () => (written ??= (node.type === 'method_invocation'
+            ? (call.object ? `${call.object.text}.${call.member}` : call.member || '')
+            : calleeText()).replace(/\s+/g, ''));
+        const matches = rule => {
+            if (rule.construct) return false;
+            if (rule.callee) return rule.callee.test(writtenCallee());
+            if (rule.package) {
+                const qualified = QUALIFIED_CALLEE.exec(writtenCallee());
+                return !!qualified && qualifiers.get(qualified[1]) === rule.package;
+            }
+            return false;
+        };
+        if (unnamed.some(matches)) facts.reflectionUses++;
+        else if (codeExecution.some(matches)) facts.evalUses++;
     };
     try {
         const candidates = [];
         if (useHints) {
+            // One candidate per node: nested calls can begin at one offset
+            // (`a.getMethod(x).getField(y)`), so the end is part of the key.
             const seen = new Set();
-            const re = new RegExp(hintPattern.source, 'g');
+            const once = (kind, node) => {
+                const key = `${kind}${node.startIndex}:${node.endIndex}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            };
+            const re = new RegExp(hintSources.join('|'), 'g');
             let m;
             while ((m = re.exec(code)) !== null) {
+                if (m[0] === '') { re.lastIndex++; continue; }
                 let node = tree.rootNode.descendantForIndex(m.index);
                 for (let i = 0; node && i < 6; i++, node = node.parent) {
-                    if (!CALL_NODE_TYPES.includes(node.type)) continue;
-                    if (!seen.has(node.startIndex)) { seen.add(node.startIndex); candidates.push(node); }
+                    if (!callTypes.includes(node.type)) continue;
+                    if (once('c', node)) candidates.push(node);
                     // `globals()[name]`: the lookup is the enclosing subscript.
                     const parent = node.parent;
-                    if (ns?.subscriptOf && parent?.type === 'subscript' &&
-                        !seen.has(-parent.startIndex - 1)) {
-                        seen.add(-parent.startIndex - 1);
+                    if (ns?.subscriptOf && parent?.type === 'subscript' && once('s', parent)) {
                         candidates.push(parent);
                     }
                     break;
@@ -898,7 +991,12 @@ function reflectionSitesInTree(tree, language, code = null) {
         candidates.sort((a, b) => a.startIndex - b.startIndex || (a.endIndex - b.endIndex));
         for (const node of candidates) visitNode(node);
     } catch (_) { /* partial inventory is disclosed as-is */ }
-    return sites;
+    return facts;
+}
+
+/** The reflection sites of one parsed file (see reflectionFactsInTree). */
+function reflectionSitesInTree(tree, language, code = null) {
+    return reflectionFactsInTree(tree, language, code).sites;
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1230,7 @@ module.exports = {
     stringAlternatives,
     classifyNameExpression,
     classifyReceiver,
+    reflectionFactsInTree,
     reflectionSitesInTree,
     globMatches,
     patternEntriesFor,

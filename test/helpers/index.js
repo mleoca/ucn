@@ -296,6 +296,9 @@ function indexSnapshot(index) {
             moduleValueAliases: (fe.moduleValueAliases || []).map(alias => JSON.stringify(alias)),
             // Reflection inventory (fix #363) is extracted in the worker too.
             reflectionSites: (fe.reflectionSites || []).map(site => JSON.stringify(site)),
+            // The use counts `repo` discloses are counted in the worker too.
+            reflectionUses: fe.reflectionUses || 0,
+            evalUses: fe.evalUses || 0,
             // C# compiler-feature facts (fix #380) come from the worker parse too.
             languageFeatures: [...(fe.languageFeatures || [])],
             conditionalViews: fe.conditionalViews || null,

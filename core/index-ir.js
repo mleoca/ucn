@@ -146,6 +146,8 @@ function createFileEntryFromIR({
         ...(ir.reflectionSites?.length > 0 && {
             reflectionSites: ir.reflectionSites,
         }),
+        ...(ir.reflectionUses > 0 && { reflectionUses: ir.reflectionUses }),
+        ...(ir.evalUses > 0 && { evalUses: ir.evalUses }),
         ...(Array.isArray(ir.computedDispatchSites) && {
             computedDispatchSites: ir.computedDispatchSites,
         }),

@@ -147,13 +147,18 @@ function createLanguageAdapter(config) {
             // safeParse returns the tree the extractors above just built.
             if (config.traits?.reflectionApi && !parsed.reflectionSites) {
                 const { safeParse } = require('./index');
-                const { reflectionSitesInTree } = require('../core/reflection');
+                const { reflectionFactsInTree } = require('../core/reflection');
                 // A language reading the file through its own view (C#
                 // conditional compilation, fix #391) supplies that tree.
                 const analysisTree = typeof languageModule.analysisTree === 'function'
                     ? languageModule.analysisTree(code, parser) : safeParse(parser, code);
-                const sites = reflectionSitesInTree(analysisTree, config.name, code);
-                if (sites.length > 0) parsed.reflectionSites = sites;
+                const facts = reflectionFactsInTree(analysisTree, config.name, code, { imports });
+                if (facts.sites.length > 0) parsed.reflectionSites = facts.sites;
+                // How often the file uses the reflection and code-execution
+                // vocabulary: what `repo` and the completeness footer count,
+                // read from the index instead of from every file's text.
+                if (facts.reflectionUses > 0) parsed.reflectionUses = facts.reflectionUses;
+                if (facts.evalUses > 0) parsed.evalUses = facts.evalUses;
             }
             // Computed dispatch sites (`handlers[name]()`) of the literal
             // parse the doctor's blind-spot inventory reads (fix #436): a

@@ -638,6 +638,10 @@ function runProjectCommand(rootDir, command, arg) {
         if (flags.cache && index.usageCacheDirty) {
             try { index.saveUsageCache(); } catch (e) { /* best-effort */ }
         }
+        // A HOT ranking computed by this command, for the next one.
+        if (flags.cache && index.hotSummaryDirty) {
+            try { index.saveHotSummaries(); } catch (e) { /* best-effort */ }
+        }
     }
 }
 

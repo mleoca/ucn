@@ -126,6 +126,35 @@ function getStats(index, options = {}) {
             ? 0
             : ((options.top != null && Number(options.top) > 0) ? Number(options.top) : paramFact('top', 'hot'));
         const FUNCTION_TYPES = CALLABLE_SYMBOL_KINDS;
+        const maxRefine = Number.isInteger(options.maxRefine) && options.maxRefine > 0
+            ? options.maxRefine : Infinity;
+        // Refinement work is bounded by call records, not wall time, so the
+        // answer is the same on every run and machine (fix #382). One
+        // refinement scans the call records of its name in the countable
+        // files; `workBudget` caps their sum. Exact answers on real projects
+        // stay far below it; a very large repository (kubernetes: ~68M
+        // records under its candidate ceilings) stops and says so.
+        const workBudget = Number.isFinite(options.workBudget) && options.workBudget > 0
+            ? options.workBudget : STATS_HOT_WORK_BUDGET;
+
+        // The ranking is a function of the index and of these options, so an
+        // answer already computed for this index state is the answer
+        // (core/hot-summary.js). Nothing below runs for it.
+        const hotSummary = require('./hot-summary');
+        const summaryKey = hotSummary.keyOf({
+            top, productionCallsOnly: options.productionCallsOnly, maxRefine, workBudget,
+            file: options.file, in: options.in,
+            exclude: Array.isArray(options.exclude)
+                ? options.exclude.filter(Boolean)
+                : (options.exclude
+                    ? String(options.exclude).split(',').map(s => s.trim()).filter(Boolean)
+                    : []),
+        });
+        const keptSummary = hotSummary.get(index, summaryKey);
+        if (keptSummary) {
+            stats.hot = keptSummary;
+            return stats;
+        }
 
         // Ensure the calls cache is fully populated before counting.
         // First-time stats --hot may need to parse files to extract calls;
@@ -375,16 +404,6 @@ function getStats(index, options = {}) {
                 }
             }
         }
-        const maxRefine = Number.isInteger(options.maxRefine) && options.maxRefine > 0
-            ? options.maxRefine : Infinity;
-        // Refinement work is bounded by call records, not wall time, so the
-        // answer is the same on every run and machine (fix #382). One
-        // refinement scans the call records of its name in the countable
-        // files; `workBudget` caps their sum. Exact answers on real projects
-        // stay far below it; a very large repository (kubernetes: ~68M
-        // records under its candidate ceilings) stops and says so.
-        const workBudget = Number.isFinite(options.workBudget) && options.workBudget > 0
-            ? options.workBudget : STATS_HOT_WORK_BUDGET;
         const workOf = candidate => recordsByName.get(candidate.name) || 0;
         // Ceilings in descending order: the early stop fires as soon as no
         // unseen ceiling can reach the current Nth count, so exactly the
@@ -511,7 +530,7 @@ function getStats(index, options = {}) {
             (a.startLine || 0) - (b.startLine || 0)
         );
 
-        stats.hot = {
+        stats.hot = hotSummary.put(index, summaryKey, {
             top,
             total: refined === candidates.length ? hotList.length : candidates.length,
             totalKind: refined === candidates.length ? 'confirmed' : 'raw-call-candidates',
@@ -524,7 +543,7 @@ function getStats(index, options = {}) {
             note: refined === candidates.length
                 ? 'Counts are confirmed caller-engine edges pinned to each displayed definition; unverified dispatch is excluded.'
                 : `Displayed counts are exact confirmed caller-engine edges; ${candidates.length} raw candidates were bounded and ${refined} required exact refinement.`,
-        };
+        });
     }
 
     return stats;
@@ -748,11 +767,6 @@ function doctor(index, options = {}) {
         skippedSources: { count: 0, fileCount: 0, files: [], reasons: {} },
     };
 
-    // Reflection/eval signals come from the shared text-blind-spot counter
-    // (core/shared.js) — the SAME routine detectCompleteness uses for the about
-    // footer, so the two never drift (field-report #2). Occurrence counts.
-    const { hasTextBlindspots, countTextBlindspots } = lazySharedModule();
-
     const computedDispatch = projectComputedDispatch(index);
     for (const [filePath, fe] of index.files) {
         fileCounts.total++;
@@ -782,14 +796,12 @@ function doctor(index, options = {}) {
         if (fe.parseError) recordBlind(blindSpots.parseFailures, 1);
         if (fe.parseRecovery) recordBlind(blindSpots.parseRecoveries, 1);
 
-        // Read file once for eval/reflection signals (shared counter).
-        if (hasTextBlindspots(lang)) {
-            try {
-                const bs = countTextBlindspots(fs.readFileSync(filePath, 'utf-8'), lang);
-                recordBlind(blindSpots.evalCalls, bs.eval);
-                recordBlind(blindSpots.reflection, bs.reflection);
-            } catch (e) { /* ignore read errors */ }
-        }
+        // Code execution and reflection: call sites of each language's
+        // vocabulary (langTraits().reflectionApi), counted in the file's
+        // tree when it was indexed. The completeness footer reads the same
+        // two numbers, so the two never drift, and no file is read here.
+        recordBlind(blindSpots.evalCalls, fe.evalUses || 0);
+        recordBlind(blindSpots.reflection, fe.reflectionUses || 0);
     }
 
     // Files that failed before a fileEntry could be created are absent from

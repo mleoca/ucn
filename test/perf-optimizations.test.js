@@ -1776,6 +1776,8 @@ describe('index reliability: parallel build equals sequential build', () => {
                 'the parity fixture must actually produce both receiver origins');
             assert.ok([...par.files.values()].some(fe => fe.reflectionSites?.[0]?.patterns?.[0] === '_get_*_perms'),
                 'the parity fixture must actually produce a reflection pattern');
+            assert.ok([...par.files.values()].some(fe => fe.reflectionUses === 1),
+                'the parity fixture must actually produce a reflection use count');
             assert.strictEqual(indexSnapshot(par), indexSnapshot(seq),
                 'parallel and sequential builds must produce identical indexes');
             const rustCalls = par.getCachedCalls(path.join(dir, 'rich2.rs'));

@@ -261,6 +261,10 @@ function createFileIR({
         ...(parsed.reflectionSites?.length > 0 && {
             reflectionSites: parsed.reflectionSites.map(item => ({ ...item })),
         }),
+        // Uses of the reflection and code-execution vocabulary, counted in
+        // the tree (core/reflection.js).
+        ...(parsed.reflectionUses > 0 && { reflectionUses: parsed.reflectionUses }),
+        ...(parsed.evalUses > 0 && { evalUses: parsed.evalUses }),
         ...(Array.isArray(parsed.computedDispatchSites) && {
             computedDispatchSites: parsed.computedDispatchSites.map(item => ({ ...item })),
         }),

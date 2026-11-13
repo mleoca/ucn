@@ -153,6 +153,10 @@ class ProjectIndex {
         this._usageResultCache = new Map();
         this._usageResultCacheWeight = 0;
         this.usageCacheDirty = false;
+        // HOT rankings already computed for this index state, by request
+        // (core/hot-summary.js); stored beside the index when dirty.
+        this._hotSummaries = null;
+        this.hotSummaryDirty = false;
         // Exact text-ground sets are likewise immutable for one built index.
         // The cache is cleared at every build and bounded in account.js.
         this._groundSetCache = new Map();
@@ -750,6 +754,7 @@ class ProjectIndex {
         this._callNameCache = null;
         this._callsGenerationKey = null;
         this._completenessCache = null;
+        require('./hot-summary').reset(this);
         this._attrTypeCache = null;
         this._computedDispatchBlindspots = null;
         this._reflectionPatternIndex = null;
@@ -1055,6 +1060,7 @@ class ProjectIndex {
         // These query caches depend on project symbols and include closure.
         // A changed file can alter either even before a full rebuild reaches
         // its graph phase, so no prior call-identity verdict may survive.
+        require('./hot-summary').reset(this);
         this._implicitConversionOwners = null;
         this._constructionAliases = null;
         this._cppScope = null;
@@ -3131,6 +3137,11 @@ class ProjectIndex {
     /** Persist the bounded, content-hash-keyed usage-query cache. */
     saveUsageCache(cachePath = undefined) {
         return indexCache.saveUsageCache(this, cachePath);
+    }
+
+    /** Persist the HOT rankings computed for the saved index state. */
+    saveHotSummaries(cachePath = undefined) {
+        return require('./hot-summary').save(this, cachePath);
     }
 
     /** Return this project's default per-user cache file path. */
