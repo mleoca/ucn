@@ -4,6 +4,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
+const vm = require('node:vm');
 
 const { CANONICAL_COMMANDS } = require('../core/registry');
 const { tmp, rm, idx } = require('./helpers');
@@ -17,6 +18,131 @@ const {
 
 const ROOT = path.join(__dirname, '..');
 const { REPOS, RELEASE_REPO_NAMES, RELEASE_REPOS } = require('../eval/lib/repos');
+
+// The gates the Eval workflow qualifies on its own runners on every trigger.
+// The release gate takes all of them or none, each exactly as qualified.
+const MATRIX_COMMANDS = [
+    'node eval/run-deletion-matrix.js',
+    'node eval/run-check-matrix.js',
+    'node eval/run-test-unit-matrix.js',
+];
+const QUALIFIED_COMMANDS = [...MATRIX_COMMANDS, 'node eval/run-outcome-eval.js --gate'];
+const MATRIX_RUNNER = /eval\/run-(?:deletion|check|test-unit)-matrix\.js/;
+const QUALIFIED_RUNNER = /eval\/run-(?:(?:deletion|check|test-unit)-matrix|outcome-eval)\.js/;
+const TOOLCHAIN_ACTION = './.github/actions/matrix-toolchains';
+// The test-unit matrix alone starts a test runner about two thousand times.
+const MATRIX_MINUTES = 120;
+const EVAL_TRIGGERS = [['schedule', false], ['workflow_dispatch', false], ['workflow_dispatch', true]];
+
+/** One step of a workflow job: its condition, the action it uses, the commands it runs. */
+function workflowStep(text) {
+    const field = name => text.match(new RegExp(`(?:^|\\n {8})${name}: (.*)`))?.[1] ?? null;
+    let script = field('run') ?? '';
+    const block = text.match(/(?:^|\n {8})run: [|>][+-]?\n/);
+    if (block) {
+        const lines = [];
+        for (const line of text.slice(block.index + block[0].length).split('\n')) {
+            if (line !== '' && !line.startsWith(' '.repeat(10))) break;
+            lines.push(line);
+        }
+        script = lines.join('\n');
+    }
+    const condition = field('if');
+    return {
+        id: field('id'),
+        uses: field('uses'),
+        condition: condition === null ? null : condition.match(/^\$\{\{ (.+) \}\}$/)?.[1] ?? condition,
+        continueOnError: field('continue-on-error'),
+        commands: script.split(/\n|&&|\|\||;/).map(command => command.trim()).filter(Boolean),
+    };
+}
+
+/** The jobs of a workflow file, each with its time limit and its steps in order. */
+function workflowJobs(text) {
+    const start = text.indexOf('\njobs:\n');
+    assert.ok(start >= 0, 'a workflow declares jobs');
+    const jobs = new Map();
+    for (const part of text.slice(start + '\njobs:'.length).split(/\n {2}(?=[\w-]+:\n)/).slice(1)) {
+        const name = part.slice(0, part.indexOf(':'));
+        const stepsAt = part.indexOf('\n    steps:\n');
+        assert.ok(stepsAt >= 0, `job ${name} declares steps`);
+        const steps = part.slice(stepsAt + '\n    steps:'.length).split(/\n {6}- /).slice(1).map(workflowStep);
+        assert.ok(steps.length > 0, `job ${name} has steps`);
+        const head = part.slice(0, stepsAt);
+        jobs.set(name, {
+            timeout: head.match(/\n {4}timeout-minutes: (.+)/)?.[1] ?? null,
+            needs: head.match(/\n {4}needs: (.+)/)?.[1] ?? null,
+            steps,
+        });
+    }
+    assert.ok(jobs.size > 0, 'a workflow has jobs');
+    return jobs;
+}
+
+/** The commands a step ends up running once every `npm run <script>` is followed. */
+function leafCommands(commands, scripts, seen = new Set()) {
+    const leaves = [];
+    for (const command of commands) {
+        const script = command.match(/^(?:\w+=\S* )*npm run(?:-script)?(?: -\S+)* ([\w:.-]+)(?: |$)/)?.[1];
+        if (!script || !scripts[script]) leaves.push(command);
+        else if (!seen.has(script)) {
+            seen.add(script);
+            leaves.push(...leafCommands(scripts[script].split(/&&|\|\||;/).map(part => part.trim()), scripts, seen));
+        }
+    }
+    return leaves;
+}
+
+/** Does this step run for this planned row, every earlier step having succeeded? */
+function stepActive(step, context) {
+    if (step.condition === null) return true;
+    return Boolean(vm.runInNewContext(step.condition, {
+        github: { event_name: context.event }, inputs: { full: context.full }, matrix: context.row,
+        steps: { dependencies: { outcome: 'success' } },
+        cancelled: () => false, failure: () => false, success: () => true, always: () => true,
+    }));
+}
+
+/** A job's time limit in minutes for a planned row; null when the job sets none. */
+function jobMinutes(job, context) {
+    if (job.timeout === null) return null;
+    const expression = job.timeout.match(/^\$\{\{ (.+) \}\}$/)?.[1] ?? job.timeout;
+    const minutes = vm.runInNewContext(expression, { matrix: context.row });
+    assert.ok(Number.isInteger(minutes) && minutes > 0 && minutes <= 360, `time limit ${job.timeout} gives ${minutes}`);
+    return minutes;
+}
+
+/**
+ * Wherever a job runs a matrix, the toolchain action has run earlier in that
+ * same job and the job's time limit leaves the matrices their time.
+ */
+function assertMatricesProvided(label, job, scripts, contexts) {
+    for (const context of contexts) {
+        const where = context.row ? `${label} (${context.event}, ${context.row.id})` : label;
+        const minutes = jobMinutes(job, context);
+        const runsAt = job.steps.findIndex(step =>
+            leafCommands(step.commands, scripts).some(command => MATRIX_RUNNER.test(command)) && stepActive(step, context));
+        if (runsAt < 0) continue;
+        assert.ok(job.steps.slice(0, runsAt).some(step => step.uses === TOOLCHAIN_ACTION && stepActive(step, context)),
+            `${where} runs a matrix without installing its toolchains first`);
+        assert.ok(minutes === null || minutes >= MATRIX_MINUTES,
+            `${where} runs a matrix under a ${minutes}-minute limit`);
+    }
+}
+
+/** A qualified gate is run exactly as the Eval workflow qualifies it, never a variant. */
+function assertQualifiedWhole(label, commands) {
+    assert.deepStrictEqual(
+        commands.filter(command => QUALIFIED_RUNNER.test(command) && !QUALIFIED_COMMANDS.includes(command)), [],
+        `${label} runs a qualified gate other than as qualified`);
+}
+
+/** The release gate holds every qualified gate or none of them. */
+function assertEnrolledTogether(label, commands) {
+    const missing = QUALIFIED_COMMANDS.filter(command => !commands.includes(command));
+    assert.ok(missing.length === 0 || missing.length === QUALIFIED_COMMANDS.length,
+        `${label} holds some of the qualified gates and not: ${missing.join(', ')}`);
+}
 
 describe('command trust matrix: fail-closed proof coverage', () => {
     it('classifies every canonical command exactly once', () => {
@@ -158,7 +284,6 @@ describe('command trust matrix: fail-closed proof coverage', () => {
     });
 
     it('every planned arm survives earlier failures without running in another job', () => {
-        const vm = require('node:vm');
         const { evaluationMatrix } = require('../eval/run-ci-plan');
         const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
         const arms = workflow.split(/\n      - name: /).slice(1).filter(step =>
@@ -210,16 +335,23 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         const action = fs.readFileSync(path.join(ROOT, '.github/actions/matrix-toolchains/action.yml'), 'utf8');
         const lock = require('../package-lock.json');
 
-        // Each matrix is one step that runs whole: no partial run, no case
-        // filter, and a toolchain that is absent is a failure.
-        const runs = workflow.match(/\n        run: node eval\/run-[a-z-]+-matrix\.js.*/g).map(line => line.trim());
-        assert.deepStrictEqual(runs, [
-            'run: node eval/run-deletion-matrix.js',
-            'run: node eval/run-check-matrix.js',
-            'run: node eval/run-test-unit-matrix.js',
-        ]);
+        // Every qualified gate is one step of its own that runs whole (no
+        // partial run, no case filter: an absent toolchain is a failure), on
+        // exactly one runner of every trigger.
+        const jobs = workflowJobs(workflow);
+        const evalJob = jobs.get('eval');
+        const contexts = EVAL_TRIGGERS.flatMap(([event, full]) =>
+            evaluationMatrix(event, full).include.map(row => ({ event, full, row })));
+        for (const command of QUALIFIED_COMMANDS) {
+            const own = evalJob.steps.filter(step => step.commands.length === 1 && step.commands[0] === command);
+            assert.strictEqual(own.length, 1, `the Eval workflow runs \`${command}\` as one step of its own`);
+            for (const [event, full] of EVAL_TRIGGERS) {
+                const rows = contexts.filter(context => context.event === event && context.full === full &&
+                    stepActive(own[0], context));
+                assert.strictEqual(rows.length, 1, `\`${command}\` runs on one runner of ${event}${full ? ' (full)' : ''}`);
+            }
+        }
         assert.doesNotMatch(workflow, /--allow-missing|--only|--pin/);
-        assert.match(workflow, /timeout-minutes: \$\{\{ matrix\.kind == 'matrices' && 120 \|\| 45 \}\}/);
 
         // Where every toolchain comes from: the lockfile, the job's own
         // setup, the shared action, or the runner image (asserted present
@@ -250,29 +382,45 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         assert.match(action, /echo "UCN_JS_TEST_MODULES=\$tools\/node_modules" >> "\$GITHUB_ENV"/);
         assert.match(setup, /uses: actions\/setup-python@v\d+\n\s+with:\n\s+python-version: '3\.\d+'/);
 
-        // The action runs on the matrices' runner, before the dependencies
-        // every arm waits for: a failed install skips the arms and fails the job.
-        const toolsStep = workflow.split(/\n      - name: /).find(step => step.startsWith('Matrix toolchains\n'));
-        const toolsIf = toolsStep.match(/\n        if: \$\{\{ (.+) \}\}\n        uses: \.\/\.github\/actions\/matrix-toolchains\n/)[1];
-        const hasTools = row => require('node:vm').runInNewContext(toolsIf, { matrix: row });
-        const rows = evaluationMatrix('workflow_dispatch', true).include;
-        assert.strictEqual(hasTools(rows.find(row => row.kind === 'matrices')), true);
-        assert.ok(workflow.indexOf('uses: ./.github/actions/matrix-toolchains') < workflow.indexOf('- run: npm ci'));
+        // In every job of both workflows, for every planned runner: a matrix
+        // runs only after the toolchain action, with the time the matrices
+        // need. In the Eval job the action also precedes the dependencies
+        // every arm waits for, so a failed install skips the arms.
+        const publishJobs = workflowJobs(publish);
+        for (const [name, job] of jobs) {
+            assertMatricesProvided(`eval.yml ${name}`, job, pkg.scripts, name === 'eval' ? contexts : [{}]);
+            assertQualifiedWhole(`eval.yml ${name}`, job.steps.flatMap(step => leafCommands(step.commands, pkg.scripts)));
+        }
+        const toolsAt = evalJob.steps.findIndex(step => step.uses === TOOLCHAIN_ACTION);
+        const dependenciesAt = evalJob.steps.findIndex(step => step.id === 'dependencies');
+        assert.ok(toolsAt >= 0 && dependenciesAt >= 0 && toolsAt < dependenciesAt);
 
-        // The release gate runs the matrices only where their toolchains
-        // are installed: in the publish job and in the pre-tag dry run.
-        // Everything `npm run trust:gate` reaches, through any script it names.
-        const reached = (name, seen = new Set()) => {
-            if (seen.has(name) || !pkg.scripts[name]) return '';
-            seen.add(name);
-            const text = pkg.scripts[name];
-            return [text, ...[...text.matchAll(/npm run ([\w:.-]+)/g)].map(match => reached(match[1], seen))].join(' ');
-        };
-        const enrolled = /run-(?:deletion|check|test-unit)-matrix\.js/.test(reached('trust:gate'));
-        const publishHasTools = publish.includes('uses: ./.github/actions/matrix-toolchains');
-        assert.strictEqual(publishHasTools, enrolled, 'trust:gate and the publish job change together');
-        assert.strictEqual(hasTools(rows.find(row => row.kind === 'release')), enrolled,
-            'trust:gate and the pre-tag dry run change together');
+        // The release gate: the script, and each publish job as it runs it.
+        // It holds every qualified gate, each as qualified, or none.
+        const gate = leafCommands(['npm run trust:gate'], pkg.scripts);
+        assertQualifiedWhole('trust:gate', gate);
+        assertEnrolledTogether('trust:gate', gate);
+        for (const [name, job] of publishJobs) {
+            const commands = job.steps.flatMap(step => leafCommands(step.commands, pkg.scripts));
+            assertMatricesProvided(`publish.yml ${name}`, job, pkg.scripts, [{}]);
+            assertQualifiedWhole(`publish.yml ${name}`, commands);
+            assertEnrolledTogether(`publish.yml ${name}`, commands);
+        }
+        // Publishing waits for the job that runs the release gate, and that
+        // step can neither be skipped nor fail without failing the job.
+        const gateSteps = publishJobs.get('test').steps.filter(step => step.commands.includes('npm run trust:gate'));
+        assert.strictEqual(gateSteps.length, 1, 'the publish test job runs the release gate');
+        assert.strictEqual(gateSteps[0].condition, null);
+        assert.strictEqual(gateSteps[0].continueOnError, null);
+        assert.strictEqual(publishJobs.get('publish-npm').needs, 'test');
+
+        // The pre-tag dry run rehearses what the publish job enforces.
+        const qualifiedIn = steps => QUALIFIED_COMMANDS.filter(command =>
+            steps.flatMap(step => leafCommands(step.commands, pkg.scripts)).includes(command));
+        const dryRun = contexts.find(context => context.row.kind === 'release');
+        assert.deepStrictEqual(qualifiedIn(evalJob.steps.filter(step => stepActive(step, dryRun))),
+            qualifiedIn(publishJobs.get('test').steps),
+            'the pre-tag dry run and the publish job hold the same qualified gates');
     });
 
     it('keeps one machine-readable release board across gates and documentation', () => {
