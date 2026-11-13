@@ -1006,7 +1006,10 @@ function clearAllCaches() {
 // optional, abstract members, bodiless trait methods, Go interface method
 // elements, Python abstract and Protocol members, C++ pure virtuals); a
 // Python protocol class carries `protocolClass`.
-const CACHE_FORMAT_VERSION = 332;
+// v333: a JS/TS file's `moduleAssignedNames` leaves out writes to a name a
+// function or block declares itself (they never reach the module's binding);
+// a Python call whose only argument is a bare generator counts one argument.
+const CACHE_FORMAT_VERSION = 333;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

@@ -52,6 +52,8 @@ let lazyProvenanceOverloadModuleCache = null;
 const lazyProvenanceOverloadModule = () => lazyProvenanceOverloadModuleCache || (lazyProvenanceOverloadModuleCache = require('./provenance-overload'));
 let lazyConstructorCallsModuleCache = null;
 const lazyConstructorCallsModule = () => lazyConstructorCallsModuleCache || (lazyConstructorCallsModuleCache = require('./constructor-calls'));
+let lazyConstructedClassModuleCache = null;
+const lazyConstructedClassModule = () => lazyConstructedClassModuleCache || (lazyConstructedClassModuleCache = require('./constructed-class'));
 let lazySourceMemoModuleCache = null;
 const lazySourceMemoModule = () => lazySourceMemoModuleCache || (lazySourceMemoModuleCache = require('./source-memo'));
 let lazyMacroExpansionModuleCache = null;
@@ -111,6 +113,24 @@ function _instanceAttributeCall(index, receiver, definitions, targets = definiti
         if (!wrapsTarget) wrapsTarget = !!_instanceAttributeCall(index, declaring.ref, remaining, targets)?.wrapsTarget;
     }
     return { wrapsTarget, reason: readsPrevious ? 'instance-attribute-wraps-method' : 'callable-value' };
+}
+
+/**
+ * The unverified reason of a call whose name an instance attribute of the
+ * receiver's class holds, for these targets; null when the targets are not
+ * concerned. The attribute may wrap a target (`self.m = wrap(self.m)`), or
+ * the class that declares it declares a target method too: which of the two
+ * the call runs is then the instance's state. An attribute of a subclass
+ * that replaces an inherited method is that subclass's member, not a target.
+ */
+function _instanceAttributeRoute(index, classRef, definitions, targets) {
+    const attribute = _instanceAttributeCall(index, classRef, definitions, targets);
+    if (!attribute) return null;
+    if (attribute.wrapsTarget) return attribute.reason;
+    const declaring = findDeclaringClass(index, classRef, definitions);
+    return declaring && !declaring.uncertain && declaring.members.some(member => !member.instanceAttribute &&
+        targets.some(target => sameDeclaration(declarationIdentity(member), declarationIdentity(target))))
+        ? 'callable-value' : null;
 }
 
 const CONSTRUCTABLE_BINDING_KINDS = new Set([
@@ -2506,46 +2526,26 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
-                // An unqualified constructor name can still have exact import
-                // provenance: `from io import StringIO; out = StringIO()`.
-                // A resolved project import pins the type to that file; a
-                // clearly external import blocks project-local single-owner
-                // confirmation. Annotation-only receivers do not take this
-                // path because they may hold a project subtype.
-                if (call.isMethod && call.receiverConstructed && call.receiverType &&
-                    !call.receiverTypeQualifier &&
+                // A receiver made by a constructor expression (`out =
+                // StringIO()`, `new User(..).save()`) has the class the
+                // expression's name denotes where it is written: the file's
+                // own binding of the local name decides, never a same-named
+                // class or import elsewhere. Annotation-only receivers do
+                // not take this path because they may hold a project subtype.
+                if (call.isMethod && call.receiverType && call.receiverTypeSource === 'constructor' &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     !_functionLocalTypeInScope(index, filePath, call.receiverType,
                         call.receiverTypeEvidence?.line ?? call.line)) {
-                    const bindings = (fileEntry.importBindings || []).filter(b =>
-                        b.name === call.receiverType || b.alias === call.receiverType);
-                    if (bindings.length > 0) {
-                        const project = bindings.map(b => ({
-                            binding: b,
-                            rel: fileEntry.moduleResolved && fileEntry.moduleResolved[b.module],
-                        })).find(x => x.rel);
-                        if (project) {
-                            call = { ...call,
-                                receiverType: project.binding.name,
-                                receiverTypeFlowFile: path.join(index.root, project.rel),
-                            };
-                        } else {
-                            const projectish = bindings.some(b =>
-                                _unresolvedModuleIsGap(index, b.module, b));
-                            const via = `${bindings[0].module}.${bindings[0].name}`;
-                            if (BUILTIN_RECEIVER_TYPES.has(call.receiverType)) {
-                                // Stable stdlib runtime classes (StringIO,
-                                // BytesIO, etc.) retain their concrete builtin
-                                // identity even though their module lies
-                                // outside the project index.
-                                call = { ...call, receiverTypePlatform: true };
-                            } else {
-                                call = { ...call, receiverType: undefined,
-                                    ...(projectish
-                                        ? { receiverQualifiedFlow: `${via} — unresolved module` }
-                                        : { receiverExternalFlow: via,
-                                            receiverExternalConcreteFlow: true }) };
-                            }
+                    call = _constructedReceiverClass(index, fileEntry, filePath, call);
+                    // An instance attribute of the constructed class holds
+                    // the name: the call runs that value, not the method.
+                    if (call.receiverConstructedClass) {
+                        const attributeRoute = _instanceAttributeRoute(index,
+                            _classRefOfDefinition(index, call.receiverConstructedClass), definitions,
+                            options.targetDefinitions || definitions);
+                        if (attributeRoute) {
+                            routeUnverified(filePath, fileEntry, call, attributeRoute, calledAs);
+                            continue;
                         }
                     }
                 }
@@ -2603,7 +2603,9 @@ function findCallers(index, name, options = {}) {
                         call = { ...call, receiverType: folded.type,
                             receiverTypeSource: 'flow',
                             receiverTypeEvidence: { source: 'flow', ...folded },
-                            ...(folded.fromFile && { receiverTypeFlowFile: folded.fromFile }) };
+                            ...(folded.fromFile && { receiverTypeFlowFile: folded.fromFile }),
+                            ...(folded.exactConstructor && folded.definition &&
+                                { receiverConstructedClass: folded.definition }) };
                     } else if (folded && folded.externalVia) {
                         call = {
                             ...call,
@@ -2618,6 +2620,19 @@ function findCallers(index, name, options = {}) {
                             receiverTypeSource: 'flow',
                             receiverTypeEvidence: { source: 'flow', ...chainedType },
                             ...(chainedType.fromFile && { receiverTypeFlowFile: chainedType.fromFile }) };
+                    }
+                    // An instance attribute of the constructed class holds
+                    // the name (`self.save = other` in its initializer): the
+                    // call runs that value, not the method (the callee
+                    // side's rule).
+                    if (call.receiverConstructedClass) {
+                        const attributeRoute = _instanceAttributeRoute(index,
+                            _classRefOfDefinition(index, call.receiverConstructedClass), definitions,
+                            options.targetDefinitions || definitions);
+                        if (attributeRoute) {
+                            routeUnverified(filePath, fileEntry, call, attributeRoute, calledAs);
+                            continue;
+                        }
                     }
                 } else if (call.isMethod && (!call.receiver || call.receiverIsChainRoot) &&
                     !call.receiverType && call.receiverCall &&
@@ -4087,9 +4102,10 @@ function findCallers(index, name, options = {}) {
                             }
                             const declaring = callerClassRef?.external ? null
                                 : findDeclaringClass(index, callerClassRef, definitions, { parentsOnly });
-                            if (!parentsOnly && _instanceAttributeCall(index, callerClassRef, definitions,
-                                options.targetDefinitions || definitions)?.wrapsTarget) {
-                                routeUnverified(filePath, fileEntry, call, 'instance-attribute-wraps-method', calledAs);
+                            const attributeRoute = parentsOnly ? null : _instanceAttributeRoute(index,
+                                callerClassRef, definitions, options.targetDefinitions || definitions);
+                            if (attributeRoute) {
+                                routeUnverified(filePath, fileEntry, call, attributeRoute, calledAs);
                                 continue;
                             }
                             const matchedClass = declaring ? declaring.ref.name : null;
@@ -9007,6 +9023,29 @@ function findCallees(index, definition, options = {}) {
             if (call.isFunctionReference && call.isPathCall &&
                 !(index.symbols.get(call.name) || []).some(d => CALLABLE_SYMBOL_KINDS.has(d.type))) continue;
             if (calleeAccount) calleeAccount.totalSites++;
+            // The class a constructor expression makes (the findCallers twin):
+            // the file's own binding of the name decides the receiver's class.
+            if (structuralCallee && call.isMethod && call.receiverType &&
+                call.receiverTypeSource === 'constructor' &&
+                !_functionLocalTypeInScope(index, def.file, call.receiverType,
+                    call.receiverTypeEvidence?.line ?? call.line)) {
+                const typed = _constructedReceiverClass(index, fileEntry, def.file, call);
+                if (typed !== call) {
+                    call = typed;
+                    const evidence = siteEvidence.get(siteId);
+                    evidence.call = call;
+                    evidence.evidence.hasReceiverType = !!call.receiverType;
+                    if (!call.receiverType && call.receiverExternalConcreteFlow) {
+                        noteSite(siteId, 'external', null, call);
+                        continue;
+                    }
+                    if (!call.receiverType && call.receiverQualifiedFlow) {
+                        if (_calleeZeroCandidateName(index, call)) noteSite(siteId, 'external', null, call);
+                        else noteUnverified(siteId, call, 'possible-dispatch', { dispatchVia: call.receiverQualifiedFlow });
+                        continue;
+                    }
+                }
+            }
             // A paren-less member access is always a field where method
             // values are path-only (fix #422, the caller side's #220 rule):
             // `take(self.len)` reads the field, never the method `len`.
@@ -9980,7 +10019,19 @@ function findCallees(index, definition, options = {}) {
                         });
                         continue;
                     }
-                    if (!qualifiedType && _isDispatchContractType(index, typeName)) {
+                    // A constructor expression made this receiver: one class
+                    // definition, never an interface or a subclass of its name.
+                    const constructedClass = structuralCallee && call.receiverConstructedClass &&
+                        call.receiverConstructedClass.name === typeName ? call.receiverConstructedClass : null;
+                    // A type imported under another name (`import { User as
+                    // U }`) is the class its own import leads to, whatever
+                    // else this file imports under the original name.
+                    const aliasedClass = structuralCallee && !constructedClass && renamedType?.fromFile &&
+                        !call.receiverTypeFlowFile && renamedType.name === typeName
+                        ? _moduleClassNamed(index,
+                            _resolveFlowTypeOrigin(index, renamedType.fromFile, typeName)?.fromFile, typeName)
+                        : null;
+                    if (!qualifiedType && !constructedClass && _isDispatchContractType(index, typeName)) {
                         noteUnverified(siteId, call, 'possible-dispatch', {
                             dispatchVia: typeName,
                             dispatchCandidates: _countDispatchCandidates(index, typeName, symbols || []),
@@ -10009,7 +10060,7 @@ function findCallees(index, definition, options = {}) {
                         ? _scopedTypeDefinitionAt(index, receiverOriginFile, typeName,
                             receiverOriginFile === def.file ? call.line : null)
                         : null;
-                    const acceptsReceiverDefinition = symbol =>
+                    const acceptsReceiverDefinition = constructedClass || aliasedClass ? isCallableRT : symbol =>
                         isCallableRT(symbol) &&
                         (!receiverTypeDefinition || !ownerDefinitionOf(index, symbol) ||
                             classKeyOf(index, ownerDefinitionOf(index, symbol)) ===
@@ -10059,16 +10110,20 @@ function findCallees(index, definition, options = {}) {
                     const sel = rustTypedProbe?.match ? { match: rustTypedProbe.match }
                         : _calleeSelectReceiverMethod(
                         index, call, symbols || [], typeName, language, def.file,
-                        acceptsReceiverDefinition, receiverOriginFile && {
-                            fromFile: receiverOriginFile, definition: receiverTypeDefinition,
-                        });
+                        acceptsReceiverDefinition, constructedClass || aliasedClass
+                            ? { fromFile: (constructedClass || aliasedClass).file,
+                                definition: constructedClass || aliasedClass, constructed: true,
+                                classRef: _classRefOfDefinition(index, constructedClass || aliasedClass) }
+                            : receiverOriginFile && {
+                                fromFile: receiverOriginFile, definition: receiverTypeDefinition,
+                            });
                     if (sel.ambiguous) {
                         noteUnverified(siteId, call, sel.reason || 'overload-ambiguous');
                         continue;
                     }
                     const match = sel.match;
                     if (match) {
-                        if (routeVirtualOverride(siteId, call, typeName, match)) continue;
+                        if (!constructedClass && routeVirtualOverride(siteId, call, typeName, match)) continue;
                         const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
                         if (existing) {
@@ -10144,6 +10199,18 @@ function findCallees(index, definition, options = {}) {
                         });
                         continue;
                     }
+                    // A constructed class whose own ancestry declares no such
+                    // member: the member is an outside base's, or one set at
+                    // run time. A same-named method of another class is never it.
+                    if (constructedClass) {
+                        if (_calleeZeroCandidateName(index, call) ||
+                            _classAncestry(index, constructedClass) === 'outside') {
+                            noteSite(siteId, 'external', null, call);
+                        } else {
+                            noteUnverified(siteId, call, 'uncertain-receiver');
+                        }
+                        continue;
+                    }
                     // Structural legacy mode retains its historical fallback.
                 } else if (call.receiverCall && (!call.receiver || call.receiverIsChainRoot) &&
                     !call.receiverIsModule && !call.isConstructor) {
@@ -10173,7 +10240,14 @@ function findCallees(index, definition, options = {}) {
                             (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                         const scopedConstructor = chained.exactConstructor &&
                             classDefsNamed(index, chained.type).hasScoped;
-                        const acceptsChainedDefinition = symbol =>
+                        // A constructor expression makes one class definition:
+                        // its members are the ones its own ancestry declares.
+                        const constructedClass = structuralCallee && chained.exactConstructor
+                            ? chained.definition || _moduleClassNamed(index,
+                                _resolveFlowTypeOrigin(index, chained.fromFile || def.file, chained.type)?.fromFile,
+                                chained.type)
+                            : null;
+                        const acceptsChainedDefinition = constructedClass ? isCallableCh : symbol =>
                             isCallableCh(symbol) &&
                             (scopedConstructor || !chained.fromFile || !symbol.file ||
                              ((language === 'java' || language === 'csharp')
@@ -10182,7 +10256,9 @@ function findCallees(index, definition, options = {}) {
                                     path.dirname(chained.fromFile)));
                         const sel = _calleeSelectReceiverMethod(
                             index, call, symbols || [], chained.type, language,
-                            def.file, acceptsChainedDefinition, chained);
+                            def.file, acceptsChainedDefinition, constructedClass
+                                ? { ...chained, definition: constructedClass, constructed: true,
+                                    classRef: _classRefOfDefinition(index, constructedClass) } : chained);
                         if (sel.match) {
                             const match = sel.match;
                             // A direct constructor expression fixes the
@@ -10211,6 +10287,17 @@ function findCallees(index, definition, options = {}) {
                         noteSite(siteId, 'external', null, call);
                     } else if (chained?.externalVia) {
                         noteUnverified(siteId, call, 'possible-dispatch');
+                    } else if (structuralCallee && chained?.exactConstructor && chained.type) {
+                        // No member of that name in the constructed class's
+                        // ancestry: an outside base's member, or unknown.
+                        const constructedClass = chained.definition || _moduleClassNamed(index,
+                            _resolveFlowTypeOrigin(index, chained.fromFile || def.file, chained.type)?.fromFile,
+                            chained.type);
+                        if (constructedClass && _classAncestry(index, constructedClass) === 'outside') {
+                            noteSite(siteId, 'external', null, call);
+                        } else {
+                            noteUnverified(siteId, call, 'uncertain-receiver');
+                        }
                     } else {
                         noteUnverified(siteId, call, 'uncertain-receiver');
                     }
@@ -17886,9 +17973,11 @@ function _importRenamedTypeName(index, file, typeName, options = {}) {
         (d.type === 'type' || IDENTITY_TYPE_KINDS.has(d.type)))) return null;
     let original = null;
     let qualifier;
+    let module;
     for (const binding of fileEntry.importBindings || []) {
         if (binding.alias === typeName && binding.name && binding.name !== typeName) {
             original = binding.name;
+            module = binding.module;
         } else if (!binding.alias && binding.kind === 'using' && binding.name === typeName) {
             // C# alias directive: the module is the aliased type.
             const head = String(binding.module || '').split('<', 1)[0].trim();
@@ -17907,7 +17996,13 @@ function _importRenamedTypeName(index, file, typeName, options = {}) {
         if (rename) original = String(rename.original).split(/::|\./).pop();
     }
     if (!original) return null;
-    if (options.withQualifier) return { name: original, qualifier };
+    if (options.withQualifier) {
+        // The module the alias was imported from: the original name is
+        // looked up there, never among this file's other imports of it.
+        const relative = module != null ? fileEntry.moduleResolved?.[module] : null;
+        return { name: original, qualifier,
+            ...(relative && { fromFile: path.isAbsolute(relative) ? relative : path.join(index.root, relative) }) };
+    }
     return original;
 }
 
@@ -19279,7 +19374,9 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
                 index, symbols, typeName, language, contextFile, accepts, call?.line, ref),
             language);
     }
-    if (classDefsNamed(index, typeName).hasScoped) {
+    if (classDefsNamed(index, typeName).hasScoped || typeOrigin?.constructed) {
+        // A constructed receiver is one class definition: its members are
+        // the ones its own ancestry declares, nearest first.
         // A returned/field type is bound where it originated. Re-resolving
         // its bare name at the consumer can pick an unrelated local class
         // (or fail when the caller imported only its producer).
@@ -19288,6 +19385,12 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
             : resolveClassRef(index, typeName, typeOrigin?.fromFile || contextFile,
                 { line: typeOrigin?.fromFile ? 0 : call?.line }));
         const declaring = ref.key && findDeclaringClass(index, ref, (symbols || []).filter(accepts));
+        // A constructed class none of whose project ancestors declares the
+        // member: an outside or unresolved base may. The caller reads the
+        // ancestry and says which.
+        if (typeOrigin?.constructed && ref.key && declaring?.uncertain && declaring.members.length === 0) {
+            return { match: null };
+        }
         if (!ref.key || declaring?.uncertain) return { ambiguous: true };
         // Name lookup precedes arity: a local override hides its base even
         // if its signature no longer accepts the call's arguments.
@@ -31542,6 +31645,140 @@ function _unprovenLocalClassReceiver(index, fileEntry, file, call) {
         receiverTypeFlowFile: undefined, receiverIsTypeQualified: undefined };
 }
 
+/** The class reference of a definition: its name with the key its namesakes are told apart by. */
+function _classRefOfDefinition(index, definition) {
+    const entry = classDefsNamed(index, definition.name).entries.find(candidate => candidate.def === definition);
+    return { name: definition.name, key: entry?.key || classKeyOf(index, definition), def: definition };
+}
+
+/** The one module-level class of `name` a file declares, or null. */
+function _moduleClassNamed(index, file, name) {
+    if (!file) return null;
+    const defs = (index.symbols.get(name) || []).filter(definition =>
+        IDENTITY_TYPE_KINDS.has(definition.type) && definition.file === file &&
+        !_isFunctionLocalType(definition) && !definition.enclosingType);
+    return defs.length === 1 ? defs[0] : null;
+}
+
+/**
+ * Where the ancestors of a class are declared: 'closed' when every one is a
+ * project class, 'outside' when one is declared outside the project and the
+ * rest are project classes, 'unknown' when a base is not resolved or is
+ * computed (`extends mixin(Base)`).
+ */
+function _classAncestry(index, definition) {
+    const start = _classRefOfDefinition(index, definition);
+    const visited = new Set([start.key]);
+    const queue = [start];
+    let outside = false;
+    while (queue.length > 0 && visited.size < 128) {
+        for (const parent of parentRefsOfClass(index, queue.shift())) {
+            if (parent.external) { outside = true; continue; }
+            if (parent.importUnresolved || !parent.key) return 'unknown';
+            if (!parent.def) {
+                // A base no project class is named after is outside the
+                // project, unless a project symbol of the name computes it.
+                if ((index.symbols.get(parent.name) || []).length > 0) return 'unknown';
+                outside = true;
+                continue;
+            }
+            if (visited.has(parent.key)) continue;
+            visited.add(parent.key);
+            queue.push(parent);
+        }
+    }
+    return outside ? 'outside' : 'closed';
+}
+
+/**
+ * A receiver typed by the constructor expression that made it (`u =
+ * User(..)` then `u.m()`, `new User(..).m()`): its class is the one the
+ * expression's name denotes there (core/constructed-class.js). A name the
+ * file imports from outside the project names an outside class; a name the
+ * file binds without settling on one class types nothing.
+ */
+function _constructedReceiverClass(index, fileEntry, filePath, call) {
+    const constructedClasses = lazyConstructedClassModule();
+    const record = constructedClasses.constructionRecordOf(index, filePath, call);
+    const constructed = record ? constructedClasses.constructedClass(index, filePath, record) : undefined;
+    if (constructed?.definition) {
+        // `with Name(..) as v`: `v` is what the manager's enter method returns.
+        if (call.receiverWithBinding &&
+            !constructedClasses.contextBindingKeepsInstance(index, constructed.definition)) {
+            return { ...call, receiverType: undefined, receiverTypeSource: undefined,
+                receiverTypeEvidence: undefined, receiverTypeQualifier: undefined,
+                receiverQualifiedFlow: `${constructed.definition.name} — context manager result` };
+        }
+        // `module.Name(..)` the module-path rule has already placed keeps
+        // that origin (the module the name was read from is what its
+        // evidence replays); the class found serves the member lookup.
+        if (call.receiverTypeQualifier && call.receiverTypeFlowFile) {
+            return { ...call, receiverConstructedClass: constructed.definition };
+        }
+        return { ...call, receiverType: constructed.definition.name,
+            receiverTypeFlowFile: constructed.definition.file,
+            receiverTypeQualifier: undefined,
+            receiverConstructedClass: constructed.definition };
+    }
+    // `registry.User(..)` where `registry` is a value: the class is whatever
+    // that attribute holds.
+    const qualifierRoot = record?.isMethod ? String(record.receiver || record.receiverRoot || '').split('.')[0] : null;
+    const rootIsImport = !!qualifierRoot && (fileEntry.importBindings || []).some(binding =>
+        (binding.alias || binding.name) === qualifierRoot ||
+        (!binding.alias && String(binding.name || '').startsWith(`${qualifierRoot}.`)));
+    if (record && record.isMethod && !record.receiverIsModule && !record.receiverModuleSpecifier &&
+        (record.receiverLocalBinding || !rootIsImport)) {
+        return { ...call, receiverType: undefined, receiverTypeSource: undefined,
+            receiverTypeEvidence: undefined, receiverTypeQualifier: undefined,
+            receiverQualifiedFlow: `${record.receiver || 'value'}.${record.name} — attribute of a value` };
+    }
+    // `module.Name(..)`: the module-path rules of a qualified receiver decide
+    // what this lookup did not. The construction record names the module
+    // also where the receiver's own record does not carry the qualifier.
+    if (call.receiverTypeQualifier) return call;
+    if (record && record.isMethod && (record.receiverIsModule || record.receiverModuleSpecifier)) {
+        const origin = _structuralQualifiedReceiverOrigin(index, fileEntry,
+            record.receiver || record.receiverModuleSpecifier, record.name,
+            call.receiverTypeEvidence || record.callSite || null);
+        if (origin?.kind === 'project') {
+            return { ...call, receiverTypeFlowFile: origin.fromFile,
+                receiverTypeQualifier: record.receiver || record.receiverModuleSpecifier };
+        }
+        if (origin?.kind === 'external') {
+            return BUILTIN_RECEIVER_TYPES.has(call.receiverType) ? { ...call, receiverTypePlatform: true }
+                : { ...call, receiverType: undefined, receiverExternalFlow: origin.via,
+                    receiverExternalConcreteFlow: true };
+        }
+        return origin ? { ...call, receiverType: undefined, receiverQualifiedFlow: origin.via } : call;
+    }
+    const localName = record?.name || call.receiverTypeAlias || call.receiverTypeEvidence?.type || call.receiverType;
+    const bindings = constructedClasses.localImportBindings(fileEntry, localName);
+    const project = bindings.filter(binding => fileEntry.moduleResolved?.[binding.module]);
+    if (bindings.length > 0 && project.length === 0) {
+        // Stable platform classes (StringIO, BytesIO, ..) keep their
+        // concrete builtin identity although their module is not indexed.
+        if (BUILTIN_RECEIVER_TYPES.has(call.receiverType)) return { ...call, receiverTypePlatform: true };
+        const via = `${bindings[0].module}.${bindings[0].name}`;
+        const gap = bindings.some(binding => _unresolvedModuleIsGap(index, binding.module, binding));
+        return { ...call, receiverType: undefined,
+            ...(gap ? { receiverQualifiedFlow: `${via} — unresolved module` }
+                : { receiverExternalFlow: via, receiverExternalConcreteFlow: true }) };
+    }
+    // No construction record to look the name up at: its import, when every
+    // import of the name here leads to one module and name.
+    const imported = new Set(project.map(binding => `${fileEntry.moduleResolved[binding.module]}\0${binding.name}`));
+    if (!record && imported.size === 1 && project.length === bindings.length) {
+        return { ...call, receiverType: project[0].name,
+            receiverTypeFlowFile: path.join(index.root, fileEntry.moduleResolved[project[0].module]) };
+    }
+    if (constructed === null || (!record && imported.size > 1)) {
+        return { ...call, receiverType: undefined, receiverTypeSource: undefined,
+            receiverTypeEvidence: undefined,
+            receiverQualifiedFlow: `${localName} — the name's binding is not one class here` };
+    }
+    return call;
+}
+
 function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, consumerAwaited) {
     const language = fileEntry.language;
     const traits = langTraits(language);
@@ -31575,20 +31812,40 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             return _localConstructorBinding(index, fileEntry, filePath, record, local)
                 ? { type: name, fromFile: filePath, definition: local, exactConstructor: true } : null;
         }
+        // The class the name denotes where it is written: this file's own
+        // binding of it decides, whichever classes of the name the project
+        // declares elsewhere (several `User` classes, one imported here).
+        const constructed = lazyConstructedClassModule().constructedClass(index, filePath, record);
+        if (constructed?.definition) {
+            return { type: constructed.definition.name, fromFile: constructed.definition.file,
+                definition: constructed.definition, exactConstructor: true };
+        }
+        // A name the file binds nowhere is a global of another script: the
+        // one class of that name is it when no callable shares the name.
         const moduleTypes = typeDefs.filter(definition => !_isFunctionLocalType(definition));
-        if (!record.localShadow && moduleTypes.length === 1 && callableDefs.length === 0) {
+        if (constructed?.unread && !record.localShadow && moduleTypes.length === 1 && callableDefs.length === 0) {
             const origin = _resolveFlowTypeOrigin(index, filePath, name, undefined, record.line);
             if (origin?.fromFile === moduleTypes[0].file) {
                 return { type: name, fromFile: origin.fromFile,
                     exactConstructor: true };
             }
         }
-        // A module value alias of a class (fix #392): `Alias().m()`
-        // constructs the class the alias names where it is bound.
-        if (!record.localShadow && callableDefs.length === 0 && typeDefs.length === 0 &&
-            _moduleValueAliasNames(index).has(name)) {
-            const aliased = _moduleValueAliasType(index, filePath, name);
-            if (aliased) return { type: aliased.type, fromFile: aliased.fromFile, exactConstructor: true };
+    }
+    // `module.Name(...)`: the class that module binds under the name, by
+    // the rule a variable made from the same expression is typed with.
+    if (!nominal && record.isMethod && record.receiverIsModule && record.receiver &&
+        !record.isFunctionReference && !record.isPotentialCallback &&
+        (index.symbols.get(name) || []).some(definition =>
+            IDENTITY_TYPE_KINDS.has(definition.type) && !_isFunctionLocalType(definition))) {
+        const constructed = lazyConstructedClassModule().constructedClass(index, filePath, record);
+        if (constructed?.definition) {
+            return { type: constructed.definition.name, fromFile: constructed.definition.file,
+                definition: constructed.definition, exactConstructor: true };
+        }
+        const origin = _structuralQualifiedReceiverOrigin(index, fileEntry, record.receiver, name,
+            record.callSite || null);
+        if (origin?.kind === 'project') {
+            return { type: name, fromFile: origin.fromFile, exactConstructor: true };
         }
     }
 

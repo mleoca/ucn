@@ -22,6 +22,13 @@
  *   node eval/run-unverified-census.js
  *   node eval/run-unverified-census.js --all          # include seed/fresh reports
  *   node eval/run-unverified-census.js --repo hono,zod
+ *   node eval/run-unverified-census.js --bands        # write core/evidence-bands.json
+ *
+ * --bands writes the table the unverified sections label their reasons with:
+ * for each reason, how many of its candidates the release board's oracles
+ * scored and how many of those were real edges. It reads the release board
+ * only and refuses a board with a repository missing, so a partial run never
+ * rewrites the tracked table.
  */
 
 'use strict';
@@ -151,6 +158,44 @@ function rollupReasons(repoRows) {
             codeUnitCompare(a.reason, b.reason));
 }
 
+// A reason is labelled only from a sample this large.
+const BAND_MINIMUM_SCORED = 30;
+// Share of scored candidates that were real edges: at or above `often`,
+// at or above `sometimes`, below it `rarely`.
+const BAND_THRESHOLDS = Object.freeze({ often: 0.5, sometimes: 0.15 });
+
+function bandOf(scored, real) {
+    if (!(scored >= BAND_MINIMUM_SCORED)) return null;
+    const share = real / scored;
+    return share >= BAND_THRESHOLDS.often ? 'often' : share >= BAND_THRESHOLDS.sometimes ? 'sometimes' : 'rarely';
+}
+
+/**
+ * The band table of a census over exactly the release board. Throws when a
+ * release repository has no report: its absence would change every share.
+ */
+function bandTable(census, releaseRepoNames) {
+    const have = new Set(census.repos.map(repo => repo.repo));
+    const missing = releaseRepoNames.filter(name => !have.has(name));
+    if (missing.length > 0) throw new Error(`release board incomplete, no report for: ${missing.join(', ')}`);
+    const board = census.repos.filter(repo => releaseRepoNames.includes(repo.repo));
+    const reasons = {};
+    for (const row of rollupReasons(board)) {
+        const scored = row.oracleTrueHits + row.falseCandidates;
+        const band = bandOf(scored, row.oracleTrueHits);
+        if (band) reasons[row.reason] = { scored, real: row.oracleTrueHits, band };
+    }
+    return {
+        schemaVersion: 1,
+        source: 'unverified candidates of the release oracle board, scored by each language\'s own tool',
+        boardDate: board.map(repo => repo.date).sort(codeUnitCompare).pop(),
+        repositories: board.map(repo => repo.repo).sort(codeUnitCompare),
+        minimumScored: BAND_MINIMUM_SCORED,
+        thresholds: { ...BAND_THRESHOLDS },
+        reasons: Object.fromEntries(Object.keys(reasons).sort(codeUnitCompare).map(reason => [reason, reasons[reason]])),
+    };
+}
+
 function formatMarkdown(census) {
     const lines = [
         '# Unverified-tier census (Phase 0)',
@@ -238,6 +283,25 @@ function main() {
         reasonRollup: rollupReasons(repos),
     };
 
+    if (argv.includes('--bands')) {
+        const { RELEASE_REPO_NAMES } = require('./lib/repos');
+        let table;
+        try {
+            table = bandTable(census, [...RELEASE_REPO_NAMES]);
+        } catch (error) {
+            process.stderr.write(`${error.message}\n`);
+            process.exitCode = 1;
+            return;
+        }
+        const out = readArgValue(argv, '--out') || path.join(__dirname, '..', 'core', 'evidence-bands.json');
+        fs.writeFileSync(out, JSON.stringify(table, null, 2) + '\n');
+        process.stdout.write(`Evidence bands of ${table.repositories.length} release repositories (${table.boardDate}): ${out}\n`);
+        for (const [reason, row] of Object.entries(table.reasons)) {
+            process.stdout.write(`  ${reason}: ${row.band} (${row.real} of ${row.scored})\n`);
+        }
+        return;
+    }
+
     const date = census.generatedAt.slice(0, 10);
     const jsonPath = path.join(REPORTS_DIR, `unverified-census-${date}.json`);
     const mdPath = path.join(REPORTS_DIR, `unverified-census-${date}.md`);
@@ -254,4 +318,6 @@ function main() {
     }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { bandOf, bandTable, rollupReasons, BAND_MINIMUM_SCORED, BAND_THRESHOLDS };

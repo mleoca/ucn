@@ -8,6 +8,7 @@ const { dynamicImportsNote, formatGitLine, unverifiedReasonLabel } = require('./
 const { provenanceReplacer } = require('./provenance');
 const { matchLabelCounts, reasonList } = require('../source-universe');
 const { uncertaintyClassOf, partitionUnverified, runtimeFamilyKey } = require('../review-items');
+const { reasonSummaryLine } = require('../evidence-bands');
 
 /**
  * One short sentence (~80 chars) of a docstring, suitable for inline display
@@ -215,6 +216,15 @@ function formatAccountLines(account, { shared = true } = {}) {
         lines.push(`FILTERED: ${account.filtered.total} hidden by flags (${parts.join(', ')})`);
     }
     return lines;
+}
+
+/**
+ * Rows an unverified list prints: every one with `all`, `top` when it was
+ * given, ten otherwise. The header always states the full count.
+ */
+function unverifiedRowCap(options) {
+    if (options?.all) return Infinity;
+    return Number.isInteger(options?.top) && options.top > 0 ? options.top : 10;
 }
 
 /**
@@ -527,7 +537,9 @@ function formatContext(ctx, options = {}) {
         if (typeUnverified.length > 0) {
             lines.push(`\nCALLERS — UNVERIFIED (${typeUnverified.length}) — call or callable-reference syntax, no binding/receiver evidence:`);
             formatAmbiguityCandidates(lines, ctx.ambiguityCandidates);
-            const cap = 10;
+            const typeReasons = reasonSummaryLine(typeUnverified, options.evidenceBands);
+            if (typeReasons) lines.push(typeReasons);
+            const cap = unverifiedRowCap(ctx.meta);
             let shown = 0;
             for (const u of typeUnverified) {
                 if (shown >= cap) break;
@@ -748,11 +760,13 @@ function formatContext(ctx, options = {}) {
     }
 
     // Actionable ambiguity: call syntax without enough identity evidence.
-    // Always visible and capped at 10 one-liners unless --all.
+    // Always visible; ten one-liners unless --top or --all says otherwise.
     if (actionableUnverified.length > 0) {
         lines.push(`${compact ? '' : '\n'}CALLERS — UNVERIFIED (${actionableUnverified.length}) — call or callable-reference syntax, no binding/receiver evidence:`);
         formatAmbiguityCandidates(lines, ctx.ambiguityCandidates);
-        const cap = (ctx.meta && ctx.meta.all) ? Infinity : 10;
+        const reasons = reasonSummaryLine(actionableUnverified, options.evidenceBands);
+        if (reasons) lines.push(reasons);
+        const cap = unverifiedRowCap(ctx.meta);
         let shown = 0;
         for (const u of actionableUnverified) {
             if (shown >= cap) break;
@@ -878,6 +892,8 @@ function formatImpact(impact, options = {}) {
     }
 
     const compact = !!options.compact;
+    const allHint = options.allHint || 'use --all';
+    const unverifiedCap = unverifiedRowCap(options);
     const lines = [];
 
     // Header
@@ -986,14 +1002,14 @@ function formatImpact(impact, options = {}) {
             const reason = impact.propertyAccesses ? 'matching attribute syntax, receiver identity unresolved'
                 : 'matching value syntax, binding identity unresolved';
             lines.push(`${compact ? '' : '\n'}UNVERIFIED ${label} ACCESS CANDIDATES (${access.unverifiedSites.length}) — ${reason}:`);
-            for (const site of access.unverifiedSites.slice(0, 10)) {
+            for (const site of access.unverifiedSites.slice(0, unverifiedCap)) {
                 const caller = site.callerName ? ` [${site.callerName}]` : '';
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
                 const why = impact.valueAccesses && site.reason ? ` (${site.reason})` : '';
                 lines.push(`  ${site.file}:${site.line}${caller} [${site.accessKind || 'access'}${Number.isInteger(site.column) ? `, column ${site.column + 1}` : ''}]${expr}${why}`);
             }
-            if (access.unverifiedSites.length > 10) {
-                lines.push(`  (+${access.unverifiedSites.length - 10} more unverified)`);
+            if (access.unverifiedSites.length > unverifiedCap) {
+                lines.push(`  (+${access.unverifiedSites.length - unverifiedCap} more unverified — ${allHint})`);
             }
         }
         const valueAccount = impact.valueAccesses?.account;
@@ -1015,21 +1031,23 @@ function formatImpact(impact, options = {}) {
         }
         if (refs.unverifiedSites.length > 0) {
             lines.push(`${compact ? '' : '\n'}UNVERIFIED TYPE REFERENCE CANDIDATES (${refs.unverifiedSites.length}) — the name, the type lookup cannot decide what it names:`);
-            for (const site of refs.unverifiedSites.slice(0, 10)) {
+            for (const site of refs.unverifiedSites.slice(0, unverifiedCap)) {
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
                 lines.push(`  ${site.file}:${site.line} [${position(site)}]${expr} (${site.reason})`);
             }
-            if (refs.unverifiedSites.length > 10) {
-                lines.push(`  (+${refs.unverifiedSites.length - 10} more unverified)`);
+            if (refs.unverifiedSites.length > unverifiedCap) {
+                lines.push(`  (+${refs.unverifiedSites.length - unverifiedCap} more unverified — ${allHint})`);
             }
         }
         if (refs.account) lines.push(formatTypeAccount(impact.function, refs));
     }
 
-    // Unverified tier: visible, capped at 10 one-liners
+    // Unverified tier: visible; ten one-liners unless --top or --all says otherwise
     if (impactUnverified.length > 0) {
         lines.push(`${compact ? '' : '\n'}UNVERIFIED CALL SITES (${impactUnverified.length}) — call or callable-reference syntax, no binding/receiver evidence:`);
-        const cap = 10;
+        const reasons = reasonSummaryLine(impactUnverified, options.evidenceBands);
+        if (reasons) lines.push(reasons);
+        const cap = unverifiedCap;
         for (const site of impactUnverified.slice(0, cap)) {
             const caller = site.callerName ? ` [${site.callerName}]` : '';
             const reason = site.reason ? ` (${unverifiedReasonLabel(site)})` : '';
@@ -1037,7 +1055,7 @@ function formatImpact(impact, options = {}) {
             lines.push(`  ${site.file}:${site.line}${caller}${expr}${reason}`);
         }
         if (impactUnverified.length > cap) {
-            lines.push(`  (+${impactUnverified.length - cap} more unverified)`);
+            lines.push(`  (+${impactUnverified.length - cap} more unverified — ${allHint})`);
         }
     }
 
@@ -1187,6 +1205,8 @@ function formatAbout(about, options = {}) {
     if (aboutUnverified && aboutUnverified.total > 0) {
         lines.push('');
         lines.push(`CALLERS — UNVERIFIED (${aboutUnverified.total}) — call or callable-reference syntax, no binding/receiver evidence:`);
+        const reasons = reasonSummaryLine(aboutUnverified.reasons || aboutUnverified.top, options.evidenceBands);
+        if (reasons) lines.push(reasons);
         for (const u of aboutUnverified.top) {
             const caller = u.callerName ? ` [${u.callerName}]` : '';
             const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';

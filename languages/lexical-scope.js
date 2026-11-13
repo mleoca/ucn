@@ -1443,5 +1443,73 @@ function pythonClassBodyOrder(classNode, node, name) {
     return before === 0 ? 'outer' : 'class';
 }
 
+/**
+ * The import statement that binds `name` for a reference at `node`, when
+ * the nearest function scope binding the name binds it by that one
+ * statement alone (`def f(): from m import Name`). Null when the name is
+ * bound at module scope, by anything else, more than once, or the scope
+ * declares it `global` / `nonlocal` or star-imports.
+ */
+function localImportStatement(node, language, name = node?.text) {
+    if (familyOf(language) !== 'python' || !node?.parent) return null;
+    let child = node;
+    let crossedFunction = false;
+    try {
+        for (let scope = node.parent; scope; child = scope, scope = scope.parent) {
+            switch (scope.type) {
+                case 'function_definition': {
+                    const body = scope.childForFieldName('body');
+                    if (!sameNode(body, child)) continue;
+                    const sites = [];
+                    const info = pyScopeBindings(scope, body, name, true, true,
+                        (site, kind) => sites.push({ site, kind }));
+                    if (info.starImport || info.global || info.nonlocal) return null;
+                    if (sites.length === 0) { crossedFunction = true; continue; }
+                    if (sites.length !== 1 || sites[0].kind !== 'import') return null;
+                    let statement = sites[0].site;
+                    while (statement && statement.type !== 'import_statement' &&
+                        statement.type !== 'import_from_statement') statement = statement.parent;
+                    return statement || null;
+                }
+                case 'lambda': {
+                    if (!sameNode(scope.childForFieldName('body'), child)) continue;
+                    const names = [];
+                    pyParameterNames(scope.childForFieldName('parameters'), names);
+                    if (names.some(n => n.text === name)) return null;
+                    crossedFunction = true;
+                    continue;
+                }
+                case 'class_definition': {
+                    const body = scope.childForFieldName('body');
+                    if (!sameNode(body, child) || crossedFunction) continue;
+                    const info = pyScopeBindings(scope, body, name, false, true);
+                    if (info.bound || info.starImport) return null;
+                    continue;
+                }
+                case 'list_comprehension': case 'set_comprehension':
+                case 'dictionary_comprehension': case 'generator_expression': {
+                    const clauses = namedChildrenOf(scope).filter(c => c.type === 'for_in_clause');
+                    if (within(node, clauses[0]?.childForFieldName('right'))) continue;
+                    for (const clause of clauses) {
+                        const names = [];
+                        pyTargetNames(clause.childForFieldName('left'), names);
+                        if (names.some(n => n.text === name)) return null;
+                    }
+                    crossedFunction = true;
+                    continue;
+                }
+                case 'module':
+                    return null;
+                default:
+                    continue;
+            }
+        }
+    } catch {
+        return null;
+    }
+    return null;
+}
+
 module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding,
+    localImportStatement,
     pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds, goExpressionTypeArgument, jsPatternTarget };

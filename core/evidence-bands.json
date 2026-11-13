@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "source": "unverified candidates of the release oracle board, scored by each language's own tool",
+  "boardDate": "2026-11-13",
+  "repositories": [
+    "cjson",
+    "clap",
+    "cobra",
+    "fmt",
+    "httpx",
+    "javapoet",
+    "newtonsoft-json",
+    "preact-signals",
+    "ripgrep",
+    "viper"
+  ],
+  "minimumScored": 30,
+  "thresholds": {
+    "often": 0.5,
+    "sometimes": 0.15
+  },
+  "reasons": {
+    "method-ambiguous": {
+      "scored": 62,
+      "real": 21,
+      "band": "sometimes"
+    },
+    "overload-ambiguous": {
+      "scored": 591,
+      "real": 393,
+      "band": "often"
+    },
+    "possible-dispatch": {
+      "scored": 763,
+      "real": 42,
+      "band": "rarely"
+    },
+    "single-owner": {
+      "scored": 45,
+      "real": 45,
+      "band": "often"
+    }
+  }
+}

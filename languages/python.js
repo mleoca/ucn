@@ -3882,7 +3882,10 @@ function findCallsInTree(code, tree, parser, sink = null) {
             const callArgsNode = node.childForFieldName('arguments');
             let argCount = 0;
             let argSpread = false;
-            if (callArgsNode) {
+            if (callArgsNode?.type === 'generator_expression') {
+                // `f(x for x in xs)`: the bare generator is the one argument.
+                argCount = 1;
+            } else if (callArgsNode) {
                 for (let i = 0; i < callArgsNode.namedChildCount; i++) {
                     const arg = callArgsNode.namedChild(i);
                     if (arg.type.endsWith('comment')) continue;

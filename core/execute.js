@@ -884,6 +884,7 @@ const HANDLERS = {
             line: p.line,
             exclude: toExcludeArray(p.exclude),
             top: num(p.limit, undefined) || num(p.top, undefined),
+            all: !!p.all,
             unreachableOnly: !!p.unreachableOnly,
             // BUG-H3: pass through user-supplied flags. impact defaults to including
             // method calls because "what breaks if I change this" should include

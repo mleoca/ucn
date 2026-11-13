@@ -2251,13 +2251,42 @@ function jsModuleValueAliases(root) {
     // A `let`/`var` alias is the class only while nothing assigns the
     // name again (fix #392): any write to that identifier anywhere in the
     // module, or a second declaration, leaves it unbound.
+    // A write inside a function or block that declares the name itself
+    // (`class Local {}; Local = f`, a parameter, a `let`) writes that
+    // declaration, never the module's binding of the same name: only names
+    // the module declares need the scope walk.
+    const moduleNames = new Set();
+    for (let statement of root.namedChildren) {
+        if (statement.type === 'export_statement') statement = statement.childForFieldName('declaration') || statement;
+        if (statement.type === 'import_statement') {
+            for (const name of statement.descendantsOfType('identifier')) moduleNames.add(name.text);
+        } else if (statement.type === 'lexical_declaration' || statement.type === 'variable_declaration') {
+            for (const declarator of statement.namedChildren) {
+                const target = declarator.type === 'variable_declarator' ? declarator.childForFieldName('name') : null;
+                if (!target) continue;
+                if (target.type === 'identifier') moduleNames.add(target.text);
+                else for (const name of target.descendantsOfType(['identifier', 'shorthand_property_identifier_pattern'])) moduleNames.add(name.text);
+            }
+        } else {
+            const name = statement.childForFieldName?.('name');
+            if (name?.type === 'identifier' || name?.type === 'type_identifier') moduleNames.add(name.text);
+        }
+    }
     const written = new Set();
+    const scopes = new Map();
+    const write = (node) => {
+        if (moduleNames.has(node.text) && !written.has(node.text)) {
+            const verdict = referenceScope(node, 'javascript', scopes);
+            if (verdict && typeof verdict === 'object' && verdict.local) return;
+        }
+        written.add(node.text);
+    };
     const writeTargets = (node) => {
         if (!node) return;
-        if (node.type === 'identifier') { written.add(node.text); return; }
+        if (node.type === 'identifier') { write(node); return; }
         if (/pattern$/.test(node.type) || node.type === 'pair_pattern' ||
             node.type === 'shorthand_property_identifier_pattern') {
-            if (node.type === 'shorthand_property_identifier_pattern') written.add(node.text);
+            if (node.type === 'shorthand_property_identifier_pattern') write(node);
             for (const child of node.namedChildren) writeTargets(child);
         }
     };

@@ -1580,6 +1580,45 @@ describe('New Formatter Coverage', () => {
             assert.ok(!text.includes('Patterns:'), 'Should not show patterns when all zero');
         });
 
+        it('every unverified list of an impact answer takes its rows from top and all', () => {
+            const sites = (count, extra) => Array.from({ length: count }, (_, i) =>
+                ({ file: 'u.ts', line: i + 1, expression: `site${i}`, reason: 'ambiguous-type', ...extra }));
+            const impact = {
+                function: 'Box', file: 'a.ts', startLine: 1, signature: 'class Box', totalCallSites: 0, byFile: [],
+                patterns: { constantArgs: 0, variableArgs: 0, awaitedCalls: 0, chainedCalls: 0, spreadCalls: 0 },
+                unverifiedSites: sites(12, { reason: 'method-ambiguous' }),
+                typeReferences: { confirmedCount: 0, unverifiedCount: 13, byFile: [], unverifiedSites: sites(13, { kind: 'type' }) },
+                valueAccesses: { confirmedCount: 0, unverifiedCount: 14, byFile: [],
+                    unverifiedSites: sites(14, { accessKind: 'read' }) },
+            };
+            const count = (text, pattern) => text.split('\n').filter(line => pattern.test(line)).length;
+            const byDefault = output.formatImpact(impact, { compact: true });
+            assert.equal(count(byDefault, /^ {2}u\.ts:\d+/), 30, 'ten rows of each list');
+            assert.ok(byDefault.includes('(+2 more unverified — use --all)'));
+            assert.ok(byDefault.includes('(+3 more unverified — use --all)'));
+            assert.ok(byDefault.includes('(+4 more unverified — use --all)'));
+            const top = output.formatImpact(impact, { compact: true, top: 2, allHint: 'use all=true' });
+            assert.equal(count(top, /^ {2}u\.ts:\d+/), 6);
+            assert.ok(top.includes('(+10 more unverified — use all=true)'));
+            const all = output.formatImpact(impact, { compact: true, all: true });
+            assert.equal(count(all, /^ {2}u\.ts:\d+/), 39);
+            assert.ok(!all.includes('more unverified'));
+        });
+
+        it('the remaining call sites of a deleted function take their rows from top and all', () => {
+            const result = {
+                base: 'HEAD', summary: {}, functions: [], newFunctions: [], moduleLevelChanges: [],
+                deletedFunctions: [{ name: 'gone', relativePath: 'a.js', startLine: 3,
+                    remainingCallSites: Array.from({ length: 12 }, (_, i) =>
+                        ({ relativePath: 'b.js', line: i + 1, content: `gone(${i})` })) }],
+            };
+            const count = text => text.split('\n').filter(line => /^ {4}b\.js:\d+/.test(line)).length;
+            assert.equal(count(output.formatDiffImpact(result)), 10);
+            assert.ok(output.formatDiffImpact(result).includes('... and 2 more'));
+            assert.equal(count(output.formatDiffImpact(result, { top: 4 })), 4);
+            assert.equal(count(output.formatDiffImpact(result, { all: true })), 12);
+        });
+
     });
 
     // ────────────────────────────────────────────────────────────────────────

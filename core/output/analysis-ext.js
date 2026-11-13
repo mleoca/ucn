@@ -304,11 +304,13 @@ function formatDiffImpact(result, options = {}) {
             const remaining = fn.remainingCallSites || [];
             if (remaining.length > 0) {
                 lines.push(`  ⚠ still called from ${remaining.length} site(s) — name-level matches:`);
-                for (const site of remaining.slice(0, 10)) {
+                const cap = options.all ? Infinity
+                    : Number.isInteger(options.top) && options.top > 0 ? options.top : 10;
+                for (const site of remaining.slice(0, cap)) {
                     lines.push(`    ${site.relativePath}:${site.line}  ${site.content}`);
                 }
-                if (remaining.length > 10) {
-                    lines.push(`    ... and ${remaining.length - 10} more`);
+                if (remaining.length > cap) {
+                    lines.push(`    ... and ${remaining.length - cap} more`);
                 }
             }
         }
@@ -320,7 +322,9 @@ function formatDiffImpact(result, options = {}) {
         for (const symbol of result[key]) {
             lines.push(`  ${symbol.type} ${symbol.name} — ${symbol.relativePath}:${symbol.startLine}`);
             if (symbol.impact) {
-                lines.push(require('./analysis').formatImpact(symbol.impact, { compact: true }));
+                lines.push(require('./analysis').formatImpact(symbol.impact, { compact: true,
+                    all: options.all, top: options.top, allHint: options.allHint,
+                    evidenceBands: options.evidenceBands }));
             } else {
                 const refs = symbol.remainingReferences || [];
                 lines.push(`  Remaining name references: ${refs.length} unverified (deleted target)`);

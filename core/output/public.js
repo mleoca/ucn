@@ -14,6 +14,8 @@ const { toCliName, toMcpName, formatSurfaceMessage } = require('../registry');
 const { LINES_COMMANDS, formatPublicLines, formatPublicRaw } = require('./lines');
 const { provenanceReplacer } = require('./provenance');
 
+const { summarizeReasons } = require('../evidence-bands');
+
 const legacy = {
     ...require('./analysis'),
     ...require('./analysis-ext'),
@@ -168,6 +170,7 @@ function formatShow(result, params = {}, hints = presentationHints()) {
             expandHint: hints.source,
             allHint: hints.all,
             usagesHint: hints.usages(context.function || result.target),
+            evidenceBands: hints.evidenceBands,
         });
         parts.push(block('RELATIONSHIPS', projectContextText(formatted.text, selected)));
     }
@@ -227,10 +230,14 @@ function formatTrace(result, params = {}, hints = presentationHints()) {
     });
 }
 
-function formatImpact(result, params = {}) {
+function formatImpact(result, params = {}, hints = presentationHints()) {
+    // `--all` prints every unverified row, `--top` (or `--limit`) that many.
+    const top = Number(params.limit) > 0 ? Number(params.limit) : Number(params.top) > 0 ? Number(params.top) : undefined;
+    const rows = { all: !!params.all, ...(Number.isInteger(top) && { top }), allHint: hints.all,
+        evidenceBands: hints.evidenceBands };
     return modeOf('impact', result) === 'diff'
-        ? legacy.formatDiffImpact(result, { all: params.all })
-        : legacy.formatImpact(result, { compact: params.compact !== false });
+        ? legacy.formatDiffImpact(result, rows)
+        : legacy.formatImpact(result, { compact: params.compact !== false, ...rows });
 }
 
 function formatTests(result, params = {}, hints = presentationHints()) {
@@ -299,6 +306,8 @@ function formatPublicText(command, result, params = {}, execution = {}) {
         if (shaped != null) return shaped;
     }
     const hints = presentationHints(execution.surface);
+    // Display only: another band table relabels the reason summaries.
+    if (execution.evidenceBands) hints.evidenceBands = execution.evidenceBands;
     if (result?.scopeWarning?.hint) {
         result.scopeWarning = {
             ...result.scopeWarning,
@@ -341,7 +350,7 @@ function formatPublicText(command, result, params = {}, execution = {}) {
             break;
         case 'source': text = formatSource(result, hints); break;
         case 'trace': text = formatTrace(result, params, hints); break;
-        case 'impact': text = formatImpact(result, params); break;
+        case 'impact': text = formatImpact(result, params, hints); break;
         case 'tests': text = formatTests(result, params, hints); break;
         case 'deps': text = formatDeps(result, params, hints); break;
         case 'api': text = legacy.formatApi(result, params.file || '.'); break;
@@ -469,6 +478,13 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
     }
     if (command === 'usages' && result?.analysisGaps) {
         commandMeta.analysisGaps = result.analysisGaps;
+    }
+    // The reasons of the unverified callers with how often each was a real
+    // edge on the release board: labels beside the data, never part of it.
+    const unverifiedCallers = command === 'impact' ? result?.unverifiedSites
+        : command === 'show' ? result?.context?.unverifiedCallers : null;
+    if (Array.isArray(unverifiedCallers) && unverifiedCallers.length > 0) {
+        commandMeta.unverifiedReasons = summarizeReasons(unverifiedCallers, execution.evidenceBands);
     }
 
     const surfaceCommand = execution.surface === 'mcp'

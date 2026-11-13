@@ -185,7 +185,11 @@ function constructionDenotes(index, resolver, query, definition, seen = new Set(
     const visited = new Set(seen).add(key);
     const traits = lazyLanguagesModule().langTraits(entry.language);
     if (query.localShadow && !localConstructionBinding(index, query, definition, traits, entry.language)) return false;
-    if (traits.constructorInheritance?.order === 'single' && definition.decorators?.length) return false;
+    // A decorated class may be replaced by its decorator: no proof that its
+    // constructor runs. Which class the name denotes (`identity`) is the
+    // declaration all the same, as the language's own typing reads it.
+    if (!query.identity && traits.constructorInheritance?.order === 'single' && definition.decorators?.length) return false;
+    const identity = query.identity ? { identity: true } : null;
     if (traits.functionalTypeConstruction) {
         const classes = cppConstructionClasses(index, query, resolver);
         return classes.length > 0 && classes.every(def =>
@@ -228,7 +232,7 @@ function constructionDenotes(index, resolver, query, definition, seen = new Set(
         const bindings = (entry.importBindings || []).filter(b => (b.alias || b.name) === qualifier);
         if (bindings.length !== 1) return false;
         const target = moduleFile(`${bindings[0].module}.${bindings[0].name}`) || moduleFile(bindings[0].module);
-        return !!target && constructionDenotes(index, resolver, { file: target, line: 1, name }, definition, visited);
+        return !!target && constructionDenotes(index, resolver, { file: target, line: 1, name, ...identity }, definition, visited);
     }
     const aliases = (entry.moduleValueAliases || []).filter(alias => alias.name === name);
     if (aliases.length) {
@@ -238,11 +242,11 @@ function constructionDenotes(index, resolver, query, definition, seen = new Set(
                 if (alternative.target) {
                     const parts = alternative.target.split('.'), targetName = parts.pop();
                     return constructionDenotes(index, resolver, { file, line: alias.line || line,
-                        name: targetName, qualifier: parts.join('.') || null }, definition, visited);
+                        name: targetName, qualifier: parts.join('.') || null, ...identity }, definition, visited);
                 }
                 const target = moduleFile(alternative.module);
                 return !!target && !!alternative.imported && constructionDenotes(index, resolver,
-                    { file: target, line: 1, name: alternative.imported }, definition, visited);
+                    { file: target, line: 1, name: alternative.imported, ...identity }, definition, visited);
             });
         });
     }
@@ -252,13 +256,16 @@ function constructionDenotes(index, resolver, query, definition, seen = new Set(
             !def.lexicalScopeStartLine && !['class', 'struct', 'interface', 'type'].includes(def.type));
         return !shadows.length && !(entry.moduleAssignedNames || []).includes(name);
     }
+    // A name the module assigns, or a function writes through its module
+    // binding, does not hold its import's value at every use.
+    if ((entry.moduleAssignedNames || []).includes(name)) return false;
     const links = [...(entry.importBindings || []).filter(b => (b.alias || b.name) === name &&
         b.name !== '*' && b.kind !== 'namespace'), ...(entry.exportDetails || []).filter(e =>
         e.type === 're-export' && (e.alias || e.name) === name && e.source)];
     if (links.length !== 1) return false;
     const target = moduleFile(links[0].module || links[0].source);
     return !!target && constructionDenotes(index, resolver, { file: target, line: 1,
-        name: links[0].name }, definition, visited);
+        name: links[0].name, ...identity }, definition, visited);
 }
 
 // A construction through a method's own receiver (fix #434): the class

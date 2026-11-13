@@ -227,6 +227,16 @@ function tagCalleesSideEffects(index, callees) {
 
 
 /**
+ * How many unverified entries get their line text and caller looked up: the
+ * rows a formatter prints. Every one with `all`, `top` when it asks for more
+ * than the default ten, the engine's default otherwise.
+ */
+function unverifiedEnrichLimit(all, top) {
+    if (all) return Infinity;
+    return Number.isInteger(top) && top > 10 ? top : undefined;
+}
+
+/**
  * Compose the conservation account for a caller query (the tiered
  * caller contract). Claims come from the PRE-display-filter findCallers result —
  * the account reconciles pre-display truth; display filters are reported
@@ -354,7 +364,8 @@ function context(index, name, options = {}) {
         // Pin caller resolution to the resolved class definition — same as the
         // function path below. Without this, same-name classes in other files
         // conflate (their usages attribute to whichever def displays).
-        let typeCallers = index.findCallers(name, { includeMethods, includeUncertain: options.includeUncertain, collectAccount: true, targetDefinitions: [def] });
+        let typeCallers = index.findCallers(name, { includeMethods, includeUncertain: options.includeUncertain, collectAccount: true, targetDefinitions: [def],
+            unverifiedEnrichLimit: unverifiedEnrichLimit(options.all, options.maxCallers) });
         const rawTypeCallers = typeCallers;
         const typeFilteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
         // Tier partition — same contract as the function path: constructor/usage
@@ -416,7 +427,9 @@ function context(index, name, options = {}) {
             ...(typeAmbiguityCandidates && {
                 ambiguityCandidates: typeAmbiguityCandidates,
             }),
-            meta: { account: typeAccount, callerTotal }
+            meta: { account: typeAccount, callerTotal,
+                ...(options.all && { all: true }),
+                ...(options.maxCallers > 0 && { top: options.maxCallers }) }
         };
 
         if (warnings.length > 0) {
@@ -433,8 +446,9 @@ function context(index, name, options = {}) {
         stats,
         targetDefinitions: [def],
         collectAccount: true,
-        // --all lifts the unverified enrichment cap (content + caller lookup)
-        unverifiedEnrichLimit: options.all ? Infinity : undefined,
+        // --all lifts the unverified enrichment cap (content + caller
+        // lookup), --top moves it with the rows it prints.
+        unverifiedEnrichLimit: unverifiedEnrichLimit(options.all, options.maxCallers),
     });
     // Callee side runs the contract too (v4): uncertain/unresolved calls in
     // the def's scope become VISIBLE unverifiedCallees entries + a conserved
@@ -589,6 +603,7 @@ function context(index, name, options = {}) {
                 hasEntrypoints: reachableSet.size > 0,
             }),
             ...(options.all && { all: true }),
+            ...(options.maxCallers > 0 && { top: options.maxCallers }),
             // Structural facts for reliability hints
             ...(def.isMethod && { isMethod: true }),
             ...(def.className && { className: def.className }),
@@ -1163,6 +1178,7 @@ function impact(index, name, options = {}) {
             includeUncertain: impactIncludeUncertain,
             targetDefinitions: [def],
             collectAccount: true,
+            unverifiedEnrichLimit: unverifiedEnrichLimit(options.all, options.top),
         });
         impactAccountRaw = callerResults.accountRaw;
         impactRoutedUnverified = callerResults.unverifiedEntries || [];
@@ -1210,6 +1226,7 @@ function impact(index, name, options = {}) {
             includeUncertain: impactIncludeUncertain,
             targetDefinitions: [def],
             collectAccount: true,
+            unverifiedEnrichLimit: unverifiedEnrichLimit(options.all, options.top),
         });
         impactAccountRaw = callerResults.accountRaw;
         impactRoutedUnverified = callerResults.unverifiedEntries || [];
@@ -1676,7 +1693,8 @@ function about(index, name, options = {}) {
         // BUG-H1: pass needsTotal:true so the returned array's `totalCount` reflects the
         // true pre-truncation candidate count. Without this, `about` would report the
         // capped count as the total (e.g. "showing 10 of 30" when there are actually 153).
-        const rawCallers = index.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap, needsTotal: true, collectAccount: true });
+        const rawCallers = index.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap, needsTotal: true, collectAccount: true,
+            unverifiedEnrichLimit: unverifiedEnrichLimit(options.all, options.maxCallers) });
         const shadowCallers = rawCallers.shadowEntries || [];
         allCallers = rawCallers;
         const aboutFilteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
@@ -1797,9 +1815,18 @@ function about(index, name, options = {}) {
             if (fa !== fb) return codeUnitCompare(fa, fb);
             return (a.line || 0) - (b.line || 0);
         });
+        // Every unverified entry's reason, counted: the listed rows are a part.
+        const unverifiedReasons = {};
+        for (const entry of unverifiedPool) {
+            const reason = entry.reason || 'unknown';
+            unverifiedReasons[reason] = (unverifiedReasons[reason] || 0) + 1;
+        }
         aboutUnverified = {
             total: unverifiedPool.length + unverifiedShadowCount,
-            top: unverifiedPool.slice(0, 10).map(c => ({
+            reasons: Object.fromEntries(Object.keys(unverifiedReasons).sort(codeUnitCompare)
+                .map(reason => [reason, unverifiedReasons[reason]])),
+            top: unverifiedPool.slice(0, options.all ? Infinity
+                : options.maxCallers > 0 ? options.maxCallers : 10).map(c => ({
                 file: c.relativePath,
                 line: c.line,
                 ...(c.callerStartLine && c.callerName && {

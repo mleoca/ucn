@@ -1957,3 +1957,83 @@ describe('check CLI exit codes distinguish could-not-run from clean', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('unverified rows: --top and --all set the rows of every unverified list', () => {
+    const { formatPublicText, formatPublicJson } = require('../core/output/public');
+    const fixture = () => {
+        const lines = ['class A:', '    def run(self): return 1', 'class B:', '    def run(self): return 2'];
+        for (let i = 0; i < 14; i++) lines.push(`def f${i}(x):`, '    x.run()');
+        return tmp({ 'a.py': lines.join('\n') + '\n' });
+    };
+    const rows = text => text.split('\n').filter(line => /a\.py:\d+ \[f\d+\]/.test(line));
+    const text = (index, command, params, surface) => {
+        const response = execute(index, command, { name: 'a.py:2:run', ...params });
+        assert.ok(response.ok, JSON.stringify(response.error));
+        return formatPublicText(command, response.result, params, { ...response, ...(surface && { surface }) });
+    };
+
+    for (const [command, params] of [['impact', {}], ['show', { sections: 'callers' }]]) {
+        it(`${command}: ten rows by default, --top rows with --top, every row with --all`, () => {
+            const dir = fixture();
+            try {
+                const index = idx(dir);
+                const byDefault = text(index, command, params);
+                assert.equal(rows(byDefault).length, 10);
+                assert.match(byDefault, /\(\+4 more unverified — use --all\)/);
+                assert.match(byDefault, /UNVERIFIED[^\n]*\(14\)/);
+
+                const three = text(index, command, { ...params, top: 3 });
+                assert.equal(rows(three).length, 3);
+                assert.match(three, /\(\+11 more unverified — use --all\)/);
+                assert.match(three, /UNVERIFIED[^\n]*\(14\)/, 'the header keeps the full count');
+
+                // Rows past the default ten carry their caller and line text too.
+                const twelve = text(index, command, { ...params, top: 12 });
+                assert.equal(rows(twelve).length, 12);
+                assert.equal(rows(twelve).filter(line => line.includes('x.run()')).length, 12);
+                assert.match(twelve, /\(\+2 more unverified — use --all\)/);
+
+                const all = text(index, command, { ...params, all: true });
+                assert.equal(rows(all).length, 14);
+                assert.equal(rows(all).filter(line => line.includes('x.run()')).length, 14);
+                assert.doesNotMatch(all, /more unverified/);
+
+                assert.match(text(index, command, params, 'mcp'), /\(\+4 more unverified — use all=true\)/);
+            } finally { rm(dir); }
+        });
+    }
+
+    it('impact --limit sets the rows as --top does', () => {
+        const dir = fixture();
+        try {
+            assert.equal(rows(text(idx(dir), 'impact', { limit: 4 })).length, 4);
+        } finally { rm(dir); }
+    });
+
+    it('the rows printed never change the account or the JSON sites', () => {
+        const dir = fixture();
+        try {
+            const index = idx(dir);
+            const sites = params => {
+                const response = execute(index, 'impact', { name: 'a.py:2:run', ...params });
+                const data = JSON.parse(formatPublicJson('impact', response.result, params, response)).data;
+                return { account: data.account, sites: data.unverifiedSites.map(site => `${site.file}:${site.line}:${site.reason}`) };
+            };
+            const base = sites({});
+            assert.equal(base.sites.length, 14);
+            assert.deepEqual(sites({ top: 3 }), base);
+            assert.deepEqual(sites({ all: true }), base);
+        } finally { rm(dir); }
+    });
+
+    it('the about summary takes the same rows', () => {
+        const dir = fixture();
+        try {
+            const index = idx(dir);
+            const top = params => execute(index, 'about', { name: 'a.py:2:run', ...params }).result.callers.unverified;
+            assert.deepEqual([top({}).total, top({}).top.length], [14, 10]);
+            assert.equal(top({ top: 12 }).top.filter(site => site.expression).length, 12);
+            assert.equal(top({ all: true }).top.filter(site => site.expression).length, 14);
+        } finally { rm(dir); }
+    });
+});

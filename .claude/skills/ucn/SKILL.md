@@ -65,7 +65,7 @@ C++ integer literals with value zero keep pointer overloads reachable as null po
 Caller candidates in `show`, `impact`, `trace` and `check` carry evidence tiers:
 
 - `CONFIRMED`: binding, receiver, import, or ownership evidence for the pinned target.
-- `UNVERIFIED`: call syntax that may reach the target, with the reason identity could not be established. Review it before a breaking change. When same-name definitions compete, `show` lists their stable handles once above the sites.
+- `UNVERIFIED`: call syntax that may reach the target, with the reason identity could not be established. Review it before a breaking change. When same-name definitions compete, `show` lists their stable handles once above the sites. Each unverified list prints ten rows; `--top=N` sets the count and `--all` prints every row, while the header always states the full count. A `by reason` line counts the reasons and says how often each was a real call on the release oracle board (`often`, `sometimes` or `rarely` with real/scored counts, `not measured` below the sample minimum). Use it to order a review: it describes the reason, never the site. JSON carries it as `meta.unverifiedReasons`.
 - Excluded sites (another definition's caller, an incompatible receiver, an external package, an arity mismatch) are counted as other-target lines in `ACCOUNT`, each with its reason in JSON.
 
 Caller, callee and trace views carry the applicable trust lines below, preserved through truncation. A source extraction, definition list or test-reference list does not provide a caller account; use `show` or `impact` when that account is needed.

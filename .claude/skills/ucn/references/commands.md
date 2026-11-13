@@ -55,13 +55,13 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `--in=<directory>` | Limit query scope to a directory. |
 | `--exclude=<patterns>` | Exclude matching paths (`--not` is an alias). |
 | `--limit=N` | Default maximum of 500 results for `find`, text `search`, `deadcode`, `api`, and `repo` files; structural `search` defaults to 50. Explicit limits override these caps and disclose omissions; `usages` and `--lines` are uncapped by default. |
-| `--top=N` | Cap listed callers/callees and ranked results; the header discloses the cut (`3 shown of 21`). Caller lists have no default cap. |
+| `--top=N` | Cap listed callers/callees and ranked results; the header discloses the cut (`3 shown of 21`). Caller lists have no default cap. Also the rows of each unverified list (ten by default; `impact` takes `--limit` the same way). |
 | `--context=N` | Lines of context around `search`/`usages` matches. |
 | `--include-tests` / `--exclude-tests` | Lift or apply the language's test-file exclusions where a command filters them (`--exclude-tests`: `usages`, `endpoints`, `entrypoints`). `usages` ignores `--include-tests` (tests are listed by default) and says so. |
 | `--include-bundled` | Index `*.min.js` and `*.bundle.js`, respecting user exclusions and bypassing the shared cache. By default they are searched for each name and listed only when the name occurs in them. `*.map` files are data and stay unindexed. MCP: `include_bundled=true`. |
 | `--depth=N` | Trace, dependency, or test traversal depth. |
 | `--direction=<value>` | Trace (`callees`/`callers`) or dependency (`imports`/`importers`/`both`) direction. |
-| `--all` | Lift result and formatter caps where a command supports it; the truncation notice says when it does. |
+| `--all` | Lift result and formatter caps where a command supports it, including every unverified list of `show` and `impact`; the truncation notice says when it does. |
 | `--max-chars=N` | Text budget in characters (10K targeted / 3K broad by default; 100K ceiling), including notices and trust lines. Trust lines are reserved first; a limit too small for them withholds the answer and names the budget that carries them. MCP: `max_chars`. CLI JSON is uncapped even with an explicit budget; `meta.maxChars` is `"not-applied"`. |
 | `--compact` / `--no-compact` | Token-efficient or full presentation (`show`/`impact` default compact, `usages` full). |
 | `--range=N-M` | Explicit line range with `source <file>` or `source --file=<path>`. |

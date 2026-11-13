@@ -19142,3 +19142,536 @@ describe('fix #490: endpoint origins, reflection tables and JSON budget disclosu
         } finally { rm(dir); }
     });
 });
+
+describe('constructed receivers: a constructed receiver has the class its name denotes where it is written', () => {
+    const build = files => {
+        const dir = tmp(Object.fromEntries(Object.entries(files).map(([name, lines]) =>
+            [name, Array.isArray(lines) ? lines.join('\n') + '\n' : lines])));
+        return { dir, index: idx(dir), files };
+    };
+    // 1-based line of the one line of a fixture file that ends with `marker`.
+    const at = (project, file, marker) => {
+        const lines = project.files[file];
+        const hits = lines.map((text, i) => (text.endsWith(marker) ? i + 1 : 0)).filter(Boolean);
+        assert.equal(hits.length, 1, `${file}: ${marker}`);
+        return hits[0];
+    };
+    const handleOf = (project, file, owner, name) => {
+        const def = (project.index.symbols.get(name) || []).find(d => d.relativePath === file &&
+            (d.className || null) === owner && !d.instanceAttribute);
+        assert.ok(def, `${file} ${owner}.${name}`);
+        return `${file}:${def.startLine}:${name}`;
+    };
+    // The tier of one call line for one definition: 'confirmed', its unverified reason, or null.
+    const tier = (project, handle, file, line) => {
+        const res = execute(project.index, 'impact', { name: handle });
+        assert.ok(res.ok, JSON.stringify(res.error));
+        assert.equal(res.result.account.conserved, true, handle);
+        if ((res.result.byFile || []).some(g => g.file === file && g.sites.some(s => s.line === line))) return 'confirmed';
+        const site = (res.result.unverifiedSites || []).find(s => s.file === file && s.line === line);
+        return site ? site.reason : null;
+    };
+    // What the function holding a call line calls there: confirmed definitions and the unverified reason.
+    const calleesAt = (project, file, fn, line, name) => {
+        const res = execute(project.index, 'context', { name: handleOf(project, file, null, fn), includeMethods: true });
+        assert.ok(res.ok, JSON.stringify(res.error));
+        assert.equal(res.result.meta.calleeAccount.conserved, true, fn);
+        const confirmed = (res.result.callees || []).filter(c => c.name === name &&
+            (c.siteProvenance || []).some(s => s.line === line)).map(c => `${c.relativePath}:${c.className}`);
+        const unverified = (res.result.unverifiedCallees || []).find(c => c.name === name &&
+            (c.siteProvenance || []).some(s => s.line === line));
+        return { confirmed, unverified: unverified ? unverified.reason : null };
+    };
+
+    const PY_MODELS = ['class Model:', '    def full_clean(self): return 1', '    def save(self): return 1',
+        'class User(Model):', '    def save(self): return 2'];
+    const PY_FORMS = ['class BaseForm:', '    def full_clean(self): return 3', '    def save(self): return 3',
+        'class User(BaseForm):', '    pass'];
+    const JS_MODELS = ['export class Model { fullClean() {} save() {} }', 'export class User extends Model { save() {} }'];
+    const JS_FORMS = ['export class BaseForm { fullClean() {} save() {} }', 'export class User extends BaseForm {}'];
+
+    it('python: the import of the name selects among same-named classes, chained and through a variable', () => {
+        const project = build({
+            'app/__init__.py': [''], 'app/models.py': PY_MODELS, 'app/forms.py': PY_FORMS,
+            'tests/models.py': ['class User:', '    def save(self): return 4', '    def full_clean(self): return 4'],
+            'app/views.py': [
+                'from app.models import User',
+                'from app.forms import User as Sheet',
+                'def chained():', '    User(a=1).save()  # chained',
+                'def inherited():', '    User(a=1).full_clean()  # inherited',
+                'def variable():', '    u = User(a=1)', '    u.save()  # variable',
+                'def aliased():', '    Sheet().save()  # aliased',
+                'def aliased_variable():', '    s = Sheet()', '    s.full_clean()  # aliased-variable',
+            ],
+        });
+        try {
+            const models = handleOf(project, 'app/models.py', 'User', 'save');
+            const base = handleOf(project, 'app/models.py', 'Model', 'save');
+            const form = handleOf(project, 'app/forms.py', 'BaseForm', 'save');
+            const other = handleOf(project, 'tests/models.py', 'User', 'save');
+            for (const marker of ['# chained', '# variable']) {
+                const line = at(project, 'app/views.py', marker);
+                assert.equal(tier(project, models, 'app/views.py', line), 'confirmed', marker);
+                for (const wrong of [base, form, other]) assert.equal(tier(project, wrong, 'app/views.py', line), null, `${marker} ${wrong}`);
+            }
+            const aliased = at(project, 'app/views.py', '# aliased');
+            assert.equal(tier(project, form, 'app/views.py', aliased), 'confirmed');
+            for (const wrong of [models, base, other]) assert.equal(tier(project, wrong, 'app/views.py', aliased), null, wrong);
+            assert.equal(tier(project, handleOf(project, 'app/models.py', 'Model', 'full_clean'), 'app/views.py',
+                at(project, 'app/views.py', '# inherited')), 'confirmed');
+            const aliasedVariable = at(project, 'app/views.py', '# aliased-variable');
+            assert.equal(tier(project, handleOf(project, 'app/forms.py', 'BaseForm', 'full_clean'), 'app/views.py',
+                aliasedVariable), 'confirmed');
+            assert.equal(tier(project, handleOf(project, 'app/models.py', 'Model', 'full_clean'), 'app/views.py',
+                aliasedVariable), null);
+            // The callee side names the same definitions, inherited ones through the constructed class.
+            assert.deepEqual(calleesAt(project, 'app/views.py', 'chained', at(project, 'app/views.py', '# chained'), 'save'),
+                { confirmed: ['app/models.py:User'], unverified: null });
+            assert.deepEqual(calleesAt(project, 'app/views.py', 'inherited', at(project, 'app/views.py', '# inherited'), 'full_clean'),
+                { confirmed: ['app/models.py:Model'], unverified: null });
+            assert.deepEqual(calleesAt(project, 'app/views.py', 'aliased', aliased, 'save'),
+                { confirmed: ['app/forms.py:BaseForm'], unverified: null });
+            assert.deepEqual(calleesAt(project, 'app/views.py', 'aliased_variable', aliasedVariable, 'full_clean'),
+                { confirmed: ['app/forms.py:BaseForm'], unverified: null });
+        } finally { rm(project.dir); }
+    });
+
+    it('python: an aliased import of one class beside a plain import of its namesake', () => {
+        const project = build({
+            'app/__init__.py': [''], 'app/models.py': PY_MODELS, 'app/forms.py': PY_FORMS,
+            'app/views.py': [
+                'from app.models import User as Account',
+                'from app.forms import User',
+                'def plain():', '    u = User()', '    u.save()  # plain',
+                'def aliased():', '    a = Account(a=1)', '    a.save()  # aliased',
+            ],
+        });
+        try {
+            const models = handleOf(project, 'app/models.py', 'User', 'save');
+            const form = handleOf(project, 'app/forms.py', 'BaseForm', 'save');
+            const plain = at(project, 'app/views.py', '# plain'), aliased = at(project, 'app/views.py', '# aliased');
+            assert.equal(tier(project, form, 'app/views.py', plain), 'confirmed');
+            assert.equal(tier(project, models, 'app/views.py', plain), null);
+            assert.equal(tier(project, models, 'app/views.py', aliased), 'confirmed');
+            assert.equal(tier(project, form, 'app/views.py', aliased), null);
+            assert.deepEqual(calleesAt(project, 'app/views.py', 'plain', plain, 'save'),
+                { confirmed: ['app/forms.py:BaseForm'], unverified: null });
+        } finally { rm(project.dir); }
+    });
+
+    it('python: a name that is not one class at the site types nothing', () => {
+        const project = build({
+            'app/__init__.py': [''], 'app/models.py': PY_MODELS, 'app/forms.py': PY_FORMS,
+            'app/factories.py': ['from app import forms', 'def User(**kw):', '    return forms.User()'],
+            'app/shadows.py': [
+                'from app.models import User', 'from app import forms',
+                'def parameter(User):', '    User().save()  # parameter',
+                'def local():', '    User = forms.User', '    User().save()  # local',
+                'def closure():', '    User = forms.User', '    def inner():', '        u = User()', '        u.save()  # closure',
+                '    return inner',
+                'def function_import():', '    from app.forms import User', '    u = User()', '    u.save()  # function-import',
+            ],
+            'app/rebound.py': ['from app.models import User', 'from app import forms', 'User = forms.User',
+                'def module():', '    u = User()', '    u.save()  # module-rebound'],
+            'app/written.py': ['from app.models import User', 'from app import forms',
+                'def swap():', '    global User', '    User = forms.User',
+                'def later():', '    User().save()  # global-chained', '    u = User()', '    u.save()  # global-variable'],
+            'app/twice.py': ['from app.models import User', 'from app.forms import User',
+                'def last():', '    u = User()', '    u.save()  # two-imports'],
+            'app/branch.py': ['import sys', 'if sys.version_info >= (99, 0):', '    from app.models import User',
+                'else:', '    from app.forms import User', 'def either():', '    u = User()', '    u.save()  # conditional'],
+            'app/made.py': ['from app.factories import User',
+                'def made():', '    User(a=1).save()  # factory-chained', '    u = User(a=1)', '    u.save()  # factory-variable'],
+            'app/module.py': ['import app.models as m',
+                'def shadowed(m):', '    m.User().save()  # module-parameter',
+                'def named():', '    m.User(a=1).save()  # module-alias'],
+        });
+        try {
+            const targets = [handleOf(project, 'app/models.py', 'User', 'save'), handleOf(project, 'app/models.py', 'Model', 'save'),
+                handleOf(project, 'app/forms.py', 'BaseForm', 'save')];
+            const undecided = [['app/shadows.py', '# parameter'], ['app/shadows.py', '# local'], ['app/shadows.py', '# closure'],
+                ['app/rebound.py', '# module-rebound'],
+                ['app/written.py', '# global-chained'], ['app/written.py', '# global-variable'],
+                ['app/twice.py', '# two-imports'], ['app/branch.py', '# conditional'],
+                ['app/made.py', '# factory-chained'], ['app/made.py', '# factory-variable'],
+                ['app/module.py', '# module-parameter']];
+            for (const [file, marker] of undecided) {
+                const line = at(project, file, marker);
+                for (const target of targets) {
+                    const found = tier(project, target, file, line);
+                    assert.ok(found && found !== 'confirmed', `${marker} for ${target}: ${found}`);
+                }
+            }
+            // A function's own import of the name is its binding there, whatever the module imports.
+            const functionImport = at(project, 'app/shadows.py', '# function-import');
+            assert.equal(tier(project, targets[2], 'app/shadows.py', functionImport), 'confirmed');
+            assert.equal(tier(project, targets[0], 'app/shadows.py', functionImport), null);
+            assert.equal(tier(project, targets[0], 'app/module.py', at(project, 'app/module.py', '# module-alias')), 'confirmed');
+            assert.equal(tier(project, targets[2], 'app/module.py', at(project, 'app/module.py', '# module-alias')), null);
+            // Neither side picks a definition by the spelling alone.
+            const closure = calleesAt(project, 'app/shadows.py', 'inner', at(project, 'app/shadows.py', '# closure'), 'save');
+            assert.deepEqual(closure.confirmed, []);
+            assert.ok(closure.unverified);
+            const rebound = calleesAt(project, 'app/rebound.py', 'module', at(project, 'app/rebound.py', '# module-rebound'), 'save');
+            assert.deepEqual(rebound.confirmed, []);
+            assert.ok(rebound.unverified);
+        } finally { rm(project.dir); }
+    });
+
+    it('python: a class whose call can return something else is no exact receiver class', () => {
+        const project = build({
+            'app/__init__.py': [''], 'app/forms.py': PY_FORMS,
+            'app/odd.py': [
+                'import abc', 'from dataclasses import dataclass', 'from app import forms',
+                'def swap(cls):', '    return forms.User',
+                'def keep(cls):', '    cls.kept = True', '    return cls',
+                'class Meta(type):', '    def __call__(cls, *args):', '        return forms.User()',
+                'class Quiet(type):', '    pass',
+                'class Allocated:', '    def __new__(cls, *args):', '        return forms.User()', '    def save(self): return 5',
+                'class Inherits(Allocated):', '    pass',
+                'class Called(metaclass=Meta):', '    def save(self): return 6',
+                '@swap', 'class Swapped:', '    def save(self): return 7',
+                '@keep', 'class Kept:', '    def save(self): return 8',
+                '@dataclass', 'class Data:', '    x: int = 0', '    def save(self): return 9',
+                'class Abstract(metaclass=abc.ABCMeta):', '    def save(self): return 10',
+                'class Plain(metaclass=Quiet):', '    def save(self): return 11',
+            ],
+            'app/views.py': [
+                'from app.odd import Allocated, Inherits, Called, Swapped, Kept, Data, Abstract, Plain',
+                'def allocated():', '    Allocated().save()  # allocated',
+                'def inherits():', '    i = Inherits()', '    i.save()  # inherits',
+                'def called():', '    Called().save()  # called',
+                'def swapped():', '    s = Swapped()', '    s.save()  # swapped',
+                'def kept():', '    Kept().save()  # kept',
+                'def data():', '    d = Data()', '    d.save()  # data',
+                'def abstract():', '    Abstract().save()  # abstract',
+                'def plain():', '    Plain().save()  # plain',
+            ],
+        });
+        try {
+            const form = handleOf(project, 'app/forms.py', 'BaseForm', 'save');
+            for (const [owner, marker] of [['Allocated', '# allocated'], ['Allocated', '# inherits'], ['Called', '# called'],
+                ['Swapped', '# swapped']]) {
+                const line = at(project, 'app/views.py', marker);
+                const own = tier(project, handleOf(project, 'app/odd.py', owner, 'save'), 'app/views.py', line);
+                assert.ok(own && own !== 'confirmed', `${marker}: ${own}`);
+                // What really runs there stays visible too.
+                assert.ok(tier(project, form, 'app/views.py', line), `${marker} keeps the other candidate`);
+            }
+            for (const [owner, marker] of [['Kept', '# kept'], ['Data', '# data'], ['Abstract', '# abstract'], ['Plain', '# plain']]) {
+                const line = at(project, 'app/views.py', marker);
+                assert.equal(tier(project, handleOf(project, 'app/odd.py', owner, 'save'), 'app/views.py', line), 'confirmed', marker);
+                assert.equal(tier(project, form, 'app/views.py', line), null, marker);
+            }
+        } finally { rm(project.dir); }
+    });
+
+    it('python: a project class decorator has to show that it returns its class', () => {
+        const project = build({
+            'deco.py': ['from functools import partial', 'from typing import overload',
+                'def auto(cls=None, *, angular=None):',
+                '    def do_replace(cls, angular=None):', '        cls.flag = angular', '        return cls',
+                '    if cls is None:', '        return partial(do_replace, angular=angular)',
+                '    return do_replace(cls, angular=angular)',
+                '@overload', 'def rich(cls): ...',
+                '@overload', 'def rich(*, angular=False): ...',
+                'def rich(cls=None, *, angular=False):',
+                '    if cls is None:', '        return auto(angular=angular)', '    return auto(cls)',
+                'alias = rich',
+                'def named(label):', '    def apply(cls):', '        cls.label = label', '        return cls', '    return apply',
+                'def wrap(cls):', '    class Wrapped(cls):', '        def save(self): return 99', '    return Wrapped',
+                'def other(cls, extra):', '    return extra'],
+            'things.py': ['import deco', 'from deco import rich, alias, named, wrap, other',
+                '@rich', 'class Plain:', '    def save(self): return 1',
+                '@rich(angular=True)', 'class Angular:', '    def save(self): return 2',
+                '@alias', 'class Aliased:', '    def save(self): return 3',
+                '@named("n")', 'class Named:', '    def save(self): return 4',
+                '@wrap', 'class Wrapped:', '    def save(self): return 5',
+                '@deco.rich', 'class Attribute:', '    def save(self): return 6',
+                '@other', 'class Other:', '    def save(self): return 7'],
+            'views.py': ['from things import Plain, Angular, Aliased, Named, Wrapped, Attribute, Other',
+                'def plain():', '    Plain().save()  # plain',
+                'def angular():', '    a = Angular()', '    a.save()  # angular',
+                'def aliased():', '    Aliased().save()  # aliased',
+                'def named():', '    Named().save()  # named',
+                'def wrapped():', '    Wrapped().save()  # wrapped',
+                'def attribute():', '    Attribute().save()  # attribute',
+                'def other():', '    o = Other()', '    o.save()  # other'],
+        });
+        try {
+            for (const [owner, marker] of [['Plain', '# plain'], ['Angular', '# angular'], ['Aliased', '# aliased'], ['Named', '# named']]) {
+                assert.equal(tier(project, handleOf(project, 'things.py', owner, 'save'), 'views.py', at(project, 'views.py', marker)),
+                    'confirmed', marker);
+            }
+            // A subclass put in the class's place, a decorator that is not read, one that returns another value.
+            for (const [owner, marker] of [['Wrapped', '# wrapped'], ['Attribute', '# attribute'], ['Other', '# other']]) {
+                const found = tier(project, handleOf(project, 'things.py', owner, 'save'), 'views.py', at(project, 'views.py', marker));
+                assert.ok(found && found !== 'confirmed', `${marker}: ${found}`);
+            }
+            const inner = (project.index.symbols.get('save') || []).find(d => d.relativePath === 'deco.py');
+            assert.ok(tier(project, `deco.py:${inner.startLine}:save`, 'views.py', at(project, 'views.py', '# wrapped')),
+                'the method of the class put in its place stays visible');
+        } finally { rm(project.dir); }
+    });
+
+    it('python: a with-statement binds what the enter method returns', () => {
+        const project = build({
+            'forms.py': PY_FORMS,
+            'ctx.py': ['import forms',
+                'class Session:', '    def __enter__(self):', '        return self', '    def __exit__(self, *a): return False',
+                '    def save(self): return 1',
+                'class Lease:', '    def __enter__(self):', '        return forms.User()', '    def __exit__(self, *a): return False',
+                '    def save(self): return 2'],
+            'views.py': ['from ctx import Session, Lease',
+                'def same():', '    with Session() as s:', '        s.save()  # same',
+                'def other():', '    with Lease() as held:', '        held.save()  # other'],
+        });
+        try {
+            assert.equal(tier(project, handleOf(project, 'ctx.py', 'Session', 'save'), 'views.py', at(project, 'views.py', '# same')), 'confirmed');
+            const lease = tier(project, handleOf(project, 'ctx.py', 'Lease', 'save'), 'views.py', at(project, 'views.py', '# other'));
+            assert.ok(lease && lease !== 'confirmed', lease);
+            assert.ok(tier(project, handleOf(project, 'forms.py', 'BaseForm', 'save'), 'views.py', at(project, 'views.py', '# other')));
+            const callee = calleesAt(project, 'views.py', 'other', at(project, 'views.py', '# other'), 'save');
+            assert.deepEqual(callee.confirmed, []);
+            assert.ok(callee.unverified);
+        } finally { rm(project.dir); }
+    });
+
+    it('python: an instance attribute of the same class holds the method name', () => {
+        const project = build({
+            'shadow.py': ['def replacement(): return 0',
+                'class User:', '    def __init__(self):', '        self.save = replacement',
+                '    def save(self): return 1', '    def full_clean(self): return 2',
+                '    def run(self):', '        self.save()  # own', '        self.full_clean()  # own-method'],
+            'views.py': ['from shadow import User',
+                'def chained():', '    User().save()  # chained',
+                'def variable():', '    u = User()', '    u.save()  # variable', '    u.full_clean()  # method'],
+        });
+        try {
+            const save = handleOf(project, 'shadow.py', 'User', 'save');
+            for (const [file, marker] of [['shadow.py', '# own'], ['views.py', '# chained'], ['views.py', '# variable']]) {
+                assert.equal(tier(project, save, file, at(project, file, marker)), 'callable-value', marker);
+            }
+            const clean = handleOf(project, 'shadow.py', 'User', 'full_clean');
+            assert.equal(tier(project, clean, 'shadow.py', at(project, 'shadow.py', '# own-method')), 'confirmed');
+            assert.equal(tier(project, clean, 'views.py', at(project, 'views.py', '# method')), 'confirmed');
+            assert.equal(calleesAt(project, 'views.py', 'chained', at(project, 'views.py', '# chained'), 'save').unverified, 'callable-value');
+        } finally { rm(project.dir); }
+    });
+
+    for (const ext of ['js', 'ts']) {
+        const typed = text => (ext === 'ts' ? text : text.replace(/: void/g, ''));
+        const from = name => `'./${name}.${ext}'`;
+        it(`${ext}: the binding of the name selects among same-named classes; shadows and rebinding type nothing`, () => {
+            const project = build({
+                'package.json': ['{ "type": "module" }'],
+                [`models.${ext}`]: JS_MODELS, [`forms.${ext}`]: JS_FORMS,
+                [`legacy/models.${ext}`]: ['export class User { save() {} fullClean() {} }'],
+                [`views.${ext}`]: [
+                    `import { User } from ${from('models')};`,
+                    `import { User as Sheet } from ${from('forms')};`,
+                    `import * as forms from ${from('forms')};`,
+                    'const registry = { User: forms.User };',
+                    typed('export function chained(): void {'), '  new User().save(); // chained', '}',
+                    typed('export function inherited(): void {'), '  new User().fullClean(); // inherited', '}',
+                    typed('export function variable(): void {'), '  const u = new User();', '  u.save(); // variable', '}',
+                    typed('export function aliased(): void {'), '  new Sheet().save(); // aliased', '}',
+                    typed('export function namespace(): void {'), '  new forms.User().save(); // namespace', '}',
+                    'export function parameter(User) {', '  new User().save(); // parameter', '}',
+                    'export function local() {', '  const User = forms.User;', '  const u = new User();', '  u.save(); // local', '}',
+                    'export function closure() {', '  const User = forms.User;', '  return () => {', '    new User().save(); // closure', '  };', '}',
+                    'export function value() {', '  new registry.User().save(); // value', '}',
+                ],
+            });
+            try {
+                const file = `views.${ext}`;
+                const models = handleOf(project, `models.${ext}`, 'User', 'save');
+                const base = handleOf(project, `models.${ext}`, 'Model', 'save');
+                const form = handleOf(project, `forms.${ext}`, 'BaseForm', 'save');
+                const legacy = handleOf(project, `legacy/models.${ext}`, 'User', 'save');
+                for (const marker of ['// chained', '// variable']) {
+                    const line = at(project, file, marker);
+                    assert.equal(tier(project, models, file, line), 'confirmed', marker);
+                    for (const wrong of [base, form, legacy]) assert.equal(tier(project, wrong, file, line), null, `${marker} ${wrong}`);
+                }
+                for (const marker of ['// aliased', '// namespace']) {
+                    const line = at(project, file, marker);
+                    assert.equal(tier(project, form, file, line), 'confirmed', marker);
+                    for (const wrong of [models, base, legacy]) assert.equal(tier(project, wrong, file, line), null, `${marker} ${wrong}`);
+                }
+                assert.equal(tier(project, handleOf(project, `models.${ext}`, 'Model', 'fullClean'), file,
+                    at(project, file, '// inherited')), 'confirmed');
+                for (const marker of ['// parameter', '// local', '// closure', '// value']) {
+                    const line = at(project, file, marker);
+                    for (const target of [models, form, legacy]) {
+                        const found = tier(project, target, file, line);
+                        assert.ok(found && found !== 'confirmed', `${marker} for ${target}: ${found}`);
+                    }
+                }
+                assert.deepEqual(calleesAt(project, file, 'namespace', at(project, file, '// namespace'), 'save'),
+                    { confirmed: [`forms.${ext}:BaseForm`], unverified: null });
+                assert.deepEqual(calleesAt(project, file, 'inherited', at(project, file, '// inherited'), 'fullClean'),
+                    { confirmed: [`models.${ext}:Model`], unverified: null });
+                for (const fn of ['parameter', 'local', 'value']) {
+                    const callee = calleesAt(project, file, fn, at(project, file, `// ${fn}`), 'save');
+                    assert.deepEqual(callee.confirmed, [], fn);
+                    assert.ok(callee.unverified, fn);
+                }
+            } finally { rm(project.dir); }
+        });
+    }
+
+    it('js: a reassigned module binding, a constructor that returns a value, a constructor function', () => {
+        const project = build({
+            'models.js': ['class Model { save() {} }', 'class User extends Model { save() {} }', 'module.exports = { Model, User };'],
+            'forms.js': ['class BaseForm { save() {} }', 'class User extends BaseForm {}', 'module.exports = { BaseForm, User };'],
+            'odd.js': ['const forms = require("./forms");',
+                'class Single {', '  constructor() {', '    if (Single.one) return Single.one;', '    Single.one = this;', '  }', '  save() {}', '}',
+                'class Plain {', '  constructor() {', '    this.go = () => { return 1; };', '    return this;', '  }', '  save() {}', '}',
+                'function Gadget() {}', 'Gadget.prototype.save = function () {};',
+                'module.exports = { Single, Plain, Gadget };'],
+            'views.js': ['let { User } = require("./models");', 'const forms = require("./forms");',
+                'const { Single, Plain, Gadget } = require("./odd");',
+                'function swap() {', '  User = forms.User;', '}',
+                'function rebound() {', '  new User().save(); // rebound', '}',
+                'function single() {', '  new Single().save(); // single', '}',
+                'function plain() {', '  new Plain().save(); // plain', '}',
+                'function gadget() {', '  new Gadget().save(); // gadget', '}',
+                'module.exports = { swap, rebound, single, plain, gadget };'],
+        });
+        try {
+            const rebound = at(project, 'views.js', '// rebound');
+            for (const target of [handleOf(project, 'models.js', 'User', 'save'), handleOf(project, 'forms.js', 'BaseForm', 'save')]) {
+                const found = tier(project, target, 'views.js', rebound);
+                assert.ok(found && found !== 'confirmed', `${target}: ${found}`);
+            }
+            const single = tier(project, handleOf(project, 'odd.js', 'Single', 'save'), 'views.js', at(project, 'views.js', '// single'));
+            assert.ok(single && single !== 'confirmed', single);
+            assert.equal(tier(project, handleOf(project, 'odd.js', 'Plain', 'save'), 'views.js', at(project, 'views.js', '// plain')), 'confirmed');
+            assert.equal(tier(project, handleOf(project, 'odd.js', 'Gadget', 'save'), 'views.js', at(project, 'views.js', '// gadget')), 'confirmed');
+        } finally { rm(project.dir); }
+    });
+
+    it('js: a write to a name a function declares itself is no write to the module binding', () => {
+        const project = build({
+            'a.js': ['class Local { ping() {} }',
+                'function rebound(factory) {', '  class Local {}', '  Local = factory;', '  return new Local();', '}',
+                'function parameter(Local) {', '  Local = null;', '}',
+                'function module_use() {', '  return new Local().ping(); // module', '}',
+                'let Shared = Local;', 'function writes() {', '  Shared = null;', '}'],
+        });
+        try {
+            const entry = [...project.index.files.values()][0];
+            assert.deepEqual(entry.moduleAssignedNames, ['Shared']);
+            assert.equal(tier(project, handleOf(project, 'a.js', 'Local', 'ping'), 'a.js', at(project, 'a.js', '// module')), 'confirmed');
+        } finally { rm(project.dir); }
+    });
+
+    it('ts: a type imported under another name is looked up from its own import', () => {
+        const project = build({
+            'package.json': ['{ "type": "module" }'],
+            'models.ts': JS_MODELS, 'forms.ts': JS_FORMS,
+            'views.ts': ["import type { User as Sheet } from './forms.ts';", "import { User } from './models.ts';",
+                'export function typed(sheet: Sheet): void {', '  sheet.save(); // typed', '}',
+                'export function made(): void {', '  new User().save(); // made', '}'],
+        });
+        try {
+            const typed = calleesAt(project, 'views.ts', 'typed', at(project, 'views.ts', '// typed'), 'save');
+            assert.deepEqual(typed.confirmed, ['forms.ts:BaseForm']);
+            assert.equal(tier(project, handleOf(project, 'models.ts', 'User', 'save'), 'views.ts', at(project, 'views.ts', '// typed')) === 'confirmed', false);
+            assert.equal(tier(project, handleOf(project, 'models.ts', 'User', 'save'), 'views.ts', at(project, 'views.ts', '// made')), 'confirmed');
+        } finally { rm(project.dir); }
+    });
+
+    it('a base that is computed leaves the member lookup undecided, an outside base makes it external', () => {
+        const project = build({
+            'package.json': ['{ "type": "module" }'],
+            'base.js': ['export class Base { save() {} }',
+                'export const Stamped = (Parent) => class extends Parent {};',
+                'export class Entry extends Stamped(Base) {}',
+                "import { EventEmitter } from 'node:events';",
+                'export class Bus extends EventEmitter {}'],
+            'other.js': ['export class Entry { save() {} emit() {} }'],
+            'views.js': ["import { Entry, Bus } from './base.js';",
+                'export function mixed() {', '  new Entry().save(); // mixed', '}',
+                'export function outside() {', '  new Bus().emit(); // outside', '}'],
+        });
+        try {
+            const mixed = calleesAt(project, 'views.js', 'mixed', at(project, 'views.js', '// mixed'), 'save');
+            assert.deepEqual(mixed.confirmed, []);
+            assert.ok(mixed.unverified);
+            const base = tier(project, handleOf(project, 'base.js', 'Base', 'save'), 'views.js', at(project, 'views.js', '// mixed'));
+            assert.ok(base, 'the inherited method stays visible');
+            const outside = calleesAt(project, 'views.js', 'outside', at(project, 'views.js', '// outside'), 'emit');
+            assert.deepEqual(outside, { confirmed: [], unverified: null });
+            assert.equal(tier(project, handleOf(project, 'other.js', 'Entry', 'emit'), 'views.js', at(project, 'views.js', '// outside')), null);
+        } finally { rm(project.dir); }
+    });
+
+    it('python: a package that star-imports its classes, a bare generator argument, a type-checking import beside a function import', () => {
+        const project = build({
+            'pkg/__init__.py': ['from ._models import *', 'from ._text import Text'],
+            'pkg/_models.py': ['__all__ = ["Request"]', 'class Request:', '    def send(self): return 1'],
+            'pkg/_text.py': ['class Text:', '    def append_tokens(self, tokens): return self'],
+            'other.py': ['class Request:', '    def send(self): return 2', 'class Text:', '    def append_tokens(self, tokens): return 3'],
+            'lazy.py': ['from typing import TYPE_CHECKING', 'if TYPE_CHECKING:', '    from pkg._text import Text',
+                'def build():', '    from pkg._text import Text', '    text = Text()', '    text.append_tokens([])  # lazy'],
+            'use.py': ['import pkg', 'from pkg import Text',
+                'def qualified():', '    request = pkg.Request()', '    request.send()  # qualified',
+                'def chained():', '    pkg.Request().send()  # chained',
+                'def generator(items):', '    text = Text()', '    text.append_tokens((item, None) for item in items)  # generator'],
+        });
+        try {
+            const send = handleOf(project, 'pkg/_models.py', 'Request', 'send');
+            const wrongSend = handleOf(project, 'other.py', 'Request', 'send');
+            for (const marker of ['# qualified', '# chained']) {
+                assert.equal(tier(project, send, 'use.py', at(project, 'use.py', marker)), 'confirmed', marker);
+                assert.equal(tier(project, wrongSend, 'use.py', at(project, 'use.py', marker)), null, marker);
+            }
+            const append = handleOf(project, 'pkg/_text.py', 'Text', 'append_tokens');
+            assert.equal(tier(project, append, 'use.py', at(project, 'use.py', '# generator')), 'confirmed');
+            assert.deepEqual(calleesAt(project, 'use.py', 'generator', at(project, 'use.py', '# generator'), 'append_tokens'),
+                { confirmed: ['pkg/_text.py:Text'], unverified: null });
+            assert.equal(tier(project, append, 'lazy.py', at(project, 'lazy.py', '# lazy')), 'confirmed');
+            assert.deepEqual(calleesAt(project, 'lazy.py', 'build', at(project, 'lazy.py', '# lazy'), 'append_tokens'),
+                { confirmed: ['pkg/_text.py:Text'], unverified: null });
+        } finally { rm(project.dir); }
+    });
+
+    it('js: a class constructed from an outside package is no caller of a project method', () => {
+        const project = build({
+            'package.json': ['{ "type": "module", "dependencies": { "ajv": "8.0.0" } }'],
+            'schemas.js': ['export class Schemas { getSchema() {} }'],
+            'use.js': ["import Ajv from 'ajv';", "import { Schemas } from './schemas.js';",
+                'export function outside() {', '  const ajv = new Ajv();', '  ajv.getSchema(); // outside', '}',
+                'export function inside() {', '  const schemas = new Schemas();', '  schemas.getSchema(); // inside', '}'],
+        });
+        try {
+            const target = handleOf(project, 'schemas.js', 'Schemas', 'getSchema');
+            assert.equal(tier(project, target, 'use.js', at(project, 'use.js', '// outside')), null);
+            assert.equal(tier(project, target, 'use.js', at(project, 'use.js', '// inside')), 'confirmed');
+            assert.deepEqual(calleesAt(project, 'use.js', 'outside', at(project, 'use.js', '// outside'), 'getSchema'),
+                { confirmed: [], unverified: null });
+        } finally { rm(project.dir); }
+    });
+
+    it('a rebuilt index answers as a fresh one', () => {
+        const project = build({
+            'app/__init__.py': [''], 'app/models.py': PY_MODELS, 'app/forms.py': PY_FORMS,
+            'app/views.py': ['from app.models import User', 'def chained():', '    User(a=1).save()  # chained'],
+        });
+        try {
+            const line = at(project, 'app/views.py', '# chained');
+            assert.equal(tier(project, handleOf(project, 'app/models.py', 'User', 'save'), 'app/views.py', line), 'confirmed');
+            fs.writeFileSync(path.join(project.dir, 'app/views.py'),
+                ['from app.forms import User', 'def chained():', '    User(a=1).save()  # chained'].join('\n') + '\n');
+            project.index.build(null, { quiet: true });
+            const fresh = idx(project.dir);
+            for (const index of [project.index, fresh]) {
+                const view = { ...project, index };
+                assert.equal(tier(view, handleOf(view, 'app/forms.py', 'BaseForm', 'save'), 'app/views.py', line), 'confirmed');
+                assert.equal(tier(view, handleOf(view, 'app/models.py', 'User', 'save'), 'app/views.py', line), null);
+            }
+        } finally { rm(project.dir); }
+    });
+});

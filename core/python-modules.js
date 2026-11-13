@@ -141,6 +141,12 @@ function pythonModuleScope(index, file, receiver, site, memo = new Map()) {
                 for (const child of current.namedChildren) stack.push(child);
             }
         }
+        // The name token of `module.Name`: the module root is read where
+        // the whole attribute is.
+        const { sameNode } = require('../languages/utils');
+        if (node?.parent?.type === 'attribute' && sameNode(node.parent.childForFieldName('attribute'), node)) {
+            node = node.parent;
+        }
         if (node) {
             const { referenceScope } = require('../languages/lexical-scope');
             const scopesKey = 'py-module-scopes';

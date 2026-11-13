@@ -268,6 +268,9 @@ const STRUCTURAL_TRAITS = {
     constructorArgumentNodes: { delegation: { nodeType: 'call_expression', argsField: 'arguments' } },
     functionalTypeConstruction: false,
     constructorInheritance: { order: 'single', classNodes: ['class_declaration', 'class'], headerNode: 'class_heritage' },
+    // Methods whose result a context-manager statement binds (`with X() as
+    // v` binds `X().__enter__()`), or null when the language has none.
+    contextEnterMethods: null,
     implicitBaseConstruction: null,
     // Whether a constructor delegation is spelled by a keyword (`this(..)`,
     // `super(..)`, `base(..)`) rather than by the type's name (C++
@@ -513,6 +516,7 @@ const NOMINAL_TRAITS = {
     hasConstructors: false,
     fixedConstructorName: null,
     constructorInheritance: null,
+    contextEnterMethods: null,
     implicitBaseConstruction: null,
     keywordConstructorDelegation: false,
     constructorUsesAreTypeReferences: false,
@@ -1038,6 +1042,7 @@ const LANGUAGES = {
             constructorProtocol: { initializer: '__init__', allocator: '__new__', metaclass: 'metaclass', builtinRoot: 'object',
                 functionNode: 'function_definition', classNode: 'class_definition',
                 headerField: 'superclasses', keywordNode: 'keyword_argument' },
+            contextEnterMethods: ['__enter__', '__aenter__'],
             // Call sites bind by parameter name (f(x=1)); signatures carry
             // keyword-only (`*`) and positional-only (`/`) markers (fix #281).
             keywordArguments: true,
