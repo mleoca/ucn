@@ -156,6 +156,7 @@ class ProjectIndex {
         // HOT rankings already computed for this index state, by request
         // (core/hot-summary.js); stored beside the index when dirty.
         this._hotSummaries = null;
+        this._hotSummarySavedGeneration = null;
         this.hotSummaryDirty = false;
         // Exact text-ground sets are likewise immutable for one built index.
         // The cache is cleared at every build and bounded in account.js.
@@ -1209,6 +1210,7 @@ class ProjectIndex {
         const existing = this.files.get(filePath);
         if (!existing) return;
 
+        require('./hot-summary').reset(this);
         this._implicitConversionOwners = null;
         this._constructionAliases = null;
         this._cppScope = null;

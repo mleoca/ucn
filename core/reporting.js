@@ -145,7 +145,7 @@ function getStats(index, options = {}) {
             top, productionCallsOnly: options.productionCallsOnly, maxRefine, workBudget,
             file: options.file, in: options.in,
             exclude: Array.isArray(options.exclude)
-                ? options.exclude.filter(Boolean)
+                ? options.exclude
                 : (options.exclude
                     ? String(options.exclude).split(',').map(s => s.trim()).filter(Boolean)
                     : []),

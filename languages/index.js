@@ -858,7 +858,7 @@ const JS_PROTOCOL_MEMBERS = protocolMembers([
     { pattern: /^\[Symbol\.[A-Za-z]+\]$/, member: true },
 ]);
 const JS_REFLECTION_API = {
-    hintPattern: /\bReflect\s*\.\s*\w|\beval\s*\(|\bnew\s+Function\b/,
+    hintPattern: /\b(?:Reflect|eval|Function)\b/,
     functions: [{ callee: /^(?:globalThis\.)?Reflect\.(?:get|set|has|deleteProperty)$/,
         nameArg: 1, receiverArg: 0, qualified: true }],
     computedMembers: true,
@@ -1129,7 +1129,7 @@ const LANGUAGES = {
                     owners: ['Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag', 'ReprEnum'] },
             ]),
             reflectionApi: {
-                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval|exec)\s*\(|\b(?:globals|vars)\s*\(\s*\)\s*\[/,
+                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval|exec|globals|vars)\b/,
                 functions: [{ callee: /^(?:getattr|setattr|hasattr|delattr)$/, nameArg: 1, receiverArg: 0 }],
                 namespaceLookups: { calls: /^eval$/, subscriptOf: /^(?:globals|vars)\(\)$/ },
                 // `exec(code)` runs statements; it names nothing a lookup

@@ -152,6 +152,13 @@ function get(index, key) {
     ensure(index);
     const summary = index._hotSummaries.get(key);
     if (summary === undefined) return undefined;
+    // A caller may edit source between the surface's freshness check and
+    // this query, or use a live index directly. Native caller queries refresh
+    // those records; a kept verdict must not bypass that existing path.
+    if (!sourceMatchesIndex(index)) {
+        reset(index);
+        return undefined;
+    }
     // Most recently asked last: the bound drops the oldest.
     index._hotSummaries.delete(key);
     index._hotSummaries.set(key, summary);
@@ -179,6 +186,9 @@ function reset(index) {
     // The generation in memory no longer describes the index, so its stored
     // summaries are not read back either.
     index._hotSummariesGeneration = index._callsGenerationKey || null;
+    // A direct indexFile/removeFileSymbols mutation leaves the calls-shard
+    // generation in place. It no longer identifies the state ranked here.
+    index._hotSummarySavedGeneration = null;
     index.hotSummaryDirty = false;
 }
 
@@ -186,7 +196,15 @@ function reset(index) {
 function forget(index) {
     index._hotSummaries = null;
     index._hotSummariesGeneration = undefined;
+    index._hotSummarySavedGeneration = index._callsGenerationKey || null;
     index.hotSummaryDirty = false;
+}
+
+/** A completed index save establishes which state a stored answer may name. */
+function adoptSavedGeneration(index) {
+    const generation = index._callsGenerationKey || null;
+    index._hotSummarySavedGeneration = generation;
+    index._hotSummariesGeneration = generation;
 }
 
 /**
@@ -195,7 +213,7 @@ function forget(index) {
  */
 function save(index, cachePath) {
     const generation = index._callsGenerationKey || null;
-    if (!generation || index.isProvenanceFactIndex) return null;
+    if (!generation || index._hotSummarySavedGeneration !== generation || index.isProvenanceFactIndex) return null;
     // The file is replaced, so what it holds for this generation comes first.
     ensure(index);
     const target = path.join(cacheDirOf(index, cachePath), SUMMARY_FILE);
@@ -220,4 +238,4 @@ function save(index, cachePath) {
     return target;
 }
 
-module.exports = { SUMMARY_FILE, keyOf, engineStamp, ensure, get, put, reset, forget, save };
+module.exports = { SUMMARY_FILE, keyOf, engineStamp, ensure, get, put, reset, forget, adoptSavedGeneration, save };

@@ -715,3 +715,136 @@ describe('repo through MCP stores the ranking for the next session', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #500 review: HOT answers follow the current and saved index states', () => {
+    it('an indexFile mutation cannot publish a ranking under the previous saved generation', () => {
+        const source = 'function helper() {}\nfunction run() {\n  helper();\n}\nmodule.exports = { helper, run };\n';
+        const dir = tmp({ 'package.json': '{}', 'lib.js': source });
+        const cacheDir = tmp({});
+        try {
+            const cachePath = path.join(cacheDir, 'index.json');
+            const index = idx(dir);
+            index.saveCache(cachePath);
+            const oldAnswer = index.getStats({ hot: true }).hot;
+            index.saveHotSummaries(cachePath);
+            const oldGeneration = index._callsGenerationKey;
+            const oldStored = fs.readFileSync(path.join(cacheDir, hotSummary.SUMMARY_FILE), 'utf8');
+            const file = path.join(dir, 'lib.js');
+            const edited = source.replace('  helper();', '  helper();\n  helper();\n  helper();');
+            fs.writeFileSync(file, edited);
+            index.indexFile(file);
+            const changed = index.getStats({ hot: true }).hot;
+            assert.strictEqual(changed.items[0].callCount, 3);
+            assert.strictEqual(index._callsGenerationKey, oldGeneration, 'calls shards keep their own generation');
+            assert.strictEqual(index.saveHotSummaries(cachePath), null, 'the changed index has not been saved');
+            assert.strictEqual(fs.readFileSync(path.join(cacheDir, hotSummary.SUMMARY_FILE), 'utf8'), oldStored);
+
+            fs.writeFileSync(file, source);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache(cachePath));
+            assert.strictEqual(loaded.isCacheStale(), false);
+            assert.deepStrictEqual(loaded.getStats({ hot: true }).hot, oldAnswer);
+
+            fs.writeFileSync(file, edited);
+            index.saveCache(cachePath);
+            const saved = new ProjectIndex(dir);
+            assert.ok(saved.loadCache(cachePath));
+            let fromDisk;
+            assert.strictEqual(countingCallerQueries(() => { fromDisk = saved.getStats({ hot: true }).hot; }), 0);
+            assert.deepStrictEqual(fromDisk, changed, 'a completed save adopts the changed ranking');
+        } finally { rm(dir); rm(cacheDir); }
+    });
+
+    it('removing a file clears the ranking and prevents publication until the index is saved', () => {
+        const dir = tmp(HOT_PROJECT);
+        const cacheDir = tmp({});
+        try {
+            const index = idx(dir);
+            const cachePath = path.join(cacheDir, 'index.json');
+            index.saveCache(cachePath);
+            assert.ok(index.getStats({ hot: true }).hot.items.length > 0);
+            const file = path.join(dir, 'app.js');
+            index.removeFileSymbols(file);
+            index.files.delete(file);
+            assert.deepStrictEqual(index.getStats({ hot: true }).hot.items, []);
+            assert.strictEqual(index.saveHotSummaries(cachePath), null);
+        } finally { rm(dir); rm(cacheDir); }
+    });
+
+    it('a cached answer never bypasses an indexed source edit', () => {
+        const dir = tmp(HOT_PROJECT);
+        try {
+            const index = idx(dir);
+            const control = idx(dir);
+            index.getStats({ hot: true });
+            control.getStats({ hot: true });
+            hotSummary.reset(control);
+            const file = path.join(dir, 'app.js');
+            fs.writeFileSync(file, HOT_PROJECT['app.js'].replaceAll('helper(', 'other('));
+            let changed;
+            assert.ok(countingCallerQueries(() => { changed = index.getStats({ hot: true }).hot; }) > 0);
+            assert.deepStrictEqual(changed, control.getStats({ hot: true }).hot,
+                'same indexed symbols and call records, existing uncached caller refresh');
+            assert.strictEqual(index.hotSummaryDirty, false, 'a ranking over edited source is not retained');
+        } finally { rm(dir); }
+    });
+
+    it('the cache key preserves an exclude array that changes the scope', () => {
+        const dir = tmp({
+            'package.json': '{}',
+            'src/_lib.js': 'function helper() {}\nfunction run() { helper(); }\nmodule.exports = { helper, run };\n',
+        });
+        try {
+            const index = idx(dir);
+            const plain = execute(index, 'repo', { sections: 'stats', hot: true, exclude: [] });
+            assert.strictEqual(plain.result.stats.hot.items.length, 1);
+            const scoped = execute(index, 'repo', { sections: 'stats', hot: true, exclude: [''] });
+            assert.strictEqual(scoped.result.stats.files, 0);
+            assert.deepStrictEqual(scoped.result.stats.hot.items, []);
+            hotSummary.reset(index);
+            assert.deepStrictEqual(scoped.result.stats.hot,
+                execute(index, 'repo', { sections: 'stats', hot: true, exclude: [''] }).result.stats.hot);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #500 review: reflection uses follow AST callees and package bindings', () => {
+    it('nested parentheses do not exceed an arbitrary candidate-location depth', () => {
+        const wrap = value => '('.repeat(12) + value + ')'.repeat(12);
+        for (const [language, code, expected] of [
+            ['javascript', `function f(c) { return ${wrap('eval')}(c); }`, { reflectionUses: 0, evalUses: 1 }],
+            ['python', `def f(c):\n    return ${wrap('eval')}(c)\n`, { reflectionUses: 0, evalUses: 1 }],
+            ['go', `package p\nimport r "reflect"\nfunc f(x any) { _ = ${wrap('r.ValueOf')}(x) }\n`, { reflectionUses: 1, evalUses: 0 }],
+        ]) {
+            const parser = getParser(language);
+            const ir = getLanguageAdapter(language).analyze(code, parser, `uses.${language}`);
+            const tree = safeParse(parser, code);
+            assert.strictEqual(tree.rootNode.hasError, false, language);
+            const located = reflectionFactsInTree(tree, language, code, { imports: ir.imports });
+            assert.deepStrictEqual({ reflectionUses: located.reflectionUses, evalUses: located.evalUses }, expected, language);
+            assert.deepStrictEqual(located, reflectionFactsInTree(tree, language, null, { imports: ir.imports }), language);
+        }
+    });
+    const cases = [
+        ['javascript', 'function f(o,k,c) { (eval)(c); eval /* c */ (c); Reflect /* c */ .get(o,k); new /* c */ Function(c); new (Function)(c); }', 1, 4],
+        ['typescript', 'function f(o:any,k:string,c:string) { (eval)(c); eval /* c */ (c); Reflect /* c */ .get(o,k); new /* c */ Function(c); new (Function)(c); }', 1, 4],
+        ['tsx', 'function f(o:any,k:string,c:string) { (eval)(c); eval /* c */ (c); Reflect /* c */ .get(o,k); new /* c */ Function(c); new (Function)(c); }', 1, 4],
+        ['python', 'def f(o,k,c):\n    (eval)(c)\n    (exec)(c)\n    (getattr)(o,k)\n', 1, 2],
+        ['go', 'package p\nimport 反射 "reflect"\nfunc f(x any) { _ = 反射.ValueOf(x) }\n', 1, 0],
+        ['go', 'package p\nimport réfl "reflect"\nfunc f(x any) { _ = réfl /* c */ .ValueOf(x); _ = (réfl.TypeOf)(x); _ = réfl.TypeFor[int]() }\n', 3, 0],
+        ['go', 'package p\nimport r "reflect"\nvar t = r.TypeOf(0)\ntype Local struct{}\nfunc (Local) ValueOf(x any) int { return 1 }\nfunc f(r Local, x any) { _ = r.ValueOf(x) }\n', 1, 0],
+        ['go', 'package p\nimport r "reflect"\ntype Local struct{}\nfunc (Local) ValueOf(x any) int { return 1 }\nfunc f(x any) { _ = r.TypeOf(x); { r := Local{}; _ = r.ValueOf(x) }; _ = r.ValueOf(x) }\n', 2, 0],
+    ];
+    for (const [number, [language, code, reflectionUses, evalUses]] of cases.entries()) {
+        it(`${language} form ${number + 1}: count and located inventory equal the full walk`, () => {
+            const parser = getParser(language);
+            const ir = getLanguageAdapter(language).analyze(code, parser, `uses.${language}`);
+            const tree = safeParse(parser, code);
+            assert.strictEqual(tree.rootNode.hasError, false);
+            assert.deepStrictEqual({ reflectionUses: ir.reflectionUses || 0, evalUses: ir.evalUses || 0 },
+                { reflectionUses, evalUses });
+            assert.deepStrictEqual(reflectionFactsInTree(tree, language, code, { imports: ir.imports }),
+                reflectionFactsInTree(tree, language, null, { imports: ir.imports }));
+        });
+    }
+});

@@ -730,7 +730,30 @@ const MEMBER_CALLEE_FIELDS = {
     member_expression: ['property', 'object'], // JS/TS
     member_access_expression: ['name', 'expression'], // C#
     attribute: ['attribute', 'object'], // Python
+    field_access: ['field', 'object'], // Java qualified namespace
 };
+
+/** Parentheses change neither a callee nor a namespace qualifier. */
+function _calleeNode(node) {
+    while (node?.type === 'parenthesized_expression') {
+        node = node.namedChildren.find(child => child.type !== 'comment');
+    }
+    return node;
+}
+
+/** A written identifier/member path, from fields rather than intervening text. */
+function _calleeName(node) {
+    node = _calleeNode(node);
+    if (!node) return '';
+    if (['identifier', 'property_identifier', 'field_identifier', 'package_identifier'].includes(node.type)) {
+        return node.text;
+    }
+    const fields = MEMBER_CALLEE_FIELDS[node.type];
+    if (!fields) return '';
+    const owner = _calleeName(node.childForFieldName(fields[1]));
+    const member = _calleeName(node.childForFieldName(fields[0]));
+    return owner && member ? `${owner}.${member}` : '';
+}
 
 /** Callee text, member name and receiver of a call node (no arguments). */
 function _calleeParts(node, wantMembers, wantQualified) {
@@ -739,7 +762,7 @@ function _calleeParts(node, wantMembers, wantQualified) {
         const name = node.childForFieldName('name')?.text || '';
         return { calleeText: name, member: name, object: node.childForFieldName('object') };
     }
-    const fn = node.childForFieldName('function') || node.namedChild(0);
+    const fn = _calleeNode(node.childForFieldName('function') || node.namedChild(0));
     if (!fn) return null;
     if (fn.type === 'identifier') {
         return { calleeText: fn.text || '', member: fn.text, object: null, bare: true };
@@ -764,7 +787,6 @@ function _callArgs(node) {
 
 // Construction nodes: `new Function(..)` builds a callable from a string.
 const NEW_NODE_TYPES = ['new_expression', 'object_creation_expression'];
-const QUALIFIED_CALLEE = /^([A-Za-z_$][\w$]*)\.[\w$]+(?:\[.*\])?$/s;
 
 /**
  * Local names a file's imports bind to the modules of `{ package }` rules:
@@ -779,7 +801,9 @@ function _packageQualifiers(rules, imports) {
     for (const item of imports || []) {
         if (!item || !modules.has(item.module)) continue;
         for (const name of item.names || []) {
-            if (name !== '_' && /^[A-Za-z_$][\w$]*$/.test(name)) qualifiers.set(name, item.module);
+            // The parser already supplies valid import names, including
+            // Unicode identifiers. Dot and blank imports bind no qualifier.
+            if (name && name !== '_' && name !== '.') qualifiers.set(name, item.module);
         }
     }
     return qualifiers;
@@ -840,6 +864,7 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
     const codeExecution = api.codeExecution || [];
     const constructs = codeExecution.filter(rule => rule.construct);
     const qualifiers = _packageQualifiers([...unnamed, ...codeExecution], options.imports);
+    const scopeMemo = new Map();
     // Candidate nodes are located natively: reflective calls from the
     // vocabulary's spelling positions (descendantForIndex, walking up to the
     // enclosing call), computed member keys by node type. No JS-side walk of
@@ -848,8 +873,8 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
     if (api.hintPattern) hintSources.push(api.hintPattern.source);
     // A package's qualifier is the file's own choice (`r "reflect"`).
     if (qualifiers.size > 0) {
-        hintSources.push(`\\b(?:${[...qualifiers.keys()].map(name =>
-            name.replace(/[$]/g, '\\$&')).join('|')})\\s*\\.`);
+        const { literalNameRegex } = require('./shared');
+        hintSources.push(...[...qualifiers.keys()].map(name => literalNameRegex(name).source));
     }
     const useHints = code != null && hintSources.length > 0;
     const callTypes = constructs.length > 0 ? [...CALL_NODE_TYPES, ...NEW_NODE_TYPES] : CALL_NODE_TYPES;
@@ -899,7 +924,7 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         if (NEW_NODE_TYPES.includes(node.type)) {
             // `new Function(code)`: the constructed class decides.
             const constructed = node.childForFieldName('constructor') || node.childForFieldName('type');
-            const text = String(constructed?.text || '').replace(/\s+/g, '');
+            const text = _calleeName(constructed);
             if (constructs.some(rule => rule.construct.test(text))) facts.evalUses++;
             return;
         }
@@ -907,7 +932,7 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         if (!call) return;
         // Match on the callee spelling first; arguments are read only for a
         // vocabulary hit (most calls in a hinted file are unrelated).
-        const calleeText = () => (call.calleeText ??= call.fn.text || '');
+        const calleeText = () => (call.calleeText ??= _calleeName(call.fn));
         for (const rule of api.functions || []) {
             if (!rule.callee.test(calleeText())) continue;
             const args = _callArgs(node);
@@ -944,14 +969,18 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         // `reflect.ValueOf`); a bare callee is its own text.
         let written = null;
         const writtenCallee = () => (written ??= (node.type === 'method_invocation'
-            ? (call.object ? `${call.object.text}.${call.member}` : call.member || '')
-            : calleeText()).replace(/\s+/g, ''));
+            ? (call.object ? `${_calleeName(call.object)}.${call.member}` : call.member || '')
+            : calleeText()));
         const matches = rule => {
             if (rule.construct) return false;
             if (rule.callee) return rule.callee.test(writtenCallee());
             if (rule.package) {
-                const qualified = QUALIFIED_CALLEE.exec(writtenCallee());
-                return !!qualified && qualifiers.get(qualified[1]) === rule.package;
+                const qualifier = _calleeNode(call.object);
+                if (qualifier?.type !== 'identifier' || qualifiers.get(qualifier.text) !== rule.package) return false;
+                // The file import owns the spelling only outside scopes
+                // that bind another value to it (parameters, locals, etc.).
+                return require('../languages/lexical-scope').referenceScope(
+                    qualifier, language, scopeMemo) === 'module';
             }
             return false;
         };
@@ -970,12 +999,12 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
                 seen.add(key);
                 return true;
             };
-            const re = new RegExp(hintSources.join('|'), 'g');
+            const re = new RegExp(hintSources.join('|'), 'gu');
             let m;
             while ((m = re.exec(code)) !== null) {
                 if (m[0] === '') { re.lastIndex++; continue; }
                 let node = tree.rootNode.descendantForIndex(m.index);
-                for (let i = 0; node && i < 6; i++, node = node.parent) {
+                for (; node; node = node.parent) {
                     if (!callTypes.includes(node.type)) continue;
                     if (once('c', node)) candidates.push(node);
                     // `globals()[name]`: the lookup is the enclosing subscript.

@@ -1013,7 +1013,9 @@ function clearAllCaches() {
 // language's reflection and code-execution vocabulary counted in the tree at
 // index time (`repo` and the completeness footer counted them by reading
 // every file's text on each query).
-const CACHE_FORMAT_VERSION = 334;
+// v335: reflection/eval facts follow commented and parenthesized callees;
+// package reflection qualifiers retain Unicode names and lexical ownership.
+const CACHE_FORMAT_VERSION = 335;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {
@@ -1339,7 +1341,6 @@ function saveCache(index, cachePath) {
     fs.writeFileSync(tmpFile, JSON.stringify(cacheData));
     fs.renameSync(tmpFile, cacheFile);
     index._cacheDir = path.dirname(cacheFile);
-    try { hotSummary.save(index, cacheFile); } catch (_) { /* the ranking is computed again */ }
 
     // MED-1 (Round 5): clear the reachabilityDirty flag now that the set is
     // safely persisted. The cli/index.js cache-save guard checks this flag
@@ -1410,6 +1411,11 @@ function saveCache(index, cachePath) {
         }
     }
 
+    // A failed save must not authorize a summary for a state that was never
+    // completely written. In particular, direct indexFile mutations cannot
+    // publish against the old calls generation while only in memory.
+    hotSummary.adoptSavedGeneration(index);
+    try { hotSummary.save(index, cacheFile); } catch (_) { /* the ranking is computed again */ }
     if (!cachePath) pruneUserCache();
     return cacheFile;
 }
