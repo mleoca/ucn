@@ -112,11 +112,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Build metadata does not change release precedence or stability.
+          release_version="${GITHUB_REF_NAME#v}"
+          release_core="${release_version%%+*}"
+          prerelease=false
+          if [[ "$release_core" == *-* ]]; then prerelease=true; fi
           # A rerun of this job finds the release it made and rewrites it.
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" --prerelease="$prerelease"
           else
-            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" --prerelease="$prerelease"
           fi
 
   publish-mcp:

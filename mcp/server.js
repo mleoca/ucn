@@ -127,13 +127,14 @@ const server = new StdioMcpServer({
 // TOOL HELPERS
 // ============================================================================
 
-function toolResult(text, command, maxChars, suffixNote, params = {}) {
+function toolResult(text, command, maxChars, suffixNote, params = {}, peerText) {
     const suffix = suffixNote || '';
     const budget = applyOutputBudget(text + suffix, {
         command,
         maxChars,
         surface: 'mcp',
         params,
+        ...(typeof peerText === 'string' && { peerText: peerText + suffix }),
     });
     // The text block is the ONLY payload channel. Truncation facts live in the
     // text itself (the OUTPUT TRUNCATED notice carries full size, limit, and
@@ -384,24 +385,11 @@ server.registerTool(
             : '';
 
         // Wrap toolResult to auto-inject command + maxChars + stripping note
-        const tr = (text) => toolResult(text, command, maxChars, ep.lines ? listingNote : strippedNote, ep);
+        const tr = (text, peerText) => toolResult(text, command, maxChars, ep.lines ? listingNote : strippedNote, ep, peerText);
         // Wrap toolError to include stripping note on error paths too
         const te = strippedNote
             ? (msg) => toolError(msg + strippedNote)
             : toolError;
-        // Translate CLI flag syntax in execute-layer notes to MCP param
-        // syntax — the deadcode exported/decorated hints were already
-        // param-styled, but limit/depth/truncation notes leaked
-        // '--limit N' / '--max-files N' / '--all' at this surface.
-        const mn = (note) => note && note
-            .replace(/--limit N\b/g, 'limit=<n>')
-            .replace(/--max-files N\b/g, 'max_files=<n>')
-            .replace(/--depth=N\b/g, 'depth=<n>')
-            .replace(/--detailed\b/g, 'detailed=true')
-            .replace(/--all\b/g, 'all=true')
-            .replace(/--expand-unverified\b/g, 'expand_unverified=true')
-            .replace(/--(\w[\w-]*)/g, (_m, f) => f.replace(/-/g, '_'));
-
         let index = null; // Track for post-command cache save
         try {
             // Public v5 has one MCP dispatch path. The canonical registry,
@@ -452,7 +440,6 @@ server.registerTool(
 
             const presentationExecution = {
                 ...execution,
-                note: mn(execution.note),
                 surface: 'mcp',
             };
             return tr(output.formatPublicText(
@@ -460,6 +447,11 @@ server.registerTool(
                 execution.result,
                 ep,
                 presentationExecution,
+            ), ep.lines || ep.raw ? undefined : output.formatPublicText(
+                canonicalCommand,
+                execution.result,
+                ep,
+                { ...execution, surface: 'cli' },
             ));
 
         } catch (e) {

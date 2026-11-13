@@ -166,7 +166,7 @@ describe('release shell contracts', () => {
                 const rows = records(full.stdout);
                 assert.ok(rows.length >= 40, `${label}: ${rows.length} rows`);
                 const comments = records(full.stderr);
-                const fullChars = [...rows, ...comments].join('\n').length;
+                const fullChars = full.stdout.length + full.stderr.length;
 
                 // A budget the whole listing fits in changes nothing.
                 const roomy = run(dir, ...args, `--max-chars=${fullChars}`);
@@ -186,9 +186,11 @@ describe('release shell contracts', () => {
                     assert.equal(said.at(-1),
                         `# truncated: ${rows.length - kept.length} of ${rows.length} rows omitted; raise --max-chars or omit it`,
                         `${label} at ${budget}`);
-                    assert.ok([...kept, ...said].join('\n').length <= budget, `${label} at ${budget}: over budget`);
+                    assert.ok(cut.stdout.length + cut.stderr.length <= budget, `${label} at ${budget}: over budget`);
                     // The next row would not have fitted.
-                    assert.ok([...rows.slice(0, kept.length + 1), ...said].join('\n').length > budget,
+                    const nextSaid = [...comments,
+                        `# truncated: ${rows.length - kept.length - 1} of ${rows.length} rows omitted; raise --max-chars or omit it`];
+                    assert.ok([...rows.slice(0, kept.length + 1), ...nextSaid].join('\n').length + 1 > budget,
                         `${label} at ${budget}: a row that fits was left out`);
                 }
 
@@ -260,6 +262,182 @@ describe('release shell contracts', () => {
             });
             assert.equal(status, 0, stderr);
             assert.doesNotMatch(stderr, /EPIPE|Unhandled/);
+        } finally { rm(dir); }
+    });
+});
+
+
+describe('fix #499: budgeted output keeps its accounting and semantic lines', () => {
+    const { applyOutputBudget } = require('../core/output-budget');
+    const { normalizeSurfaceGuidance } = require('./agent-public-surface-benchmark');
+    it('withholds incomplete line accounting across tiny budgets and keeps ordered whole rows otherwise', () => {
+        const shapes = [
+            ['a.js:1:target()', '# ACCOUNT: ' + 'x'.repeat(220), '# CONTRACT: degraded'],
+            ['# ACCOUNT: ' + 'x'.repeat(120), '# CONTRACT: complete'],
+            ['a.js:1:' + '𐐀'.repeat(1000), '', '# ACCOUNT: all', '# CONTRACT: complete'],
+            ...[1, 10, 40].map(count => [...Array.from({ length: count }, (_, i) => `a.js:${i + 1}:target(${i})`),
+                '# ACCOUNT: first target', '# CONTRACT: first complete', '# ACCOUNT: second target', '# CONTRACT: second complete']),
+        ];
+        for (const lines of shapes) {
+            const text = lines.join('\n');
+            const accounts = lines.filter(line => line.startsWith('# '));
+            const rows = lines.filter(line => line && !line.startsWith('# '));
+            for (const limit of [1, 20, 70, 100, 200, 300, 500, 1200]) {
+                const result = applyOutputBudget(text, { command: 'show', maxChars: limit, surface: 'mcp', params: { lines: true } });
+                assert.ok(result.text.length <= limit);
+                const shown = result.text.split('\n').filter(line => line && !line.startsWith('# '));
+                if (accounts.some(line => !result.text.split('\n').includes(line))) {
+                    assert.equal(result.contractMetadataComplete, false);
+                    assert.ok(result.text === '' || /withheld/.test(result.text), result.text);
+                    assert.deepEqual(shown, []);
+                } else {
+                    assert.deepEqual(shown, rows.slice(0, shown.length));
+                    if (result.truncated) assert.match(result.text, new RegExp(`# truncated: ${rows.length - shown.length} of ${rows.length} rows omitted`));
+                }
+            }
+        }
+    });
+
+    it('pairs native presentation costs while checking actual full-size and hard-limit facts independently', () => {
+        const dir = path.join(__dirname, 'fixtures', 'agent-benchmark');
+        const index = idx(dir);
+        const params = { sections: 'summary,health', deep: true, exclude: 'tests' };
+        const execution = execute(index, 'repo', params);
+        assert.equal(execution.ok, true);
+        const cliText = formatPublicText('repo', execution.result, params, { ...execution, surface: 'cli' });
+        const mcpText = formatPublicText('repo', execution.result, params, { ...execution, surface: 'mcp' });
+        for (const limit of [500, 800, 1200, 2000, 3000, 4000]) {
+            const cli = applyOutputBudget(cliText, { command: 'repo', maxChars: limit, surface: 'cli', params, trailingChars: 1, peerText: mcpText });
+            const mcp = applyOutputBudget(mcpText, { command: 'repo', maxChars: limit, surface: 'mcp', params, peerText: cliText });
+            assert.ok(cli.text.length + 1 <= limit);
+            assert.ok(mcp.text.length <= limit);
+            assert.equal(cli.fullChars, cliText.length);
+            assert.equal(mcp.fullChars, mcpText.length);
+            for (const [result, full] of [[cli, cliText], [mcp, mcpText]]) {
+                const total = result.text.match(/OUTPUT TRUNCATED: (\d+) chars total/);
+                if (total) assert.equal(Number(total[1]), full.length);
+            }
+            assert.equal(normalizeSurfaceGuidance(cli.text.trimEnd()), normalizeSurfaceGuidance(mcp.text.trimEnd()), `budget ${limit}`);
+        }
+        const semantic = 'ACCOUNT: 5 confirmed\nCONTRACT: complete\nfile.js:8:call()\n# truncated: 2 of 5 rows omitted; raise --max-chars or omit it\n... OUTPUT TRUNCATED: 4000 chars total; hard limit 500. Use --max-chars=N.';
+        for (const mutated of [semantic.replace('5 confirmed', '4 confirmed'), semantic.replace('complete', 'degraded'),
+            semantic.replace('file.js:8:call()\n', ''), semantic.replace('2 of 5', '3 of 5'), semantic.replace('hard limit 500', 'hard limit 501')]) {
+            assert.notEqual(normalizeSurfaceGuidance(mutated), normalizeSurfaceGuidance(semantic));
+        }
+    });
+
+    it('paired withheld notices reserve full-size digit widths and keep identical trust lines', () => {
+        for (const count of [2, 9, 10, 99, 100]) {
+            const trust = [...Array.from({ length: count - 1 }, (_, i) => `ACCOUNT: t${i}`), 'CONTRACT: ' + 'x'.repeat(800)];
+            const tail = '\n' + trust.join('\n');
+            for (const boundary of [1000, 10000]) {
+                if (tail.length + 6 > boundary - 1) continue;
+                const smaller = 'Next: ' + 'a'.repeat(boundary - 1 - tail.length - 6) + tail;
+                const larger = 'Next: b' + smaller.slice(6);
+                for (const [cliText, mcpText] of [[smaller, larger], [larger, smaller]]) {
+                    for (const limit of [...Array.from({ length: 160 }, (_, i) => i + 1), 199, 200, 299, 300, 399, 400, 499, 500]) {
+                        const cli = applyOutputBudget(cliText, { command: 'show', maxChars: limit, surface: 'cli', trailingChars: 1, peerText: mcpText });
+                        const mcp = applyOutputBudget(mcpText, { command: 'show', maxChars: limit, surface: 'mcp', peerText: cliText });
+                        const label = `${cliText.length}/${mcpText.length} chars, ${count} trust lines, budget ${limit}`;
+                        assert.deepEqual(cli.contractMetadata, mcp.contractMetadata, label);
+                        assert.equal(cli.contractMetadataComplete, mcp.contractMetadataComplete, label);
+                        assert.equal(cli.text.match(/(\d+ of \d+) trust line/)?.[1], mcp.text.match(/(\d+ of \d+) trust line/)?.[1], label);
+                        assert.ok(cli.text.length + 1 <= limit, label);
+                        assert.ok(mcp.text.length <= limit, label);
+                        assert.equal(cli.fullChars, cliText.length);
+                        assert.equal(mcp.fullChars, mcpText.length);
+                    }
+                }
+            }
+        }
+    });
+
+    it('real MCP caller listings explicitly withhold at 100 and 200 chars', async () => {
+        const { McpClient } = require('./helpers');
+        const client = new McpClient();
+        try {
+            await client.start(); await client.initialize();
+            for (const max_chars of [100, 200]) {
+                const result = await client.callTool({ command: 'show', project_dir: path.join(__dirname, 'fixtures', 'agent-benchmark'),
+                    name: 'processCheckout', lines: true, max_chars });
+                assert.equal(result.isError, false);
+                assert.ok(result.text.length <= max_chars);
+                assert.match(result.text, /Answer withheld/);
+            }
+        } finally { client.stop(); }
+    });
+});
+
+
+describe('fix #499: CLI shell budgets count the emitted newline', () => {
+    it('interactive raw extraction prints its mandatory note and refuses a budget that cannot carry it', () => {
+        const dir = tmp({ 'lib.js': 'function target() {\n  const value = 1;\n  return value;\n}\n' });
+        try {
+            const args = ['source', 'target', '--raw', '--max-lines=2'];
+            const full = run(dir, ...args);
+            const repl = command => spawnSync(process.execPath, [cli, dir, '--interactive'], {
+                input: command + '\nquit\n', encoding: 'utf8',
+            });
+            const shown = repl(args.join(' '));
+            assert.equal(shown.status, 0, shown.stderr);
+            assert.ok(shown.stdout.includes(full.stdout + full.stderr), shown.stdout);
+            assert.match(shown.stdout, /# Source truncated:[^\n]+\nucn> Goodbye!/);
+            const refused = repl(args.join(' ') + ` --max-chars=${full.stdout.length}\nfind target`);
+            assert.doesNotMatch(refused.stdout, /function target\(/);
+            assert.match(refused.stdout + refused.stderr, /exceeds --max-chars/);
+            assert.doesNotMatch(refused.stdout + refused.stderr, /Internal error/);
+            assert.match(refused.stdout, /Found 1 match/);
+            const exact = repl(args.join(' ') + ` --max-chars=${full.stdout.length + full.stderr.length}`);
+            assert.ok(exact.stdout.includes(full.stdout + full.stderr), exact.stdout);
+        } finally { rm(dir); }
+    });
+
+    it('counts raw extraction notes before emitting any source', () => {
+        const dir = tmp({ 'lib.js': 'function target() {\n  const value = 1;\n  return value;\n}\n' });
+        try {
+            const args = ['source', 'target', '--raw', '--max-lines=2'];
+            const full = run(dir, ...args);
+            assert.equal(full.status, 0, full.stderr);
+            assert.match(full.stderr, /Source truncated/);
+            const total = full.stdout.length + full.stderr.length;
+            for (const limit of [full.stdout.length - 1, full.stdout.length, total - 1, total, total + 1]) {
+                const result = run(dir, ...args, `--max-chars=${limit}`);
+                if (limit < total) {
+                    assert.equal(result.status, 2, `${limit}: ${result.stdout}`);
+                    assert.equal(result.stdout, '');
+                    assert.match(result.stderr, /exceeds --max-chars/);
+                } else {
+                    assert.equal(result.status, 0, result.stderr);
+                    assert.equal(result.stdout, full.stdout);
+                    assert.equal(result.stderr, full.stderr);
+                    assert.ok(result.stdout.length + result.stderr.length <= limit);
+                }
+            }
+        } finally { rm(dir); }
+    });
+
+    it('keeps actual stdout and accounting stderr within exact-fit row budgets', () => {
+        const dir = tmp({ 'lib.js': 'function target() {}\n' + Array.from({ length: 20 }, (_, i) => `function c${i}() { target(); }`).join('\n') });
+        try {
+            const full = run(dir, 'show', 'target', '--lines');
+            const total = full.stdout.length + full.stderr.length;
+            for (const limit of [total - 1, total, total + 1, 300, 301]) {
+                const result = run(dir, 'show', 'target', '--lines', `--max-chars=${limit}`);
+                if (result.status === 0) assert.ok(result.stdout.length + result.stderr.length <= limit, `${limit}: ${result.stdout.length + result.stderr.length}`);
+                else assert.equal(result.status, 2, result.stderr);
+            }
+            const source = run(dir, 'source', 'target', '--raw');
+            for (const limit of [source.stdout.length - 1, source.stdout.length, source.stdout.length + 1]) {
+                const result = run(dir, 'source', 'target', '--raw', `--max-chars=${limit}`);
+                if (limit < source.stdout.length) {
+                    assert.equal(result.status, 2);
+                    assert.equal(result.stdout, '');
+                } else {
+                    assert.equal(result.status, 0, result.stderr);
+                    assert.equal(result.stdout, source.stdout);
+                    assert.ok(result.stdout.length <= limit);
+                }
+            }
         } finally { rm(dir); }
     });
 });

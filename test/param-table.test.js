@@ -758,12 +758,13 @@ describe('parameter table: the engine takes the table\'s values and applies its 
             assert.deepEqual(kept, rows.slice(0, kept.length));
             assert.ok(cut.text.endsWith(`# truncated: ${rows.length - kept.length} of ${rows.length} rows omitted; raise max_chars or narrow the query`), cut.text.slice(-200));
             assert.doesNotMatch(cut.text, /OUTPUT TRUNCATED/);
-            // A budget no row fits in still answers as a listing.
+            // When even the accounting does not fit, no partial listing is
+            // presented as complete.
             const none = await client.callTool({ command: 'search', project_dir: dir, term: 'needle', lines: true, max_chars: 120 });
             assert.equal(none.isError, false, none.text);
             assert.ok(none.text.length <= 120, `${none.text.length} chars`);
             assert.ok(none.text.split('\n').every(line => line.startsWith('# ')), none.text);
-            assert.ok(none.text.endsWith(`# truncated: ${rows.length} of ${rows.length} rows omitted; raise max_chars or narrow the query`), none.text);
+            assert.match(none.text, /Answer withheld.*accounting/, none.text);
             // A note about a dropped parameter is a comment line, not a row.
             const noted = await client.callTool({ command: 'search', project_dir: dir, term: 'needle 7', lines: true, depth: 2 });
             assert.equal(noted.isError, false, noted.text);
@@ -874,12 +875,93 @@ describe('parameter table: line listing budget', () => {
         assert.match(budgetLineListing(listing(40), 400, 'mcp').text, /raise max_chars or narrow the query$/);
     });
 
-    it('answers with no row where the surface always has a budget: the count, then the comment lines that fit', () => {
+    it('answers with no rows only beside complete accounting, otherwise explicitly withholds the answer', () => {
         const none = budgetLineListing(listing(3), 90, 'mcp', { allowNoRows: true });
         assert.equal(none.text, '# ACCOUNT: all of it\n# truncated: 3 of 3 rows omitted; raise max_chars or narrow the query');
         assert.equal(none.omitted, 3);
         const tight = budgetLineListing(listing(3), 70, 'mcp', { allowNoRows: true });
-        assert.equal(tight.text, '# truncated: 3 of 3 rows omitted; raise max_chars or narrow the query');
-        assert.equal(budgetLineListing(listing(3), 20, 'mcp', { allowNoRows: true }), null);
+        assert.match(tight.text, /Answer withheld/);
+        assert.equal(tight.contractMetadataComplete, false);
+        const tiny = budgetLineListing(listing(3), 20, 'mcp', { allowNoRows: true });
+        assert.match(tiny.text, /withheld/);
+        assert.equal(tiny.contractMetadataComplete, false);
+    });
+});
+
+
+describe('fix #499: exact flag values across surfaces', () => {
+    it('shared notes preserve native numeric value syntax without an adapter-only translator', () => {
+        const note = 'Showing 2 of 5 results. Use --limit N to see more. Use --max-files N to increase.';
+        assert.equal(registry.formatSurfaceMessage(note, 'mcp'),
+            'Showing 2 of 5 results. Use limit=<n> to see more. Use max_files=<n> to increase.');
+        assert.equal(registry.formatSurfaceMessage(note, 'cli'), note);
+        assert.equal(registry.formatSurfaceMessage('Use --depth N.', 'mcp'), 'Use depth=<n>.');
+    });
+
+    it('reads and validates explicit values of every negative boolean spelling', () => {
+        for (const [param, spec] of Object.entries(PARAMS)) {
+            if (spec.type !== 'boolean') continue;
+            for (const flag of cliSpellings(param).off) {
+                assert.equal(parseFlags([`${flag}=true`])[param], false, flag);
+                assert.equal(parseFlags([`${flag}=false`])[param], true, flag);
+                assert.throws(() => validateFlags(parseFlags([`${flag}=bad`])), /true or false/, flag);
+                assert.throws(() => validateFlags(parseFlags([`${flag}=false`, `${flag}=bad`])), /true or false/, flag);
+                for (const on of cliSpellings(param).on) {
+                    assert.equal(parseFlags([on, `${flag}=true`])[param], false, flag);
+                }
+            }
+        }
+    });
+
+    it('process booleans share explicit-value semantics, including JSON refusals and interactive notes', () => {
+        const { parseProcessFlags } = require('../cli/flags');
+        const controls = {
+            '--json': ['json', true], '--quiet': ['quiet', true], '--verbose': ['quiet', false],
+            '--no-quiet': ['quiet', false], '--no-cache': ['cache', false],
+            '--clear-cache': ['clearCache', true], '--interactive': ['interactive', true],
+            '-i': ['interactive', true], '--mcp': ['mcp', true], '--help': ['help', true],
+            '-h': ['help', true], '--version': ['version', true], '-v': ['version', true],
+        };
+        for (const [flag, [key, bare]] of Object.entries(controls)) {
+            assert.equal(parseProcessFlags([`${flag}=true`])[key], bare, flag);
+            assert.equal(parseProcessFlags([`${flag}=false`])[key], !bare, flag);
+            assert.throws(() => validateFlags(parseProcessFlags([`${flag}=bad`])), /true or false/, flag);
+        }
+        const dir = tmp({ 'lib.js': 'function target() {}' });
+        try {
+            const call = (...args) => spawnSync(process.execPath, [CLI, dir, ...args], { encoding: 'utf8' });
+            const json = call('find', 'target', '--json=true');
+            assert.equal(json.status, 0, json.stderr);
+            assert.ok(Array.isArray(JSON.parse(json.stdout).data));
+            assert.match(call('find', 'target', '--json=false').stdout, /^Found /);
+            const refused = call('find', 'target', '--json=true', '--no-cache=bad');
+            assert.equal(JSON.parse(refused.stdout).meta.ok, false);
+            assert.match(call('--version=true').stdout, /^\d+\.\d+\.\d+/);
+            assert.match(call('--help=true').stdout, /Usage/);
+            const repl = spawnSync(process.execPath, [CLI, dir, '--interactive=true'], {
+                input: 'find target --json=true\nfind target --json=bad\nfind target --no-cache=true\nquit\n', encoding: 'utf8',
+            });
+            assert.equal(repl.status, 0, repl.stderr);
+            assert.match(repl.stdout, /interactive mode prints text output/);
+            assert.match(repl.stdout + repl.stderr, /Invalid --json value/);
+            assert.match(repl.stdout, /controls apply when starting UCN/);
+        } finally { rm(dir); }
+    });
+
+    it('rejects padded, blank and non-string scalar enums before dispatch', () => {
+        const dir = tmp({ 'lib.js': 'function caller() { return target(); }\nfunction target() { return leaf(); }\nfunction leaf() {}' });
+        try {
+            const index = idx(dir);
+            for (const [command, field, value] of [['trace', 'direction', 'callers'], ['trace', 'to', 'entrypoints'], ['find', 'type', 'function']]) {
+                for (const bad of [` ${value} `, '', [value]]) {
+                    const answer = execute(index, command, { name: 'target', [field]: bad });
+                    assert.equal(answer.ok, false, `${command} ${field} ${JSON.stringify(bad)}`);
+                    assert.match(answer.error, /Invalid/);
+                }
+                const cli = spawnSync(process.execPath, [CLI, dir, command, 'target', `--${field}= ${value} `], { encoding: 'utf8' });
+                assert.notEqual(cli.status, 0);
+                assert.match(cli.stderr, /Invalid/);
+            }
+        } finally { rm(dir); }
     });
 });

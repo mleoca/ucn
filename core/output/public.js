@@ -309,10 +309,10 @@ function formatPublicText(command, result, params = {}, execution = {}) {
     // Display only: another band table relabels the reason summaries.
     if (execution.evidenceBands) hints.evidenceBands = execution.evidenceBands;
     if (result?.scopeWarning?.hint) {
-        result.scopeWarning = {
+        result = { ...result, scopeWarning: {
             ...result.scopeWarning,
             hint: formatSurfaceMessage(result.scopeWarning.hint, execution.surface),
-        };
+        } };
     }
     let text;
     switch (command) {

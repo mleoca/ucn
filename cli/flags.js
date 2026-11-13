@@ -56,24 +56,46 @@ function repeatedValues(tokens, flags) {
 
 /**
  * A boolean parameter as the tokens set it, or undefined. A negative
- * spelling wins over an affirmative one; `--flag=true` and `--flag=false`
- * are the explicit forms of an affirmative spelling.
+ * spelling wins over an affirmative one. An explicit value describes the
+ * written spelling: `--no-flag=false` enables the parameter.
  */
 function writtenBoolean(tokens, spellings, problems) {
     let value;
-    for (const flag of spellings.on) {
-        if (tokens.includes(flag)) value = true;
-        const explicit = tokens.find(token => token.startsWith(`${flag}=`));
-        if (explicit === undefined) continue;
-        const written = explicit.slice(flag.length + 1);
-        if (written === 'true') value = true;
-        else if (written === 'false') value = false;
-        else problems.push(`Invalid ${flag} value: must be true or false (got "${written}")`);
-    }
-    for (const flag of spellings.off) {
-        if (tokens.includes(flag)) value = false;
+    for (const [flags, enabled] of [[spellings.on, true], [spellings.off, false]]) {
+        for (const flag of flags) {
+            if (tokens.includes(flag)) value = enabled;
+            // Validate every occurrence, including a malformed repeat.
+            for (const token of tokens.filter(token => token.startsWith(`${flag}=`))) {
+                const written = token.slice(flag.length + 1);
+                if (written === 'true') value = enabled;
+                else if (written === 'false') value = !enabled;
+                else problems.push(`Invalid ${flag} value: must be true or false (got "${written}")`);
+            }
+        }
     }
     return value;
+}
+
+/** CLI process controls use the same boolean syntax as command parameters. */
+function parseProcessFlags(tokens) {
+    const flags = {};
+    const problems = [];
+    const spellings = {
+        help: { on: ['--help', '-h'], off: [] },
+        version: { on: ['--version', '-v'], off: [] },
+        mcp: { on: ['--mcp'], off: [] },
+        json: { on: ['--json'], off: [] },
+        quiet: { on: ['--quiet'], off: ['--verbose', '--no-quiet'] },
+        cache: { on: [], off: ['--no-cache'] },
+        clearCache: { on: ['--clear-cache'], off: [] },
+        interactive: { on: ['--interactive', '-i'], off: [] },
+    };
+    for (const [name, names] of Object.entries(spellings)) {
+        const value = writtenBoolean(tokens, names, problems);
+        if (value !== undefined) flags[name] = value;
+    }
+    Object.defineProperty(flags, 'problems', { value: problems, enumerable: false });
+    return flags;
 }
 
 /**
@@ -159,4 +181,4 @@ function processInteger(tokens, flag, { max = 10000000 } = {}) {
     return n;
 }
 
-module.exports = { FlagValidationError, parseFlags, validateFlags, processInteger };
+module.exports = { FlagValidationError, parseFlags, parseProcessFlags, validateFlags, processInteger };

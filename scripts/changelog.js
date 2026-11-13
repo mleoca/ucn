@@ -40,19 +40,46 @@ const HEADER = [
     '',
 ].join('\n');
 
-const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)$/;
+const VERSION_RE = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
-/** [major, minor, patch] of a version or a version tag, or null. */
+/** SemVer components of a version or a version tag, or null. */
 function versionParts(text) {
     const match = VERSION_RE.exec(String(text).trim());
-    return match ? match.slice(1).map(Number) : null;
+    if (!match) return null;
+    const prerelease = match[4] ? match[4].split('.') : [];
+    if (prerelease.some(part => /^\d+$/.test(part) && part.length > 1 && part.startsWith('0'))) return null;
+    return { core: match.slice(1, 4), prerelease };
 }
+
+const compareNumber = (a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+const versionIdentity = text => String(text).trim().replace(/^v/, '');
 
 function compareVersions(a, b) {
     const x = versionParts(a);
     const y = versionParts(b);
-    return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+    if (!x || !y) throw new Error(`invalid version: ${!x ? a : b}`);
+    for (let i = 0; i < 3; i++) {
+        const compared = compareNumber(x.core[i], y.core[i]);
+        if (compared) return compared;
+    }
+    if (x.prerelease.length === 0 || y.prerelease.length === 0) {
+        return Number(y.prerelease.length > 0) - Number(x.prerelease.length > 0);
+    }
+    for (let i = 0; i < Math.min(x.prerelease.length, y.prerelease.length); i++) {
+        const left = x.prerelease[i], right = y.prerelease[i];
+        if (left === right) continue;
+        const leftNumeric = /^\d+$/.test(left), rightNumeric = /^\d+$/.test(right);
+        if (leftNumeric && rightNumeric) return compareNumber(left, right);
+        if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+        return left < right ? -1 : 1;
+    }
+    return x.prerelease.length - y.prerelease.length;
 }
+
+// Build metadata leaves precedence unchanged, but distinct tagged versions
+// still have distinct sections, with a deterministic order for tied versions.
+const compareVersionIdentities = (a, b) => compareVersions(a, b) ||
+    (versionIdentity(a) < versionIdentity(b) ? -1 : versionIdentity(a) > versionIdentity(b) ? 1 : 0);
 
 /**
  * How a commit subject is filed: { type, text }, or null for a version
@@ -100,10 +127,11 @@ function renderSection(version, date, commits) {
 /** The sections of a changelog text, in file order: [{ version, text }]. */
 function splitSections(changelog) {
     const sections = [];
-    const starts = [...String(changelog).matchAll(/^## (\d+\.\d+\.\d+)\b.*$/gm)];
+    const starts = [...String(changelog).matchAll(/^## (\S+)(?:[ \t].*)?$/gm)]
+        .filter(match => versionParts(match[1]));
     starts.forEach((match, i) => {
         const end = i + 1 < starts.length ? starts[i + 1].index : changelog.length;
-        sections.push({ version: match[1], text: changelog.slice(match.index, end).replace(/\n*$/, '\n') });
+        sections.push({ version: versionIdentity(match[1]), text: changelog.slice(match.index, end).replace(/\n*$/, '\n') });
     });
     return sections;
 }
@@ -113,14 +141,16 @@ function splitSections(changelog) {
  * existing one, and sections stay ordered newest version first.
  */
 function upsertSection(changelog, version, section) {
+    version = versionIdentity(version);
     const sections = splitSections(changelog || '').filter(entry => entry.version !== version);
     sections.push({ version, text: section.replace(/\n*$/, '\n') });
-    sections.sort((a, b) => compareVersions(b.version, a.version));
+    sections.sort((a, b) => compareVersionIdentities(b.version, a.version));
     return `${HEADER}\n${sections.map(entry => entry.text).join('\n')}`;
 }
 
 /** The body of one version's section (without its heading), or null. */
 function notesOf(changelog, version) {
+    version = versionIdentity(version);
     const entry = splitSections(changelog || '').find(section => section.version === version);
     if (!entry) return null;
     return entry.text.split('\n').slice(1).join('\n').trim() + '\n';
@@ -140,7 +170,7 @@ function gitOrNull(cwd, args) {
 function versionTags(cwd) {
     const listed = gitOrNull(cwd, ['tag', '--merged', 'HEAD', '--list', 'v*']);
     if (!listed) return [];
-    return listed.split('\n').map(tag => tag.trim()).filter(tag => versionParts(tag)).sort(compareVersions);
+    return listed.split('\n').map(tag => tag.trim()).filter(tag => versionParts(tag)).sort(compareVersionIdentities);
 }
 
 /** The commits in (from, to], newest first; from the start of history when `from` is null. */
@@ -179,7 +209,8 @@ function historyIsComplete(cwd, previous, to) {
  */
 function sectionFromHistory(cwd, version, today) {
     const tags = versionTags(cwd);
-    const own = tags.find(tag => compareVersions(tag, version) === 0) || null;
+    if (!versionParts(version)) throw new Error(`invalid version: ${version}`);
+    const own = tags.find(tag => versionIdentity(tag) === versionIdentity(version)) || null;
     const earlier = tags.filter(tag => compareVersions(tag, version) < 0);
     const previous = earlier.length > 0 ? earlier[earlier.length - 1] : null;
     const to = own || 'HEAD';
@@ -202,7 +233,7 @@ function main(argv, cwd = path.join(__dirname, '..')) {
         // The recorded section, else the history of a version that is tagged.
         const recorded = notesOf(existing, version);
         const tagged = recorded === null &&
-            versionTags(cwd).some(tag => compareVersions(tag, version) === 0);
+            versionTags(cwd).some(tag => versionIdentity(tag) === versionIdentity(version));
         const section = tagged ? sectionFromHistory(cwd, version, today) : null;
         const notes = recorded !== null ? recorded : section && notesOf(`${HEADER}\n${section}`, version);
         if (!notes) throw new Error(`no notes for ${version}: CHANGELOG.md has no section for it and its history is not in this clone`);
@@ -232,7 +263,10 @@ function main(argv, cwd = path.join(__dirname, '..')) {
     const section = sectionFromHistory(cwd, version, today);
     if (section === null) {
         // A shallow clone (the publish job sets the version from the tag):
-        // the section was committed with the version, nothing to write.
+        // only a section already committed with THIS version can be reused.
+        if (notesOf(existing, version) === null) {
+            throw new Error(`the history needed for ${version} is not in this clone and CHANGELOG.md has no section for it; fetch the missing history and tags (git fetch --unshallow --tags), then retry`);
+        }
         console.log(`CHANGELOG.md left as it is: the history needed for ${version} is not in this clone`);
         return;
     }

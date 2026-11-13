@@ -54,10 +54,90 @@ describe('public-surface agent benchmark contract', () => {
         }), {
             command: 'audit_async',
             project_dir: '/project',
-            max_chars: 100000,
             file: 'src',
             include_tests: true,
         });
+    });
+
+    it('compares the same explicit or default transport budget on both surfaces', () => {
+        const { parseFlags } = require('../cli/flags');
+        const { normalizeParams, paramDefault, paramRange } = require('../core/registry');
+        for (const command of ['repo', 'show']) {
+            for (const params of [{}, { maxChars: 500 }, { max_chars: 701 }, { all: true }, { all: true, maxChars: 900 }]) {
+                const call = { command, params };
+                const cli = parseFlags(toCliInvocation(call).flags);
+                const mcp = normalizeParams(toMcpArguments('/project', call));
+                const budget = p => p.maxChars ?? (p.all ? paramRange('maxChars').max : paramDefault('maxChars', command));
+                assert.equal(budget(cli), budget(mcp), JSON.stringify(call));
+                assert.equal(Object.hasOwn(mcp, 'maxChars'), Object.hasOwn(cli, 'maxChars'));
+            }
+        }
+        const a20 = SCENARIOS.find(scenario => scenario.id === 'A20');
+        assert.ok(a20);
+        const cli = parseFlags(toCliInvocation(a20).flags);
+        const mcp = normalizeParams(toMcpArguments('/project', a20));
+        assert.equal(cli.maxChars, undefined);
+        assert.equal(mcp.maxChars, undefined);
+        assert.equal(paramDefault('maxChars', a20.command), 3000);
+    });
+
+    it('preserves true and false booleans, including flags with only a negative spelling', () => {
+        const { PARAMS, normalizeParams } = require('../core/registry');
+        const { parseFlags, validateFlags } = require('../cli/flags');
+        for (const [param, spec] of Object.entries(PARAMS)) {
+            if (spec.type !== 'boolean') continue;
+            for (const value of [true, false]) {
+                const call = { command: 'show', params: { [param]: value } };
+                const cli = parseFlags(toCliInvocation(call).flags);
+                validateFlags(cli);
+                const mcp = normalizeParams(toMcpArguments('/project', call));
+                assert.equal(cli[param], mcp[param], `${param}=${value}`);
+                assert.equal(cli[param], value, `${param}=${value}`);
+            }
+        }
+        assert.deepEqual(toCliInvocation({ command: 'show', params: { followSymlinks: false } }).flags,
+            ['--no-follow-symlinks']);
+        assert.deepEqual(toCliInvocation({ command: 'show', params: { followSymlinks: true } }).flags,
+            ['--no-follow-symlinks=false']);
+    });
+
+    it('A20 default-budget parity keeps actual native full-size and emitted-length facts', async () => {
+        const path = require('path');
+        const { spawnSync } = require('child_process');
+        const { McpClient } = require('./helpers');
+        const { paramDefault } = require('../core/registry');
+        const project = path.join(__dirname, 'fixtures/agent-benchmark');
+        const scenario = SCENARIOS.find(row => row.id === 'A20');
+        const budget = paramDefault('maxChars', scenario.command);
+        const invocation = toCliInvocation(scenario);
+        const cliArgs = [path.join(__dirname, '../cli/index.js'), project,
+            invocation.command, ...invocation.args, ...invocation.flags];
+        const cli = spawnSync(process.execPath, cliArgs, { encoding: 'utf8' });
+        assert.equal(cli.status, 0, cli.stderr);
+        // Read each presentation from its own cache/session. A separate
+        // fresh build can have different health-timing digits.
+        const fullCli = spawnSync(process.execPath, [...cliArgs, '--max-chars=100000'], { encoding: 'utf8' });
+        assert.equal(fullCli.status, 0, fullCli.stderr);
+        const client = new McpClient();
+        try {
+            await client.start(); await client.initialize();
+            const mcp = await client.callTool(toMcpArguments(project, scenario));
+            assert.equal(mcp.isError, false, mcp.text);
+            const fullMcp = await client.callTool({ ...toMcpArguments(project, scenario), max_chars: 100000 });
+            assert.equal(fullMcp.isError, false, fullMcp.text);
+            for (const [surface, text, full] of [
+                ['cli', cli.stdout, fullCli.stdout.replace(/\n$/, '')],
+                ['mcp', mcp.text, fullMcp.text],
+            ]) {
+                assert.ok(full.length > budget, `${surface}: fixture must require truncation`);
+                assert.ok(text.length <= budget, `${surface}: ${text.length} > ${budget}`);
+                const notice = text.match(/OUTPUT TRUNCATED: (\d+) chars total; hard limit (\d+)/);
+                assert.ok(notice, text);
+                assert.equal(Number(notice[1]), full.length, surface);
+                assert.equal(Number(notice[2]), budget, surface);
+            }
+            assert.equal(normalizeSurfaceGuidance(cli.stdout.trimEnd()), normalizeSurfaceGuidance(mcp.text.trimEnd()));
+        } finally { client.stop(); }
     });
 
     it('scores command choice and required parameters independently', () => {

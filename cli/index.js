@@ -39,7 +39,7 @@ const {
     paramValues,
     GLOBAL_PARAMS,
 } = require('../core/registry');
-const { FlagValidationError, parseFlags, validateFlags, processInteger } = require('./flags');
+const { FlagValidationError, parseFlags, parseProcessFlags, validateFlags, processInteger } = require('./flags');
 const { buildPublicParams, isPublicCommand, noOpNotes } = require('../core/public-command');
 const { execute } = require('../core/execute');
 const { describeError } = require('../core/errors');
@@ -91,7 +91,9 @@ function resultExitCode(command, result) {
 
 /** Emit the one CLI error contract, including failures before main dispatch. */
 function emitCliError(msg, command = activeCanonicalCommand, { internal = false } = {}) {
-    const wantsJson = process.argv.includes('--json');
+    const argv = process.argv.slice(2);
+    const end = argv.indexOf('--');
+    const wantsJson = parseProcessFlags(end === -1 ? argv : argv.slice(0, end)).json;
     const error = typeof msg === 'string' ? msg : String(msg);
     if (wantsJson) {
         const canonical = command && isPublicCommand(command)
@@ -150,9 +152,17 @@ function emitCaughtError(e) {
 // ============================================================================
 
 const rawArgs = process.argv.slice(2);
+const processArgs = rawArgs.includes('--') ? rawArgs.slice(0, rawArgs.indexOf('--')) : rawArgs;
+const processFlags = parseProcessFlags(processArgs);
+try {
+    validateFlags(processFlags);
+} catch (e) {
+    emitCliError(e.message);
+    process.exit(processFlags.json ? 1 : 2);
+}
 
 // MCP server mode — launch server and skip CLI
-if (rawArgs.includes('--mcp')) {
+if (processFlags.mcp) {
     require('../mcp/server.js');
 } else {
 // Support -- to separate flags from positional arguments
@@ -164,24 +174,24 @@ const argsAfterDoubleDash = doubleDashIdx === -1 ? [] : rawArgs.slice(doubleDash
 // Parameters come from the registry's table (cli/flags.js); the flags of the
 // CLI process itself are read here.
 const flags = parseFlags(args);
-flags.json = args.includes('--json');
-flags.quiet = !args.includes('--verbose') && !args.includes('--no-quiet');
-flags.cache = !args.includes('--no-cache') && !flags.includeBundled;
-flags.clearCache = args.includes('--clear-cache');
-flags.interactive = args.includes('--interactive') || args.includes('-i');
+flags.json = processFlags.json ?? false;
+flags.quiet = processFlags.quiet ?? true;
+flags.cache = (processFlags.cache ?? true) && !flags.includeBundled;
+flags.clearCache = processFlags.clearCache ?? false;
+flags.interactive = processFlags.interactive ?? false;
 flags.followSymlinks = flags.followSymlinks ?? paramDefault('followSymlinks');
 
 // Known flags for validation
 const knownFlags = getCliAcceptedFlags();
 
 // Handle help flag
-if (args.includes('--help') || args.includes('-h')) {
+if (processFlags.help) {
     printUsage();
     process.exit(0);
 }
 
 // Handle version flag — read from package.json (single source of truth, shared with MCP serverInfo)
-if (args.includes('--version') || args.includes('-v')) {
+if (processFlags.version) {
     console.log(require('../package.json').version);
     process.exit(0);
 }
@@ -220,8 +230,7 @@ const VALUE_FLAGS = getCliValueFlags();
 // Remove flags from args, then add args after -- (which are all positional)
 const positionalArgs = [
     ...args.filter((a, idx) =>
-        !a.startsWith('--') &&
-        a !== '-i' &&
+        !a.startsWith('-') &&
         !(idx > 0 && VALUE_FLAGS.has(args[idx - 1]) && !args[idx - 1].includes('='))
     ),
     ...argsAfterDoubleDash
@@ -246,6 +255,15 @@ function requireArg(arg, usage) {
     }
 }
 
+/** Exact raw source and mandatory note bytes, shared by budgets and emitters. */
+function rawCliOutput(text, note, interactive = false) {
+    const body = String(text);
+    return {
+        source: body + (interactive || !body.endsWith('\n') ? '\n' : ''),
+        note: note ? commentLines(formatSurfaceMessage(note, 'cli')).join('\n') + '\n' : '',
+    };
+}
+
 function formatCliText(command, result, params, execution, displayFlags) {
     const text = output.formatPublicText(command, result, params, {
         ...execution,
@@ -258,8 +276,12 @@ function formatCliText(command, result, params, execution, displayFlags) {
     // source is never cut either, since a truncated function body is worse
     // than a long one: there the budget is a fail-before-output guard.
     if (params?.lines || params?.raw) {
-        if (displayFlags?.maxChars && text.length > displayFlags.maxChars) {
-            const listing = params.lines ? budgetLineListing(text, displayFlags.maxChars, 'cli') : null;
+        const rawOutput = params.raw ? rawCliOutput(text, execution?.note, displayFlags?.interactive) : null;
+        const emittedChars = params.lines
+            ? (text.split('\n').filter(Boolean).join('\n').length + (text ? 1 : 0))
+            : rawOutput.source.length + rawOutput.note.length;
+        if (displayFlags?.maxChars && emittedChars > displayFlags.maxChars) {
+            const listing = params.lines ? budgetLineListing(text, displayFlags.maxChars - 1, 'cli') : null;
             if (listing) return listing.text;
             fail(params.lines
                 ? `Output exceeds --max-chars=${displayFlags.maxChars} and not one row fits beside the accounting lines. Raise --max-chars or omit it.`
@@ -274,6 +296,7 @@ function formatCliText(command, result, params, execution, displayFlags) {
         surface: 'cli',
         params,
         trailingChars: 1, // emitCliText appends the terminal newline.
+        peerText: output.formatPublicText(command, result, params, { ...execution, surface: 'mcp' }),
     }).text;
 }
 
@@ -297,11 +320,11 @@ function emitCliText(text, params, json, note) {
         return;
     }
     if (!json && params?.raw) {
-        const body = String(text);
-        process.stdout.write(body.endsWith('\n') ? body : body + '\n');
+        const rawOutput = rawCliOutput(text, note);
+        process.stdout.write(rawOutput.source);
         // Code lines are never reinterpreted (a Python comment starts with
         // "# " too), so the note travels on its own channel.
-        if (note) process.stderr.write(commentLines(formatSurfaceMessage(note, 'cli')).join('\n') + '\n');
+        if (rawOutput.note) process.stderr.write(rawOutput.note);
         return;
     }
     console.log(text);
@@ -893,7 +916,7 @@ Flags can be added per-command: show myFunc --sections=source,callers
         const skipNext = new Set();
         for (let i = 1; i < tokens.length; i++) {
             if (skipNext.has(i)) { continue; }
-            if (tokens[i].startsWith('--')) {
+            if (tokens[i].startsWith('-')) {
                 flagTokens.push(tokens[i]);
                 // If it's a value-flag without = and next token exists and isn't a flag, consume it too
                 if (valueFlagNames.has(tokens[i]) && !tokens[i].includes('=') && i + 1 < tokens.length && !tokens[i + 1].startsWith('--')) {
@@ -909,23 +932,28 @@ Flags can be added per-command: show myFunc --sections=source,callers
         // Unknown flags error instead of folding their value into the symbol
         // name. Same vocabulary as one-shot mode.
         const unknown = flagTokens.filter(t =>
-            t.startsWith('--') && !knownFlags.has(t.split('=')[0]));
+            t.startsWith('-') && !knownFlags.has(t.split('=')[0]));
         if (unknown.length > 0) {
             console.log(`Unknown flag(s): ${unknown.join(', ')}`);
             rl.prompt();
             return;
         }
         const iflags = parseFlags(flagTokens);
-        // parseFlags never extracts --json (it is a global-argv flag), so
-        // check the raw tokens.
-        if (flagTokens.includes('--json')) {
-            console.log('Note: interactive mode prints text output — run `ucn . <command> --json` one-shot for JSON.');
-        }
+        const iprocess = parseProcessFlags(flagTokens);
 
         try {
             // The same value rules as one-shot mode: a bad value is refused
             // with a message, never silently coerced.
             validateFlags(iflags);
+            validateFlags(iprocess);
+            if (iprocess.json) {
+                console.log('Note: interactive mode prints text output — run `ucn . <command> --json` one-shot for JSON.');
+            }
+            const startupOnly = Object.keys(iprocess).filter(key => key !== 'json');
+            if (startupOnly.length > 0 || flagTokens.some(token => token === '--workers' || token.startsWith('--workers='))) {
+                processInteger(flagTokens, '--workers');
+                console.log('Note: CLI process controls apply when starting UCN; they do not change an active interactive session.');
+            }
             // The REPL is an edit/query loop, not a frozen snapshot. Keep the
             // symbol table and call cache on the same generation by checking
             // source staleness before every command. getCachedCalls already
@@ -957,7 +985,7 @@ Flags can be added per-command: show myFunc --sections=source,callers
         } catch (e) {
             if (e instanceof FlagValidationError) {
                 console.log(e.message);
-            } else {
+            } else if (!(e instanceof CommandError)) {
                 const described = describeError(e);
                 console.error(described.internalError ? described.error : `Error: ${described.error}`);
             }
@@ -985,13 +1013,21 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
             : formatSurfaceMessage(publicExecution.error, 'cli'));
         return;
     }
-    console.log(formatCliText(
+    const text = formatCliText(
         command,
         publicExecution.result,
         publicParams,
         publicExecution,
-        iflags,
-    ));
+        { ...iflags, interactive: true },
+    );
+    if (publicParams.raw) {
+        // Keep the REPL's existing source/newline and prompt layout; the
+        // mandatory disclosure follows it in the same text stream.
+        const rawOutput = rawCliOutput(text, publicExecution.note, true);
+        process.stdout.write(rawOutput.source + rawOutput.note);
+    } else {
+        console.log(text);
+    }
 }
 
 // ============================================================================

@@ -311,13 +311,14 @@ function formatPublicRaw(result, execution = {}) {
  * records left out. A record is never cut and a comment line is never
  * dropped: the accounting still describes the whole answer. Null when the
  * listing has no record to drop or when not one record fits beside the
- * comment lines (`allowNoRows` answers that case with no row instead).
+ * comment lines. `allowNoRows` may return no rows, but still keeps every
+ * comment; if that cannot fit, it explicitly withholds the whole answer.
  */
 function budgetLineListing(text, limit, surface = 'cli', { allowNoRows = false } = {}) {
     const lines = String(text).split('\n').filter(line => line !== '');
     const records = lines.filter(line => !line.startsWith('# '));
     const comments = lines.filter(line => line.startsWith('# '));
-    if (records.length === 0) return null;
+    if (records.length === 0 && !allowNoRows) return null;
     const advice = surface === 'mcp'
         ? 'raise max_chars or narrow the query'
         : 'raise --max-chars or omit it';
@@ -325,6 +326,20 @@ function budgetLineListing(text, limit, surface = 'cli', { allowNoRows = false }
     // The most records whose text, with every comment line and the trailer
     // that counts the rest, is within the limit.
     const fixed = comments.reduce((sum, line) => sum + line.length + 1, 0);
+    const withheld = () => {
+        const flag = surface === 'mcp' ? 'max_chars' : '--max-chars';
+        const needed = Math.min(String(text).length, fixed + trailer(records.length).length);
+        const notices = [
+            `# Answer withheld: accounting does not fit; raise ${flag} to at least ${needed}.`,
+            `# Answer withheld; ${flag}>=${needed}`,
+            `# withheld; >=${needed}`,
+        ];
+        return {
+            text: notices.find(notice => notice.length <= limit) || '',
+            rows: records.length, omitted: records.length, contractMetadataComplete: false,
+        };
+    };
+    if (records.length === 0) return withheld();
     const prefix = [0];
     for (const record of records) prefix.push(prefix[prefix.length - 1] + record.length + 1);
     let kept = 0;
@@ -332,24 +347,20 @@ function budgetLineListing(text, limit, surface = 'cli', { allowNoRows = false }
         if (prefix[count] + fixed + trailer(records.length - count).length <= limit) { kept = count; break; }
     }
     if (kept === 0) {
-        // Not one row fits. A surface that always has a budget still gets a
-        // listing: the line that counts every row, then the comment lines
-        // there is room for.
+        // No row fits. Never present a partial accounting as the complete
+        // answer: all comment lines accompany the row count, or the entire
+        // answer is withheld explicitly.
         const all = trailer(records.length);
-        if (!allowNoRows || all.length > limit) return null;
-        const room = [];
-        let used = all.length;
-        for (const line of comments) {
-            if (used + line.length + 1 > limit) break;
-            used += line.length + 1;
-            room.push(line);
-        }
-        return { text: [...room, all].join('\n'), rows: records.length, omitted: records.length };
+        if (!allowNoRows) return null;
+        if (fixed + all.length > limit) return withheld();
+        return { text: [...comments, all].join('\n'), rows: records.length, omitted: records.length,
+            contractMetadataComplete: true };
     }
     return {
         text: [...records.slice(0, kept), ...comments, trailer(records.length - kept)].join('\n'),
         rows: records.length,
         omitted: records.length - kept,
+        contractMetadataComplete: true,
     };
 }
 

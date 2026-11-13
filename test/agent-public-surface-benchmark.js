@@ -33,6 +33,7 @@ const {
     resolveCommand,
     toCliName,
     toMcpName,
+    cliSpellings,
 } = require('../core/registry');
 const { COMMAND_TRUST_MATRIX } = require('../core/trust-matrix');
 
@@ -449,10 +450,16 @@ function toCliInvocation(call) {
     }
     const flags = [];
     for (const [key, value] of Object.entries(params)) {
-        if (key === positionalKey || value == null || value === false) continue;
+        if (key === positionalKey || value == null) continue;
         const flag = `--${cliFlagName(key)}`;
-        if (value === true) flags.push(flag);
-        else if (Array.isArray(value)) flags.push(`${flag}=${value.join(',')}`);
+        if (typeof value === 'boolean') {
+            const spellings = cliSpellings(key);
+            const exact = (value ? spellings.on : spellings.off)?.[0];
+            if (exact) flags.push(exact);
+            else if (spellings.on?.length) flags.push(`${spellings.on[0]}=${value}`);
+            else if (spellings.off?.length) flags.push(`${spellings.off[0]}=${!value}`);
+            else flags.push(`${flag}=${value}`);
+        } else if (Array.isArray(value)) flags.push(`${flag}=${value.join(',')}`);
         else flags.push(`${flag}=${value}`);
     }
     return { command: toCliName(command), args, flags };
@@ -467,7 +474,6 @@ function toMcpArguments(projectDir, call) {
     return {
         command: toMcpName(canonicalCommand(call.command)),
         project_dir: projectDir,
-        max_chars: 100000,
         ...encoded,
     };
 }
@@ -575,6 +581,18 @@ function scoreContract(scenario, document) {
 // facts, trust tiers, locations, accounts, and source remain byte-compared.
 function normalizeSurfaceGuidance(text) {
     return String(text || '')
+        // Size is the actual native presentation, so CLI/MCP totals may
+        // differ. Budget regressions independently check that each total is
+        // its full text length and every emitted answer fits its limit.
+        // Keep the limit and all omitted-row / trust counts comparable.
+        .replace(/^(\.\.\. OUTPUT TRUNCATED:) \d+ chars total; hard limit (\d+)\. Use .*$/gm,
+            '$1 <surface-size> chars total; hard limit $2. <surface-guidance>')
+        .replace(/^(\.\.\. OUTPUT TRUNCATED) \(\d+→(\d+)\)\. (?:Narrow with|Raise) .*$/gm,
+            '$1 (<surface-size>→$2). <surface-guidance>')
+        .replace(/^(\.\.\. OUTPUT TRUNCATED\.) Raise (?:--max-chars=N|max_chars=<n>)\.$/gm,
+            '$1 <surface-guidance>')
+        .replace(/(# truncated: \d+ of \d+ rows omitted); raise (?:--max-chars or omit it|max_chars or narrow the query)$/gm,
+            '$1; <surface-guidance>')
         .replace(/^Next: .*$/gm, 'Next: <surface-guidance>')
         .replace(/(?:ucn repo --sections=health --deep for detail|run command=repo with sections=health and deep=true for detail)/g,
             '<health-guidance>')

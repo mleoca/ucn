@@ -156,7 +156,7 @@ const SECTION_AWARE_COMMANDS = new Set(['show', 'impact', 'check']);
  * no sections or its fixed parts alone do not fit (caller falls back to a
  * head cut).
  */
-function sectionAwareCut(text, budget) {
+function sectionAwareCut(text, budget, lineCost = line => line.length) {
     const lines = text.split('\n');
     const blocks = []; // { kind: 'fixed', line } | { kind: 'section', header, body }
     let current = null;
@@ -181,7 +181,7 @@ function sectionAwareCut(text, budget) {
     const gapLine = '  ...';
     let used = 0;
     for (const block of blocks) {
-        used += (block.kind === 'fixed' ? block.line.length : block.header.length) + 1;
+        used += lineCost(block.kind === 'fixed' ? block.line : block.header) + 1;
     }
     // Reserve the worst-case `+N more` line and one gap marker per section.
     for (const section of sections) {
@@ -216,7 +216,7 @@ function sectionAwareCut(text, budget) {
             const state = orders.get(section);
             if (state.next >= state.order.length) continue;
             const index = state.order[state.next];
-            const cost = section.body[index].length + 1;
+            const cost = lineCost(section.body[index]) + 1;
             if (used + cost > budget) { state.next = state.order.length; continue; }
             used += cost;
             state.taken.add(index);
@@ -253,12 +253,31 @@ function applyOutputBudget(text, {
     surface = 'cli',
     params = {},
     trailingChars = 0,
+    peerText,
 } = {}) {
     const defaultLimit = paramDefault('maxChars',
         resolveCommand(command, 'mcp') || resolveCommand(command, 'cli') || command);
     const requested = maxChars || (all ? MAX_OUTPUT_CHARS : defaultLimit);
     const hardLimit = Math.min(requested, MAX_OUTPUT_CHARS);
-    const limit = Math.max(0, hardLimit - trailingChars);
+    // Native CLI/MCP guidance has different lengths. Both presentations
+    // select the same semantic lines using the larger cost at each source
+    // line, including room for the CLI's terminal newline. Rendered text
+    // keeps its own native guidance and actual full-character count.
+    const paired = typeof peerText === 'string';
+    const costs = new Map();
+    if (paired) {
+        const own = String(text || '').split('\n'), peer = peerText.split('\n');
+        for (let i = 0; i < own.length; i++) {
+            const cost = Math.max(own[i].length, (peer[i] || '').length);
+            costs.set(own[i], Math.max(costs.get(own[i]) || 0, cost));
+            costs.set(own[i].trim(), Math.max(costs.get(own[i].trim()) || 0,
+                Math.max(own[i].trim().length, (peer[i] || '').trim().length)));
+        }
+    }
+    const lineCost = line => costs.get(line) ?? line.length;
+    const textCost = value => value.split('\n').reduce((sum, line) => sum + lineCost(line) + 1, -1);
+    const terminalChars = paired ? Math.max(1, trailingChars) : trailingChars;
+    const limit = Math.max(0, hardLimit - terminalChars);
     if (!text) {
         return {
             text: '(no output)'.slice(0, limit),
@@ -270,7 +289,7 @@ function applyOutputBudget(text, {
         };
     }
 
-    if (text.length <= limit) {
+    if (textCost(text) <= limit) {
         return {
             text,
             truncated: false,
@@ -294,29 +313,42 @@ function applyOutputBudget(text, {
                 fullChars: text.length,
                 requestedLimit: hardLimit,
                 contractMetadata: [],
-                contractMetadataComplete: true,
+                contractMetadataComplete: listing.contractMetadataComplete,
             };
         }
     }
     const supportsAll = FLAG_APPLICABILITY[canonical]?.includes('all') &&
         !(canonical === 'deps' && params.cycles);
-    const allHint = supportsAll
-        ? (surface === 'mcp'
-            ? 'Use all=true or max_chars=<n> (100K maximum).'
-            : 'Use --all or --max-chars=N (100K maximum).')
-        : (surface === 'mcp'
-            ? 'Use max_chars=<n> (100K maximum).'
-            : 'Use --max-chars=N (100K maximum).');
+    const noticesFor = (target, fullChars) => {
+        const allHint = supportsAll
+            ? (target === 'mcp'
+                ? 'Use all=true or max_chars=<n> (100K maximum).'
+                : 'Use --all or --max-chars=N (100K maximum).')
+            : (target === 'mcp'
+                ? 'Use max_chars=<n> (100K maximum).'
+                : 'Use --max-chars=N (100K maximum).');
+        const raiseHint = target === 'mcp' ? 'max_chars=<n>' : '--max-chars=N';
+        const compactScope = compactNarrowingHint(command, target, params);
+        const compactGuidance = compactScope.includes(raiseHint)
+            ? `Raise ${raiseHint}.`
+            : `Narrow with ${compactScope || raiseHint}; raise ${raiseHint}.`;
+        return {
+            longNotice: `... OUTPUT TRUNCATED: ${fullChars} chars total; hard limit ${hardLimit}. ` +
+                `${narrowingHint(command, target, params)} ${allHint}`,
+            compactNotice: `... OUTPUT TRUNCATED (${fullChars}→${hardLimit}). ${compactGuidance}`,
+            shortNotice: `... OUTPUT TRUNCATED. Raise ${raiseHint}.`,
+            raiseHint,
+        };
+    };
+    const ownNotices = noticesFor(surface, text.length);
+    if (paired) {
+        const peerNotices = noticesFor(surface === 'mcp' ? 'cli' : 'mcp', peerText.length);
+        for (const name of ['longNotice', 'compactNotice', 'shortNotice']) {
+            costs.set(ownNotices[name], Math.max(ownNotices[name].length, peerNotices[name].length));
+        }
+    }
+    const { longNotice, compactNotice, shortNotice, raiseHint } = ownNotices;
     const compactBudget = limit < 500;
-    const raiseHint = surface === 'mcp' ? 'max_chars=<n>' : '--max-chars=N';
-    const compactScope = compactNarrowingHint(command, surface, params);
-    const compactGuidance = compactScope.includes(raiseHint)
-        ? `Raise ${raiseHint}.`
-        : `Narrow with ${compactScope || raiseHint}; raise ${raiseHint}.`;
-    const longNotice = `... OUTPUT TRUNCATED: ${text.length} chars total; hard limit ${hardLimit}. ` +
-        `${narrowingHint(command, surface, params)} ${allHint}`;
-    const compactNotice = `... OUTPUT TRUNCATED (${text.length}→${hardLimit}). ${compactGuidance}`;
-    const shortNotice = `... OUTPUT TRUNCATED. Raise ${raiseHint}.`;
 
     // Trust lines (ACCOUNT/CONTRACT/WARNING/...) qualify the answer: room for
     // every one of them is reserved before any body text. Optional
@@ -325,7 +357,7 @@ function applyOutputBudget(text, {
     const trust = candidates.filter(candidate => candidate.priority === 0);
     const optional = candidates.filter(candidate => candidate.priority > 0)
         .sort((a, b) => a.priority - b.priority || a.sourceIndex - b.sourceIndex);
-    const trustChars = trust.reduce((sum, candidate) => sum + candidate.line.length + 1, 0);
+    const trustChars = trust.reduce((sum, candidate) => sum + lineCost(candidate.line) + 1, 0);
     const result = (rendered, appended, complete) => ({
         text: rendered,
         truncated: true,
@@ -339,6 +371,16 @@ function applyOutputBudget(text, {
     // number of complete source lines it holds.
     const headCut = (budget) => {
         if (budget <= 0) return { body: '', keptLines: 0 };
+        if (paired) {
+            const kept = [];
+            let used = -1;
+            for (const line of text.split('\n')) {
+                if (used + lineCost(line) + 1 > budget) break;
+                kept.push(line);
+                used += lineCost(line) + 1;
+            }
+            return { body: kept.join('\n'), keptLines: kept.length };
+        }
         const prefix = text.slice(0, budget);
         const lastNewline = prefix.lastIndexOf('\n');
         const body = lastNewline > budget * 0.8 ? prefix.slice(0, lastNewline) : prefix;
@@ -354,18 +396,18 @@ function applyOutputBudget(text, {
     // to `optionalShare` chars (priority order) before the body; the body
     // takes the rest. Returns null when the notice and the trust lines alone
     // exceed the limit.
-    const costOf = list => list.reduce((sum, candidate) => sum + candidate.line.length + 1, 0);
+    const costOf = list => list.reduce((sum, candidate) => sum + lineCost(candidate.line) + 1, 0);
     const layout = (notice, heading, separator, optionalShare) => {
-        const reserveFor = metadataChars => notice.length + (metadataChars > 0 ? heading.length + metadataChars : 0);
+        const reserveFor = metadataChars => lineCost(notice) + (metadataChars > 0 ? heading.length + metadataChars : 0);
         if (reserveFor(trustChars) > limit) return null;
         const reservedOptional = [];
         let optionalChars = 0;
         const optionalRoom = Math.min(optionalShare, limit - reserveFor(trustChars) - (trustChars > 0 ? 0 : heading.length));
         for (const candidate of optional) {
             if (reservedOptional.length >= MAX_PRESERVED_CONTRACT_LINES) break;
-            if (optionalChars + candidate.line.length + 1 > optionalRoom) continue;
+            if (optionalChars + lineCost(candidate.line) + 1 > optionalRoom) continue;
             reservedOptional.push(candidate);
-            optionalChars += candidate.line.length + 1;
+            optionalChars += lineCost(candidate.line) + 1;
         }
         const reserved = [...trust, ...reservedOptional];
         const pendingOf = cutState => reserved.filter(candidate => candidate.sourceIndex >= cutState.keptLines);
@@ -379,12 +421,12 @@ function applyOutputBudget(text, {
         }
         const metadata = pendingOf(cut);
         let rendered = cut.body ? `${cut.body}${separator}${notice}` : notice;
-        let used = rendered.length + (metadata.length > 0 ? heading.length + costOf(metadata) : 0);
+        let used = textCost(rendered) + (metadata.length > 0 ? heading.length + costOf(metadata) : 0);
         let omitted = 0;
         const taken = new Set(reserved);
         for (const candidate of optional) {
             if (taken.has(candidate) || candidate.sourceIndex < cut.keptLines) continue;
-            const cost = candidate.line.length + 1 + (metadata.length === 0 ? heading.length : 0);
+            const cost = lineCost(candidate.line) + 1 + (metadata.length === 0 ? heading.length : 0);
             if (metadata.length >= trust.length + MAX_PRESERVED_CONTRACT_LINES || used + cost > limit) {
                 omitted++;
                 continue;
@@ -410,28 +452,35 @@ function applyOutputBudget(text, {
     // so with the budget that would carry them.
     const withheld = () => {
         const flag = surface === 'mcp' ? 'max_chars' : '--max-chars';
-        const noticeFor = (shown, needed) => `... OUTPUT TRUNCATED (${text.length}→${hardLimit}): answer withheld; ` +
-            `${shown} of ${trust.length} trust line(s) shown. Raise ${flag} to at least ${needed}.`;
+        const noticeFor = (shown, needed, target = surface, fullChars = text.length) =>
+            `... OUTPUT TRUNCATED (${fullChars}→${hardLimit}): answer withheld; ` +
+            `${shown} of ${trust.length} trust line(s) shown. Raise ${target === 'mcp' ? 'max_chars' : '--max-chars'} to at least ${needed}.`;
         // Smallest budget whose shortest layout carries every trust line.
-        const needed = trailingChars + shortNotice.length + trustChars;
+        const needed = terminalChars + lineCost(shortNotice) + trustChars;
         let shown = 0;
-        let used = noticeFor(trust.length, needed).length;
+        const noticeCost = text => paired ? Math.max(text.length,
+            text.replace(surface === 'mcp' ? 'max_chars' : '--max-chars', surface === 'mcp' ? '--max-chars' : 'max_chars').length) : text.length;
+        // Native full sizes can have different digit widths. Pair the whole
+        // notice before choosing trust lines, just as for ordinary notices.
+        const fullNoticeCost = shown => Math.max(noticeFor(shown, needed).length,
+            paired ? noticeFor(shown, needed, surface === 'mcp' ? 'cli' : 'mcp', peerText.length).length : 0);
+        let used = fullNoticeCost(trust.length);
         const kept = [];
         for (const candidate of trust) {
-            if (used + candidate.line.length + 1 > limit) break;
+            if (used + lineCost(candidate.line) + 1 > limit) break;
             kept.push(candidate.line);
-            used += candidate.line.length + 1;
+            used += lineCost(candidate.line) + 1;
             shown++;
         }
         const notice = noticeFor(shown, needed);
-        if (notice.length > limit) {
+        if (fullNoticeCost(shown) > limit) {
             // Shorter statements of the same fact; a budget number is never
             // cut mid-digit.
             const shorter = [
                 `TRUNCATED: answer withheld; raise ${flag} to at least ${needed}.`,
                 `Answer withheld; ${flag}>=${needed}`,
                 `withheld; >=${needed}`,
-            ].find(text => text.length <= limit);
+            ].find(text => noticeCost(text) <= limit);
             return result(shorter || '', [], false);
         }
         return result([notice, ...kept].join('\n'), kept, false);
@@ -466,26 +515,26 @@ function applyOutputBudget(text, {
         // Sections keep every non-indented line (trust lines included) in
         // place; trust lines inside a cut section body are appended, with
         // their room taken from the sections.
-        let sectionBudget = limit - longNotice.length - 2;
+        let sectionBudget = limit - lineCost(longNotice) - 2;
         for (let attempt = 0; attempt < 2; attempt++) {
-            const sectioned = sectionAwareCut(text, sectionBudget);
+            const sectioned = sectionAwareCut(text, sectionBudget, lineCost);
             if (sectioned === null) break;
             const visible = new Set(sectioned.split('\n').map(line => line.trim()));
             const missing = trust.filter(candidate => !visible.has(candidate.line));
-            const missingChars = missing.reduce((sum, candidate) => sum + candidate.line.length + 1, 0);
+            const missingChars = missing.reduce((sum, candidate) => sum + lineCost(candidate.line) + 1, 0);
             let rendered = `${sectioned}\n\n${longNotice}`;
-            if (rendered.length + missingChars > limit) {
+            if (textCost(rendered) + missingChars > limit) {
                 sectionBudget -= missingChars;
                 continue;
             }
             const appended = missing.map(candidate => candidate.line);
             let omitted = 0;
-            let used = rendered.length + missingChars;
+            let used = textCost(rendered) + missingChars;
             for (const candidate of optional) {
                 if (visible.has(candidate.line)) continue;
-                if (used + candidate.line.length + 1 > limit) { omitted++; continue; }
+                if (used + lineCost(candidate.line) + 1 > limit) { omitted++; continue; }
                 appended.push(candidate.line);
-                used += candidate.line.length + 1;
+                used += lineCost(candidate.line) + 1;
             }
             if (appended.length > 0) rendered += '\n' + appended.join('\n');
             return result(rendered, appended, omitted === 0);

@@ -509,6 +509,10 @@ const foldValue = (fold, value) => (fold === 'upper' ? value.toUpperCase() : fol
 /** The values a caller wrote for a closed-set parameter: each as written and as the table folds it. */
 function writtenValues(param, value) {
     const spec = PARAMS[param];
+    // Scalar enums are exact strings in the MCP schema. Validate the value
+    // dispatch will actually receive; trimming here silently selected a
+    // different mode when its handler compared the original spelling.
+    if (!spec.list && !spec.fold) return [{ written: String(value), folded: String(value) }];
     const parts = spec.list
         ? (Array.isArray(value) ? value : String(value).split(','))
         : [value];
@@ -531,9 +535,10 @@ function paramTableError(command, params = {}) {
         const rangeError = paramRangeError(param, value);
         if (rangeError) return rangeError;
         const allowed = paramValues(param, command, mode);
-        if (!allowed || value === '' || (Array.isArray(value) && value.length === 0)) continue;
-        const written = writtenValues(param, value);
+        if (!allowed || (spec.list && (value === '' || (Array.isArray(value) && value.length === 0)))) continue;
         const subject = `${toMcpName(command)}${mode === 'lines' ? ' lines' : ''} ${param}`;
+        if (!spec.list && typeof value !== 'string') return `Invalid ${subject}: must be a string. Valid: ${allowed.join(', ')}.`;
+        const written = writtenValues(param, value);
         if (written.length === 0) return `No ${subject} given. Valid: ${allowed.join(', ')}.`;
         const unknown = written.filter(part => !allowed.includes(part.folded)).map(part => part.written);
         if (unknown.length > 0) {
@@ -794,6 +799,11 @@ function formatSurfaceMessage(message, surface = 'cli') {
     const knownParams = new Set(Object.values(FLAG_APPLICABILITY).flat());
     const booleanParams = new Set(BOOLEAN_PARAMS);
     if (surface === 'mcp') {
+        rendered = rendered.replace(/--([a-z][a-z0-9-]*)[ \t]+N\b/g, (whole, flag) => {
+            const camel = flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+            return ['integer', 'number'].includes(PARAMS[camel]?.type)
+                ? `${REVERSE_PARAM_MAP[camel] || camel}=<n>` : whole;
+        });
         rendered = rendered.replace(/--([a-z][a-z0-9-]*)(?:=([^\s,.)]+))?/g,
             (whole, flag, rawValue) => {
                 const camel = flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());

@@ -222,7 +222,7 @@ describe('changelog: written from the history of a repository', () => {
             // Without the recorded section the clone cannot say.
             fs.rmSync(path.join(work, 'CHANGELOG.md'));
             assert.throws(() => run(work, '--notes', '1.1.0'), /not in this clone/);
-            assert.match(run(work), /left as it is/);
+            assert.throws(() => run(work), /fetch.*history and tags/);
             assert.equal(fs.existsSync(path.join(work, 'CHANGELOG.md')), false);
         } finally { rm(origin); if (clone) rm(clone); }
     });
@@ -304,5 +304,78 @@ describe('changelog: the release flow', () => {
         assert.equal(new Set(versions).size, versions.length);
         // Regenerating a recorded section changes nothing about the others.
         assert.equal(changelog.upsertSection(text, versions[0], changelog.splitSections(text)[0].text), text);
+    });
+});
+
+
+describe('fix #499: prereleases and missing release history', () => {
+    it('orders SemVer identifiers numerically and keeps exact prerelease/build section identities', () => {
+        const versions = ['1.1.0-alpha', '1.1.0-alpha.2', '1.1.0-alpha.10', '1.1.0-beta.2', '1.1.0-beta.11',
+            '1.1.0-rc.1', '1.1.0-rc.2', '1.1.0-rc.10', '1.1.0'];
+        assert.deepEqual([...versions].reverse().sort(changelog.compareVersions), versions);
+        assert.equal(changelog.compareVersions('1.1.0+build.1', '1.1.0+build.2'), 0);
+        let text = '';
+        for (const version of [...versions, '1.1.0+build.1', '1.1.0+build.2']) {
+            const section = changelog.renderSection(version, '2026-01-01', [{ hash: 'abc', subject: `fix: only ${version}` }]);
+            text = changelog.upsertSection(text, version, section);
+            assert.match(changelog.notesOf(text, version), new RegExp(`only ${version.replace(/[.+]/g, '\\$&')}`));
+            assert.equal(changelog.classify(version), null);
+        }
+        assert.equal(changelog.splitSections(text).length, versions.length + 2);
+        assert.doesNotMatch(changelog.notesOf(text, '1.1.0+build.1'), /build\.2/);
+        assert.equal(changelog.upsertSection(text, '1.1.0-rc.2', changelog.splitSections(text).find(s => s.version === '1.1.0-rc.2').text), text);
+        assert.throws(() => changelog.compareVersions('1.1.0-rc.01', '1.1.0'), /invalid version/);
+    });
+
+    it('npm version prerelease commits separate sections, then a stable version can follow', () => {
+        const dir = repository(['feat: initial', '1.0.0', '@v1.0.0', 'fix: next'], '1.0.0');
+        try {
+            fs.mkdirSync(path.join(dir, 'scripts'));
+            fs.copyFileSync(SCRIPT, path.join(dir, 'scripts', 'changelog.js'));
+            const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'package.json')));
+            manifest.scripts = { version: 'node scripts/changelog.js && git add CHANGELOG.md' };
+            fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(manifest));
+            git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'chore: tooling');
+            for (const args of [['prerelease', '--preid', 'rc'], ['prerelease', '--preid', 'rc'], ['patch']]) {
+                const bumped = spawnSync('npm', ['version', ...args], { cwd: dir, env: GIT_ENV, encoding: 'utf8' });
+                assert.equal(bumped.status, 0, bumped.stderr);
+                assert.equal(git(dir, 'status', '--porcelain'), '');
+            }
+            assert.deepEqual(changelog.splitSections(read(dir)).map(s => s.version), ['1.0.1', '1.0.1-rc.1', '1.0.1-rc.0']);
+            assert.match(run(dir, '--notes', '1.0.1-rc.0'), /next/);
+            assert.doesNotMatch(run(dir, '--notes', '1.0.1-rc.1'), /next/);
+        } finally { rm(dir); }
+    });
+
+    it('refuses a new version in a shallow clone without its history and leaves the changelog untouched', () => {
+        const origin = repository(['feat: initial', '1.0.0', '@v1.0.0', 'feat: new work'], '1.1.0');
+        let clone;
+        try {
+            const prior = '## 1.0.0 - 2026-01-01\nold notes\n';
+            fs.writeFileSync(path.join(origin, 'CHANGELOG.md'), prior);
+            git(origin, 'add', '-A'); git(origin, 'commit', '-qm', 'docs: prior notes');
+            clone = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-changelog-shallow-'));
+            git(clone, 'clone', '-q', '--depth', '1', `file://${origin}`, 'work');
+            const work = path.join(clone, 'work');
+            assert.throws(() => run(work), /fetch.*history and tags/);
+            assert.equal(read(work), prior);
+            assert.equal(git(work, 'tag', '--list', 'v1.1.0'), '');
+        } finally { rm(origin); if (clone) rm(clone); }
+    });
+
+    it('the GitHub release command marks prereleases and ignores hyphens in build metadata', () => {
+        const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/publish.yml'), 'utf8');
+        const job = workflow.split('      - name: Create or update the GitHub release')[1].split('\n  publish-mcp:')[0];
+        const script = job.split('        run: |\n')[1].split('\n').map(line => line.replace(/^          /, '')).join('\n');
+        for (const tag of ['v1.2.3', 'v1.2.3-rc.0', 'v1.2.3+build-with-hyphen']) {
+            for (const exists of [true, false]) {
+                const stub = `gh() { if [[ "$1 $2" == 'release view' ]]; then return ${exists ? 0 : 1}; fi; printf '%s\\n' "$@"; };\n`;
+                const result = spawnSync('bash', ['-c', stub + script], { encoding: 'utf8',
+                    env: { ...process.env, GITHUB_REF_NAME: tag, RUNNER_TEMP: '/unused' } });
+                assert.equal(result.status, 0, result.stderr);
+                assert.match(result.stdout, new RegExp(`--prerelease=${tag.includes('-rc')}`));
+                assert.match(result.stdout, exists ? /edit/ : /create/);
+            }
+        }
     });
 });
