@@ -94,13 +94,26 @@ const RUNNERS = {
     'maven': { probe: ['mvn', ['--version']], full: 'mvn -q test' },
 };
 
-function toolEnv(extra = {}) {
-    const front = (process.env.UCN_TEST_TOOLS || '').split(path.delimiter).filter(Boolean);
+function toolEnv(extra = {}, base = process.env) {
+    const front = (base.UCN_TEST_TOOLS || '').split(path.delimiter).filter(Boolean);
     return {
-        ...process.env,
-        PATH: [...front, process.env.PATH].join(path.delimiter),
+        ...base,
+        PATH: [...front, base.PATH].join(path.delimiter),
         ...extra,
     };
+}
+
+// What tells a test runner it is under continuous integration: the common
+// switch, and the one GitHub Actions sets beside it. Runners change what
+// they accept when they see either (vitest rejects a focused test), and the
+// claims are about a run on a developer's machine.
+const CI_MARKERS = ['CI', 'GITHUB_ACTIONS'];
+
+/** The environment a case's commands run in: the tools' own, with no CI marker. */
+function runnerEnv(extra = {}, base = process.env) {
+    const env = toolEnv(extra, base);
+    for (const marker of CI_MARKERS) delete env[marker];
+    return env;
 }
 
 /**
@@ -453,11 +466,7 @@ function main() {
             }
             // go reports a cached result for a package it already ran with
             // the same flags, and executes nothing: every run here must run.
-            // CI is unset: runners change what they accept under it
-            // (vitest rejects a focused test), and the claims are about a
-            // run on a developer's machine.
-            const env = toolEnv({ CARGO_TARGET_DIR: cargoTarget, NO_COLOR: '1', GOFLAGS: '-count=1' });
-            delete env.CI;
+            const env = runnerEnv({ CARGO_TARGET_DIR: cargoTarget, NO_COLOR: '1', GOFLAGS: '-count=1' });
             const cwd = path.join(dir, testCase.cwd || '');
             const full = runRecorded(testCase.full || spec.full, cwd, env);
             const label = labelOf;
@@ -586,4 +595,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { answerOf, materialize, judgeWholeRun, judgeJoined, namedIdentities, sharedBodyOnly, RUNNERS };
+module.exports = { answerOf, materialize, judgeWholeRun, judgeJoined, namedIdentities, sharedBodyOnly, runnerEnv, RUNNERS };

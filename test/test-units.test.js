@@ -29,7 +29,7 @@ const {
     shellSplit, configArguments, pytestOptions, markSelects, nodeRunsFile,
 } = require('../core/test-units');
 const { CASES } = require('../eval/test-unit-matrix-cases');
-const { answerOf, judgeWholeRun, judgeJoined, namedIdentities, materialize, sharedBodyOnly } = require('../eval/run-test-unit-matrix');
+const { answerOf, judgeWholeRun, judgeJoined, namedIdentities, materialize, sharedBodyOnly, runnerEnv } = require('../eval/run-test-unit-matrix');
 const PINNED = require('../eval/test-unit-matrix-answers.json');
 
 function git(dir, ...args) {
@@ -3128,5 +3128,18 @@ describe('test units: the judge holds a weaker claim to what it says', () => {
             onlyInWholeRun: ['tests/test_a.py::helper'],
         });
         assert.deepStrictEqual(named.onlyInWholeRun, ['tests/test_a.py:2']);
+    });
+
+    it('a case runs as on a developer machine: no marker of continuous integration reaches its runner', () => {
+        // vitest refuses a focused test when it sees either marker, so a
+        // runner that kept one would judge another claim than the engine makes.
+        const host = { PATH: '/usr/bin', HOME: '/home/dev', UCN_TEST_TOOLS: '/opt/tools/bin', CI: 'true', GITHUB_ACTIONS: 'true' };
+        assert.deepStrictEqual(runnerEnv({ NO_COLOR: '1' }, host), {
+            PATH: ['/opt/tools/bin', '/usr/bin'].join(path.delimiter),
+            HOME: '/home/dev', UCN_TEST_TOOLS: '/opt/tools/bin', NO_COLOR: '1',
+        });
+        assert.deepStrictEqual(host.CI, 'true', 'the host environment itself is left alone');
+        const here = runnerEnv();
+        assert.ok(!('CI' in here) && !('GITHUB_ACTIONS' in here));
     });
 });
