@@ -12,8 +12,14 @@ name: Eval
 #    when a default-arm claim has a reference UCN missed (false-dead gate)
 #  - consistency: deterministic stable-handle board requires overlapping find,
 #    show, source, impact, tests, check, and caller-trace claims to agree exactly
-# Separate from ci.yml: heavier, network-dependent, weekly + on demand. A
-# manual dispatch from main is the required pre-tag release dry run.
+#  - matrices: small projects the eval writes itself, each judged by the
+#    language's own compiler or test runner (deletion: a deletion the engine
+#    clears and the compiler rejects; check: READY for a change the compiler
+#    rejects or BLOCKED for one it accepts; test-unit: a listed test the
+#    runner never executes or a printed command that runs something else)
+# Separate from ci.yml: heavier, network-dependent, weekly + on demand. A push
+# does not start it. A manual dispatch from main is the required pre-tag
+# release dry run.
 
 on:
   workflow_dispatch:
@@ -45,7 +51,8 @@ jobs:
     name: Eval (${{ matrix.id }})
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The test-unit matrix starts a test runner about two thousand times.
+    timeout-minutes: ${{ matrix.kind == 'matrices' && 120 || 45 }}
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -106,6 +113,11 @@ jobs:
           mkdir -p "$HOME/jdtls" && tar -xzf /tmp/jdtls.tar.gz -C "$HOME/jdtls"
           echo "UCN_EVAL_JDTLS=$HOME/jdtls/bin/jdtls" >> "$GITHUB_ENV"
 
+      # pytest, jest, vitest, mocha and the C++ compiler, for the matrices.
+      - name: Matrix toolchains
+        if: ${{ matrix.kind == 'matrices' }}
+        uses: ./.github/actions/matrix-toolchains
+
       - run: npm ci
         id: dependencies
 
@@ -148,6 +160,25 @@ jobs:
       - name: "Outcome gate (pinned tuned set, toolchain-judged)"
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' }}
         run: node eval/run-outcome-eval.js --gate
+
+      # Toolchain-judged matrices, on every trigger, on their own runner. A
+      # toolchain that is not installed fails its matrix: a case that was not
+      # judged is never a pass. Like the outcome gate above they are NOT in
+      # npm run trust:gate, so a tag push does not run them: until they are, a
+      # release relies on a green dispatch of this workflow from the commit to
+      # be tagged. They join trust:gate, and the publish job gets the same
+      # toolchain action, only after a green run on this runner.
+      - name: "Deletion matrix (gate: false-safe = 0)"
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'matrices' }}
+        run: node eval/run-deletion-matrix.js
+
+      - name: "Check matrix (gate: false-ready = 0, false-blocked = 0)"
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'matrices' }}
+        run: node eval/run-check-matrix.js
+
+      - name: "Test-unit matrix (gate: every listed test and printed command judged by its runner)"
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'matrices' }}
+        run: node eval/run-test-unit-matrix.js
 
       - name: "Pre-tag release dry run (publish-blocking board)"
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'release' }}

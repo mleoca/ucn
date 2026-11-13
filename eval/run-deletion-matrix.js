@@ -24,7 +24,8 @@
  *
  * usage: node eval/run-deletion-matrix.js [--allow-missing] [--only <substring>]
  *   JAVAC and CXX override the Java and C++ compilers.
- *   UCN_EVAL_REPORTS_DIR, when set, receives deletion-matrix-<date>.json.
+ *   UCN_EVAL_REPORTS_DIR, when set, receives deletion-matrix-<date>.json,
+ *   which names the version of every toolchain that judged.
  */
 
 'use strict';
@@ -32,7 +33,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const { ProjectIndex } = require('../core/project');
 const { assessDeletion } = require('../core/deletion');
@@ -100,8 +101,23 @@ function succeeds(command, cwd) {
     }
 }
 
-function available(toolchain) {
-    try { return succeeds(toolchain.probe, os.tmpdir()); } catch { return false; }
+/**
+ * The first line a toolchain's probe prints: the version that judges, kept
+ * in the report. Null when the toolchain cannot run.
+ */
+function toolchainVersion(toolchain) {
+    const [cmd, args] = toolchain.probe;
+    const result = spawnSync(cmd, args, { cwd: os.tmpdir(), encoding: 'utf8', timeout: TIMEOUT_MS });
+    if (result.error || result.status !== 0) return null;
+    const line = `${result.stdout}\n${result.stderr}`.split('\n').map(text => text.trim()).find(Boolean);
+    return line || 'version not printed';
+}
+
+/** Every toolchain's version by language; null marks one that is not usable. */
+function toolchainVersions() {
+    const versions = {};
+    for (const [lang, toolchain] of Object.entries(TOOLCHAINS)) versions[lang] = toolchainVersion(toolchain);
+    return versions;
 }
 
 function buildIndex(root) {
@@ -157,8 +173,9 @@ function main() {
     const args = process.argv.slice(2);
     const allowMissing = args.includes('--allow-missing');
     const only = args.includes('--only') ? args[args.indexOf('--only') + 1] : null;
+    const toolchains = toolchainVersions();
     const usable = {};
-    for (const [lang, toolchain] of Object.entries(TOOLCHAINS)) usable[lang] = available(toolchain);
+    for (const lang of Object.keys(TOOLCHAINS)) usable[lang] = toolchains[lang] !== null;
 
     const rows = [];
     const totals = { judged: 0, falseSafe: 0, overCautious: 0, problems: 0, notJudged: 0 };
@@ -210,7 +227,10 @@ function main() {
     const failed = totals.falseSafe > 0 || totals.problems > 0 || totals.judged === 0 ||
         (!allowMissing && totals.notJudged > 0);
     const verdict = failed ? 'FAIL' : (totals.notJudged > 0 ? 'PASS (partial)' : 'PASS');
-    console.log(`\nDELETION MATRIX: ${verdict} (${totals.judged} judged, ` +
+    const judgedBy = Object.entries(toolchains).filter(([, version]) => version)
+        .map(([lang, version]) => `${lang} ${version}`).join(' | ');
+    console.log(`\ntoolchains: ${judgedBy || 'none'}`);
+    console.log(`DELETION MATRIX: ${verdict} (${totals.judged} judged, ` +
         `${totals.falseSafe} false-safe, ${totals.overCautious} over-cautious, ` +
         `${totals.problems} problem(s), ${totals.notJudged} not judged)`);
 
@@ -218,7 +238,7 @@ function main() {
     if (reportsDir) {
         fs.mkdirSync(reportsDir, { recursive: true });
         const file = path.join(reportsDir, `deletion-matrix-${new Date().toISOString().slice(0, 10)}.json`);
-        fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, totals, allowMissing, rows }, null, 2));
+        fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, totals, allowMissing, toolchains, rows }, null, 2));
         console.log(`  JSON: ${file}`);
     }
     process.exit(failed ? 1 : 0);
@@ -226,4 +246,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { TOOLCHAINS, runCase };
+module.exports = { TOOLCHAINS, runCase, toolchainVersions };

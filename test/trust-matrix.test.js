@@ -143,7 +143,11 @@ describe('command trust matrix: fail-closed proof coverage', () => {
             assert.strictEqual(rows.filter(row => row.kind === 'release').length, event === 'workflow_dispatch' ? 1 : 0);
         }
         assert.deepStrictEqual(evaluationMatrix('workflow_dispatch', false).include.map(row => row.kind),
-            ['checks', 'release']);
+            ['checks', 'matrices', 'release']);
+        for (const [event, full] of [['schedule', false], ['workflow_dispatch', false], ['workflow_dispatch', true]]) {
+            assert.strictEqual(evaluationMatrix(event, full).include.filter(row => row.kind === 'matrices').length, 1,
+                `${event} judges the matrices on one runner`);
+        }
         assert.deepStrictEqual(evaluationMatrix('schedule', false), evaluationMatrix('schedule', true));
         assert.throws(() => evaluationMatrix('push', true), /Unsupported/);
         assert.throws(() => evaluationMatrix('schedule', 'false'), /boolean/);
@@ -159,7 +163,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
         const arms = workflow.split(/\n      - name: /).slice(1).filter(step =>
             /\n        run: (?:node eval\/|npm run trust:gate)/.test(step));
-        assert.strictEqual(arms.length, 8);
+        assert.strictEqual(arms.length, 11);
         for (const [event, full] of [['schedule', false], ['workflow_dispatch', true], ['workflow_dispatch', false]]) {
             for (const matrix of evaluationMatrix(event, full).include) {
                 for (const step of arms) {
@@ -175,7 +179,8 @@ describe('command trust matrix: fail-closed proof coverage', () => {
                         success: () => false,
                     });
                     const kind = step.startsWith('"Pre-tag') ? 'release' :
-                        step.startsWith('"Oracle eval') ? 'oracle' : 'checks';
+                        step.startsWith('"Oracle eval') ? 'oracle' :
+                            / matrix \(gate: /.test(title) ? 'matrices' : 'checks';
                     const scheduled = !step.startsWith('"Outcome') && kind === 'checks';
                     const expected = matrix.kind === kind && (!scheduled || event === 'schedule' || full);
                     assert.strictEqual(evaluate(false, 'success'), expected, `${event}/${matrix.id}/${title}`);
@@ -193,6 +198,81 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         assert.match(workflow, /needs: \[plan, eval\]\n    if: always\(\)/);
         assert.match(workflow, /uses: actions\/upload-artifact\/merge@v6/);
         assert.match(workflow, /pattern: eval-reports-\*/);
+    });
+
+    it('the matrices run with every toolchain they judge by, and a missing one fails them', () => {
+        const { evaluationMatrix } = require('../eval/run-ci-plan');
+        const { TOOLCHAINS } = require('../eval/run-deletion-matrix');
+        const { RUNNERS } = require('../eval/run-test-unit-matrix');
+        const pkg = require('../package.json');
+        const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
+        const publish = fs.readFileSync(path.join(ROOT, '.github/workflows/publish.yml'), 'utf8');
+        const action = fs.readFileSync(path.join(ROOT, '.github/actions/matrix-toolchains/action.yml'), 'utf8');
+        const lock = require('../package-lock.json');
+
+        // Each matrix is one step that runs whole: no partial run, no case
+        // filter, and a toolchain that is absent is a failure.
+        const runs = workflow.match(/\n        run: node eval\/run-[a-z-]+-matrix\.js.*/g).map(line => line.trim());
+        assert.deepStrictEqual(runs, [
+            'run: node eval/run-deletion-matrix.js',
+            'run: node eval/run-check-matrix.js',
+            'run: node eval/run-test-unit-matrix.js',
+        ]);
+        assert.doesNotMatch(workflow, /--allow-missing|--only|--pin/);
+        assert.match(workflow, /timeout-minutes: \$\{\{ matrix\.kind == 'matrices' && 120 \|\| 45 \}\}/);
+
+        // Where every toolchain comes from: the lockfile, the job's own
+        // setup, the shared action, or the runner image (asserted present
+        // by the action's version step).
+        const setup = `${workflow}\n${action}`;
+        const provided = {
+            ts: () => lock.packages['node_modules/typescript'],
+            py: () => lock.packages['node_modules/pyright'],
+            go: () => /uses: actions\/setup-go@/.test(workflow),
+            rs: () => /\n        rustc --version\n/.test(action),
+            java: () => /uses: actions\/setup-java@/.test(workflow),
+            cs: () => /uses: actions\/setup-dotnet@/.test(workflow),
+            cpp: () => /echo "CXX=clang\+\+-18" >> "\$GITHUB_ENV"/.test(action),
+            pytest: () => /pip install .*pytest==\d+\.\d+\.\d+/.test(action),
+            'node-test': () => /uses: actions\/setup-node@/.test(workflow),
+            jest: () => /npm install .* jest@\d+\.\d+\.\d+/.test(action),
+            vitest: () => /npm install .* vitest@\d+\.\d+\.\d+/.test(action),
+            mocha: () => /npm install .* mocha@\d+\.\d+\.\d+/.test(action),
+            'go-test': () => /uses: actions\/setup-go@/.test(workflow),
+            'cargo-test': () => /\n        cargo --version\n/.test(action),
+            'dotnet-test': () => /uses: actions\/setup-dotnet@/.test(workflow),
+            maven: () => /\n        mvn --version\n/.test(action) && /uses: actions\/setup-java@/.test(workflow),
+        };
+        for (const name of [...Object.keys(TOOLCHAINS), ...Object.keys(RUNNERS)]) {
+            assert.ok(provided[name], `no declared source for the ${name} toolchain`);
+            assert.ok(provided[name](), `the matrices job does not provide ${name}`);
+        }
+        assert.match(action, /echo "UCN_JS_TEST_MODULES=\$tools\/node_modules" >> "\$GITHUB_ENV"/);
+        assert.match(setup, /uses: actions\/setup-python@v\d+\n\s+with:\n\s+python-version: '3\.\d+'/);
+
+        // The action runs on the matrices' runner, before the dependencies
+        // every arm waits for: a failed install skips the arms and fails the job.
+        const toolsStep = workflow.split(/\n      - name: /).find(step => step.startsWith('Matrix toolchains\n'));
+        const toolsIf = toolsStep.match(/\n        if: \$\{\{ (.+) \}\}\n        uses: \.\/\.github\/actions\/matrix-toolchains\n/)[1];
+        const hasTools = row => require('node:vm').runInNewContext(toolsIf, { matrix: row });
+        const rows = evaluationMatrix('workflow_dispatch', true).include;
+        assert.strictEqual(hasTools(rows.find(row => row.kind === 'matrices')), true);
+        assert.ok(workflow.indexOf('uses: ./.github/actions/matrix-toolchains') < workflow.indexOf('- run: npm ci'));
+
+        // The release gate runs the matrices only where their toolchains
+        // are installed: in the publish job and in the pre-tag dry run.
+        // Everything `npm run trust:gate` reaches, through any script it names.
+        const reached = (name, seen = new Set()) => {
+            if (seen.has(name) || !pkg.scripts[name]) return '';
+            seen.add(name);
+            const text = pkg.scripts[name];
+            return [text, ...[...text.matchAll(/npm run ([\w:.-]+)/g)].map(match => reached(match[1], seen))].join(' ');
+        };
+        const enrolled = /run-(?:deletion|check|test-unit)-matrix\.js/.test(reached('trust:gate'));
+        const publishHasTools = publish.includes('uses: ./.github/actions/matrix-toolchains');
+        assert.strictEqual(publishHasTools, enrolled, 'trust:gate and the publish job change together');
+        assert.strictEqual(hasTools(rows.find(row => row.kind === 'release')), enrolled,
+            'trust:gate and the pre-tag dry run change together');
     });
 
     it('keeps one machine-readable release board across gates and documentation', () => {

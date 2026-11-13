@@ -60,7 +60,8 @@
  * usage: node eval/run-test-unit-matrix.js [--allow-missing] [--only <substring>] [--pin]
  *   UCN_TEST_TOOLS: directories put in front of PATH (pytest, mvn).
  *   UCN_JS_TEST_MODULES: a node_modules directory holding jest, vitest, mocha.
- *   UCN_EVAL_REPORTS_DIR, when set, receives test-unit-matrix-<date>.json.
+ *   UCN_EVAL_REPORTS_DIR, when set, receives test-unit-matrix-<date>.json,
+ *   which names the version of every runner that judged.
  *   --pin rewrites the pinned answers from the engine's current ones.
  */
 
@@ -69,7 +70,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync, spawnSync } = require('child_process');
+const { spawnSync } = require('child_process');
 
 const { ProjectIndex } = require('../core/project');
 const { createTestModel, selectorText, unitLabel, commandsFor, linkFile, standsForSeveral } = require('../core/test-units');
@@ -102,19 +103,28 @@ function toolEnv(extra = {}) {
     };
 }
 
-function available(runner) {
+/**
+ * The version of a runner that can judge, kept in the report: the first
+ * line its probe prints, and for a runner that is a package the version of
+ * that package. Null when the runner is not installed.
+ */
+function runnerVersion(runner) {
     const spec = RUNNERS[runner];
-    if (!spec) return false;
+    if (!spec) return null;
+    let packaged = '';
     if (spec.modules) {
         const modules = process.env.UCN_JS_TEST_MODULES;
-        if (!modules || !fs.existsSync(path.join(modules, spec.modules))) return false;
+        if (!modules || !fs.existsSync(path.join(modules, spec.modules))) return null;
+        try {
+            packaged = `${spec.modules} ${JSON.parse(fs.readFileSync(path.join(modules, spec.modules, 'package.json'), 'utf8')).version}, node `;
+        } catch {
+            return null;
+        }
     }
-    try {
-        execFileSync(spec.probe[0], spec.probe[1], { stdio: 'pipe', env: toolEnv(), timeout: 60000 });
-        return true;
-    } catch {
-        return false;
-    }
+    const result = spawnSync(spec.probe[0], spec.probe[1], { encoding: 'utf8', env: toolEnv(), timeout: 60000 });
+    if (result.error || result.status !== 0) return null;
+    const line = `${result.stdout}\n${result.stderr}`.split('\n').map(text => text.trim()).find(Boolean);
+    return `${packaged}${line || 'version not printed'}`;
 }
 
 /**
@@ -430,8 +440,8 @@ function main() {
             totals.withheld += answer.units.filter(unit => !unit.selector).length;
             if (testCase.judge === false) continue;
 
-            if (!present.has(testCase.runner)) present.set(testCase.runner, available(testCase.runner));
-            if (!present.get(testCase.runner)) {
+            if (!present.has(testCase.runner)) present.set(testCase.runner, runnerVersion(testCase.runner));
+            if (present.get(testCase.runner) === null) {
                 missing.add(testCase.runner);
                 continue;
             }
@@ -553,6 +563,11 @@ function main() {
     }
     if (totals.judged === 0) failures.push('NOTHING-JUDGED: no case ran under its runner');
 
+    const runners = {};
+    for (const runner of [...present.keys()].sort()) runners[runner] = present.get(runner);
+    const judgedBy = Object.entries(runners).filter(([, version]) => version)
+        .map(([runner, version]) => `${runner} (${version})`).join(' | ');
+    console.log(`runners: ${judgedBy || 'none'}`);
     console.log(`test-unit matrix: ${totals.cases} cases, ${totals.judged} judged by their runner`);
     console.log(`  units listed: ${totals.units} · unit selectors run: ${totals.selectors} · file commands run: ${totals.fileCommands} · joined commands run: ${totals.joined || 0}`);
     console.log(`  units without a command: ${totals.withheld} · runner tests the engine does not list (named by their cases): ${totals.undeclared}`);
@@ -564,7 +579,7 @@ function main() {
         fs.mkdirSync(reports, { recursive: true });
         const date = new Date().toISOString().slice(0, 10);
         fs.writeFileSync(path.join(reports, `test-unit-matrix-${date}.json`),
-            JSON.stringify({ totals, missing: [...missing].sort(), failures, rows }, null, 2));
+            JSON.stringify({ totals, runners, missing: [...missing].sort(), failures, rows }, null, 2));
     }
     process.exit(failures.length === 0 ? 0 : 1);
 }

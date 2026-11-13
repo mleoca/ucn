@@ -16,7 +16,14 @@ const ORACLE_GROUPS = {
 function evaluationMatrix(event, full, repos = REPOS) {
     if (!['schedule', 'workflow_dispatch'].includes(event)) throw new Error(`Unsupported evaluation event: ${event}`);
     if (typeof full !== 'boolean') throw new Error('full must be a boolean');
-    const include = [{ id: 'checks', kind: 'checks', repos: '' }];
+    // The matrices are judged by compilers and test runners on projects they
+    // write themselves, not on the pinned board: their own runner, on every
+    // trigger, so their toolchains never share a job with a timing or an
+    // oracle arm.
+    const include = [
+        { id: 'checks', kind: 'checks', repos: '' },
+        { id: 'matrices', kind: 'matrices', repos: '' },
+    ];
     if (event === 'schedule' || full) {
         const groups = new Map(Object.keys(ORACLE_GROUPS).map(group => [group, []]));
         const names = new Set();

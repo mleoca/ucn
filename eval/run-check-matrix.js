@@ -22,7 +22,8 @@
  *
  * usage: node eval/run-check-matrix.js [--allow-missing] [--only <substring>]
  *   JAVAC and CXX override the Java and C++ compilers.
- *   UCN_EVAL_REPORTS_DIR, when set, receives check-matrix-<date>.json.
+ *   UCN_EVAL_REPORTS_DIR, when set, receives check-matrix-<date>.json,
+ *   which names the version of every toolchain that judged.
  */
 
 'use strict';
@@ -35,7 +36,7 @@ const { execFileSync } = require('child_process');
 const { ProjectIndex } = require('../core/project');
 const { check } = require('../core/check');
 const { CASES } = require('./check-matrix-cases');
-const { TOOLCHAINS } = require('./run-deletion-matrix');
+const { TOOLCHAINS, toolchainVersions } = require('./run-deletion-matrix');
 
 const TIMEOUT_MS = 180000;
 const BUILD_OUTPUTS = ['out', 'obj', 'bin', 'a.out', 'out.rmeta'];
@@ -51,10 +52,6 @@ function succeeds(command, cwd) {
         if (error.status == null) throw error;
         return false;
     }
-}
-
-function available(toolchain) {
-    try { return succeeds(toolchain.probe, os.tmpdir()); } catch { return false; }
 }
 
 function git(cwd, ...args) {
@@ -147,8 +144,9 @@ function main() {
     const args = process.argv.slice(2);
     const allowMissing = args.includes('--allow-missing');
     const only = args.includes('--only') ? args[args.indexOf('--only') + 1] : null;
+    const toolchains = toolchainVersions();
     const usable = {};
-    for (const [lang, toolchain] of Object.entries(TOOLCHAINS)) usable[lang] = available(toolchain);
+    for (const lang of Object.keys(TOOLCHAINS)) usable[lang] = toolchains[lang] !== null;
 
     const rows = [];
     const totals = { judged: 0, falseReady: 0, falseBlocked: 0, overCautious: 0, problems: 0, notJudged: 0 };
@@ -199,7 +197,10 @@ function main() {
     const failed = totals.falseReady > 0 || totals.falseBlocked > 0 || totals.problems > 0 ||
         totals.judged === 0 || (!allowMissing && totals.notJudged > 0);
     const verdict = failed ? 'FAIL' : (totals.notJudged > 0 ? 'PASS (partial)' : 'PASS');
-    console.log(`\nCHECK MATRIX: ${verdict} (${totals.judged} judged, ${totals.falseReady} false-ready, ` +
+    const judgedBy = Object.entries(toolchains).filter(([, version]) => version)
+        .map(([lang, version]) => `${lang} ${version}`).join(' | ');
+    console.log(`\ntoolchains: ${judgedBy || 'none'}`);
+    console.log(`CHECK MATRIX: ${verdict} (${totals.judged} judged, ${totals.falseReady} false-ready, ` +
         `${totals.falseBlocked} false-blocked, ${totals.overCautious} over-cautious, ` +
         `${totals.problems} problem(s), ${totals.notJudged} not judged)`);
 
@@ -207,7 +208,7 @@ function main() {
     if (reportsDir) {
         fs.mkdirSync(reportsDir, { recursive: true });
         const file = path.join(reportsDir, `check-matrix-${new Date().toISOString().slice(0, 10)}.json`);
-        fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, totals, allowMissing, rows }, null, 2));
+        fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, totals, allowMissing, toolchains, rows }, null, 2));
         console.log(`  JSON: ${file}`);
     }
     process.exit(failed ? 1 : 0);
