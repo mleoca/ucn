@@ -2354,6 +2354,8 @@ const HANDLERS = {
                 base: p.base || 'HEAD',
                 staged: p.staged || false,
                 file: p.file,
+                all: !!p.all,
+                top: num(p.limit, undefined) || num(p.top, undefined),
                 ...(target && { repoRoot: target.repoRoot }),
             });
             // Paths of an exported snapshot are reported where the

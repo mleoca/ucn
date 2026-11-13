@@ -2293,7 +2293,7 @@ function diffImpact(index, options = {}) {
                         { cwd: repoRoot, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
                     );
                     const oldParsed = parse(oldContent, lang);
-                    collectNonCallableChanges(index, change, oldParsed, [], symbolChanges);
+                    collectNonCallableChanges(index, change, oldParsed, [], symbolChanges, null, options);
                     const baseEntry = index.fileEntryForContent(change.filePath, oldContent);
                     for (const oldFn of extractCallableSymbols(oldParsed)) {
                         deletedFunctions.push(withBaseDeclaration({
@@ -2347,7 +2347,7 @@ function diffImpact(index, options = {}) {
             }
         }
 
-        collectNonCallableChanges(index, change, oldParsed, fileEntry.symbols, symbolChanges, oldLines);
+        collectNonCallableChanges(index, change, oldParsed, fileEntry.symbols, symbolChanges, oldLines, options);
 
         // The base revision read with the index's own eyes, and both
         // revisions' syntax trees: what a changed callable's contract was
@@ -2677,6 +2677,7 @@ function diffImpact(index, options = {}) {
                 targetDefinitions: targetDefs.length > 0 ? targetDefs : undefined,
                 includeMethods: true,
                 collectAccount: true,
+                unverifiedEnrichLimit: unverifiedEnrichLimit(options.all, options.top),
             });
             // Call sites the base declaration bound that the changed one's
             // sweep excludes (fix #394) are the change's likeliest breaks:
@@ -2887,7 +2888,7 @@ function withBaseDeclaration(item, baseEntry, oldSymbol) {
 
 // Non-callable declarations have change dependencies too. Keep them separate
 // from functions so type references never inflate call-site accounting.
-function collectNonCallableChanges(index, change, oldParsed, currentSymbols, output, oldLines = null) {
+function collectNonCallableChanges(index, change, oldParsed, currentSymbols, output, oldLines = null, options = {}) {
     const nonCallable = s => NON_CALLABLE_TYPES.has(s.type) || s.type === 'record';
     const oldSymbols = [];
     for (const cls of oldParsed?.classes || []) {
@@ -2939,6 +2940,7 @@ function collectNonCallableChanges(index, change, oldParsed, currentSymbols, out
         } else {
             item.impact = impact(index, symbol.name, {
                 file: change.relativePath, line: symbol.startLine, className: symbol.className,
+                all: options.all, top: options.top,
             });
         }
         output[kind].push(item);

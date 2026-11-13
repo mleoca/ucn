@@ -27,7 +27,8 @@
  * --bands writes the table the unverified sections label their reasons with:
  * for each reason, how many of its candidates the release board's oracles
  * scored and how many of those were real edges. It reads the release board
- * only and refuses a board with a repository missing, so a partial run never
+ * only and requires pinned commits, primary oracles and every sampled symbol
+ * evaluated without errors. A partial or failed run never
  * rewrites the tracked table.
  */
 
@@ -38,6 +39,8 @@ const path = require('path');
 
 const REPORTS_DIR = process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports');
 const REPORT_RE = /^oracle-eval-(.+)-(\d{4}-\d{2}-\d{2})((?:-[a-z0-9]+)*)\.json$/;
+const PRIMARY_ORACLES = Object.freeze({ javascript: 'ts-morph', typescript: 'ts-morph', python: 'pyright',
+    go: 'gopls', rust: 'rust-analyzer', java: 'jdtls', csharp: 'roslyn', c: 'clangd', cpp: 'clangd' });
 
 function codeUnitCompare(a, b) {
     return a < b ? -1 : a > b ? 1 : 0;
@@ -118,6 +121,15 @@ function censusRepo(entry, report) {
         oracle: summary.oracle || null,
         date: entry.date,
         commit: summary.commit || null,
+        qualification: {
+            error: summary.error || report.error || null,
+            sampled: summary.sampled, evaluated: summary.evaluated, errors: summary.errors,
+            symbols: perSymbol.length,
+            symbolErrors: perSymbol.filter(symbol => symbol.error).length,
+            sourceErrors: summary.sourceStatusErrors || 0,
+            lookupErrors: summary.definitionLookupErrors || 0,
+            reasonsPresent: !!summary.unverifiedReasons && typeof summary.unverifiedReasons === 'object' && !Array.isArray(summary.unverifiedReasons),
+        },
         oracleCallEdges: summary.oracleCallEdges || 0,
         unverifiedCandidates: summary.unverifiedEdges || 0,
         trueEdgesUnverified: burden.trueEdgesUnverified || 0,
@@ -174,11 +186,32 @@ function bandOf(scored, real) {
  * The band table of a census over exactly the release board. Throws when a
  * release repository has no report: its absence would change every share.
  */
-function bandTable(census, releaseRepoNames) {
+function bandTable(census, releaseRepos) {
+    const releaseRepoNames = releaseRepos.map(repo => repo.name);
     const have = new Set(census.repos.map(repo => repo.repo));
     const missing = releaseRepoNames.filter(name => !have.has(name));
     if (missing.length > 0) throw new Error(`release board incomplete, no report for: ${missing.join(', ')}`);
     const board = census.repos.filter(repo => releaseRepoNames.includes(repo.repo));
+    for (const pin of releaseRepos) {
+        const rows = board.filter(repo => repo.repo === pin.name);
+        if (rows.length !== 1) throw new Error(`release board has several reports for: ${pin.name}`);
+        const row = rows[0];
+        const expectedOracle = pin.oracle || PRIMARY_ORACLES[pin.language];
+        if (!pin.commit || row.commit !== pin.commit || !expectedOracle || row.oracle !== expectedOracle) {
+            throw new Error(`release board report is off pin for: ${pin.name}`);
+        }
+        const q = row.qualification;
+        if (!q || q.error || !Number.isInteger(q.sampled) || q.sampled <= 0 ||
+            q.evaluated !== q.sampled || q.symbols !== q.sampled || q.errors !== 0 ||
+            q.symbolErrors !== 0 || q.sourceErrors !== 0 || q.lookupErrors !== 0 || q.reasonsPresent !== true) {
+            throw new Error(`release board report is incomplete or failed for: ${pin.name}`);
+        }
+        if (!row.reasons.every(reason => [reason.candidates, reason.oracleTrueHits, reason.falseCandidates, reason.unscored]
+            .every(value => Number.isInteger(value) && value >= 0) &&
+            reason.candidates === reason.oracleTrueHits + reason.falseCandidates + reason.unscored)) {
+            throw new Error(`release board reason counts are invalid for: ${pin.name}`);
+        }
+    }
     const reasons = {};
     for (const row of rollupReasons(board)) {
         const scored = row.oracleTrueHits + row.falseCandidates;
@@ -244,12 +277,20 @@ function formatMarkdown(census) {
 function main() {
     const argv = process.argv.slice(2);
     const includeVariants = argv.includes('--all');
+    const bands = argv.includes('--bands');
+    if (bands && includeVariants) {
+        process.stderr.write('Evidence bands require canonical release reports; --all includes variant samples.\n');
+        process.exitCode = 1;
+        return;
+    }
     const repoFilterRaw = readArgValue(argv, '--repo');
     const repoFilter = repoFilterRaw
         ? new Set(repoFilterRaw.split(',').map(value => value.trim()).filter(Boolean))
         : null;
 
-    const entries = selectLatestReports(includeVariants);
+    const releaseRepos = bands ? require('./lib/repos').RELEASE_REPOS : null;
+    const releasePrefixes = releaseRepos && new Set(releaseRepos.map(repo => `${repo.name}-${PRIMARY_ORACLES[repo.language]}`));
+    const entries = selectLatestReports(includeVariants).filter(entry => !bands || releasePrefixes.has(entry.prefix));
     // Older filename formats (repo without oracle, per-oracle variants) create
     // several prefixes per repo — dedup by the report's own summary.repo,
     // preferring the newest date, then the richer schema, then edge count.
@@ -283,11 +324,10 @@ function main() {
         reasonRollup: rollupReasons(repos),
     };
 
-    if (argv.includes('--bands')) {
-        const { RELEASE_REPO_NAMES } = require('./lib/repos');
+    if (bands) {
         let table;
         try {
-            table = bandTable(census, [...RELEASE_REPO_NAMES]);
+            table = bandTable(census, releaseRepos);
         } catch (error) {
             process.stderr.write(`${error.message}\n`);
             process.exitCode = 1;

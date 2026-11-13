@@ -1040,6 +1040,7 @@ const LANGUAGES = {
             classesCallableWithoutNew: true,
             constructorInheritance: { order: 'c3', classNodes: ['class_definition'], headerField: 'superclasses', keywordNode: 'keyword_argument' },
             constructorProtocol: { initializer: '__init__', allocator: '__new__', metaclass: 'metaclass', builtinRoot: 'object',
+                metaclassMethods: ['__call__', '__new__', '__init__'], identityMembers: ['__class__', '__getattribute__', '__getattr__'], identityOverrides: ['__getattribute__', '__setattr__', '__delattr__'],
                 functionNode: 'function_definition', classNode: 'class_definition',
                 headerField: 'superclasses', keywordNode: 'keyword_argument' },
             contextEnterMethods: ['__enter__', '__aenter__'],

@@ -8946,15 +8946,6 @@ function findCallees(index, definition, options = {}) {
                 },
                 options: { sameClass: !!call.receiver && _isReservedReceiver(language, call.receiver) },
             });
-            const shadowedClassReceiver = structuralCallee &&
-                _unprovenLocalClassReceiver(index, fileEntry, def.file, call);
-            if (shadowedClassReceiver) {
-                const evidence = siteEvidence.get(siteId);
-                evidence.call = shadowedClassReceiver;
-                evidence.evidence.hasReceiverType = false;
-                noteUnverified(siteId, shadowedClassReceiver, 'ambiguous-binding');
-                continue;
-            }
             if (language === 'csharp') {
                 // fix #353: `Beta.Helper.Widget()` — namespace-qualified type
                 // receiver (see the findCallers twin).
@@ -9023,6 +9014,18 @@ function findCallees(index, definition, options = {}) {
             if (call.isFunctionReference && call.isPathCall &&
                 !(index.symbols.get(call.name) || []).some(d => CALLABLE_SYMBOL_KINDS.has(d.type))) continue;
             if (calleeAccount) calleeAccount.totalSites++;
+            // A refused local construction is still a call in this
+            // function's ground set. Enroll it only after scope filtering;
+            // an inner class method must not enter the surrounding answer.
+            const shadowedClassReceiver = structuralCallee &&
+                _unprovenLocalClassReceiver(index, fileEntry, def.file, call);
+            if (shadowedClassReceiver) {
+                const evidence = siteEvidence.get(siteId);
+                evidence.call = shadowedClassReceiver;
+                evidence.evidence.hasReceiverType = false;
+                noteUnverified(siteId, shadowedClassReceiver, 'ambiguous-binding');
+                continue;
+            }
             // The class a constructor expression makes (the findCallers twin):
             // the file's own binding of the name decides the receiver's class.
             if (structuralCallee && call.isMethod && call.receiverType &&
@@ -31636,7 +31639,9 @@ function _unprovenLocalClassReceiver(index, fileEntry, file, call) {
     const recordedRow = constructed
         ? (call.receiverTypeLocalClassRef?.start === start ? call.receiverTypeLocalClassRef.row : undefined)
         : call.receiverLocalClassRow;
-    if (_localClassReferenceBinds(index, fileEntry, file, start, name, local, recordedRow)) return null;
+    if (_localClassReferenceBinds(index, fileEntry, file, start, name, local, recordedRow) &&
+        (!constructed || (lazyConstructedClassModule().constructionKeepsClass(index, local) &&
+            (!call.receiverWithBinding || lazyConstructedClassModule().contextBindingKeepsInstance(index, local))))) return null;
     // Neither the type name nor the qualifier spelling is a declaration
     // witness once a value binding shadows it. Do not attach that false
     // proof to the unverified entry either.
@@ -31700,6 +31705,12 @@ function _classAncestry(index, definition) {
 function _constructedReceiverClass(index, fileEntry, filePath, call) {
     const constructedClasses = lazyConstructedClassModule();
     const record = constructedClasses.constructionRecordOf(index, filePath, call);
+    if (record?.isMethod && record.receiver &&
+        constructedClasses.qualifiedBindingChanged(index, filePath, record, record.receiver)) {
+        return { ...call, receiverType: undefined, receiverTypeSource: undefined,
+            receiverTypeEvidence: undefined, receiverTypeQualifier: undefined, receiverTypeFlowFile: undefined,
+            receiverQualifiedFlow: `${record.receiver}.${record.name} — written namespace binding` };
+    }
     const constructed = record ? constructedClasses.constructedClass(index, filePath, record) : undefined;
     if (constructed?.definition) {
         // `with Name(..) as v`: `v` is what the manager's enter method returns.
@@ -31735,6 +31746,17 @@ function _constructedReceiverClass(index, fileEntry, filePath, call) {
     // `module.Name(..)`: the module-path rules of a qualified receiver decide
     // what this lookup did not. The construction record names the module
     // also where the receiver's own record does not carry the qualifier.
+    if (constructed === null) {
+        const qualifier = record?.receiver || record?.receiverModuleSpecifier;
+        const origin = record?.isMethod && qualifier && _structuralQualifiedReceiverOrigin(index, fileEntry,
+            qualifier, record.name, record.callSite || null);
+        if (origin?.kind !== 'external') {
+            return { ...call, receiverType: undefined, receiverTypeSource: undefined,
+                receiverTypeEvidence: undefined, receiverTypeQualifier: undefined,
+                receiverTypeFlowFile: undefined, receiverConstructedClass: undefined,
+                receiverQualifiedFlow: `${record?.name || call.receiverType} — construction result is not one class` };
+        }
+    }
     if (call.receiverTypeQualifier) return call;
     if (record && record.isMethod && (record.receiverIsModule || record.receiverModuleSpecifier)) {
         const origin = _structuralQualifiedReceiverOrigin(index, fileEntry,
@@ -31809,7 +31831,8 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             !NON_CALLABLE_TYPES.has(definition.type));
         const local = _functionLocalTypeInScope(index, filePath, name, record.line);
         if (local) {
-            return _localConstructorBinding(index, fileEntry, filePath, record, local)
+            return _localConstructorBinding(index, fileEntry, filePath, record, local) &&
+                lazyConstructedClassModule().constructionKeepsClass(index, local)
                 ? { type: name, fromFile: filePath, definition: local, exactConstructor: true } : null;
         }
         // The class the name denotes where it is written: this file's own
@@ -31825,7 +31848,8 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         const moduleTypes = typeDefs.filter(definition => !_isFunctionLocalType(definition));
         if (constructed?.unread && !record.localShadow && moduleTypes.length === 1 && callableDefs.length === 0) {
             const origin = _resolveFlowTypeOrigin(index, filePath, name, undefined, record.line);
-            if (origin?.fromFile === moduleTypes[0].file) {
+            if (origin?.fromFile === moduleTypes[0].file &&
+                lazyConstructedClassModule().constructionKeepsClass(index, moduleTypes[0])) {
                 return { type: name, fromFile: origin.fromFile,
                     exactConstructor: true };
             }
@@ -31842,6 +31866,7 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             return { type: constructed.definition.name, fromFile: constructed.definition.file,
                 definition: constructed.definition, exactConstructor: true };
         }
+        if (constructed === null) return null;
         const origin = _structuralQualifiedReceiverOrigin(index, fileEntry, record.receiver, name,
             record.callSite || null);
         if (origin?.kind === 'project') {

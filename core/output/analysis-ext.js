@@ -200,6 +200,8 @@ function formatDiffImpact(result, options = {}) {
 
     const lines = [];
     const MAX_CALLERS_PER_FN = options.all ? Infinity : 30;
+    const unverifiedLimit = options.all ? Infinity
+        : Number.isInteger(options.top) && options.top > 0 ? options.top : 10;
 
     lines.push(`Diff Impact Analysis (vs ${result.base})`);
     lines.push('═'.repeat(60));
@@ -262,7 +264,7 @@ function formatDiffImpact(result, options = {}) {
             // Unverified tier: visible one-liners with reasons (never silently dropped)
             const unverified = fn.unverifiedCallers || [];
             if (unverified.length > 0) {
-                const cap = options.all ? Infinity : 10;
+                const cap = unverifiedLimit;
                 lines.push(`  Unverified call sites (${unverified.length}) — call syntax, no binding/receiver evidence:`);
                 for (const u of unverified.slice(0, cap)) {
                     const caller = u.callerName ? ` [${u.callerName}]` : '';
@@ -304,8 +306,7 @@ function formatDiffImpact(result, options = {}) {
             const remaining = fn.remainingCallSites || [];
             if (remaining.length > 0) {
                 lines.push(`  ⚠ still called from ${remaining.length} site(s) — name-level matches:`);
-                const cap = options.all ? Infinity
-                    : Number.isInteger(options.top) && options.top > 0 ? options.top : 10;
+                const cap = unverifiedLimit;
                 for (const site of remaining.slice(0, cap)) {
                     lines.push(`    ${site.relativePath}:${site.line}  ${site.content}`);
                 }
@@ -328,10 +329,10 @@ function formatDiffImpact(result, options = {}) {
             } else {
                 const refs = symbol.remainingReferences || [];
                 lines.push(`  Remaining name references: ${refs.length} unverified (deleted target)`);
-                for (const site of refs.slice(0, MAX_CALLERS_PER_FN)) {
+                for (const site of refs.slice(0, unverifiedLimit)) {
                     lines.push(`    ${site.file}:${site.line}: ${site.expression}`);
                 }
-                if (refs.length > MAX_CALLERS_PER_FN) lines.push(`    (+${refs.length - MAX_CALLERS_PER_FN} more)`);
+                if (refs.length > unverifiedLimit) lines.push(`    (+${refs.length - unverifiedLimit} more)`);
             }
         }
     }

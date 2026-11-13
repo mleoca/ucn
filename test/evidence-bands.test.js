@@ -29,8 +29,10 @@ describe('evidence bands of the unverified tier', () => {
     });
 
     it('the table is built from the whole release board and nothing else', () => {
-        const names = ['a', 'b'];
+        const names = ['a', 'b'].map(name => ({ name, commit: `pin-${name}`, oracle: 'judge' }));
         const repo = (name, reasons, date = '2026-01-02') => ({ repo: name, date,
+            commit: `pin-${name}`, oracle: 'judge',
+            qualification: { sampled: 1, evaluated: 1, symbols: 1, errors: 0, symbolErrors: 0, sourceErrors: 0, lookupErrors: 0, reasonsPresent: true },
             reasons: Object.entries(reasons).map(([reason, [hits, wrong, unscored = 0]]) =>
                 ({ reason, candidates: hits + wrong + unscored, oracleTrueHits: hits, falseCandidates: wrong, unscored })) });
         const census = { repos: [
@@ -50,6 +52,66 @@ describe('evidence bands of the unverified tier', () => {
         assert.equal(built.generatedAt, undefined, 'the tracked table changes only with its board');
         // A board with a repository missing never yields a table.
         assert.throws(() => bandTable({ repos: census.repos.slice(1) }, names), /no report for: a/);
+        for (const change of [
+            row => { row.commit = 'another-pin'; },
+            row => { row.oracle = 'another-judge'; },
+            row => { row.qualification.error = 'oracle failed'; },
+            row => { row.qualification.errors = 1; },
+            row => { row.qualification.evaluated = 0; },
+            row => { row.qualification.symbols = 0; },
+            row => { row.qualification.symbolErrors = 1; },
+            row => { row.qualification.sourceErrors = 1; },
+            row => { row.qualification.reasonsPresent = false; },
+            row => { row.reasons[0].candidates++; },
+        ]) {
+            const copy = structuredClone(census);
+            change(copy.repos[0]);
+            assert.throws(() => bandTable(copy, names), /release board/);
+        }
+    });
+
+    it('a failed, partial or off-pin release report never overwrites the table (fix #498)', () => {
+        const { spawnSync } = require('child_process');
+        const { RELEASE_REPOS } = require('../eval/lib/repos');
+        const oracles = { javascript: 'ts-morph', typescript: 'ts-morph', python: 'pyright', go: 'gopls',
+            rust: 'rust-analyzer', java: 'jdtls', csharp: 'roslyn', c: 'clangd', cpp: 'clangd' };
+        const reports = RELEASE_REPOS.map(repo => ({ file: `oracle-eval-${repo.name}-${oracles[repo.language]}-2026-01-02.json`,
+            value: { schemaVersion: 1, summary: { repo: repo.name, commit: repo.commit, oracle: oracles[repo.language],
+                sampled: 1, evaluated: 1, errors: 0, unverifiedReasons: {
+                    example: { candidates: 40, hits: 20, falseCandidates: 20, unscored: 0 },
+                } }, perSymbol: [{ name: 'example' }] } }));
+        const dir = tmp({});
+        try {
+            const destination = path.join(dir, 'bands.json');
+            const run = extra => spawnSync(process.execPath, [path.join(ROOT, 'eval/run-unverified-census.js'),
+                '--bands', '--out', destination, ...extra], { encoding: 'utf8',
+                env: { ...process.env, UCN_EVAL_REPORTS_DIR: dir } });
+            for (const report of reports) fs.writeFileSync(path.join(dir, report.file), JSON.stringify(report.value));
+            assert.equal(run([]).status, 0);
+            const accepted = fs.readFileSync(destination, 'utf8');
+            assert.equal(JSON.parse(accepted).repositories.length, RELEASE_REPOS.length);
+            for (const change of [
+                value => { value.summary.error = 'compiler unavailable'; },
+                value => { value.summary.evaluated = 0; value.summary.errors = 1; },
+                value => { value.summary.commit = 'wrong'; },
+                value => { value.summary.oracle = 'wrong'; },
+                value => { value.perSymbol = []; },
+                value => { delete value.summary.unverifiedReasons; },
+                value => { value.perSymbol[0].error = 'lookup failed'; },
+            ]) {
+                const broken = structuredClone(reports[0].value);
+                change(broken);
+                fs.writeFileSync(path.join(dir, reports[0].file), JSON.stringify(broken));
+                assert.equal(run([]).status, 1);
+                assert.equal(fs.readFileSync(destination, 'utf8'), accepted);
+            }
+            fs.writeFileSync(path.join(dir, reports[0].file), JSON.stringify(reports[0].value));
+            assert.equal(run(['--all']).status, 1);
+            assert.equal(fs.readFileSync(destination, 'utf8'), accepted);
+            fs.unlinkSync(path.join(dir, reports[0].file));
+            assert.equal(run([]).status, 1);
+            assert.equal(fs.readFileSync(destination, 'utf8'), accepted);
+        } finally { rm(dir); }
     });
 
     it('the tracked table is the release board and agrees with its own rule', () => {

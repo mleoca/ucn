@@ -2010,6 +2010,34 @@ describe('unverified rows: --top and --all set the rows of every unverified list
         } finally { rm(dir); }
     });
 
+    it('target-less impact carries row limits and enriches every displayed diff site (fix #498)', () => {
+        const { execFileSync } = require('child_process');
+        const dir = fixture();
+        try {
+            const git = args => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+            git(['init', '-q']);
+            git(['add', '.']);
+            git(['-c', 'user.name=test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'baseline']);
+            const file = path.join(dir, 'a.py');
+            fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('return 1', 'return 10'));
+            const index = idx(dir);
+            for (const [params, expected] of [[{}, 10], [{ top: 3 }, 3], [{ limit: 4 }, 4], [{ top: 12 }, 12], [{ all: true }, 14]]) {
+                const response = execute(index, 'impact', params);
+                assert.ok(response.ok, response.error);
+                const rendered = formatPublicText('impact', response.result, params, response);
+                assert.equal(rows(rendered).length, expected, JSON.stringify(params));
+                assert.equal(rows(rendered).filter(line => line.includes('x.run()')).length, expected);
+                assert.match(rendered, /Unverified call sites \(14\)/);
+                const data = JSON.parse(formatPublicJson('impact', response.result, params, response)).data;
+                assert.equal(data.functions[0].unverifiedCallers.length, 14);
+                for (const site of data.functions[0].unverifiedCallers.slice(0, expected)) {
+                    assert.match(site.content, /x\.run\(\)/);
+                    assert.match(site.callerName, /^f\d+$/);
+                }
+            }
+        } finally { rm(dir); }
+    });
+
     it('the rows printed never change the account or the JSON sites', () => {
         const dir = fixture();
         try {
