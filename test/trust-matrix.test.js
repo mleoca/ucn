@@ -34,6 +34,25 @@ const TOOLCHAIN_ACTION = './.github/actions/matrix-toolchains';
 const MATRIX_MINUTES = 120;
 const EVAL_TRIGGERS = [['schedule', false], ['workflow_dispatch', false], ['workflow_dispatch', true]];
 
+// This guard accepts a small command language, not arbitrary shell programs:
+// literal node commands and npm run aliases joined by &&. Only terminal node
+// commands may receive npm's literal `--` arguments. Other gate-bearing forms
+// fail closed; unrelated installer/upload shell blocks stay opaque.
+const NPM_RUN = /\bnpm\b[^\n;&|]*\brun(?:-script)?\b/;
+const LITERAL_WORD = /^[A-Za-z0-9_./:@%+=,-]+$/;
+
+function relevantCommands(text) {
+    return QUALIFIED_RUNNER.test(text) || /\btrust:gate\b/.test(text) || NPM_RUN.test(text);
+}
+
+/** Scalar conditions are deliberately limited to bare GitHub expressions. */
+function workflowCondition(value) {
+    if (value === null) return null;
+    value = value.trim();
+    assert.ok(!/^["']/.test(value), `quoted workflow condition is unsupported: ${value}`);
+    return value.match(/^\$\{\{ (.+) \}\}$/)?.[1] ?? value;
+}
+
 /** One step of a workflow job: its condition, the action it uses, the commands it runs. */
 function workflowStep(text) {
     const field = name => text.match(new RegExp(`(?:^|\\n {8})${name}: (.*)`))?.[1] ?? null;
@@ -51,9 +70,9 @@ function workflowStep(text) {
     return {
         id: field('id'),
         uses: field('uses'),
-        condition: condition === null ? null : condition.match(/^\$\{\{ (.+) \}\}$/)?.[1] ?? condition,
+        condition: workflowCondition(condition),
         continueOnError: field('continue-on-error'),
-        commands: script.split(/\n|&&|\|\||;/).map(command => command.trim()).filter(Boolean),
+        commands: script.trim() ? [script.trim()] : [],
     };
 }
 
@@ -72,6 +91,8 @@ function workflowJobs(text) {
         jobs.set(name, {
             timeout: head.match(/\n {4}timeout-minutes: (.+)/)?.[1] ?? null,
             needs: head.match(/\n {4}needs: (.+)/)?.[1] ?? null,
+            condition: workflowCondition(head.match(/\n {4}if: (.+)/)?.[1] ?? null),
+            continueOnError: head.match(/\n {4}continue-on-error: (.+)/)?.[1] ?? null,
             steps,
         });
     }
@@ -80,17 +101,58 @@ function workflowJobs(text) {
 }
 
 /** The commands a step ends up running once every `npm run <script>` is followed. */
-function leafCommands(commands, scripts, seen = new Set()) {
+function leafCommands(commands, scripts, stack = [], enforced = false) {
     const leaves = [];
-    for (const command of commands) {
-        const script = command.match(/^(?:\w+=\S* )*npm run(?:-script)?(?: -\S+)* ([\w:.-]+)(?: |$)/)?.[1];
-        if (!script || !scripts[script]) leaves.push(command);
-        else if (!seen.has(script)) {
-            seen.add(script);
-            leaves.push(...leafCommands(scripts[script].split(/&&|\|\||;/).map(part => part.trim()), scripts, seen));
+    for (const text of commands) {
+        if (!enforced && !relevantCommands(text)) {
+            leaves.push(text);
+            continue;
+        }
+        // Never discard an operator: || can skip a gate or swallow its failure;
+        // newlines/semicolon/background/pipelines need shell semantics we do not model.
+        const chain = text.split('&&');
+        assert.ok(chain.every(command => command.trim()) &&
+            !/[\n\r;&|]/.test(chain.join('')), `unsupported gate command syntax: ${text}`);
+        for (const part of chain) {
+            const words = part.trim().split(/[ \t]+/);
+            assert.ok(words.every(word => LITERAL_WORD.test(word)), `unsupported gate command syntax: ${part}`);
+            if (words[0] === 'npm') {
+                assert.ok(['run', 'run-script'].includes(words[1]) && /^[\w:.-]+$/.test(words[2] || ''),
+                    `unsupported npm gate invocation: ${part}`);
+                const script = words[2];
+                const tail = words.slice(3);
+                assert.ok(tail.length === 0 || tail[0] === '--', `unsupported npm gate arguments: ${part}`);
+                assert.ok(Object.hasOwn(scripts, script) && typeof scripts[script] === 'string' && scripts[script].trim(),
+                    `unknown or empty gate script: ${script}`);
+                assert.ok(!stack.includes(script), `cyclic gate script: ${[...stack, script].join(' -> ')}`);
+                let body = scripts[script];
+                const args = tail.slice(1);
+                if (args.length) {
+                    // npm appends arguments to its script text, which is not the
+                    // same as forwarding them to every child of a composite alias.
+                    assert.ok(!body.includes('&&') && !NPM_RUN.test(body),
+                        `cannot forward arguments through a composite gate script: ${script}`);
+                    body += ` ${args.join(' ')}`;
+                }
+                leaves.push(...leafCommands([body], scripts, [...stack, script],
+                    enforced || script === 'trust:gate' || script.startsWith('trust:gate:') || args.length > 0));
+            } else {
+                let executable = 0;
+                while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[executable] || '')) executable++;
+                assert.strictEqual(words[executable], 'node', `unsupported gate executable: ${part}`);
+                assert.ok(words.length > executable + 1, `node gate has no script: ${part}`);
+                leaves.push(words.join(' '));
+            }
         }
     }
     return leaves;
+}
+
+/** Qualification and publishing use the default dependency-success condition. */
+function assertRequiredJob(label, job) {
+    assert.ok(job, `${label} exists`);
+    assert.strictEqual(job.condition, null, `${label} must not override its dependency-success condition`);
+    assert.strictEqual(job.continueOnError, null, `${label} must fail when a gate fails`);
 }
 
 /** Does this step run for this planned row, every earlier step having succeeded? */
@@ -145,6 +207,58 @@ function assertEnrolledTogether(label, commands) {
 }
 
 describe('command trust matrix: fail-closed proof coverage', () => {
+    it('keeps forwarded arguments and failure behavior in gate command expansion', () => {
+        const scripts = {
+            'trust:gate': 'npm run checks && npm run outcome -- --gate',
+            checks: MATRIX_COMMANDS.join(' && '),
+            check: MATRIX_COMMANDS[1],
+            outcome: 'node eval/run-outcome-eval.js',
+            alias: 'npm run check',
+        };
+        const judge = text => {
+            const block = `run: |\n${text.split('\n').map(line => `          ${line}`).join('\n')}`;
+            const commands = leafCommands(workflowStep(block).commands, scripts);
+            assertQualifiedWhole('regression', commands);
+            return commands;
+        };
+        assert.deepStrictEqual(judge('npm run trust:gate'), QUALIFIED_COMMANDS);
+        assert.deepStrictEqual(judge('npm run-script alias'), [MATRIX_COMMANDS[1]]);
+        assert.deepStrictEqual(judge('npm run check && npm run check'), [MATRIX_COMMANDS[1], MATRIX_COMMANDS[1]]);
+        for (const args of ['--only ts-', '--allow-missing', '--pin', '--repo websocket']) {
+            assert.throws(() => judge(`npm run check -- ${args}`), /other than as qualified/);
+        }
+        for (const text of [
+            'npm run trust:gate || true', 'true || npm run trust:gate',
+            'npm run trust:gate; true', 'npm run trust:gate | cat', 'npm run trust:gate &',
+            'npm run trust:gate\ntrue', 'exit 0 && npm run trust:gate', 'exec true && npm run trust:gate',
+            'npm --prefix elsewhere run trust:gate', 'npm run --if-present absent',
+            'npm run check --allow-missing', 'npm run alias -- --only ts-',
+        ]) assert.throws(() => judge(text), /unsupported|cannot forward/, text);
+        for (const suffix of [' || true', '; true', '\ntrue']) {
+            assert.throws(() => leafCommands(['npm run trust:gate'], {
+                ...scripts, 'trust:gate': scripts['trust:gate'] + suffix,
+            }), /unsupported gate command syntax/);
+        }
+        assert.throws(() => judge('npm run absent'), /unknown or empty/);
+        assert.throws(() => leafCommands(['npm run trust:gate'], { 'trust:gate': 'npm run trust:gate' }), /cyclic/);
+        assert.throws(() => leafCommands(['npm run trust:gate'], { 'trust:gate': '' }), /unknown or empty/);
+        const installer = 'if command -v compiler; then echo "already installed"; else install compiler; fi';
+        assert.deepStrictEqual(leafCommands([installer], scripts), [installer]);
+    });
+
+    it('keeps required workflow jobs blocking and refuses ambiguous condition scalars', () => {
+        const read = head => workflowJobs(`name: test\njobs:\n  test:\n${head}    steps:\n      - run: npm run trust:gate\n`).get('test');
+        assertRequiredJob('test', read(''));
+        for (const condition of ['always()', 'false', '${{ always() }}']) {
+            assert.throws(() => assertRequiredJob('test', read(`    if: ${condition}\n`)), /dependency-success/);
+        }
+        assert.throws(() => assertRequiredJob('test', read('    continue-on-error: true\n')), /must fail/);
+        assert.throws(() => workflowStep("uses: example\n        if: 'false'"), /quoted workflow condition/);
+        assert.throws(() => workflowStep("uses: example\n        if:    'false'"), /quoted workflow condition/);
+        assert.strictEqual(stepActive(workflowStep('uses: example\n        if: false'), {}), false);
+        assert.strictEqual(stepActive(workflowStep("uses: example\n        if: ${{ 'false' }}"), {}), true);
+    });
+
     it('classifies every canonical command exactly once', () => {
         const canonical = [...CANONICAL_COMMANDS].sort();
         const classified = Object.keys(COMMAND_TRUST_MATRIX).sort();
@@ -340,6 +454,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         // exactly one runner of every trigger.
         const jobs = workflowJobs(workflow);
         const evalJob = jobs.get('eval');
+        assertRequiredJob('eval.yml eval', evalJob);
         const contexts = EVAL_TRIGGERS.flatMap(([event, full]) =>
             evaluationMatrix(event, full).include.map(row => ({ event, full, row })));
         for (const command of QUALIFIED_COMMANDS) {
@@ -387,6 +502,8 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         // need. In the Eval job the action also precedes the dependencies
         // every arm waits for, so a failed install skips the arms.
         const publishJobs = workflowJobs(publish);
+        assertRequiredJob('publish.yml test', publishJobs.get('test'));
+        assertRequiredJob('publish.yml publish-npm', publishJobs.get('publish-npm'));
         for (const [name, job] of jobs) {
             assertMatricesProvided(`eval.yml ${name}`, job, pkg.scripts, name === 'eval' ? contexts : [{}]);
             assertQualifiedWhole(`eval.yml ${name}`, job.steps.flatMap(step => leafCommands(step.commands, pkg.scripts)));
