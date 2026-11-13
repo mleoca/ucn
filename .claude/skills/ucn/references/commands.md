@@ -11,9 +11,9 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `show <handle>` | Symbol summary, callers, and callees. `--sections=summary,callers,callees,source,dependencies,tests,types,example,related` selects projections. |
 | `find <name>` | Locate definitions and their stable handles. Text shows the top 5 in detail and counts the rest; JSON returns up to 500; `--limit=N` raises both. `--type=type`, `--with-source`, `--compact`, `--exact`. |
 | `usages <name>` | Every line where the name occurs: definitions, calls, imports, type references, and comment/string/docstring text (`OTHER TEXT`), test files included. `--code-only`, `--exclude-tests`, `--context=N`. |
-| `search [term]` | Literal text by default; `--regex` for RE2-compatible linear-time regular expressions; structural filters `--type`, `--param`, `--receiver`, `--returns`, `--decorator`, `--exported`, `--unused`. |
+| `search [term]` | Literal text by default; `--regex` for RE2-compatible linear-time regular expressions; structural filters `--type` (`function`, `class`, `call`, `method`, `type`, `constructor`, `state`, `field`, `constant`, `macro`, `variable`, `interface`, `enum`, `struct`, `trait`, `record`, `namespace`), `--param`, `--receiver`, `--returns`, `--decorator`, `--exported`, `--unused`. |
 | `source <handle\|file:range>` | Extract a function, class-like declaration, or exact line range (`src/a.js:10-30`, `src/a.js --range=10-30`, or `--file=PATH --range=N-M`; MCP `name` or `file` with `range`). `--raw`, `--max-lines=N`. |
-| `trace <handle>` | Callees by default (depth 3). `--direction=callers` for blast radius, `--to=entrypoints` for paths to roots, `--depth=N`, `--expand-unverified`. |
+| `trace <handle>` | Callees by default (depth 3). `--direction=callers` for blast radius, `--to=entrypoints` for paths to roots (depth 5), `--depth=N`, `--expand-unverified`. |
 
 ## Change and validation
 
@@ -33,8 +33,8 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `repo` | Orientation. `--sections=summary,files,stats,health`; `--deep` adds readiness evidence; `--hot`, `--functions`, `--detailed`, `--top-level`, `--in=DIR`. |
 | `deps <file>` | File dependency graph: `--direction=imports\|importers\|both`, `--depth=N`, `--detailed`. `deps --cycles` (no file target) reports circular imports. |
 | `api [file]` | Exported/public surface of a project or file. An exact file includes tests; broader scans exclude tests with a count unless `--include-tests`. |
-| `entrypoints` | Framework, route, task, test, and runtime entry points. `--type`, `--framework`; tests excluded unless `--include-tests`. |
-| `endpoints` | Server/client HTTP surface. `--bridge`, `--server-only`, `--client-only`, `--unmatched`, `--method`, `--prefix`, `--hide-uncertain`, `--exclude-tests`, `--in=DIR`. |
+| `entrypoints` | Framework, route, task, test, and runtime entry points. `--type` (`cli`, `di`, `events`, `http`, `jobs`, `runtime`, `test`), `--framework` (comma-separated labels); tests excluded unless `--include-tests`. |
+| `endpoints` | Server/client HTTP surface. `--bridge`, `--server-only`, `--client-only`, `--unmatched`, `--method` (an HTTP verb, `ALL` or `USE`, any letter case), `--framework` (one label a row carries), `--prefix`, `--hide-uncertain`, `--exclude-tests`, `--in=DIR`. |
 
 ## Focused audits and runtime evidence
 
@@ -55,19 +55,19 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `--in=<directory>` | Limit query scope to a directory. |
 | `--exclude=<patterns>` | Exclude matching paths (`--not` is an alias). |
 | `--limit=N` | Default maximum of 500 results for `find`, text `search`, `deadcode`, `api`, and `repo` files; structural `search` defaults to 50. Explicit limits override these caps and disclose omissions; `usages` and `--lines` are uncapped by default. |
-| `--top=N` | Cap listed callers/callees and ranked results; the header discloses the cut (`3 shown of 21`). Caller lists have no default cap. Also the rows of each unverified list (ten by default; `impact` takes `--limit` the same way). |
+| `--top=N` | Cap listed callers/callees and ranked results; the header discloses the cut (`3 shown of 21`). Caller lists have no default cap. Also the rows of each unverified list (10 by default; `impact` takes `--limit` the same way). On `search` it bounds matches as `--limit` does. |
 | `--context=N` | Lines of context around `search`/`usages` matches. |
 | `--include-tests` / `--exclude-tests` | Lift or apply the language's test-file exclusions where a command filters them (`--exclude-tests`: `usages`, `endpoints`, `entrypoints`). `usages` ignores `--include-tests` (tests are listed by default) and says so. |
 | `--include-bundled` | Index `*.min.js` and `*.bundle.js`, respecting user exclusions and bypassing the shared cache. By default they are searched for each name and listed only when the name occurs in them. `*.map` files are data and stay unindexed. MCP: `include_bundled=true`. |
-| `--depth=N` | Trace, dependency, or test traversal depth. |
+| `--depth=N` | Trace, dependency, or test traversal depth, 0 to 100. Omitted: `trace` 3, `trace --to=entrypoints` 5, `deps` 2, `tests` 0 (direct links only). |
 | `--direction=<value>` | Trace (`callees`/`callers`) or dependency (`imports`/`importers`/`both`) direction. |
 | `--all` | Lift result and formatter caps where a command supports it, including every unverified list of `show` and `impact`; the truncation notice says when it does. |
 | `--max-chars=N` | Text budget in characters (10K targeted / 3K broad by default; 100K ceiling), including notices and trust lines. Trust lines are reserved first; a limit too small for them withholds the answer and names the budget that carries them. MCP: `max_chars`. CLI JSON is uncapped even with an explicit budget; `meta.maxChars` is `"not-applied"`. |
 | `--compact` / `--no-compact` | Token-efficient or full presentation (`show`/`impact` default compact, `usages` full). |
 | `--range=N-M` | Explicit line range with `source <file>` or `source --file=<path>`. |
 | `--json` | Stable `{ meta, data }` envelope; `meta.contract` carries the truth boundary, decision safety, and next actions. |
-| `--lines` | `find`/`usages`/`search`/`show`/`impact`: uncapped `path:line:text` records with tier tags after a tab. `show` accepts the callers/callees sections (default callers). Accounting and notes go to stderr. Exit 0 for records, 1 for none, 2 for errors. |
-| `--raw` | `source`: code only, including full large classes. Notes and `--max-lines` truncation travel on stderr. In shell modes an explicit `--max-chars` fails before stdout instead of truncating. |
+| `--lines` | `find`/`usages`/`search`/`show`/`impact`: uncapped `path:line:text` records with tier tags after a tab. `show` accepts the callers/callees sections (default callers). Accounting and notes go to stderr. Exit 0 for records, 1 for none, 2 for errors. Under an explicit `--max-chars` (over MCP, under its budget) the rows that fit are printed whole, every accounting line is kept, and one `# truncated: X of Y rows omitted` line counts the rest; a budget no row fits in is an error. |
+| `--raw` | `source`: code only, including full large classes. Notes and `--max-lines` truncation travel on stderr. Raw source is never cut by a character budget: an explicit `--max-chars` it exceeds fails before stdout. |
 | `--expand-unverified` | `trace --direction=callers`: follow possible edges; descendants stay marked possible. |
 | `--base=<ref>` / `--staged` | Git scope for target-less `impact` and `check`. `check <handle> --base=<ref>` reads the old declaration at that ref. `impact <handle>` takes neither; `check <handle>` does not take `--staged`. |
 | `--strict` | Target-less `check`: `REVIEW_REQUIRED` fails too (exit 1, `trust.passes: false`), not only `BLOCKED`. |
@@ -75,6 +75,7 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `--workers=N` | Build workers; `0` disables the parallel build. |
 | `--code-only` | Exclude comments and strings in `search`/`usages`. |
 | `--regex` | Interpret a `search` term as a regular expression; without it the term is literal. |
+| Flag forms | A value flag is written `--flag=value` or `--flag value`, and is refused without a value. A boolean flag is `--flag`, `--flag=true` or `--flag=false`. Value sets, numeric bounds and defaults are the same on the CLI and over MCP; `ucn --help` lists them all, and a value outside them is refused with the valid list. |
 
 ## Target forms and exit codes
 

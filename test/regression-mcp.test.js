@@ -907,9 +907,16 @@ describe('fix #341: lines and raw over MCP', () => {
                 name: 'helper', lines: true, max_chars: 2200 });
             assert.equal(result.isError, false, result.text);
             assert.ok(result.text.length <= 2200);
-            assert.match(result.text, /OUTPUT TRUNCATED/);
             assert.match(result.text, /^# ACCOUNT:/m);
             assert.match(result.text, /^# CONTRACT:/m);
+            // The listing stays a listing: whole records, then comment lines,
+            // the last of which counts the rows left out.
+            const lines = result.text.split('\n');
+            assert.ok(lines.every(line => line.startsWith('# ') || /^lib\.js:\d+:/.test(line)), result.text);
+            const kept = lines.filter(line => !line.startsWith('# ')).length;
+            assert.ok(kept > 0 && kept < 150);
+            assert.equal(lines.at(-1), `# truncated: ${150 - kept} of 150 rows omitted; raise max_chars or narrow the query`);
+            assert.doesNotMatch(result.text, /OUTPUT TRUNCATED/);
         } finally { client.stop(); rm(dir); }
     });
     it('lines=true returns grep-shaped records with "# " accounting; raw=true returns code only', async () => {

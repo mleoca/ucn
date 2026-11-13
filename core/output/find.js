@@ -10,9 +10,10 @@ const {
 } = require('./shared');
 
 const { formatSymbolHandle } = require('../shared');
+const { paramFact } = require('../registry');
 
 // Detailed text rows shown by default; the rest are counted.
-const DEFAULT_DISPLAY_LIMIT = 5;
+const DEFAULT_DISPLAY_LIMIT = paramFact('limit', 'findDetail');
 
 /**
  * Trim a docstring to a single short sentence (max 80 chars) for inline display.

@@ -127,21 +127,76 @@ describe('release shell contracts', () => {
             const invalid = run(dir, 'show', 'helper', '--lines', '--sections=source');
             assert.equal(invalid.status, 2);
             assert.equal(invalid.stdout, '');
-            assert.match(invalid.stderr, /Available: callers, callees/);
+            assert.match(invalid.stderr, /Invalid show lines sections "source"\. Valid: callers, callees\./);
         } finally { rm(dir); }
     });
 
-    it('never writes partial records or prose into budgeted shell output', () => {
+    it('raw source is never cut: an exceeded budget refuses before any output', () => {
         const dir = tmp(fixture);
         try {
-            for (const args of [['show', 'helper', '--lines'], ['source', 'helper', '--raw']]) {
-                const clipped = run(dir, ...args, '--max-chars=10');
-                assert.equal(clipped.status, 2, clipped.stderr);
-                assert.equal(clipped.stdout, '');
-                assert.match(clipped.stderr, /shell output cannot be truncated/);
-                const full = run(dir, ...args, '--max-chars=10000');
-                assert.equal(full.status, 0, full.stderr);
-                assert.equal(full.stdout, run(dir, ...args).stdout);
+            const args = ['source', 'helper', '--raw'];
+            const clipped = run(dir, ...args, '--max-chars=10');
+            assert.equal(clipped.status, 2, clipped.stderr);
+            assert.equal(clipped.stdout, '');
+            assert.match(clipped.stderr, /shell output cannot be truncated/);
+            const full = run(dir, ...args, '--max-chars=10000');
+            assert.equal(full.status, 0, full.stderr);
+            assert.equal(full.stdout, run(dir, ...args).stdout);
+        } finally { rm(dir); }
+    });
+
+    it('a line listing under a budget prints the rows that fit and counts the rest', () => {
+        const dir = tmp({
+            'package.json': '{}',
+            'lib.js': 'function helper(x) {\n  return x + 1;\n}\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\n' +
+                Array.from({ length: 40 }, (_, i) => `function run${i}() { return helper(${i}); }`).join('\n'),
+        });
+        try {
+            for (const args of [
+                ['show', 'helper', '--lines'],
+                ['impact', 'helper', '--lines'],
+                ['usages', 'helper', '--lines'],
+                ['search', 'helper', '--lines'],
+                ['find', 'run*', '--lines'],
+            ]) {
+                const label = args.join(' ');
+                const full = run(dir, ...args);
+                assert.equal(full.status, 0, `${label}: ${full.stderr}`);
+                const rows = records(full.stdout);
+                assert.ok(rows.length >= 40, `${label}: ${rows.length} rows`);
+                const comments = records(full.stderr);
+                const fullChars = [...rows, ...comments].join('\n').length;
+
+                // A budget the whole listing fits in changes nothing.
+                const roomy = run(dir, ...args, `--max-chars=${fullChars}`);
+                assert.equal(roomy.stdout, full.stdout, label);
+                assert.equal(roomy.stderr, full.stderr, label);
+
+                for (const budget of [fullChars - 1, Math.floor(fullChars / 2), comments.join('\n').length + 200]) {
+                    const cut = run(dir, ...args, `--max-chars=${budget}`);
+                    assert.equal(cut.status, 0, `${label} at ${budget}: ${cut.stderr}`);
+                    const kept = records(cut.stdout);
+                    // Whole records only, the first ones, in their order.
+                    assert.ok(kept.length > 0 && kept.length < rows.length, `${label} at ${budget}: ${kept.length} rows`);
+                    assert.deepEqual(kept, rows.slice(0, kept.length), `${label} at ${budget}`);
+                    const said = records(cut.stderr);
+                    // Every accounting line survives, then one line counts the rest.
+                    assert.deepEqual(said.slice(0, -1), comments, `${label} at ${budget}`);
+                    assert.equal(said.at(-1),
+                        `# truncated: ${rows.length - kept.length} of ${rows.length} rows omitted; raise --max-chars or omit it`,
+                        `${label} at ${budget}`);
+                    assert.ok([...kept, ...said].join('\n').length <= budget, `${label} at ${budget}: over budget`);
+                    // The next row would not have fitted.
+                    assert.ok([...rows.slice(0, kept.length + 1), ...said].join('\n').length > budget,
+                        `${label} at ${budget}: a row that fits was left out`);
+                }
+
+                // Not one row fits: nothing is printed and the command says why.
+                const none = run(dir, ...args, '--max-chars=10');
+                assert.equal(none.status, 2, label);
+                assert.equal(none.stdout, '', label);
+                assert.match(none.stderr, /not one row fits/, label);
             }
         } finally { rm(dir); }
     });

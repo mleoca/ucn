@@ -3,17 +3,17 @@
 const {
     BROAD_COMMANDS: BROAD_CANONICAL,
     FLAG_APPLICABILITY,
+    paramDefault,
+    paramRange,
     resolveCommand,
-    toMcpName,
 } = require('./registry');
+const { LINES_COMMANDS, budgetLineListing } = require('./output/lines');
 
-const DEFAULT_OUTPUT_CHARS = 10000;
-const BROAD_OUTPUT_CHARS = 3000;
-const MAX_OUTPUT_CHARS = 100000;
-const BROAD_COMMANDS = new Set([
-    ...BROAD_CANONICAL,
-    ...[...BROAD_CANONICAL].map(toMcpName),
-]);
+// The output budget is the parameter table's `maxChars`: its ceiling, its
+// default, and the smaller default of the broad sweep commands.
+const DEFAULT_OUTPUT_CHARS = paramDefault('maxChars');
+const BROAD_OUTPUT_CHARS = paramDefault('maxChars', [...BROAD_CANONICAL][0]);
+const MAX_OUTPUT_CHARS = paramRange('maxChars').max;
 
 const CONTRACT_LINE_RE = /^\s*(?:(?:Summary|ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|VALUE ACCOUNT|TYPE ACCOUNT|Note):|TRUST: (?:BLOCKED|REVIEW_REQUIRED|READY_FOR_TOOLCHAIN)\b|\d+ test-file usage\(s\) hidden\b|Found \d+ (?:definitions|fuzzy matches)\b)/;
 // Trust lines: the accounting and contract lines that qualify a caller
@@ -254,9 +254,8 @@ function applyOutputBudget(text, {
     params = {},
     trailingChars = 0,
 } = {}) {
-    const defaultLimit = BROAD_COMMANDS.has(command)
-        ? BROAD_OUTPUT_CHARS
-        : DEFAULT_OUTPUT_CHARS;
+    const defaultLimit = paramDefault('maxChars',
+        resolveCommand(command, 'mcp') || resolveCommand(command, 'cli') || command);
     const requested = maxChars || (all ? MAX_OUTPUT_CHARS : defaultLimit);
     const hardLimit = Math.min(requested, MAX_OUTPUT_CHARS);
     const limit = Math.max(0, hardLimit - trailingChars);
@@ -284,6 +283,21 @@ function applyOutputBudget(text, {
 
     const canonical = resolveCommand(command, surface === 'mcp' ? 'mcp' : 'cli') ||
         command;
+    // A line listing is cut between records: the rows that fit, the
+    // accounting, and one line counting the rows left out.
+    if (params.lines && LINES_COMMANDS.has(canonical)) {
+        const listing = budgetLineListing(text, limit, surface, { allowNoRows: true });
+        if (listing) {
+            return {
+                text: listing.text,
+                truncated: true,
+                fullChars: text.length,
+                requestedLimit: hardLimit,
+                contractMetadata: [],
+                contractMetadataComplete: true,
+            };
+        }
+    }
     const supportsAll = FLAG_APPLICABILITY[canonical]?.includes('all') &&
         !(canonical === 'deps' && params.cycles);
     const allHint = supportsAll

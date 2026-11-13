@@ -1868,7 +1868,7 @@ describe('structural search: hardening', () => {
             const i = idx(d);
             const { ok, error } = execute(i, 'search', { type: 'bogus' });
             assert.ok(!ok, 'should fail');
-            assert.ok(error.includes('Invalid type'), error);
+            assert.ok(error.includes('Invalid search type "bogus"'), error);
             assert.ok(error.includes('function, class, call, method, type'));
         } finally { rm(d); }
     });
@@ -2095,7 +2095,7 @@ describe('structural search: hardening', () => {
         });
         try {
             const out = runCli(d, 'search', [], ['--type=bogus']);
-            assert.ok(out.includes('Invalid type'), 'should show invalid type error: ' + out);
+            assert.ok(out.includes('Invalid search type "bogus"'), 'should show invalid type error: ' + out);
         } finally { rm(d); }
     });
 });

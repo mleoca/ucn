@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { langTraits } = require('../../languages');
 const { dynamicImportsNote, formatGitLine, unverifiedReasonLabel } = require('./shared');
+const { paramFact } = require('../registry');
 const { provenanceReplacer } = require('./provenance');
 const { matchLabelCounts, reasonList } = require('../source-universe');
 const { uncertaintyClassOf, partitionUnverified, runtimeFamilyKey } = require('../review-items');
@@ -224,7 +225,7 @@ function formatAccountLines(account, { shared = true } = {}) {
  */
 function unverifiedRowCap(options) {
     if (options?.all) return Infinity;
-    return Number.isInteger(options?.top) && options.top > 0 ? options.top : 10;
+    return Number.isInteger(options?.top) && options.top > 0 ? options.top : paramFact('top', 'unverifiedRows');
 }
 
 /**

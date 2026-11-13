@@ -29,13 +29,16 @@ const {
     FLAG_APPLICABILITY,
     REVERSE_PARAM_MAP,
     generateMcpParamSection,
+    mcpParamProperties,
+    paramValues,
+    GLOBAL_PARAMS,
     resolveCommand,
     suggestCommand,
     v4MigrationHint,
     formatSurfaceMessage,
 } = require('../core/registry');
 const { execute } = require('../core/execute');
-const { sourceRangeTarget } = require('../core/public-command');
+const { sourceRangeTarget, noOpNotes } = require('../core/public-command');
 const { describeError, UcnError } = require('../core/errors');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
 
@@ -236,10 +239,10 @@ const CONCISE_TOOL_DESCRIPTION = `Auditable AST code intelligence for JavaScript
 Use UCN for semantic questions: exact definitions, symbol-aware callers/callees, change impact, test selection, dependencies, APIs, entry points, and focused audits. Use grep/ripgrep for simple literals, error messages, configuration, filenames, Markdown, and unsupported languages. UCN search is worthwhile when AST structure, code-only filtering, or the shared agent contract matters.
 
 18 task-oriented commands:
-- repo: repository overview; sections=files,stats,health adds detail. Reports skipped unsupported source explicitly and hands it to grep/language-native tooling.
-- show: one symbol; sections=summary,callers,callees,source,dependencies,tests,types,example,related.
+- repo: repository overview; sections=${paramValues('sections', 'repo').join(',')} selects detail. Reports skipped unsupported source explicitly and hands it to grep/language-native tooling.
+- show: one symbol; sections=${paramValues('sections', 'show').join(',')}.
 - find/usages/search/source: locate definitions, literal-name occurrences, literal text (regex=true selects the linear-time RE2-compatible engine), AST structure, or exact source. Find activity is pinned confirmed + visible-unverified candidates; proved other-target calls are separate.
-- trace: direction=callees or callers; to=entrypoints follows callers to roots.
+- trace: direction=${paramValues('direction', 'trace').join(' or ')}; to=${paramValues('to', 'trace').join('|')} follows callers to roots.
 - impact: symbol impact when name is set; Git-diff impact when it is omitted.
 - tests: static direct links by default; depth>0 includes transitive affected links. Empty results are not runtime coverage proof.
 - deps/api/entrypoints/endpoints: architecture and public surfaces.
@@ -253,92 +256,23 @@ CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires 
 // and made the single MCP tool difficult for agents to parse.
 const TOOL_DESCRIPTION = CONCISE_TOOL_DESCRIPTION;
 
-const stringParam = (description, extra = {}) => ({ type: 'string', description, ...extra });
-const booleanParam = description => ({ type: 'boolean', description });
-const integerParam = (description, extra = {}) => ({ type: 'integer', description, ...extra });
-const numberParam = (description, extra = {}) => ({ type: 'number', description, ...extra });
-
-// Keep the public JSON Schema and runtime validation rules in one dependency-
-// free object. Unknown keys remain allowed so the handler can return typo and
-// applicability guidance instead of silently changing the requested answer.
+// The public JSON Schema and the runtime validation rules are one object,
+// written from the registry's parameter table: a type, a bound, a value list
+// or a default stated here is the one the engine uses. Unknown keys remain
+// allowed so the handler can return typo and applicability guidance instead
+// of silently changing the requested answer.
 const INPUT_SHAPE = {
-    command: stringParam(
-        `UCN task command. One of: ${getMcpCommandEnum().join(', ')}.`,
-        { enum: getMcpCommandEnum() },
-    ),
-    project_dir: stringParam('Non-empty absolute path, or a path relative to the MCP server process working directory, identifying the project to analyze.', { minLength: 1 }),
-    name: stringParam('Symbol name or stable path:line:name handle. Used by show/find/usages/source/trace/impact/tests/check/plan.'),
-    file: stringParam('File target for source/deps/api or a symbol-disambiguation filter.'),
-    sections: stringParam('Comma-separated projection. show: summary,callers,callees,source,dependencies,tests,types,example,related. repo: summary,files,stats,health.'),
-    exclude: stringParam('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
-    include_tests: booleanParam('Include test files in results (excluded by default)'),
-    exclude_tests: booleanParam('Exclude test files: the default for entrypoints (include_tests=true lists them); usages and endpoints list test files unless exclude_tests=true.'),
-    include_methods: booleanParam('Include method callees where receiver evidence permits. Caller-bearing views always tier method sites.'),
-    expand_unverified: booleanParam('trace callers: follow unverified edges; downstream nodes remain marked possible, never confirmed.'),
-    min_confidence: numberParam('Minimum ordinal evidence weight (legacy name; not a probability) for caller/callee edges', { minimum: 0, maximum: 1 }),
-    show_confidence: booleanParam('show: resolution-evidence labels default to visible; set false to hide them. Numeric weights are ordinal, not probabilities.'),
-    unreachable_only: booleanParam('show/impact: retain only relationships unreachable from detected entry points.'),
-    with_types: booleanParam('show: include related type definitions.'),
-    with_source: booleanParam('Attach exact source to find results.'),
-    detailed: booleanParam('repo files: show symbols per file; deps: include import declarations and importers.'),
-    exact: booleanParam('Exact name match only (no substring matching)'),
-    in: stringParam('Only search in this directory path (e.g. "src/core")'),
-    top: integerParam('Max results to show (default: 10). Must be a positive integer.', { exclusiveMinimum: 0, maximum: 10000 }),
-    depth: integerParam('Max depth (default: 3 for trace, 2 for deps); expands all children. Non-negative integer.', { minimum: 0, maximum: 100 }),
-    code_only: booleanParam('Exclude matches in comments and strings'),
-    context: integerParam('Lines of context around each match. Non-negative integer.', { minimum: 0, maximum: 1000 }),
-    include_exported: booleanParam('Include exported symbols in deadcode results'),
-    include_decorated: booleanParam('Include decorated/annotated symbols in deadcode results'),
-    calls_only: booleanParam('tests: retain direct calls and test-case matches only.'),
-    max_lines: integerParam('source: maximum lines per declaration; raw mode discloses any truncation.', { exclusiveMinimum: 0, maximum: 1000000 }),
-    direction: stringParam('trace: callees/callers. deps: imports/importers/both.', { enum: ['callees', 'callers', 'imports', 'importers', 'both'] }),
-    to: stringParam('trace with direction=callers: continue toward entry points.', { enum: ['entrypoints'] }),
-    cycles: booleanParam('deps: report circular imports instead of a file graph.'),
-    term: stringParam('Literal search term by default. Set regex=true only for regular-expression syntax.'),
-    regex: booleanParam('Treat search term as a regular expression (default: false/literal). Ordinary patterns run in an RE2-compatible linear-time engine; unsafe nested repetition is rejected.'),
-    functions: booleanParam('repo stats: include per-function line counts sorted by size.'),
-    hot: booleanParam('repo stats: include the top N most-called functions.'),
-    diverse: booleanParam('show example: return representatives from distinct argument shapes.'),
-    lines: booleanParam('find/usages/search/show/impact: path:line:text listings without default row caps; explicit top/limit still apply. show accepts callers/callees sections, default callers. Tier tags follow a tab; accounting and notes follow as "# " lines. MCP transport budgets still apply and preserve accounting.'),
-    raw: booleanParam('source: code text without a header or line-number gutter, including full large classes. Notes follow as "# " lines; MCP transport budgets still apply.'),
-    git: booleanParam('show summary: attach last-modified, author, and recent-change metadata.'),
-    add_param: stringParam('Parameter name to add (plan command)'),
-    remove_param: stringParam('Parameter name to remove (plan command)'),
-    rename_to: stringParam('New name for the function, method, or type (plan command)'),
-    default_value: stringParam('Default value for added parameter (plan command)'),
-    delete: booleanParam('plan: assess deleting the declaration. Returns no-static-dependents, has-static-dependents or review with its basis; static evidence, never a deletion guarantee.'),
-    stack: stringParam('The stack trace text to parse (stacktrace command)'),
-    range: stringParam('source line range, e.g. "10-20" or "15", of the file given as file or name.'),
-    base: stringParam('Git ref (default: HEAD). impact/check without a symbol: diff against it; check with a symbol: compare the declaration with its version there. E.g. "HEAD~3", "main", a commit SHA'),
-    staged: booleanParam('impact/check without a symbol: analyze staged changes.'),
-    strict: booleanParam('check without a symbol: REVIEW_REQUIRED fails too (trust.passes=false), not only BLOCKED.'),
-    deep: booleanParam('repo: include health and sample the ordinal resolution-evidence profile, not accuracy.'),
-    compact: booleanParam('Compact output defaults to true for show/impact and false for usages; set the opposite value to change that command\'s presentation.'),
-    case_sensitive: booleanParam('Case-sensitive search (default: false, case-insensitive)'),
-    all: booleanParam('Lift formatter and result caps where supported.'),
-    top_level: booleanParam('repo files: show only top-level functions.'),
-    class_name: stringParam('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
-    line: integerParam('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.', { exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-    limit: integerParam('Max results to return (default: 500; structural search: 50; usages and lines: uncapped). Caps find, usages, search, deadcode, api, and repo files. find text shows the top 5 in detail and counts the rest; limit raises both. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
-    max_files: integerParam('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 10000000 }),
-    max_chars: integerParam('Max output characters, not UTF-8 bytes, including notes and preserved metadata. Broad sweep commands (repo, entrypoints, endpoints, deadcode, deps, check, audit_async) default to 3K; all other commands default to 10K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.', { exclusiveMinimum: 0, maximum: 100000 }),
-    type: stringParam('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),
-    param: stringParam('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
-    receiver: stringParam('Filter calls by receiver (structural search, type=call). E.g. "db", "http".'),
-    returns: stringParam('Filter by return type (structural search). E.g. "Promise", "error".'),
-    decorator: stringParam('Filter by decorator/annotation (structural search). E.g. "Route", "Test".'),
-    exported: booleanParam('Only exported/public symbols (structural search).'),
-    unused: booleanParam('Only symbols with zero callers (structural search).'),
-    framework: stringParam('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.'),
-    follow_symlinks: booleanParam('Follow symlinks during file discovery (default: true)'),
-    include_bundled: booleanParam('Index *.min.js and *.bundle.js files (default: false). Source maps remain disclosed but unindexed. Bypasses the shared cache.'),
-    bridge: booleanParam('Match server routes to client requests (endpoints command).'),
-    server_only: booleanParam('Only list server routes (endpoints command).'),
-    client_only: booleanParam('Only list client requests (endpoints command).'),
-    unmatched: booleanParam('Only show unmatched routes/requests (endpoints command).'),
-    method: stringParam('Filter by HTTP method (e.g. "GET", "POST") for endpoints.'),
-    prefix: stringParam('Filter routes/requests by path prefix (endpoints command).'),
-    hide_uncertain: booleanParam('Hide uncertain (interpolated-path) bridges (endpoints command).'),
+    command: {
+        type: 'string',
+        description: `UCN task command. One of: ${getMcpCommandEnum().join(', ')}.`,
+        enum: getMcpCommandEnum(),
+    },
+    project_dir: {
+        type: 'string',
+        description: 'Non-empty absolute path, or a path relative to the MCP server process working directory, identifying the project to analyze.',
+        minLength: 1,
+    },
+    ...mcpParamProperties(),
 };
 
 const INPUT_SCHEMA = {
@@ -417,7 +351,7 @@ server.registerTool(
         if (applicable) {
             // Truly global options — apply to all commands (build/display control).
             // Command-specific params (name, term, stack, range, etc.) are in FLAG_APPLICABILITY.
-            const coreParams = new Set(['maxChars', 'maxFiles', 'followSymlinks', 'includeBundled']);
+            const coreParams = new Set(GLOBAL_PARAMS);
             for (const key of Object.keys(ep)) {
                 if (coreParams.has(key)) continue;
                 if (!applicable.includes(key) && ep[key] !== undefined &&
@@ -438,17 +372,19 @@ server.registerTool(
         if (strippedParams.length > 0) {
             noteParts.push(`${strippedParams.join(', ')} ignored (not applicable to ${command}).`);
         }
-        if (ep.includeMethods && ['impact', 'trace', 'tests', 'check'].includes(canonicalCommand)) {
-            noteParts.push(`include_methods=true has no effect on '${command}' — method calls are always tiered by receiver evidence.`);
-        }
+        for (const note of noOpNotes(canonicalCommand, ep)) noteParts.push(formatSurfaceMessage(note, 'mcp'));
         if (projectScopeNote) noteParts.push(projectScopeNote);
         noteParts.push(...unknownParamNotes);
         const strippedNote = noteParts.length > 0
             ? '\n\n' + noteParts.map(part => `Note: ${part}`).join('\n')
             : '';
+        // In a line listing everything that is not a record is a "# " line.
+        const listingNote = noteParts.length > 0
+            ? '\n' + noteParts.map(part => `# Note: ${part}`).join('\n')
+            : '';
 
         // Wrap toolResult to auto-inject command + maxChars + stripping note
-        const tr = (text) => toolResult(text, command, maxChars, strippedNote, ep);
+        const tr = (text) => toolResult(text, command, maxChars, ep.lines ? listingNote : strippedNote, ep);
         // Wrap toolError to include stripping note on error paths too
         const te = strippedNote
             ? (msg) => toolError(msg + strippedNote)

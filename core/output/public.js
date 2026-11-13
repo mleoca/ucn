@@ -10,7 +10,7 @@
 
 const { COMMAND_CONTRACTS } = require('../command-contracts');
 const { COMMAND_TRUST_MATRIX } = require('../trust-matrix');
-const { toCliName, toMcpName, formatSurfaceMessage } = require('../registry');
+const { toCliName, toMcpName, formatSurfaceMessage, paramDefault } = require('../registry');
 const { LINES_COMMANDS, formatPublicLines, formatPublicRaw } = require('./lines');
 const { provenanceReplacer } = require('./provenance');
 
@@ -165,8 +165,8 @@ function formatShow(result, params = {}, hints = presentationHints()) {
     if (result.context) {
         const context = { ...result.context };
         const formatted = legacy.formatContext(context, {
-            showConfidence: params.showConfidence !== false,
-            compact: params.compact !== false,
+            showConfidence: params.showConfidence ?? paramDefault('showConfidence'),
+            compact: params.compact ?? paramDefault('compact', 'show'),
             expandHint: hints.source,
             allHint: hints.all,
             usagesHint: hints.usages(context.function || result.target),
@@ -237,7 +237,7 @@ function formatImpact(result, params = {}, hints = presentationHints()) {
         evidenceBands: hints.evidenceBands };
     return modeOf('impact', result) === 'diff'
         ? legacy.formatDiffImpact(result, rows)
-        : legacy.formatImpact(result, { compact: params.compact !== false, ...rows });
+        : legacy.formatImpact(result, { compact: params.compact ?? paramDefault('compact', 'impact'), ...rows });
 }
 
 function formatTests(result, params = {}, hints = presentationHints()) {
@@ -321,7 +321,7 @@ function formatPublicText(command, result, params = {}, execution = {}) {
             text = modeOf('find', result) === 'type'
                 ? legacy.formatTypedef(result, params.name)
                 : legacy.formatFindDetailed(result, params.name, {
-                    compact: params.compact,
+                    compact: params.compact ?? paramDefault('compact', 'find'),
                     withSource: params.withSource,
                     top: params.limit,
                     all: !!params.all,
@@ -329,7 +329,7 @@ function formatPublicText(command, result, params = {}, execution = {}) {
                 });
             break;
         case 'usages': text = legacy.formatUsages(result, params.name, {
-            compact: params.compact,
+            compact: params.compact ?? paramDefault('compact', 'usages'),
             all: params.all,
             allHint: hints.all,
         }); break;

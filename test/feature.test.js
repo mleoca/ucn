@@ -2088,8 +2088,9 @@ describe('MCP parameter parity: all and top_level', () => {
     const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
 
     it('MCP schema includes all and top_level parameters', () => {
-        assert.ok(serverCode.includes("all: booleanParam("), 'Schema should have all parameter');
-        assert.ok(serverCode.includes("top_level: booleanParam("), 'Schema should have top_level parameter');
+        const schema = require('../core/registry').mcpParamProperties();
+        assert.strictEqual(schema.all.type, 'boolean', 'Schema should have all parameter');
+        assert.strictEqual(schema.top_level.type, 'boolean', 'Schema should have top_level parameter');
     });
 
     it('MCP normalizes all params once at top — no per-case drift', () => {

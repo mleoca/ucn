@@ -17,6 +17,7 @@ const { isAccessorDefinition, findAccessorReferences } = require('./accessors');
 const isSafeRegex = require('safe-regex2');
 const { RE2JS } = require('re2js');
 const { UcnError } = require('./errors');
+const { paramValues } = require('./registry');
 const { createTestModel, addTestCaseRows, linkFiles } = require('./test-units');
 
 // Keep the established search-input contract for the canonical catastrophic
@@ -37,11 +38,8 @@ function buildGlobMatcher(pattern, caseSensitive) {
     return (name) => regex.test(name);
 }
 
-const STRUCTURAL_TYPES = new Set([
-    'function', 'class', 'call', 'method', 'type', 'constructor',
-    'state', 'field', 'constant', 'macro', 'variable',
-    'interface', 'enum', 'struct', 'trait', 'record', 'namespace',
-]);
+// The kinds a structural search takes: the parameter table's set.
+const STRUCTURAL_TYPES = new Set(paramValues('type', 'search'));
 
 /**
  * Substring match. Case-insensitive by default.

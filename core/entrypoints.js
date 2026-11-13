@@ -595,6 +595,12 @@ const FRAMEWORK_PATTERNS = [
 
 ];
 
+// What the `type` and `framework` filters accept: the kinds and the labels a
+// pattern above carries, and nothing else.
+const ENTRYPOINT_TYPES = Object.freeze([...new Set(FRAMEWORK_PATTERNS.map(p => p.type))].sort());
+const ENTRYPOINT_FRAMEWORKS = Object.freeze(
+    [...new Set(FRAMEWORK_PATTERNS.map(p => p.framework.toLowerCase()))].sort());
+
 // ============================================================================
 // DETECTION
 // ============================================================================
@@ -864,11 +870,10 @@ function detectEntrypoints(index, options = {}) {
     // Validate --type against the pattern registry up front — an unknown
     // value used to fall through to the filter and silently return nothing.
     if (options.type) {
-        const validTypes = new Set(FRAMEWORK_PATTERNS.map(p => p.type));
-        if (!validTypes.has(options.type)) {
+        if (!ENTRYPOINT_TYPES.includes(options.type)) {
             return {
                 error: 'invalid-type',
-                message: `Unknown type "${options.type}". Valid: ${[...validTypes].sort().join(', ')}.`,
+                message: `Unknown type "${options.type}". Valid: ${ENTRYPOINT_TYPES.join(', ')}.`,
             };
         }
     }
@@ -876,13 +881,12 @@ function detectEntrypoints(index, options = {}) {
     // Same discipline for --framework (fix #243) — a typo like 'flsk'
     // silently filtered everything to an empty result.
     if (options.framework) {
-        const validFrameworks = new Set(FRAMEWORK_PATTERNS.map(p => p.framework.toLowerCase()));
         const wanted = String(options.framework).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-        const unknown = wanted.filter(f => !validFrameworks.has(f));
+        const unknown = wanted.filter(f => !ENTRYPOINT_FRAMEWORKS.includes(f));
         if (unknown.length > 0) {
             return {
                 error: 'invalid-framework',
-                message: `Unknown framework "${unknown.join('", "')}". Valid: ${[...validFrameworks].sort().join(', ')}.`,
+                message: `Unknown framework "${unknown.join('", "')}". Valid: ${ENTRYPOINT_FRAMEWORKS.join(', ')}.`,
             };
         }
     }
@@ -1462,6 +1466,8 @@ function isFrameworkEntrypoint(symbol, index) {
 }
 
 module.exports = {
+    ENTRYPOINT_TYPES,
+    ENTRYPOINT_FRAMEWORKS,
     FRAMEWORK_PATTERNS,
     detectEntrypoints,
     isFrameworkEntrypoint,

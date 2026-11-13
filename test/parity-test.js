@@ -15,6 +15,7 @@ const {
     getCliCommandSet,
     getMcpCommandEnum,
     generateMcpParamSection,
+    mcpParamProperties,
     normalizeParams,
     resolveCommand,
     suggestCommand,
@@ -140,21 +141,23 @@ describe('single-router architecture', () => {
 
     it('the MCP schema and generated flag reference cover every accepted parameter', () => {
         const generated = generateMcpParamSection();
+        const schema = mcpParamProperties();
         for (const [command, params] of Object.entries(FLAG_APPLICABILITY)) {
             assert.ok(generated.includes(`  ${toMcpName(command)}:`));
             for (const param of params) {
                 const surface = REVERSE_PARAM_MAP[param] || param;
                 assert.ok(generated.includes(surface), `${command}.${surface}`);
-                assert.match(mcpCode,
-                    new RegExp(`\\n\\s*${surface}:\\s*(?:stringParam|booleanParam|integerParam|numberParam)\\(`),
-                    `${surface} schema`);
+                assert.ok(schema[surface], `${surface} schema`);
             }
         }
         for (const snake of Object.keys(PARAM_MAP)) {
-            assert.match(mcpCode,
-                new RegExp(`\\n\\s*${snake}:\\s*(?:stringParam|booleanParam|integerParam|numberParam)\\(`),
-                `${snake} schema`);
+            if (snake === 'project_dir') continue;
+            assert.ok(schema[snake], `${snake} schema`);
         }
+        // The server writes its schema from the table: it declares no
+        // parameter of its own beside the two transport fields.
+        assert.match(mcpCode, /\.\.\.mcpParamProperties\(\)/);
+        assert.doesNotMatch(mcpCode, /(?:stringParam|booleanParam|integerParam|numberParam)\(/);
     });
 });
 
@@ -375,9 +378,9 @@ describe('tiered evidence survives composition', () => {
         try {
             const index = idx(dir);
             assert.match(execute(index, 'show', { name: 'processData', sections: 'bogus' }).error,
-                /Unknown show section/);
+                /Invalid show sections "bogus"\. Valid: summary, callers, callees/);
             assert.match(execute(index, 'trace', { name: 'processData', direction: 'sideways' }).error,
-                /callees or callers/);
+                /Invalid trace direction "sideways"\. Valid: callees, callers\./);
             assert.match(execute(index, 'trace', { name: 'processData', to: 'entrypoints' }).error,
                 /requires --direction=callers/);
         } finally { rm(dir); }

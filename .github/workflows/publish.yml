@@ -89,6 +89,36 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  release:
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Creates the GitHub release of the tag
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Every tag and commit: when CHANGELOG.md has no section for this
+          # version, the notes are the commits since the previous version tag.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Release notes of this version
+        run: node scripts/changelog.js --notes "${GITHUB_REF_NAME#v}" > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A rerun of this job finds the release it made and rewrites it.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+
   publish-mcp:
     needs: publish-npm
     runs-on: ubuntu-latest

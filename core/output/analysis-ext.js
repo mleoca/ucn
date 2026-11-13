@@ -3,6 +3,7 @@
  */
 
 const { dynamicImportsNote, formatLineRanges, unverifiedReasonLabel, advisoryLine } = require('./shared');
+const { paramFact } = require('../registry');
 const { formatAccountLines, formatSharedAccountLines, formatCalleeAccountLine, unverifiedCalleeLines, initializerReviewLines } = require('./analysis');
 
 /**
@@ -201,7 +202,7 @@ function formatDiffImpact(result, options = {}) {
     const lines = [];
     const MAX_CALLERS_PER_FN = options.all ? Infinity : 30;
     const unverifiedLimit = options.all ? Infinity
-        : Number.isInteger(options.top) && options.top > 0 ? options.top : 10;
+        : Number.isInteger(options.top) && options.top > 0 ? options.top : paramFact('top', 'unverifiedRows');
 
     lines.push(`Diff Impact Analysis (vs ${result.base})`);
     lines.push('═'.repeat(60));

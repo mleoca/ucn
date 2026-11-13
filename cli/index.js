@@ -30,13 +30,22 @@ const {
     formatSurfaceMessage,
     getCliFlagsForCommand,
     getCliAcceptedFlags,
+    getCliValueFlags,
+    generateCliParamReference,
+    commandMode,
+    paramDefault,
+    paramFact,
+    paramRange,
+    paramValues,
+    GLOBAL_PARAMS,
 } = require('../core/registry');
-const { buildPublicParams, isPublicCommand } = require('../core/public-command');
+const { FlagValidationError, parseFlags, validateFlags, processInteger } = require('./flags');
+const { buildPublicParams, isPublicCommand, noOpNotes } = require('../core/public-command');
 const { execute } = require('../core/execute');
 const { describeError } = require('../core/errors');
-const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
+const { applyOutputBudget } = require('../core/output-budget');
 const { clearAllCaches } = require('../core/cache');
-const { commentLines } = require('../core/output/lines');
+const { commentLines, budgetLineListing } = require('../core/output/lines');
 
 // A downstream consumer such as head may finish before our write drains.
 // Handle the pipe closure without an unhandled Node error or bypassing cache
@@ -52,13 +61,6 @@ let activeCanonicalCommand = null;
 // Sentinel error for command failures that have already printed their message.
 // Thrown instead of process.exit(1) so finally blocks can run (cache save).
 class CommandError extends Error { constructor() { super(); } }
-
-// Thrown by validateNumericFlags when a numeric flag has a bad value.
-// The CLI top-level catches this, prints the message, and exits 2 (JSON: 1). Interactive
-// mode catches it inside its REPL try/catch and continues the session.
-class FlagValidationError extends Error {
-    constructor(msg) { super(msg); this.name = 'FlagValidationError'; }
-}
 
 function unknownCommandMessage(command, { interactive = false } = {}) {
     const migration = v4MigrationHint(command, 'cli');
@@ -85,110 +87,6 @@ function resultExitCode(command, result) {
     // review-required and must fail a CI gate.
     return (Number(result.mismatches || 0) > 0 ||
         Number(result.unverifiedCount || 0) > 0) ? 1 : 0;
-}
-
-/**
- * Validate that a raw flag value is a positive integer. Returns the parsed
- * number when valid, or throws FlagValidationError. Callers pass `null`/`undefined`
- * raw values through unchanged (no flag → no validation).
- *
- * @param {string|null|undefined} raw - The raw string captured from the CLI/interactive token.
- * @param {string} flagName - The CLI flag name including dashes (e.g. "--top") for error messages.
- * @param {object} [opts]
- * @param {boolean} [opts.allowZero=false] - Whether 0 is a valid value (e.g. depth=0 may be meaningful).
- * @param {number} [opts.cap=10000000] - Maximum accepted value (rejects 1e100 etc).
- * @returns {number|undefined} The validated integer, or undefined when raw is null/undefined.
- */
-function validatePositiveInt(raw, flagName, { allowZero = false, cap = 10000000 } = {}) {
-    if (raw == null) return undefined;
-    const label = allowZero ? 'non-negative integer' : 'positive integer';
-    const trimmed = String(raw).trim();
-    if (trimmed === '') {
-        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got "${raw}")`);
-    }
-    // CLI integer flags use canonical base-10 spelling. Number()/parseInt()
-    // accept exponent, decimal and hexadecimal forms (`1e1`, `2.5`, `0x10`),
-    // which is especially dangerous for source-line identity because a
-    // malformed pin can accidentally select a real definition.
-    if (!/^\d+$/.test(trimmed)) {
-        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got "${raw}")`);
-    }
-    const n = Number(trimmed);
-    if (!isFinite(n) || isNaN(n)) {
-        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got "${raw}")`);
-    }
-    if (!Number.isInteger(n)) {
-        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got ${n})`);
-    }
-    if (allowZero) {
-        if (n < 0) {
-            throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got ${n})`);
-        }
-    } else if (n <= 0) {
-        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got ${n})`);
-    }
-    if (n > cap) {
-        throw new FlagValidationError(`Invalid ${flagName} value: ${n} exceeds maximum (${cap})`);
-    }
-    return n;
-}
-
-/**
- * Validate all numeric flags on a parsed flags object. Looks at the *Raw
- * companion strings preserved by parseFlags so we catch user-supplied bad
- * values regardless of whether the parsed numeric form happened to be falsy.
- * Mutates `flags` to hold the validated numeric values.
- *
- * Throws FlagValidationError on the first invalid flag.
- */
-function validateNumericFlags(flags) {
-    // --top: positive integer, no zero. Used by show/find/repo/etc.
-    if (flags.topRaw != null) {
-        flags.top = validatePositiveInt(flags.topRaw, '--top');
-    }
-    // --limit: positive integer, no zero. Reject "0 = no limit" silent coercion.
-    if (flags.limitRaw != null) {
-        flags.limit = validatePositiveInt(flags.limitRaw, '--limit');
-    }
-    // --max-files: positive integer, no zero.
-    if (flags.maxFilesRaw != null) {
-        flags.maxFiles = validatePositiveInt(flags.maxFilesRaw, '--max-files');
-    }
-    if (flags.lineRaw != null) {
-        flags.line = validatePositiveInt(flags.lineRaw, '--line');
-    }
-    // --max-lines: positive integer, no zero. Used by source.
-    if (flags.maxLinesRaw != null) {
-        flags.maxLines = validatePositiveInt(flags.maxLinesRaw, '--max-lines');
-    }
-    // --depth: non-negative integer (0 is meaningful: "this symbol only").
-    if (flags.depthRaw != null) {
-        flags.depth = validatePositiveInt(flags.depthRaw, '--depth', { allowZero: true });
-    }
-    // --context: non-negative integer (0 = no surrounding lines).
-    if (flags.contextRaw != null) {
-        flags.context = validatePositiveInt(flags.contextRaw, '--context', { allowZero: true });
-    }
-    // --workers: non-negative integer (0 disables parallel build).
-    if (flags.workersRaw != null) {
-        flags.workers = validatePositiveInt(flags.workersRaw, '--workers', { allowZero: true });
-    }
-    if (flags.maxCharsRaw != null) {
-        flags.maxChars = validatePositiveInt(flags.maxCharsRaw, '--max-chars', {
-            cap: MAX_OUTPUT_CHARS,
-        });
-    }
-    // --min-confidence: number in [0,1] (ordinal evidence weight). Anything
-    // else used to coerce to 0 silently — "abc" behaved like no filter.
-    if (flags.minConfidenceRaw != null) {
-        const value = Number(flags.minConfidenceRaw);
-        if (flags.minConfidenceRaw === '' || !Number.isFinite(value) ||
-            value < 0 || value > 1) {
-            throw new FlagValidationError(
-                `Invalid --min-confidence value: "${flags.minConfidenceRaw}" — must be a number between 0 and 1.`);
-        }
-        flags.minConfidence = value;
-    }
 }
 
 /** Emit the one CLI error contract, including failures before main dispatch. */
@@ -262,146 +160,16 @@ const doubleDashIdx = rawArgs.indexOf('--');
 const args = doubleDashIdx === -1 ? rawArgs : rawArgs.slice(0, doubleDashIdx);
 const argsAfterDoubleDash = doubleDashIdx === -1 ? [] : rawArgs.slice(doubleDashIdx + 1);
 
-// Parse flags
-/**
- * Parse flags from an array of tokens. Supports both --flag=value and --flag value forms.
- * Shared between global CLI mode and interactive mode.
- */
-function parseFlags(tokens) {
-    function getValueFlag(flagName) {
-        const eqForm = tokens.find(a => a.startsWith(flagName + '='));
-        if (eqForm) return eqForm.split('=').slice(1).join('=');
-        const idx = tokens.indexOf(flagName);
-        if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
-            return tokens[idx + 1];
-        }
-        return null;
-    }
-    function parseExclude() {
-        const result = [];
-        for (const a of tokens) {
-            if (a.startsWith('--exclude=') || a.startsWith('--not=')) {
-                result.push(...a.split('=').slice(1).join('=').split(','));
-            }
-        }
-        for (const flag of ['--exclude', '--not']) {
-            for (let i = 0; i < tokens.length; i++) {
-                if (tokens[i] === flag && i + 1 < tokens.length && !tokens[i + 1].startsWith('-')) {
-                    result.push(...tokens[i + 1].split(','));
-                }
-            }
-        }
-        return result;
-    }
-    return {
-        file: getValueFlag('--file'),
-        exclude: parseExclude(),
-        in: getValueFlag('--in'),
-        includeTests: tokens.includes('--include-tests') ? true : undefined,
-        excludeTests: tokens.includes('--exclude-tests') ? true : undefined,
-        includeExported: tokens.includes('--include-exported') || undefined,
-        includeDecorated: tokens.includes('--include-decorated') || undefined,
-        expandUnverified: tokens.includes('--expand-unverified') || undefined,
-        includeMethods: tokens.some(a => a === '--include-methods=false' || a === '--no-include-methods') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
-        detailed: tokens.includes('--detailed') || undefined,
-        topLevel: tokens.includes('--top-level') || undefined,
-        all: tokens.includes('--all') || undefined,
-        exact: tokens.includes('--exact') || undefined,
-        callsOnly: tokens.includes('--calls-only') || undefined,
-        codeOnly: tokens.includes('--code-only') || undefined,
-        caseSensitive: tokens.includes('--case-sensitive') || undefined,
-        withTypes: tokens.includes('--with-types') || undefined,
-        withSource: tokens.includes('--with-source') || undefined,
-        cycles: tokens.includes('--cycles') || undefined,
-        depth: getValueFlag('--depth'),
-        depthRaw: getValueFlag('--depth'),
-        // `top` is the parsed numeric value (NaN/0 default → falsy). `topRaw`
-        // preserves the original string so downstream validators can produce
-        // helpful errors for "abc"/"-1"/"0" instead of silently defaulting.
-        top: parseInt(getValueFlag('--top') || '0'),
-        topRaw: getValueFlag('--top'),
-        context: parseInt(getValueFlag('--context') || '0'),
-        contextRaw: getValueFlag('--context'),
-        direction: getValueFlag('--direction'),
-        to: getValueFlag('--to'),
-        sections: getValueFlag('--sections'),
-        range: getValueFlag('--range'),
-        addParam: getValueFlag('--add-param'),
-        removeParam: getValueFlag('--remove-param'),
-        renameTo: getValueFlag('--rename-to'),
-        delete: tokens.includes('--delete') || undefined,
-        defaultValue: getValueFlag('--default-value') ?? getValueFlag('--default'),
-        base: getValueFlag('--base'),
-        staged: tokens.includes('--staged') || undefined,
-        strict: tokens.includes('--strict') || undefined,
-        deep: tokens.includes('--deep') || undefined,
-        compact: tokens.includes('--no-compact')
-            ? false
-            : (tokens.includes('--compact') ? true : undefined),
-        maxLines: getValueFlag('--max-lines') || null,
-        maxLinesRaw: getValueFlag('--max-lines'),
-        regex: tokens.includes('--regex')
-            ? true
-            : (tokens.includes('--no-regex') ? false : undefined),
-        functions: tokens.includes('--functions') || undefined,
-        hot: tokens.includes('--hot') || undefined,
-        diverse: tokens.includes('--diverse') || undefined,
-        raw: tokens.includes('--raw') || undefined,
-        lines: tokens.includes('--lines') || undefined,
-        git: tokens.includes('--git') || undefined,
-        className: getValueFlag('--class-name'),
-        // Explicit line pin (fix #249: our own disambiguation notes advertise
-        // line= but no surface accepted it).
-        line: parseInt(getValueFlag('--line') || '0', 10) || undefined,
-        lineRaw: getValueFlag('--line'),
-        limit: parseInt(getValueFlag('--limit') || '0') || undefined,
-        limitRaw: getValueFlag('--limit'),
-        maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
-        maxFilesRaw: getValueFlag('--max-files'),
-        maxChars: parseInt(getValueFlag('--max-chars') || '0') || undefined,
-        maxCharsRaw: getValueFlag('--max-chars'),
-        // Structural search flags
-        type: getValueFlag('--type'),
-        param: getValueFlag('--param'),
-        receiver: getValueFlag('--receiver'),
-        returns: getValueFlag('--returns'),
-        decorator: getValueFlag('--decorator'),
-        exported: tokens.includes('--exported') || undefined,
-        unused: tokens.includes('--unused') || undefined,
-        showConfidence: (tokens.includes('--hide-confidence') || tokens.includes('--no-confidence')) ? false
-            : tokens.includes('--show-confidence') ? true : undefined,
-        minConfidence: 0,
-        minConfidenceRaw: getValueFlag('--min-confidence'),
-        unreachableOnly: tokens.includes('--unreachable-only') || undefined,
-        framework: getValueFlag('--framework'),
-        // endpoints command flags
-        bridge: tokens.includes('--bridge') || undefined,
-        serverOnly: tokens.includes('--server-only') || undefined,
-        clientOnly: tokens.includes('--client-only') || undefined,
-        unmatched: tokens.includes('--unmatched') || undefined,
-        method: getValueFlag('--method'),
-        prefix: getValueFlag('--prefix'),
-        hideUncertain: tokens.includes('--hide-uncertain') || tokens.includes('--no-uncertain') || undefined,
-        stack: getValueFlag('--stack'),
-        workersRaw: getValueFlag('--workers'),
-        includeBundled: tokens.includes('--include-bundled') || undefined,
-        workers: (() => {
-            const v = getValueFlag('--workers');
-            if (v === null) return undefined;
-            const n = parseInt(v, 10);
-            return isNaN(n) ? undefined : n;
-        })(),
-    };
-}
-
 // Parse shared flags from CLI args, then add global-only flags
+// Parameters come from the registry's table (cli/flags.js); the flags of the
+// CLI process itself are read here.
 const flags = parseFlags(args);
 flags.json = args.includes('--json');
 flags.quiet = !args.includes('--verbose') && !args.includes('--no-quiet');
 flags.cache = !args.includes('--no-cache') && !flags.includeBundled;
 flags.clearCache = args.includes('--clear-cache');
 flags.interactive = args.includes('--interactive') || args.includes('-i');
-flags.followSymlinks = !args.includes('--no-follow-symlinks');
+flags.followSymlinks = flags.followSymlinks ?? paramDefault('followSymlinks');
 
 // Known flags for validation
 const knownFlags = getCliAcceptedFlags();
@@ -433,11 +201,11 @@ if (unknownFlags.length > 0) {
     process.exit(flags.json ? 1 : 2);
 }
 
-// Validate numeric flag values up front so bad input fails before we build
-// any indexes. Applies to --top, --limit, --max-files, --max-lines, --depth,
-// --context, --workers. Throws FlagValidationError with a helpful message.
+// Refuse a flag value the parameter table does not take before any index is
+// built: a number outside its bounds, a flag written without its value.
 try {
-    validateNumericFlags(flags);
+    validateFlags(flags);
+    flags.workers = processInteger(args, '--workers');
 } catch (e) {
     if (e instanceof FlagValidationError) {
         emitCliError(e.message);
@@ -447,14 +215,7 @@ try {
 }
 
 // Value flags that consume the next token (space form: --flag value)
-const VALUE_FLAGS = new Set([
-    '--file', '--depth', '--top', '--context', '--direction', '--to', '--sections', '--range',
-    '--add-param', '--remove-param', '--rename-to', '--default', '--default-value',
-    '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name', '--line',
-    '--type', '--param', '--receiver', '--returns', '--decorator',
-    '--limit', '--max-files', '--max-chars', '--min-confidence', '--stack', '--framework',
-    '--workers', '--method', '--prefix'
-]);
+const VALUE_FLAGS = getCliValueFlags();
 
 // Remove flags from args, then add args after -- (which are all positional)
 const positionalArgs = [
@@ -490,13 +251,19 @@ function formatCliText(command, result, params, execution, displayFlags) {
         ...execution,
         surface: 'cli',
     });
-    // --lines / --raw are pipe surfaces: records are compact, a truncated
-    // function body is worse than a long one, and an empty answer must stay
-    // empty (grep prints nothing and exits 1). An explicit --max-chars acts
-    // as a fail-before-output guard, never a lossy source/record truncation.
+    // --lines / --raw are pipe surfaces with no default budget, and an empty
+    // answer must stay empty (grep prints nothing and exits 1). Under an
+    // explicit --max-chars a line listing prints the rows that fit and one
+    // line counting the rest, as `| head` would; a record is never cut. Raw
+    // source is never cut either, since a truncated function body is worse
+    // than a long one: there the budget is a fail-before-output guard.
     if (params?.lines || params?.raw) {
         if (displayFlags?.maxChars && text.length > displayFlags.maxChars) {
-            fail(`Output exceeds --max-chars=${displayFlags.maxChars}; shell output cannot be truncated. Narrow the query, use --limit/--max-lines, or omit --max-chars.`);
+            const listing = params.lines ? budgetLineListing(text, displayFlags.maxChars, 'cli') : null;
+            if (listing) return listing.text;
+            fail(params.lines
+                ? `Output exceeds --max-chars=${displayFlags.maxChars} and not one row fits beside the accounting lines. Raise --max-chars or omit it.`
+                : `Output exceeds --max-chars=${displayFlags.maxChars}; shell output cannot be truncated. Narrow the query, use --limit/--max-lines, or omit --max-chars.`);
         }
         return text;
     }
@@ -638,20 +405,14 @@ function main() {
  * Tiered-output contract notes shared by one-shot and interactive mode.
  */
 function printTieredNoOpNotes(canonical, flags, print) {
-    if (!['show', 'impact', 'trace', 'tests', 'check'].includes(canonical)) return;
-    if (['impact', 'trace', 'tests', 'check'].includes(canonical) && flags.includeMethods) {
-        print(`Note: --include-methods has no effect on '${toCliName(canonical)}' — method calls are always tiered by receiver evidence.`);
-    }
-    if (canonical === 'show' && flags.includeMethods) {
-        print(`Note: --include-methods on '${toCliName(canonical)}' affects only method-callee display for standalone-function targets — caller tiers are always evidence-based, and method targets analyze method calls by default.`);
-    }
+    for (const note of noOpNotes(canonical, flags)) print(`Note: ${formatSurfaceMessage(note, 'cli')}`);
 }
 
+// Keys of a parsed flag object that no command's applicability decides: the
+// CLI process flags and the parameters every command accepts.
 const GLOBAL_FLAG_KEYS = new Set([
-    'json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'includeBundled', 'maxFiles',
-    'verbose', 'interactive', '_fileFromFileMode', 'topRaw',
-    'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw',
-    'workers', 'workersRaw', 'lineRaw', 'maxChars', 'maxCharsRaw', 'minConfidenceRaw',
+    'json', 'quiet', 'cache', 'clearCache', 'verbose', 'interactive', 'workers',
+    '_fileFromFileMode', ...GLOBAL_PARAMS,
 ]);
 
 /** Apply one command/flag policy across project, file, glob, and REPL modes. */
@@ -715,7 +476,7 @@ function runFileCommand(filePath, command, arg) {
         tests: 'tests <name>', plan: 'plan <name>',
     };
     // Structural search doesn't require term
-    const isStructural = flags.type || flags.param || flags.receiver || flags.returns || flags.decorator || flags.exported || flags.unused;
+    const isStructural = commandMode('search', flags) === 'structural';
     const hasFlagTarget = canonical === 'source' && flags.range;
     if (needsArg[canonical] && !(canonical === 'search' && isStructural) && !hasFlagTarget) {
         requireArg(arg, `Usage: ucn <file> ${needsArg[canonical]}`);
@@ -917,6 +678,13 @@ function printUsage() {
         const flags = getCliFlagsForCommand(command);
         return `  ${command.padEnd(14)} ${flags.join(' ')}`;
     }).join('\n');
+    // Value lists, defaults and bounds are the registry's parameter table.
+    const values = (param, command, separator = '|') => paramValues(param, command).join(separator);
+    const budget = {
+        max: paramRange('maxChars').max,
+        targeted: paramDefault('maxChars', 'show'),
+        broad: paramDefault('maxChars', 'repo'),
+    };
     console.log(`UCN - Universal Code Navigator
 
 Supported: JavaScript/TypeScript, Python, Go, Rust, Java, C, C++, C#, HTML
@@ -928,12 +696,12 @@ Usage:
 
 Commands:
   repo                            Repository overview
-    --sections=summary,files,stats,health  Select repository sections
+    --sections=${values('sections', 'repo', ',')}  Select repository sections
     --deep                         Include deep readiness evidence
   show <symbol>                   Symbol summary and relationships
-    --sections=summary,callers,callees,source,dependencies,tests,types,example,related
+    --sections=${values('sections', 'show', ',')}
   find <name>                     Definitions; --type=type, --with-source
-    text: top 5 in detail + a count of the rest; --json: up to 500;
+    text: top ${paramFact('limit', 'findDetail')} in detail + a count of the rest; --json: up to ${paramDefault('limit', 'find')};
     --limit=N raises both
   usages <name>                   Calls, imports, definitions, references (test files
                                   included; --exclude-tests hides them with a count)
@@ -941,11 +709,11 @@ Commands:
     literal text by default; --regex enables regular-expression syntax
   source <symbol|file:range>      Exact function, class, or line extraction
   trace <symbol>                  Call graph
-    --direction=callees|callers   Downstream or upstream (default: callees)
-    --to=entrypoints              Follow callers toward entry points
+    --direction=${values('direction', 'trace')}   Downstream or upstream (default: ${paramDefault('direction', 'trace')})
+    --to=${values('to', 'trace')}              Follow callers toward entry points
   impact [symbol]                 Symbol impact; without symbol, Git-diff impact
   tests <symbol>                  Direct tests; --depth=N adds transitive impact
-  deps <file>                     File graph; --direction=imports|importers|both
+  deps <file>                     File graph; --direction=${values('direction', 'deps')}
     --detailed                     Include import declarations
   deps --cycles                   Report circular dependencies (no file target)
   api [file]                      Project or file public API (exact files include tests;
@@ -963,20 +731,25 @@ Common flags:
   --all --compact --no-compact --json --include-tests --class-name=X --line=N
   --range=N-M (source <file> --range=N-M, or --file=PATH)
   --base=REF --staged --strict --no-cache --clear-cache [--all] --max-files=N --workers=N
-  --max-chars=N (text characters, not UTF-8 bytes; default 10K targeted / 3K broad, ceiling 100K)
+  --max-chars=N (text characters, not UTF-8 bytes; default ${budget.targeted} targeted / ${budget.broad} broad, ceiling ${budget.max})
            JSON is uncapped; meta.maxChars is "not-applied", even with an explicit budget.
   --lines  find/usages/search/show/impact: grep -n shape, one path:line:text
            record per output line; usages combines occurrences on each source line
            (tags after a tab: # unverified: <reason>, # import,
            # callee); accounting and notes go to stderr as "# " lines; exit 1
            when nothing matched; exit 2 on errors. No default result cap.
-           show defaults to callers; --sections=callers,callees selects bands.
+           Under an explicit --max-chars the rows that fit are printed whole
+           and one "# truncated: X of Y rows omitted" line counts the rest.
+           show defaults to ${paramDefault('sections', 'show', 'lines').join(',')}; --sections=${paramValues('sections', 'show', 'lines').join(',')} selects bands.
   --raw    source: full code, no header or gutter (including large classes).
-           Shell modes fail before output if an explicit --max-chars is exceeded.
+           Never cut: an explicit --max-chars it exceeds fails before output.
   Cache: per-user by default; set UCN_CACHE_DIR to override the cache root.
 
 Accepted flags by command:
 ${perCommandFlags}
+
+Values, bounds and defaults:
+${generateCliParamReference()}
 
 Global/build/output flags:
   --help -h --version -v --mcp --json --verbose --no-quiet --quiet
@@ -1074,12 +847,12 @@ function runInteractive(rootDir) {
         if (input === 'help') {
             console.log(`
 Commands:
-  repo                   Repository overview (--sections=files,stats,health)
+  repo                   Repository overview (--sections=${paramValues('sections', 'repo').join(',')})
   show <name>            Symbol summary + relationships (--sections=...)
-  find <name>            Find definitions (--type=type, --with-source; top 5 shown, --limit=N)
+  find <name>            Find definitions (--type=type, --with-source; top ${paramFact('limit', 'findDetail')} shown, --limit=N)
   usages <name>          All usages grouped by type
   source <target>        Extract a symbol or file:line-range
-  trace <name>           Call tree (--direction=callees|callers, --to=entrypoints)
+  trace <name>           Call tree (--direction=${paramValues('direction', 'trace').join('|')}, --to=${paramValues('to', 'trace').join('|')})
   impact [name]          Symbol impact, or Git diff impact without a name
   tests <name>           Direct tests; --depth=N includes transitive impact
   deps <file>            File graph (--direction=, --depth=, --detailed, --cycles)
@@ -1114,7 +887,7 @@ Flags can be added per-command: show myFunc --sections=source,callers
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--to', '--sections', '--range', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--max-chars', '--min-confidence', '--class-name', '--line', '--framework', '--method', '--prefix']);
+        const valueFlagNames = VALUE_FLAGS;
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
@@ -1150,10 +923,9 @@ Flags can be added per-command: show myFunc --sections=source,callers
         }
 
         try {
-            // Validate numeric flags (--top, --limit, etc) — same rules as
-            // global CLI mode. MED-2/MED-3/MED-5: bad values are rejected with
-            // a helpful message instead of being silently coerced.
-            validateNumericFlags(iflags);
+            // The same value rules as one-shot mode: a bad value is refused
+            // with a message, never silently coerced.
+            validateFlags(iflags);
             // The REPL is an edit/query loop, not a frozen snapshot. Keep the
             // symbol table and call cache on the same generation by checking
             // source staleness before every command. getCachedCalls already

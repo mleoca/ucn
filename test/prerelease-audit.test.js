@@ -1789,7 +1789,7 @@ describe('UCN v5 prerelease audit regressions', () => {
             assert.match(invalidIn.error, /No files matched/);
             const invalidType = execute(index, 'find', { name: 'target', type: 'bogus' });
             assert.equal(invalidType.ok, false);
-            assert.match(invalidType.error, /Invalid find type.*Valid types/);
+            assert.match(invalidType.error, /Invalid find type "bogus"\. Valid: type, function, class/);
 
             const found = execute(index, 'find', { name: 'target', limit: 1 });
             const foundText = publicOutput.formatPublicText('find', found.result,
@@ -1830,9 +1830,9 @@ describe('UCN v5 prerelease audit regressions', () => {
             'lib.js': Array.from({ length: 80 }, (_, i) =>
                 `export function item${i}(){ return ${i}; }`).join('\n'),
         });
-        const serverSource = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf8');
-        assert.match(serverSource, /show_confidence.*default to visible/);
-        assert.match(serverSource, /compact.*default/i);
+        const schema = require('../core/registry').mcpParamProperties();
+        assert.match(schema.show_confidence.description, /default to visible/);
+        assert.match(schema.compact.description, /Omitted: show, impact true; find, usages false/);
         const client = new McpClient();
         try {
             await client.start();

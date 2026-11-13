@@ -11,6 +11,7 @@ const fs = require('fs');
 const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
 const path = require('path');
 const { isTestFile } = require('./discovery');
+const { paramFact } = require('./registry');
 const { summarizeCommandTrust } = require('./trust-matrix');
 const { projectComputedDispatch } = require('./ast-analysis');
 const { langTraits } = require('../languages');
@@ -123,7 +124,7 @@ function getStats(index, options = {}) {
         // positive integer, 0 (show nothing), or undefined (default 10).
         const top = options.top === 0
             ? 0
-            : ((options.top != null && Number(options.top) > 0) ? Number(options.top) : 10);
+            : ((options.top != null && Number(options.top) > 0) ? Number(options.top) : paramFact('top', 'hot'));
         const FUNCTION_TYPES = CALLABLE_SYMBOL_KINDS;
 
         // Ensure the calls cache is fully populated before counting.

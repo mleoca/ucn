@@ -15,10 +15,11 @@
 'use strict';
 
 const { CALLABLE_SYMBOL_KINDS } = require('../shared');
-const { formatSurfaceMessage } = require('../registry');
+const { CANONICAL_COMMANDS, FLAG_APPLICABILITY, formatSurfaceMessage } = require('../registry');
 const { formatAccountLines, formatCalleeAccountLine } = require('./analysis');
 
-const LINES_COMMANDS = new Set(['find', 'usages', 'search', 'show', 'impact']);
+// The commands that take `lines`: the registry's applicability.
+const LINES_COMMANDS = new Set(CANONICAL_COMMANDS.filter(command => FLAG_APPLICABILITY[command].includes('lines')));
 
 function record(pathLike, line, text, tag = '') {
     // One record per line is the contract: a multi-line signature or a
@@ -304,4 +305,52 @@ function formatPublicRaw(result, execution = {}) {
     return code;
 }
 
-module.exports = { LINES_COMMANDS, formatPublicLines, formatPublicRaw, commentLines };
+/**
+ * A line listing cut to `limit` characters: the records that fit, in their
+ * order, then every comment line, then one `# truncated` line counting the
+ * records left out. A record is never cut and a comment line is never
+ * dropped: the accounting still describes the whole answer. Null when the
+ * listing has no record to drop or when not one record fits beside the
+ * comment lines (`allowNoRows` answers that case with no row instead).
+ */
+function budgetLineListing(text, limit, surface = 'cli', { allowNoRows = false } = {}) {
+    const lines = String(text).split('\n').filter(line => line !== '');
+    const records = lines.filter(line => !line.startsWith('# '));
+    const comments = lines.filter(line => line.startsWith('# '));
+    if (records.length === 0) return null;
+    const advice = surface === 'mcp'
+        ? 'raise max_chars or narrow the query'
+        : 'raise --max-chars or omit it';
+    const trailer = omitted => `# truncated: ${omitted} of ${records.length} rows omitted; ${advice}`;
+    // The most records whose text, with every comment line and the trailer
+    // that counts the rest, is within the limit.
+    const fixed = comments.reduce((sum, line) => sum + line.length + 1, 0);
+    const prefix = [0];
+    for (const record of records) prefix.push(prefix[prefix.length - 1] + record.length + 1);
+    let kept = 0;
+    for (let count = records.length - 1; count >= 1; count--) {
+        if (prefix[count] + fixed + trailer(records.length - count).length <= limit) { kept = count; break; }
+    }
+    if (kept === 0) {
+        // Not one row fits. A surface that always has a budget still gets a
+        // listing: the line that counts every row, then the comment lines
+        // there is room for.
+        const all = trailer(records.length);
+        if (!allowNoRows || all.length > limit) return null;
+        const room = [];
+        let used = all.length;
+        for (const line of comments) {
+            if (used + line.length + 1 > limit) break;
+            used += line.length + 1;
+            room.push(line);
+        }
+        return { text: [...room, all].join('\n'), rows: records.length, omitted: records.length };
+    }
+    return {
+        text: [...records.slice(0, kept), ...comments, trailer(records.length - kept)].join('\n'),
+        rows: records.length,
+        omitted: records.length - kept,
+    };
+}
+
+module.exports = { LINES_COMMANDS, formatPublicLines, formatPublicRaw, commentLines, budgetLineListing };

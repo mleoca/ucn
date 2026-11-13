@@ -522,6 +522,19 @@ const GO_ROUTER_MODULES = [
     [/^github\.com\/julienschmidt\/httprouter$/, 'httprouter'],
 ];
 
+// The framework labels a route or a request can carry. A label is known to
+// the `framework` filter when it is listed here or appears in the answer it
+// filters, so a label the answer prints is always one the filter takes.
+const ENDPOINT_FRAMEWORKS = Object.freeze([...new Set([
+    ...Object.values(SERVER_RECEIVER_PATTERNS).flat().map(pattern => pattern.framework),
+    ...Object.values(CLIENT_PATTERNS).flatMap(patterns => patterns.receivers).map(pattern => pattern.framework),
+    ...JS_ROUTER_MODULES.map(([, framework]) => framework),
+    ...GO_ROUTER_MODULES.map(([, framework]) => framework),
+    'actix', 'aiohttp', 'aspnet', 'django', 'fastapi', 'fetch', 'flask', 'go-inprocess',
+    'inject', 'jax-rs', 'nestjs', 'nextjs', 'request-helper', 'route-config', 'spring',
+    'starlette', 'supertest', 'unknown-python',
+])].sort());
+
 function frameworkOfModule(table, spec) {
     for (const [re, framework] of table) if (re.test(spec)) return framework;
     return null;
@@ -3138,6 +3151,7 @@ function endpoints(index, options = {}) {
 }
 
 module.exports = {
+    ENDPOINT_FRAMEWORKS,
     endpoints,
     extractServerRoutes,
     extractClientRequests,

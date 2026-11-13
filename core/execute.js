@@ -15,7 +15,7 @@ const path = require('path');
 const { addTestExclusions, pickBestDefinition, parseSymbolHandle, looksLikeHandle } = require('./shared');
 const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
 const { renderExpandItem } = require('./expand-cache');
-const { CANONICAL_COMMANDS } = require('./registry');
+const { CANONICAL_COMMANDS, FLAG_APPLICABILITY, commandMode, paramDefault, paramTableError, toCliName } = require('./registry');
 const { sourceRangeTarget } = require('./public-command');
 const { isAccessorDefinition } = require('./accessors');
 const { describeError } = require('./errors');
@@ -216,7 +216,7 @@ function buildCallerOptions(p) {
         includeUncertain: p.includeUncertain || false,
         includeTests: p.includeTests,
         exclude: toExcludeArray(p.exclude),
-        minConfidence: num(p.minConfidence, 0),
+        minConfidence: num(p.minConfidence, paramDefault('minConfidence')),
     };
 }
 
@@ -297,9 +297,12 @@ function num(val, fallback) {
     return isNaN(n) ? fallback : n;
 }
 
-/** Shared listing bound; shell listings remain uncapped unless requested. */
-function listingLimit(p) {
-    return num(p.limit, undefined) || (p.lines || p.all ? undefined : 500);
+/**
+ * The listing bound of `command`: an explicit limit, else the command's
+ * default limit. Shell listings and `all` have no default bound.
+ */
+function listingLimit(p, command) {
+    return num(p.limit, undefined) || (p.lines || p.all ? undefined : paramDefault('limit', command));
 }
 
 /**
@@ -424,31 +427,17 @@ function readAndExtract(match) {
     return cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 }
 
-const SHOW_SECTIONS = new Set([
-    'summary', 'callers', 'callees', 'source', 'dependencies',
-    'tests', 'types', 'example', 'related',
-]);
-const REPO_SECTIONS = new Set(['summary', 'files', 'stats', 'health']);
-
-/** Parse a comma-separated/array section selector with validation. */
-function parseSections(value, defaults, allowed, command) {
-    const supplied = value != null && value !== '';
+/**
+ * The sections a `show` or `repo` request selects: the ones it names, else
+ * the command's default for its mode. The parameter table has already
+ * refused a name outside the command's set.
+ */
+function selectedSections(command, p) {
+    const supplied = p.sections != null && p.sections !== '';
     const raw = !supplied
-        ? defaults
-        : (Array.isArray(value) ? value : String(value).split(','));
-    const sections = [...new Set(raw.map(s => String(s).trim().toLowerCase()).filter(Boolean))];
-    if (supplied && sections.length === 0) {
-        return {
-            error: `No valid ${command} sections were provided. Available: ${[...allowed].join(', ')}.`,
-        };
-    }
-    const invalid = sections.filter(s => !allowed.has(s));
-    if (invalid.length > 0) {
-        return {
-            error: `Unknown ${command} section(s): ${invalid.join(', ')}. Available: ${[...allowed].join(', ')}.`,
-        };
-    }
-    return { sections };
+        ? paramDefault('sections', command, commandMode(command, p))
+        : (Array.isArray(p.sections) ? p.sections : String(p.sections).split(','));
+    return [...new Set(raw.map(s => String(s).trim().toLowerCase()).filter(Boolean))];
 }
 
 function addMode(result, mode) {
@@ -474,14 +463,17 @@ const PUBLIC_COMMAND_SET = new Set(CANONICAL_COMMANDS);
  * glob, file, and programmatic callers receive the same answer.
  */
 function validatePublicParams(command, p) {
-    if (p.raw && command !== 'source') return '--raw is supported only by source.';
-    if (p.lines && !['find', 'usages', 'search', 'show', 'impact'].includes(command)) {
-        return '--lines is supported by find, usages, search, show, and impact.';
+    // The shell modes change the shape of the whole answer: on a command
+    // that has none they are refused, not ignored.
+    for (const shape of ['raw', 'lines']) {
+        if (!p[shape] || FLAG_APPLICABILITY[command].includes(shape)) continue;
+        const takers = CANONICAL_COMMANDS.filter(name => FLAG_APPLICABILITY[name].includes(shape)).map(toCliName);
+        return takers.length === 1
+            ? `--${shape} is supported only by ${takers[0]}.`
+            : `--${shape} is supported by ${takers.slice(0, -1).join(', ')}, and ${takers.at(-1)}.`;
     }
-    if (p.lines && command === 'show' && p.sections) {
-        const parsed = parseSections(p.sections, ['callers'], new Set(['callers', 'callees']), 'show --lines');
-        if (parsed.error) return parsed.error;
-    }
+    const tableError = paramTableError(command, p);
+    if (tableError) return tableError;
     const hasName = typeof p.name === 'string' && p.name.trim() !== '';
     const gitScope = p.staged || (typeof p.base === 'string' && p.base.trim() !== '');
     if (command === 'impact' && hasName && gitScope) {
@@ -507,14 +499,14 @@ function validatePublicParams(command, p) {
         return 'search receiver filtering requires type=call (or omit type to select call mode).';
     }
     if (command === 'trace' && p.to === 'entrypoints' &&
-        (p.direction || 'callees') !== 'callers') {
+        (p.direction || paramDefault('direction', 'trace')) !== 'callers') {
         return 'trace --to=entrypoints requires --direction=callers.';
     }
     if (command === 'deps' && p.cycles &&
         (p.file || p.direction || p.depth != null || p.detailed || p.all)) {
         return 'deps cycles mode cannot be combined with file, direction, depth, detailed, or all.';
     }
-    if (command === 'tests' && Number(p.depth || 0) > 0 && p.callsOnly) {
+    if (command === 'tests' && Number(p.depth || paramDefault('depth', 'tests')) > 0 && p.callsOnly) {
         return 'tests callsOnly applies to direct mode and cannot be combined with depth>0.';
     }
     if (command === 'entrypoints' && p.includeTests === true && p.excludeTests === true) {
@@ -591,13 +583,7 @@ const HANDLERS = {
             line: resolved.def.nameLine || resolved.def.startLine,
             ...(resolved.def.className && { className: resolved.def.className }),
         } : query;
-        const parsed = parseSections(
-            p.sections,
-            p.lines ? ['callers'] : ['summary', 'callers', 'callees'],
-            SHOW_SECTIONS,
-            'show',
-        );
-        if (parsed.error) return { ok: false, error: parsed.error };
+        const parsed = { sections: selectedSections('show', p) };
         if (p.withTypes && !parsed.sections.includes('types')) parsed.sections.push('types');
 
         const selected = new Set(parsed.sections);
@@ -733,10 +719,7 @@ const HANDLERS = {
         }
         const err = requireFile(p.file);
         if (err) return { ok: false, error: err };
-        const direction = p.direction || 'both';
-        if (!['imports', 'importers', 'both'].includes(direction)) {
-            return { ok: false, error: 'deps direction must be imports, importers, or both.' };
-        }
+        const direction = p.direction || paramDefault('direction', 'deps');
         const graphResponse = HANDLERS.graph(index, {
             file: p.file,
             direction,
@@ -768,9 +751,7 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const inErr = validateInFilter(index, p.in);
         if (inErr) return { ok: false, error: inErr };
-        const defaults = p.deep ? ['summary', 'health'] : ['summary'];
-        const parsed = parseSections(p.sections, defaults, REPO_SECTIONS, 'repo');
-        if (parsed.error) return { ok: false, error: parsed.error };
+        const parsed = { sections: selectedSections('repo', p) };
         const selected = new Set(parsed.sections);
         const result = { sections: parsed.sections };
         const notes = [];
@@ -787,7 +768,7 @@ const HANDLERS = {
             ...p,
             // repo's public limit caps the file result set. Direct toc's
             // legacy symbol-list cap is intentionally not composed here.
-            top: p.top || listingLimit(p),
+            top: p.top || listingLimit(p, 'repo'),
             limit: undefined,
         });
         if (!failure && selected.has('stats')) failure = collect('stats', 'stats', p);
@@ -912,7 +893,7 @@ const HANDLERS = {
         const depthVal = num(p.depth, undefined);
         const result = index.blast(p.name, {
             ...buildCallerOptions(p),
-            depth: depthVal ?? 3,
+            depth: depthVal ?? paramDefault('depth', 'trace'),
             all: !!p.all,
             expandUnverified: !!p.expandUnverified,
         });
@@ -936,7 +917,7 @@ const HANDLERS = {
         const depthVal = num(p.depth, undefined);
         const result = index.reverseTrace(p.name, {
             ...buildCallerOptions(p),
-            depth: depthVal ?? 5,
+            depth: depthVal ?? paramDefault('depth', 'trace', 'entrypoints'),
             all: !!p.all,
             expandUnverified: !!p.expandUnverified,
         });
@@ -967,13 +948,7 @@ const HANDLERS = {
     },
 
     trace: (index, p) => {
-        const direction = p.direction || 'callees';
-        if (!['callees', 'callers'].includes(direction)) {
-            return { ok: false, error: 'trace direction must be callees or callers.' };
-        }
-        if (p.to && p.to !== 'entrypoints') {
-            return { ok: false, error: 'trace --to currently accepts only entrypoints.' };
-        }
+        const direction = p.direction || paramDefault('direction', 'trace');
         if (direction === 'callers') {
             const response = p.to === 'entrypoints'
                 ? HANDLERS.reverseTrace(index, { ...p, direction: undefined, to: undefined })
@@ -996,7 +971,7 @@ const HANDLERS = {
         const depthVal = num(p.depth, undefined);
         const result = index.trace(p.name, {
             ...buildCallerOptions(p),
-            depth: depthVal ?? 3,
+            depth: depthVal ?? paramDefault('depth', 'trace'),
             all: !!p.all,
             expandUnverified: !!p.expandUnverified,
         });
@@ -1133,7 +1108,7 @@ const HANDLERS = {
         const { check } = require('./check');
         try {
             const result = check(index, {
-                base: p.base || 'HEAD',
+                base: p.base || paramDefault('base'),
                 staged: !!p.staged,
                 file: p.file,
                 limit: num(p.limit, undefined),
@@ -1151,21 +1126,13 @@ const HANDLERS = {
     find: (index, p) => {
         const inErr = validateInFilter(index, p.in);
         if (inErr) return { ok: false, error: inErr };
-        const validFindTypes = new Set([
-            'type', 'function', 'class', 'variable', 'state', 'constant',
-            'field', 'macro', 'method', 'constructor', 'interface', 'enum',
-            'struct', 'trait', 'record', 'namespace',
-        ]);
-        if (p.type && !validFindTypes.has(p.type)) {
-            return { ok: false, error: `Invalid find type "${p.type}". Valid types: ${[...validFindTypes].join(', ')}.` };
-        }
         if (p.type === 'type') {
             const response = HANDLERS.typedef(index, { ...p });
             if (response.ok) {
                 if (!p.withSource && Array.isArray(response.result)) {
                     response.result = response.result.map(({ code, ...item }) => item);
                 }
-                const limit = listingLimit(p);
+                const limit = listingLimit(p, 'find');
                 if (limit && limit > 0 && Array.isArray(response.result)) {
                     const { items, total, limited } = applyLimit(response.result, limit);
                     response.result = items;
@@ -1217,12 +1184,14 @@ const HANDLERS = {
                 item.startLine === line || item.nameLine === line);
         }
         if (p.type) {
-            const kindGroups = {
-                function: new Set(['function', 'method', 'constructor', 'get', 'set']),
-                class: new Set(CLASS_KIND_TYPES),
-                variable: new Set(['state', 'constant', 'field']),
-            };
-            const kinds = kindGroups[p.type] || new Set([p.type]);
+            // A Map: a kind may be named like an inherited object property
+            // (`constructor`), which a plain object lookup would return.
+            const kindGroups = new Map([
+                ['function', new Set(['function', 'method', 'constructor', 'get', 'set'])],
+                ['class', new Set(CLASS_KIND_TYPES)],
+                ['variable', new Set(['state', 'constant', 'field'])],
+            ]);
+            const kinds = kindGroups.get(p.type) || new Set([p.type]);
             result = result.filter(item => kinds.has(item.type));
         }
         const fullFindCount = result.length;
@@ -1255,7 +1224,7 @@ const HANDLERS = {
             if (unsearched) notes.push(unsearched);
         }
         // Apply limit
-        const limit = listingLimit(p);
+        const limit = listingLimit(p, 'find');
         if (!p.lines) {
             index._beginOp();
             try {
@@ -1314,7 +1283,7 @@ const HANDLERS = {
         const userExclude = toExcludeArray(p.exclude);
         const unfiltered = index.usages(p.name, {
             codeOnly: p.codeOnly || false,
-            context: num(p.context, 0),
+            context: num(p.context, paramDefault('context')),
             className: p.className,
             // A stable handle pins which definition is meant; it must not
             // silently turn into a same-file-only usage scan. An explicit
@@ -1469,7 +1438,7 @@ const HANDLERS = {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         // Detect structural search mode: any of these flags triggers index-based search
-        const isStructural = p.type || p.param || p.receiver || p.returns || p.decorator || p.exported || p.unused;
+        const isStructural = commandMode('search', p) === 'structural';
         if (isStructural) {
             const exclude = applyTestExclusions(p.exclude, p.includeTests);
             const topVal = num(p.top, undefined) || num(p.limit, undefined);
@@ -1487,7 +1456,7 @@ const HANDLERS = {
                 testExclude: p.includeTests ? undefined : ['test files'],
                 in: p.in,
                 file: p.file,
-                top: topVal || (p.lines ? undefined : 50),
+                top: topVal || (p.lines ? undefined : paramDefault('limit', 'search', 'structural')),
             });
             if (result.meta.error) return { ok: false, error: result.meta.error };
             const unsupported = (!p.regex && (p.term || p.name))
@@ -1511,14 +1480,14 @@ const HANDLERS = {
         const testsExcluded = !p.includeTests;
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
         // JSON is intentionally structured rather than byte-truncated, so
-        // text search needs a row bound of its own. Keep the documented
-        // default at 500 and retain total/truncated metadata for controlled
-        // expansion with an explicit top/limit.
+        // text search needs a row bound of its own: the default limit, with
+        // total/truncated metadata for controlled expansion by an explicit
+        // top/limit.
         const topVal = num(p.top, undefined) || num(p.limit, undefined);
-        const effectiveLimit = topVal || (p.lines ? undefined : 500);
+        const effectiveLimit = topVal || (p.lines ? undefined : paramDefault('limit', 'search'));
         const result = index.search(p.term, {
             codeOnly: p.codeOnly || false,
-            context: num(p.context, 0),
+            context: num(p.context, paramDefault('context')),
             caseSensitive: p.caseSensitive || false,
             exclude,
             in: p.in,
@@ -1546,7 +1515,7 @@ const HANDLERS = {
     },
 
     tests: (index, p) => {
-        const depth = num(p.depth, 0);
+        const depth = num(p.depth, paramDefault('depth', 'tests'));
         if (depth > 0) {
             const response = HANDLERS.affectedTests(index, { ...p, depth });
             if (response.ok) addMode(response.result, 'affected');
@@ -1693,7 +1662,7 @@ const HANDLERS = {
             file: p.file,
         });
         // Apply limit to dead code results (result is an array with custom properties)
-        const limit = listingLimit(p);
+        const limit = listingLimit(p, 'deadcode');
         let note;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
             note = limitNote(limit, result.length);
@@ -1800,21 +1769,12 @@ const HANDLERS = {
     endpoints: (index, p) => {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
-        // Minor polish: validate --method against known HTTP verbs to catch
-        // typos that would otherwise silently filter out everything.
-        // 'ALL' / 'USE' are downstream route labels that can be queried explicitly.
-        const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD', 'ALL', 'USE']);
-        let normMethod = null;
-        if (p.method != null && String(p.method).trim() !== '') {
-            normMethod = String(p.method).trim().toUpperCase();
-            if (!HTTP_METHODS.has(normMethod)) {
-                return {
-                    ok: false,
-                    error: `Invalid --method value: "${p.method}". Expected one of ${[...HTTP_METHODS].join(', ')}.`,
-                };
-            }
-        }
-        const { endpoints } = require('./bridge');
+        // The method is one of the table's verbs in any letter case; a typo
+        // is refused there instead of filtering everything out.
+        const normMethod = p.method != null && String(p.method).trim() !== ''
+            ? String(p.method).trim().toUpperCase()
+            : null;
+        const { endpoints, ENDPOINT_FRAMEWORKS } = require('./bridge');
         // HIGH-2: --unmatched implies --bridge (we need bridges to know what's
         // unmatched). Without bridges computed, we can't separate matched from
         // unmatched on either side.
@@ -1833,16 +1793,14 @@ const HANDLERS = {
         });
         if (p.framework != null && String(p.framework).trim() !== '') {
             const framework = String(p.framework).trim().toLowerCase();
-            const known = new Set([
-                'actix', 'aspnet', 'aspnet-minimal', 'axios', 'axum',
-                'dotnet-httpclient', 'express', 'fastapi', 'fetch', 'flask',
-                'go-http', 'jax-rs', 'nestjs', 'nextjs', 'requests',
-                'reqwest', 'spring', 'spring-client', 'unknown-python',
-            ]);
-            if (!known.has(framework)) {
+            // Known: a label the endpoint detectors declare, or one a row of
+            // this answer carries. A label the answer prints always filters.
+            const present = [...result.routes, ...result.requests].map(row => row.framework).filter(Boolean);
+            const known = [...new Set([...ENDPOINT_FRAMEWORKS, ...present])].sort();
+            if (!known.includes(framework)) {
                 return {
                     ok: false,
-                    error: `Invalid --framework value: "${p.framework}". Valid: ${[...known].join(', ')}.`,
+                    error: `Invalid endpoints framework "${p.framework}". Valid: ${known.join(', ')}.`,
                 };
             }
             result.routes = result.routes.filter(route => route.framework === framework);
@@ -2228,8 +2186,8 @@ const HANDLERS = {
         const err = requireFile(p.file);
         if (err) return { ok: false, error: err };
         const result = index.graph(p.file, {
-            direction: p.direction || 'both',
-            maxDepth: num(p.depth, 2),
+            direction: p.direction || paramDefault('direction', 'deps'),
+            maxDepth: num(p.depth, paramDefault('depth', 'deps')),
         });
         if (result && result.error === 'invalid-direction') {
             return { ok: false, error: result.message };
@@ -2351,7 +2309,7 @@ const HANDLERS = {
         try {
             const view = target ? target.index : index;
             result = view.diffImpact({
-                base: p.base || 'HEAD',
+                base: p.base || paramDefault('base'),
                 staged: p.staged || false,
                 file: p.file,
                 all: !!p.all,
@@ -2436,7 +2394,7 @@ const HANDLERS = {
             if (fileErr) return { ok: false, error: fileErr };
         }
         // Apply limit to api results (api returns an array)
-        const limit = listingLimit(p);
+        const limit = listingLimit(p, 'api');
         let note;
         if (limit && limit > 0 && Array.isArray(result)) {
             const { items, total, limited } = applyLimit(result, limit);

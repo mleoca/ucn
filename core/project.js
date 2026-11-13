@@ -9,6 +9,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { paramDefault } = require('./registry');
 const { UcnError } = require('./errors');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, gitTrackedPaths, gitListing, compareNames, classifyUnsupportedSourceFile, projectDiscoveryOptions } = require('./discovery');
 const { cleanHtmlScriptTags } = require('./parser');
@@ -705,7 +706,7 @@ class ProjectIndex {
         }
 
         // Track if files were truncated by maxFiles limit
-        const maxFiles = options.maxFiles || this.config.maxFiles || 50000;
+        const maxFiles = options.maxFiles || this.config.maxFiles || paramDefault('maxFiles');
         const maxFileIssues = this.discoveryIssues.filter(issue => issue.reason === 'max-files');
         if (!Array.isArray(pattern) && maxFileIssues.length > 0) {
             this.truncated = { indexed: files.length, maxFiles, skipped: maxFileIssues.length };

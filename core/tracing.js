@@ -21,6 +21,7 @@
 
 const path = require('path');
 const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
+const { paramDefault } = require('./registry');
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
 const { getLanguageAdapter } = require('../languages');
@@ -148,7 +149,7 @@ function trace(index, name, options = {}) {
     index._beginOp();
     try {
     // Sanitize depth: use default for null/undefined, clamp negative to 0
-    const rawDepth = options.depth ?? 3;
+    const rawDepth = options.depth ?? paramDefault('depth', 'trace');
     const maxDepth = Math.max(0, rawDepth);
     const direction = options.direction || 'down';  // 'down' = callees, 'up' = callers, 'both'
     const maxChildren = options.all ? Infinity : 10;
@@ -341,7 +342,7 @@ function trace(index, name, options = {}) {
 function blast(index, name, options = {}) {
     index._beginOp();
     try {
-        const maxDepth = Math.max(0, options.depth ?? 3);
+        const maxDepth = Math.max(0, options.depth ?? paramDefault('depth', 'trace'));
         const maxChildren = options.all ? Infinity : 10;
         const includeMethods = options.includeMethods ?? true;
         const exclude = options.exclude || [];
@@ -593,7 +594,7 @@ function blast(index, name, options = {}) {
 function reverseTrace(index, name, options = {}) {
     index._beginOp();
     try {
-        const maxDepth = Math.max(0, options.depth ?? 5);
+        const maxDepth = Math.max(0, options.depth ?? paramDefault('depth', 'trace', 'entrypoints'));
         const maxChildren = options.all ? Infinity : 10;
         const includeMethods = options.includeMethods ?? true;
         const exclude = options.exclude || [];

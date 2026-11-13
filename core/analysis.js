@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { UcnError } = require('./errors');
+const { paramFact } = require('./registry');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots,
@@ -233,7 +234,7 @@ function tagCalleesSideEffects(index, callees) {
  */
 function unverifiedEnrichLimit(all, top) {
     if (all) return Infinity;
-    return Number.isInteger(top) && top > 10 ? top : undefined;
+    return Number.isInteger(top) && top > paramFact('top', 'unverifiedRows') ? top : undefined;
 }
 
 /**

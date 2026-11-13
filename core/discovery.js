@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { langTraits } = require('../languages');
+const { paramDefault } = require('./registry');
 const { IgnoreRules } = require('./ignore-rules');
 
 // Always ignore - unambiguous, never user code
@@ -315,14 +316,14 @@ function compareNames(a, b) {
  * @param {string} options.root - Root directory (defaults to cwd)
  * @param {string[]} options.ignores - Patterns to ignore
  * @param {number} options.maxDepth - Maximum directory depth (default: 20)
- * @param {number} options.maxFiles - Maximum files to return (default: 10000)
+ * @param {number} options.maxFiles - Maximum files to return (default: the parameter table's)
  * @returns {string[]} - Array of absolute file paths
  */
 function expandGlob(pattern, options = {}) {
     const root = path.resolve(options.root || process.cwd());
     const ignores = options.ignores || DEFAULT_IGNORES;
     const maxDepth = options.maxDepth ?? 1000;
-    const maxFiles = options.maxFiles ?? 50000;
+    const maxFiles = options.maxFiles ?? paramDefault('maxFiles');
     const maxFileSize = options.maxFileSize ?? (8 * 1024 * 1024);
     const followSymlinks = options.followSymlinks !== false; // default true
     const gitignoreRules = options.gitignoreRules || null;
@@ -1087,7 +1088,7 @@ function projectDiscoveryOptions(root, config = {}, overrides = {}) {
     const outsideProject = patternList(config.outsideProject);
     const options = {
         root,
-        maxFiles: overrides.maxFiles || config.maxFiles || 50000,
+        maxFiles: overrides.maxFiles || config.maxFiles || paramDefault('maxFiles'),
         maxDepth: overrides.maxDepth ?? config.maxDepth,
         maxFileSize: overrides.maxFileSize ?? config.maxFileSize,
         followSymlinks: overrides.followSymlinks,

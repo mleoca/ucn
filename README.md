@@ -229,10 +229,12 @@ CLI JSON is uncapped by `--max-chars`, even when explicitly supplied;
 
 Listings are deterministic for a given source tree: a fresh build, a cache
 load, and an incremental rebuild return the same records in the same order.
-`--lines` listings have no default row cap. Explicit limits disclose what they omit,
-and a shell-mode character budget fails before writing partial output.
+`--lines` listings have no default row cap. Explicit limits disclose what they omit.
+Under an explicit `--max-chars` a listing prints the rows that fit, whole, and
+one `# truncated: X of Y rows omitted` line on stderr.
 `source --raw` extracts complete functions and classes unless an explicit
-line limit is requested; any resulting truncation is reported on stderr.
+line limit is requested; any resulting truncation is reported on stderr. Raw
+source is never cut by a character budget: one it exceeds fails before any output.
 
 Ordinary text-mode command errors also exit 2. JSON keeps exit 0 for successful
 empty results and exit 1 for command errors (`meta.ok: false` plus `error`).
@@ -361,7 +363,11 @@ view. C# source generators and external assemblies are also outside the
 index. HTML has regression coverage but no compiler/LSP repository oracle.
 
 The CLI, MCP, and skill share the same resolution rules and evidence. Changing
-the transport does not change what the engine knows about the code.
+the transport does not change what the engine knows about the code. Their
+parameters are one table: `ucn --help` lists every value set, bound and default,
+and the MCP input schema states the same ones.
+
+Changes per release are in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

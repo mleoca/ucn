@@ -896,7 +896,7 @@ describe('UCN v5 release-readiness audit regressions', () => {
             for (const sections of [' ', ',', ' , ']) {
                 const result = execute(index, 'repo', { sections });
                 assert.equal(result.ok, false);
-                assert.match(result.error, /No valid repo sections/);
+                assert.match(result.error, /No repo sections given\. Valid: summary, files, stats, health\./);
             }
         } finally { rm(dir); }
     });

@@ -1,6 +1,6 @@
 'use strict';
 
-const { CANONICAL_COMMANDS } = require('./registry');
+const { CANONICAL_COMMANDS, GLOBAL_PARAMS } = require('./registry');
 
 const NAME_COMMANDS = new Set(['show', 'find', 'usages', 'trace', 'tests', 'plan']);
 
@@ -34,14 +34,16 @@ function sourceRangeTarget(params) {
 /** Build normalized execute() params from the shared CLI-style positional arg. */
 function buildPublicParams(command, arg, params = {}) {
     const clean = { ...params };
-    if (clean.top === 0 && params.topRaw == null) delete clean.top;
-    if (clean.maxLines == null) delete clean.maxLines;
-    // Surface-only values never belong in execute params.
-    for (const key of ['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'includeBundled', 'interactive',
-        'topRaw', 'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'maxChars', 'maxCharsRaw',
-        'depthRaw', 'contextRaw', 'workersRaw',
-        '_fileFromFileMode']) delete clean[key];
+    // Process flags and the build/transport parameters every command accepts
+    // never belong in execute params: the surface applies them itself.
+    for (const key of ['json', 'quiet', 'cache', 'clearCache', 'interactive', 'workers', '_fileFromFileMode',
+        ...GLOBAL_PARAMS]) delete clean[key];
 
+    return withoutUnset(subjectParams(command, arg, clean));
+}
+
+/** The params with the positional argument placed as the command's subject. */
+function subjectParams(command, arg, clean) {
     if (NAME_COMMANDS.has(command)) return { ...clean, name: arg || clean.name };
     switch (command) {
         case 'search': return { ...clean, term: arg || clean.term };
@@ -58,8 +60,32 @@ function buildPublicParams(command, arg, params = {}) {
     }
 }
 
+/** A parameter that was not given has no key: the same object MCP arguments make. */
+function withoutUnset(params) {
+    for (const key of Object.keys(params)) {
+        if (params[key] === undefined) delete params[key];
+    }
+    return params;
+}
+
+/**
+ * What to say about a parameter a command accepts and that changes nothing,
+ * or less than its name suggests, there. One text for every surface, in CLI
+ * spelling: the surface renders it with formatSurfaceMessage.
+ */
+function noOpNotes(command, params = {}) {
+    if (!params.includeMethods) return [];
+    if (['impact', 'trace', 'tests', 'check'].includes(command)) {
+        return [`--include-methods has no effect on '${command}' — method calls are always tiered by receiver evidence.`];
+    }
+    if (command === 'show') {
+        return [`--include-methods on '${command}' affects only method-callee display for standalone-function targets — caller tiers are always evidence-based, and method targets analyze method calls by default.`];
+    }
+    return [];
+}
+
 function isPublicCommand(command) {
     return CANONICAL_COMMANDS.includes(command);
 }
 
-module.exports = { buildPublicParams, isPublicCommand, parseSourceTarget, sourceRangeTarget };
+module.exports = { buildPublicParams, isPublicCommand, noOpNotes, parseSourceTarget, sourceRangeTarget };
