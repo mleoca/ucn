@@ -3926,7 +3926,9 @@ describe('constructor alias inventory lifetime', () => {
             const cache = path.join(dir, 'index.json');
             index.saveCache(cache);
 
-            fs.writeFileSync(file, 'struct Root {};\nusing Fresh = Root;\n');
+            // The rewrite has another byte length: a same-size rewrite inside
+            // the filesystem clock tick of the first write reads as unchanged.
+            fs.writeFileSync(file, 'struct Root {};\n\nusing Fresh = Root;\n');
             index.indexFile(file);
             assert.deepStrictEqual(query('Alias'), ['Alias']);
             assert.deepStrictEqual(query('Fresh'), ['Fresh', 'Root']);

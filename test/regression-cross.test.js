@@ -43,7 +43,10 @@ describe('fix #484: implicit conversion owners belong to an index build', () => 
             const cache = path.join(dir, 'index.json');
             index.saveCache(cache);
 
-            fs.writeFileSync(file, source.replace('implicit operator', 'explicit operator'));
+            // The edit has another byte length: a same-size rewrite inside
+            // the filesystem clock tick of the first write reads as unchanged.
+            const edited = `${source.replace('implicit operator', 'explicit operator')}\n`;
+            fs.writeFileSync(file, edited);
             index.indexFile(file);
             assert.deepEqual(query().callers.map(call => call.line), [5]);
             assert.notStrictEqual(index._implicitConversionOwners, owners);
@@ -53,7 +56,7 @@ describe('fix #484: implicit conversion owners belong to an index build', () => 
             assert.equal(query().callers.length, 0);
             assert.ok(query().unverifiedCallers.some(call => call.line === 5));
 
-            fs.writeFileSync(file, source.replace('implicit operator', 'explicit operator'));
+            fs.writeFileSync(file, edited);
             index.build(null, { quiet: true, workers: 0 });
             assert.deepEqual(query().callers.map(call => call.line), [5]);
         } finally { rm(dir); }
