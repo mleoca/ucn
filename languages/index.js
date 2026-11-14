@@ -874,10 +874,27 @@ const JS_PROTOCOL_MEMBERS = protocolMembers([
     { pattern: /^\[Symbol\.[A-Za-z]+\]$/, member: true },
 ]);
 const JS_REFLECTION_API = {
-    hintPattern: /\b(?:Reflect|eval|Function)\b/,
+    hintPattern: /\b(?:Reflect|eval|Function|spyOn|spyOnProperty|stub|spy|replace|replaceGetter|replaceSetter|mock|expects)\b/,
     functions: [{ callee: /^(?:globalThis\.)?Reflect\.(?:get|set|has|deleteProperty)$/,
         nameArg: 1, receiverArg: 0, qualified: true }],
     computedMembers: true,
+    // Test doubles that replace an existing member by its name. Matched as
+    // written, on any receiver (a sandbox, a runner object under any local
+    // name): `name` is the callee's last segment, `bare` admits a global
+    // or an imported function, `owner` constrains what the callee is a
+    // member of, `ownerArg` and `nameArg` are the patched object and the
+    // member name, `valueArg` is a replacement that is never a literal.
+    patches: [
+        // jest / vitest / jasmine / bun: spyOn(obj, 'name').
+        { name: /^(?:spyOn|spyOnProperty)$/, bare: true, ownerArg: 0, nameArg: 1 },
+        // sinon, its sandboxes and wrappers of them. A text replacement
+        // (`replace(text, 'a', 'b')`) has a literal where the fake goes.
+        { name: /^(?:stub|spy)$/, bare: true, ownerArg: 0, nameArg: 1 },
+        { name: /^(?:replace|replaceGetter|replaceSetter)$/, bare: true, ownerArg: 0, nameArg: 1, valueArg: 2 },
+        { name: /^expects$/, nameArg: 0, ownerOfCall: /^mock$/ },
+        // node:test: mock.method(obj, 'name'), t.mock.getter(obj, 'name').
+        { name: /^(?:method|getter|setter)$/, owner: /(?:^|\.)mock$/, ownerArg: 0, nameArg: 1 },
+    ],
     namespaceLookups: { calls: /^eval$/ },
     // Every other operation of the Reflect namespace (apply, construct,
     // ownKeys, defineProperty, a decorator's Reflect.metadata).
@@ -1164,7 +1181,7 @@ const LANGUAGES = {
             ]),
             reflectionApi: {
                 pythonBindingIdentity: true,
-                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval|exec|globals|vars|patch|MonkeyPatch)\b/,
+                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval|exec|globals|vars|patch|MonkeyPatch|spy)\b/,
                 functions: [{ callee: /^(?:getattr|setattr|hasattr|delattr)$/, nameArg: 1, receiverArg: 0 }],
                 namespaceLookups: { calls: /^eval$/, subscriptOf: /^(?:globals|vars)\(\)$/ },
                 // `exec(code)` runs statements; it names nothing a lookup

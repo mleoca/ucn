@@ -848,3 +848,31 @@ describe('fix #500 review: reflection uses follow AST callees and package bindin
         });
     }
 });
+
+describe('fix #505: a test double that patches a member by name is a reflective use', () => {
+    // [language, code, the member names in source order]
+    const cases = [
+        ['javascript', 'function f(o) { jest /* c */ .spyOn(o, "a"); (vi.spyOn)(o, "b"); sinon?.stub(o, "c"); sinon\n  .spy /* c */ (o, "d"); (spyOn)(o, "e"); t.mock.method(o, "f"); sinon.mock(o).expects("g"); box.replace(o, "h", () => 1); }',
+            ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']],
+        ['typescript', 'function f(o: any) { jest.spyOn(o as any, "a"); vi.spyOn(<any>o, "b"); sinon.stub(o!, "c"); }', ['a', 'b', 'c']],
+        ['tsx', 'function f(o: any) { jest.spyOn(o as any, "a"); const e = <div onClick={() => sinon.stub(o, "b")} />; return e; }', ['a', 'b']],
+        // The same members with another shape: a string method, a literal
+        // where the owner goes, a missing or runtime name.
+        ['javascript', 'function f(o, s) { s.replace(/a/, "b"); "x".replace("a", "b"); o.stub("a"); o.spy("a", "b"); o.method(o, "a"); jest.spyOn(o, s); o.expects(); sinon.stub(); }', []],
+        ['python', 'import app\ndef test_it(monkeypatch, mocker):\n    (monkeypatch.setattr)(app, "a", 1)\n    monkeypatch . delattr(app, "b")\n    mocker.patch("app.c")\n    mocker.spy(app, "d")\n    self.box.patch.object(app, "e")\n',
+            ['a', 'b', 'c', 'd', 'e']],
+        ['python', 'import app\ndef test_it(monkeypatch, mocker, client):\n    monkeypatch.setenv("a", "1")\n    monkeypatch.setattr(app, "b", 1, raising=False)\n    mocker.patch("app.c", create=True)\n    client.patch("/app/d")\n    mocker.stub("e")\n', []],
+    ];
+    for (const [number, [language, code, names]] of cases.entries()) {
+        it(`${language} form ${number + 1}: one use per patch, and the located inventory equals the full walk`, () => {
+            const parser = getParser(language);
+            const ir = getLanguageAdapter(language).analyze(code, parser, `uses.${language}`);
+            const tree = safeParse(parser, code);
+            assert.strictEqual(tree.rootNode.hasError, false);
+            assert.deepStrictEqual((ir.reflectionSites || []).map(site => site.name), names);
+            assert.strictEqual(ir.reflectionUses || 0, names.length);
+            assert.deepStrictEqual(reflectionFactsInTree(tree, language, code, { imports: ir.imports }),
+                reflectionFactsInTree(tree, language, null, { imports: ir.imports }));
+        });
+    }
+});

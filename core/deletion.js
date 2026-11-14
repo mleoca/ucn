@@ -16,7 +16,10 @@
  *   has-static-dependents  a confirmed call or an unambiguous use exists
  *                          OUTSIDE the declaration. The first such site is
  *                          given. Unresolved name-only evidence remains
- *                          review and never borrows another target's site;
+ *                          review and never borrows another target's site:
+ *                          a call that shares a name with a member of a type
+ *                          is a dependent of the type only when it is proven
+ *                          to reach that member;
  *   review                 no use outside the declaration was found, but a
  *                          zero is not evidence here: a shield applies
  *                          (consumers outside the repository, a contract, a
@@ -69,6 +72,7 @@ const REASON_TEXT = Object.freeze({
     'claimed': 'the name has no use in project source outside its own declarations, and no shield applies',
     'has-callers': 'a call is proven to reach this declaration from outside it',
     'unresolved-use': 'uses of the name exist, but none is proven to reach this declaration',
+    'unresolved-member-use': 'a call shares a name with a member of this type, but none is proven to reach it',
     'identifier-normalization': 'Python normalizes a source identifier spelling that the caller graph does not model',
     'builtin-namespace-effect': 'project source can change the builtin namespace that this declaration relies on',
     'has-usages': 'the name is used outside the declaration',
@@ -161,6 +165,38 @@ function callSiteOutside(index, declaration, indexed, names) {
 }
 
 /**
+ * The first call PROVEN to reach a member of this type from outside it, in
+ * (path, line) order, or null. The audit keeps a type whose member's NAME is
+ * called anywhere (a name inventory, enough to withhold a claim); a verdict
+ * cites a site, and `children()` in another file says nothing about a
+ * `children` this type declares. A call made by the type's own members is
+ * deleted with the type.
+ */
+function memberCallOutside(index, declaration, indexed, names) {
+    const members = [];
+    for (const symbols of index.symbols.values()) {
+        for (const symbol of symbols) {
+            if (symbol.file === declaration.file && symbol.className === declaration.name) members.push(symbol);
+        }
+    }
+    const wanted = new Set(names);
+    const sites = [];
+    for (const member of members) {
+        if (!wanted.has(member.name)) continue;
+        const callers = index.findCallers(member.name, { targetDefinitions: [member], collectAccount: true,
+            includeMethods: true, maxResults: Infinity });
+        for (const caller of callers) {
+            if (caller.tier === 'unverified') continue;
+            const file = caller.file || path.join(index.root, caller.relativePath);
+            if (withinDeclaration(declaration, indexed, file, caller.line)) continue;
+            if (members.some(own => own.file === caller.callerFile && own.startLine === caller.callerStartLine)) continue;
+            sites.push({ file: caller.relativePath || relativeOf(index, file), line: caller.line });
+        }
+    }
+    return sites.sort(compareSites)[0] || null;
+}
+
+/**
  * The first use of the name outside the declaration, with the pipeline's
  * reason for it, or null.
  *
@@ -196,20 +232,23 @@ function useOutsideDeclaration(index, declaration, indexed, deadcode, options) {
         // Its conservative audit veto survives without a misleading site.
     }
     let found = null;
-    deadcode(index, {
+    let memberCallsUnproven = false;
+    const pass = extra => deadcode(index, {
         names: new Set([name]),
         includeExported: true,
         includeDecorated: true,
         includeTests: true,
         ownBodyOnly: new Set([name]),
+        ...extra,
         ...(!indexed && {
             declarations: [{ symbol: declaration, fileEntry: options.fileEntry || null }],
         }),
         explain: (symbol, reason, detail) => {
             if (!sameDeclaration(symbol, declaration)) return;
             if (reason === 'member-in-use') {
-                const site = callSiteOutside(index, declaration, indexed, (detail && detail.members) || []);
+                const site = memberCallOutside(index, declaration, indexed, (detail && detail.members) || []);
                 if (site) found = { reason, site };
+                else memberCallsUnproven = true;
             } else if (reason === 'has-usages') {
                 const sites = ((detail && detail.usages) || [])
                     .filter(usage => !withinDeclaration(declaration, indexed, usage.file, usage.line))
@@ -222,6 +261,14 @@ function useOutsideDeclaration(index, declaration, indexed, deadcode, options) {
             }
         },
     });
+    pass({});
+    if (!found && memberCallsUnproven) {
+        // No call reaches a member of this type. The audit still withholds
+        // it, so the answer is a use of the type's own name when there is
+        // one, and review when there is none.
+        pass({ memberCallsUnproven: new Set([name]) });
+        if (!found) found = { reason: 'unresolved-member-use' };
+    }
     return found || (call ? { reason: 'unresolved-use' } : null);
 }
 

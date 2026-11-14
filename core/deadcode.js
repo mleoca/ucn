@@ -927,6 +927,11 @@ function deadcode(index, options = {}) {
     // with it, so the name goes on to the text scan under the recursion
     // carve-out below. The audit never sets this.
     const ownBodyOnly = options.ownBodyOnly instanceof Set ? options.ownBodyOnly : null;
+    // Assessment only: names of types for which the caller has shown that
+    // no call reaches one of their members. A call of a member's NAME then
+    // does not end the chain, and the uses of the type's own name are
+    // reported. The audit never sets this.
+    const memberCallsUnproven = options.memberCallsUnproven instanceof Set ? options.memberCallsUnproven : null;
     // Declarations the index does not hold (deleted since, or read from a
     // base revision), assessed from their own record against this index's
     // uses of the name. Their line numbers describe a file that no longer
@@ -1767,7 +1772,8 @@ function deadcode(index, options = {}) {
                 // A type reached only through one of its members is still
                 // live. This is the normal invocation form for C# extension
                 // containers and other static helper types.
-                if (members.some(m => index.calleeIndex.has(m.name))) {
+                if (members.some(m => index.calleeIndex.has(m.name)) &&
+                    !(memberCallsUnproven && memberCallsUnproven.has(name))) {
                     withhold(symbol, 'member-in-use', explain && {
                         members: members.filter(m => index.calleeIndex.has(m.name)).map(m => m.name),
                     });

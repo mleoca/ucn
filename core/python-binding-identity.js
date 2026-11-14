@@ -2,7 +2,7 @@
 
 // Resolve only identities written in Python syntax. Multiple writes, parameters,
 // conditional bindings and unknown expressions have no proven identity.
-const { referenceScopeNode, pythonScopeBindingKinds } = require('../languages/lexical-scope');
+const { referenceScopeNode, pythonScopeBindingTable } = require('../languages/lexical-scope');
 const { sameNode } = require('../languages/utils');
 const BUILTINS = new Set(['object', 'property', 'classmethod', 'staticmethod',
     'getattr', 'setattr', 'hasattr', 'delattr', 'eval', 'exec', 'globals', 'locals', 'vars', '__import__']);
@@ -19,10 +19,70 @@ const NAMESPACE_ATTRIBUTES = new Set(['__dict__', '__self__', '__globals__', '__
 const STANDARD_NAMESPACES = new Set(['builtins', 'typing']);
 const NAMESPACE_READS = new Set(['get', 'keys', 'values', 'items', 'copy', '__getitem__', '__contains__', '__iter__', '__len__']);
 const UNKNOWN_ORIGIN = '<unresolved-origin>';
-const POSSIBLE_RUNTIME_APIS = [...BUILTINS].map(name => `builtins.${name}`).concat([
-    'unittest.mock.patch', 'unittest.mock.patch.object', 'pytest.MonkeyPatch.instance.setattr',
-    'setuptools.setup', 'distutils.core.setup',
+
+// Test doubles install, replace or remove an attribute by its runtime name.
+// The attribute must exist unless the call says it may not, so the call is a
+// runtime use of the declaration. Each shape says where the name is written:
+//   target  a dotted path string (`"pkg.module.name"`) in `targetAt`;
+//   object  an owner object in `targetAt` and the member name in `memberAt`.
+// `objectWhen` is the argument whose presence selects the object form of an
+// API that has both. `optional` is the argument that lets the name be absent.
+const argument = (position, keyword) => Object.freeze({ position, keyword });
+const TARGET_PATCH = Object.freeze({ targetAt: argument(0, 'target'), target: true,
+    optional: Object.freeze({ at: argument(3, 'create'), value: 'true' }) });
+const OBJECT_PATCH = Object.freeze({ targetAt: argument(0, 'target'), memberAt: argument(1, 'attribute'), object: true,
+    optional: Object.freeze({ at: argument(4, 'create'), value: 'true' }) });
+const ATTRIBUTE_SET = Object.freeze({ targetAt: argument(0, 'target'), memberAt: argument(1, 'name'), target: true, object: true,
+    objectWhen: argument(2, 'value'), optional: Object.freeze({ at: argument(3, 'raising'), value: 'false' }) });
+const ATTRIBUTE_DELETE = Object.freeze({ targetAt: argument(0, 'target'), memberAt: argument(1, 'name'), target: true, object: true,
+    objectWhen: argument(1, 'name'), optional: Object.freeze({ at: argument(2, 'raising'), value: 'false' }) });
+const MEMBER_SPY = Object.freeze({ targetAt: argument(0, 'obj'), memberAt: argument(1, 'name'), object: true });
+const MONKEYPATCH = 'pytest.MonkeyPatch.instance';
+const MOCKER = 'pytest_mock.MockerFixture.instance';
+const PATCH_APIS = new Map([
+    ['unittest.mock.patch', TARGET_PATCH],
+    ['unittest.mock.patch.object', OBJECT_PATCH],
+    [`${MONKEYPATCH}.setattr`, ATTRIBUTE_SET],
+    [`${MONKEYPATCH}.delattr`, ATTRIBUTE_DELETE],
+    [`${MOCKER}.patch`, TARGET_PATCH],
+    [`${MOCKER}.patch.object`, OBJECT_PATCH],
+    [`${MOCKER}.spy`, MEMBER_SPY],
 ]);
+// Other import paths of the same APIs: pytest's implementation module,
+// pytest-mock's plugin module and former class name, the `mock` distribution.
+const API_ALIASES = [
+    ['_pytest.monkeypatch.MonkeyPatch', 'pytest.MonkeyPatch'],
+    ['pytest_mock.plugin.MockerFixture', 'pytest_mock.MockerFixture'],
+    ['pytest_mock.MockFixture', 'pytest_mock.MockerFixture'],
+    ['mock.mock', 'unittest.mock'],
+    ['mock', 'unittest.mock'],
+];
+// What calling one of these yields: the class, or `context()` of the class
+// or of an instance.
+const INSTANCE_PRODUCERS = new Map([
+    ['pytest.MonkeyPatch', MONKEYPATCH],
+    ['pytest.MonkeyPatch.context', MONKEYPATCH],
+    [`${MONKEYPATCH}.context`, MONKEYPATCH],
+    ['pytest_mock.MockerFixture', MOCKER],
+]);
+const INSTANCE_CLASSES = new Map([['pytest.MonkeyPatch', MONKEYPATCH], ['pytest_mock.MockerFixture', MOCKER]]);
+// pytest fills a parameter of these names with the fixture of that name.
+const FIXTURE_PARAMETERS = new Map([['monkeypatch', MONKEYPATCH],
+    ...['mocker', 'class_mocker', 'module_mocker', 'package_mocker', 'session_mocker'].map(name => [name, MOCKER])]);
+// The member a call is written with when its receiver has no identity.
+const SPELLED_APIS = new Map([['patch', 'unittest.mock.patch'], ['setattr', `${MONKEYPATCH}.setattr`],
+    ['delattr', `${MONKEYPATCH}.delattr`], ['spy', `${MOCKER}.spy`]]);
+
+const POSSIBLE_RUNTIME_APIS = [...BUILTINS].map(name => `builtins.${name}`).concat([
+    ...PATCH_APIS.keys(), 'setuptools.setup', 'distutils.core.setup',
+]);
+
+function canonicalApi(origin) {
+    for (const [from, to] of API_ALIASES) {
+        if (origin === from || origin.startsWith(`${from}.`)) return to + origin.slice(from.length);
+    }
+    return origin;
+}
 
 // Python normalizes identifiers, not string values. Keep original spellings
 // on declarations/handles; use normalized identity only at this boundary.
@@ -115,10 +175,26 @@ function pythonProjectIdentityAffected(index, identity) {
     return effects.has(identity) || [...effects].some(effect => effect.startsWith(`${identity}.`));
 }
 
+// One walk of a scope answers for every name it binds; a file's identities
+// ask about many names of the same few scopes.
+const SCOPE_BINDINGS = new WeakMap();
+function scopeBindings(node) {
+    let scope = node;
+    while (scope && !['module', 'function_definition', 'class_definition'].includes(scope.type)) scope = scope.parent;
+    if (!scope) return new Map();
+    let tables = SCOPE_BINDINGS.get(scope.tree);
+    if (!tables) { tables = new Map(); SCOPE_BINDINGS.set(scope.tree, tables); }
+    const key = `${scope.type}:${scope.startIndex}:${scope.endIndex}`;
+    let table = tables.get(key);
+    if (!table) { table = pythonScopeBindingTable(scope); tables.set(key, table); }
+    return table;
+}
+
 function bindingSites(scope, name) {
     const found = [];
+    const table = scopeBindings(scope);
     for (const spelling of sourceSpellings(scope.tree, name)) {
-        for (const binding of pythonScopeBindingKinds(scope, spelling)) {
+        for (const binding of table.get(spelling) || []) {
             if (!found.some(other => sameNode(other.node, binding.node))) found.push(binding);
         }
     }
@@ -475,6 +551,28 @@ function namespaceWritten(node, memo) {
     return written;
 }
 
+/**
+ * Origins a parameter without a default can be given: the fixture pytest
+ * injects under that name, and an instance of the patcher class it is
+ * annotated with. Null when the site is no such parameter.
+ */
+function parameterOrigins(site, memo, depth, ignoreEffects) {
+    const holder = site.parent;
+    const typed = holder?.type === 'typed_parameter';
+    if ((typed ? holder.parent : holder)?.type !== 'parameters') return null;
+    const origins = [];
+    const fixture = FIXTURE_PARAMETERS.get(pythonSourceName(site.text));
+    if (fixture) origins.push(fixture);
+    if (typed) {
+        const annotation = holder.childForFieldName('type')?.namedChild(0);
+        for (const origin of resolveIdentity(annotation, memo, depth + 1, ignoreEffects).origins) {
+            const instance = INSTANCE_CLASSES.get(canonicalApi(origin));
+            if (instance && !origins.includes(instance)) origins.push(instance);
+        }
+    }
+    return origins;
+}
+
 /** Possible origins survive uncertainty; only a single unwritten origin is an exemption. */
 function resolveIdentity(expression, memo, depth = 0, ignoreEffects = false) {
     let node = expression;
@@ -502,7 +600,7 @@ function resolveIdentity(expression, memo, depth = 0, ignoreEffects = false) {
         const importsModule = called.origins.some(origin => ['builtins.__import__', 'importlib.import_module'].includes(origin));
         const moduleName = argument?.type === 'string' ? require('./runtime-entrypoints').pythonStringLiteral(argument) : null;
         result = { origins: called.origins.flatMap(origin => origin.startsWith(UNKNOWN_ORIGIN) ? [UNKNOWN_ORIGIN]
-            : ['pytest.MonkeyPatch', 'pytest.MonkeyPatch.context'].includes(origin) ? ['pytest.MonkeyPatch.instance'] : []), certain: called.certain };
+            : INSTANCE_PRODUCERS.has(canonicalApi(origin)) ? [INSTANCE_PRODUCERS.get(canonicalApi(origin))] : []), certain: called.certain };
         if (importsModule && (moduleName === 'builtins' || moduleName == null)) result = {
             origins: [...result.origins, moduleName === 'builtins' ? 'builtins' : UNKNOWN_ORIGIN], certain: false,
         };
@@ -574,6 +672,14 @@ function resolveIdentity(expression, memo, depth = 0, ignoreEffects = false) {
                     if (imported) origins.push(imported); else certain = false;
                     continue;
                 }
+                const injected = parameterOrigins(site, memo, depth, ignoreEffects);
+                if (injected) {
+                    // A caller, a fixture of the project or a plugin may pass
+                    // another value: a possible origin, never an exact one.
+                    origins.push(...injected);
+                    certain = false;
+                    continue;
+                }
                 const parent = site.parent;
                 let value = bindingValue(site, deferred ? Infinity : node.startIndex);
                 if (['default_parameter', 'typed_default_parameter'].includes(parent?.type)) certain = false;
@@ -632,6 +738,64 @@ function pythonPossibleIdentities(expression, memo = new Map()) {
     return origins.some(origin => origin.startsWith(UNKNOWN_ORIGIN))
         ? [...new Set([...origins.filter(origin => !origin.startsWith(UNKNOWN_ORIGIN)), ...POSSIBLE_RUNTIME_APIS])]
         : origins;
+}
+
+/** The patch shape of a resolved API identity (see PATCH_APIS), or null. */
+function pythonPatchApi(identity) {
+    return PATCH_APIS.get(canonicalApi(identity)) || null;
+}
+
+/**
+ * The patch shape a callee is WRITTEN as, for a callee no identity is proven
+ * for: a member `patch`, `patch.object`, `setattr`, `delattr` or `spy` of any
+ * receiver (a fixture stored on `self`, a helper's parameter, a wrapper
+ * object), or a bare `patch` this file does not define. The spelling proves
+ * nothing about the receiver; its only use is to keep a declaration the call
+ * names out of a deletion claim.
+ */
+function pythonPatchSpelling(callee, memo = new Map()) {
+    let node = callee;
+    while (node?.type === 'parenthesized_expression') node = node.namedChild(0);
+    if (node?.type === 'attribute') {
+        const member = pythonSourceName(node.childForFieldName('attribute')?.text);
+        let owner = node.childForFieldName('object');
+        while (owner?.type === 'parenthesized_expression') owner = owner.namedChild(0);
+        const ownerName = owner?.type === 'attribute' ? owner.childForFieldName('attribute')?.text
+            : owner?.type === 'identifier' ? owner.text : null;
+        if (member === 'object' && pythonSourceName(ownerName) === 'patch') return OBJECT_PATCH;
+        return PATCH_APIS.get(SPELLED_APIS.get(member)) || null;
+    }
+    if (node?.type !== 'identifier' || pythonSourceName(node.text) !== 'patch') return null;
+    // A function or class this file defines under the name is that definition.
+    const scope = sourceScope(node, memo);
+    if (scope && bindingSites(scope, node.text).some(binding => binding.kind === 'def')) return null;
+    return TARGET_PATCH;
+}
+
+/**
+ * Every value a name is written with in the scope that binds it, or null
+ * when one of its bindings has no readable value (a parameter, an import, an
+ * unpacking this reader cannot project). Possible values, in no order: a
+ * liveness reader asks what the name MAY hold, not what it holds at a line.
+ */
+function pythonPossibleValues(identifier, memo = new Map()) {
+    if (identifier?.type !== 'identifier') return null;
+    const scope = sourceScope(identifier, memo);
+    if (!scope) return null;
+    const sites = bindingSites(scope, identifier.text);
+    if (!sites.length) return null;
+    const values = [];
+    for (const binding of sites) {
+        // A parameter holds what its callers pass, whatever its default is.
+        if (binding.kind !== 'binding' || parameterOrigins(binding.node, memo, 0, true) ||
+            ['default_parameter', 'typed_default_parameter'].includes(binding.node.parent?.type)) return null;
+        const value = bindingValue(binding.node, Infinity);
+        if (value) { values.push(value); continue; }
+        const iterated = iterationValues(binding.node);
+        if (!iterated.length || iterated.unresolved) return null;
+        values.push(...iterated);
+    }
+    return values;
 }
 
 /** Written nesting is retained on saved declarations for runtime module paths. */
@@ -704,4 +868,5 @@ function registrationUnknown(declaration) {
 }
 
 module.exports = { pythonIdentity, pythonPossibleIdentities, pythonRuntimeOwners, pythonBoundValue,
-    pythonSourceName, pythonNormalizedNames, pythonProjectIdentityAffected, registrationUnknown };
+    pythonSourceName, pythonNormalizedNames, pythonProjectIdentityAffected, registrationUnknown,
+    pythonPatchApi, pythonPatchSpelling, pythonPossibleValues };

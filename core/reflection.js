@@ -19,6 +19,15 @@
  * A pattern whose literal part names nothing specific (`"_%s" % x`, a bare
  * parameter) stays a disclosed dynamic use, never a blanket withhold.
  *
+ * A test double that replaces a member by its name is the same kind of use:
+ * the member must exist for the test to run (fix #505). Python's patch APIs
+ * are read by binding identity (python-binding-identity.js: unittest.mock,
+ * pytest's monkeypatch, pytest-mock), and by the member the callee is
+ * written with when no identity is proven; other languages name theirs in
+ * the trait rule list `patches`. Such a site names an attribute by a dotted
+ * runtime path (`runtime-target`, matched against a declaration's own path)
+ * or by an owner object and a member name (`runtime-member`).
+ *
  * Site extraction is syntax-only and runs in the same per-file parse as the
  * computed-dispatch inventory (ast-analysis.js); the per-project matcher is
  * memoized on the index and reset with it.
@@ -26,7 +35,8 @@
 
 const { langTraits, detectLanguage } = require('../languages');
 const { sameNode } = require('../languages/utils');
-const { pythonPossibleIdentities, pythonSourceName } = require('./python-binding-identity');
+const { pythonPossibleIdentities, pythonSourceName, pythonPatchApi, pythonPatchSpelling,
+    pythonPossibleValues } = require('./python-binding-identity');
 
 const WILD = '\u0000*';
 const MODULE_RECEIVER = Object.freeze({ kind: 'module' });
@@ -121,28 +131,35 @@ function _unwrap(node) {
     return cur;
 }
 
-function _stringLiteral(node) {
-    const pieces = [];
+function _stringLiteral(node, ctx, depth = 0) {
+    let alternatives = [[]];
     let sawContent = false;
+    let sawPiece = false;
+    const append = piece => { for (const alternative of alternatives) alternative.push(piece); sawPiece = true; };
     for (const child of node.children || []) {
         if (STRING_CONTENT_NODES.has(child.type)) {
-            pieces.push(child.text);
+            append(child.text);
             sawContent = true;
         } else if (INTERPOLATION_NODES.has(child.type)) {
-            pieces.push(WILD);
+            // `ctx.interpolations`: a plain `{name}` is read through the
+            // context's resolver; a conversion or a format changes the text.
+            const plain = ctx?.interpolations && child.namedChildCount === 1 &&
+                !child.children.some(part => !part.isNamed && part.type === '=');
+            const value = plain ? stringAlternatives(child.namedChild(0), ctx, depth + 1) : null;
+            if (value) { alternatives = _concat(alternatives, value); sawPiece = true; } else append(WILD);
         } else if (child.type === 'escape_sequence') {
             // An escaped character never spells an identifier fragment.
-            pieces.push('\\');
+            append('\\');
         }
         // Delimiters, prefixes and quote tokens carry no name text.
     }
-    if (!sawContent && pieces.length === 0) {
+    if (!sawContent && !sawPiece) {
         // Grammars that keep simple literals as one token (`"abc"`, `'abc'`).
         const raw = String(node.text || '');
         const m = /^[A-Za-z@$]*(["'`])([\s\S]*)\1$/.exec(raw);
-        if (m) pieces.push(m[2]);
+        if (m) append(m[2]);
     }
-    return [pieces];
+    return alternatives;
 }
 
 /**
@@ -159,7 +176,7 @@ function stringAlternatives(node, ctx, depth = 0) {
             ? require('./runtime-entrypoints').pythonStringLiteral(node)
             : ['javascript', 'typescript', 'tsx', 'html'].includes(ctx?.language)
                 ? require('../languages/static-js').jsString(node) : null;
-        return literal != null ? [[literal]] : _stringLiteral(node);
+        return literal != null ? [[literal]] : _stringLiteral(node, ctx, depth);
     }
     switch (node.type) {
         case 'concatenated_string': {
@@ -271,6 +288,60 @@ function _specific(pieces) {
     let chars = 0;
     for (const p of pieces) if (p !== WILD) chars += (p.match(/[A-Za-z0-9]/g) || []).length;
     return chars >= MIN_SPECIFIC_CHARS;
+}
+
+// What the owner of a patched member, and its replacement, are never written as.
+const PATCH_LITERALS = new Set(['string', 'template_string', 'regex', 'number', 'true', 'false', 'null', 'undefined']);
+const DOTTED_PATH = /^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)+$/u;
+const DOTTED_FRAGMENT = /^[\p{L}\p{N}_.]+$/u;
+
+/**
+ * The runtime path one alternative of a patch target spells:
+ * { name?, patterns, runtimeTarget }, or null when it names no member.
+ *
+ * A literal path (`pkg.module.name`) is exact. A path with a runtime part
+ * (`f"{MOD}.name"`, `MOD + ".name"`, `"%s.name" % MOD`) is a glob over the
+ * path, `*.name`: it names a member only when its literal fragments are path
+ * text and its last segment spells something specific, so `f"{MOD}.{name}"`
+ * stays an unnamed dynamic use. `patterns` are the member spellings the
+ * project matcher is keyed by; `runtimeTarget` is what the owner-aware
+ * matcher (runtimeTargetReaches) compares with a declaration's own path.
+ * `dottedOnly`: the callee has no proven identity, so a literal target counts
+ * only when it is written as a dotted path (never a URL or a file name).
+ */
+function _runtimeTarget(alternative, dottedOnly) {
+    const pieces = [];
+    for (const piece of alternative) {
+        if (piece === WILD) {
+            if (pieces[pieces.length - 1] !== WILD) pieces.push(WILD);
+        } else if (piece.length > 0) {
+            if (pieces.length > 0 && pieces[pieces.length - 1] !== WILD) pieces[pieces.length - 1] += piece;
+            else pieces.push(piece);
+        }
+    }
+    const literals = pieces.filter(piece => piece !== WILD);
+    if (literals.some(piece => piece.includes('*'))) return null;
+    const runtimeTarget = pieces.map(piece => (piece === WILD ? '*' : piece)).join('');
+    const member = runtimeTarget.slice(runtimeTarget.lastIndexOf('.') + 1);
+    if (!member) return null;
+    if (!pieces.includes(WILD)) {
+        if (!runtimeTarget.includes('.') || (dottedOnly && !DOTTED_PATH.test(runtimeTarget))) return null;
+    } else {
+        if (literals.some(piece => !DOTTED_FRAGMENT.test(piece))) return null;
+        if (member.includes('*')) {
+            // `*`, `_*`: the segment names every member, so it names none.
+            if (!_specific(member.split('*').flatMap((part, position) => (position ? [WILD, part] : [part])))) return null;
+            return { patterns: [member], runtimeTarget };
+        }
+    }
+    // A private source member is spelled _Owner__member by runtime APIs. The
+    // owner-aware matcher decides it; the project matcher must first make its
+    // source spelling reachable.
+    const spellings = new Set([member]);
+    for (let offset = 1; offset < member.length - 1; offset++) {
+        if (member[offset] === '_' && member[offset + 1] === '_') spellings.add(member.slice(offset));
+    }
+    return { name: member, patterns: [...spellings], runtimeTarget };
 }
 
 /**
@@ -844,8 +915,8 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
     const resolve = makeResolver();
     const ctx = { formatCalls: api.formatCalls || null, resolve, language };
     const sites = facts.sites;
-    const push = (node, kind, nameNode, receiverNode, receiverFact) => {
-        const cls = classifyNameExpression(nameNode, ctx);
+    const push = (node, kind, nameNode, receiverNode, receiverFact, nameCtx = ctx) => {
+        const cls = classifyNameExpression(nameNode, nameCtx);
         const expression = String(node.text || '');
         // A name that is the enclosing callable's parameter is decided one
         // call away, by what its callers pass (fix #428).
@@ -894,12 +965,52 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         if (ns?.subscriptOf) types.push('subscript');
     }
     if (api.computedMembers) types.push('subscript_expression');
-    const wantMembers = (api.members || []).length > 0;
+    const wantMembers = (api.members || []).length > 0 || (api.patches || []).length > 0;
     // Qualified callees (`Reflect.get`, a package's functions) need the
     // callee text of member-shaped calls; bare vocabularies (`getattr`)
     // never do.
     const wantQualified = api.pythonBindingIdentity || qualifiers.size > 0 ||
         [...(api.functions || []), ...unnamed, ...codeExecution].some(rule => rule.qualified);
+    // A patch call names what it replaces by a dotted path string or by an
+    // owner object and a member name (the shapes of python-binding-identity).
+    // Names in it are read as Python reads them: a module constant from a
+    // function body, a plain `{name}` of an f-string, every value a name is
+    // written with. A runtime part leaves a pattern.
+    const patchCtx = api.pythonBindingIdentity
+        ? { ...ctx, resolve: identifier => pythonPossibleValues(identifier, scopeMemo), interpolations: true } : ctx;
+    const patchSites = (node, shapes, spelledOnly) => {
+        const args = _callArgs(node) || [];
+        const positional = args.filter(arg => arg.type !== 'keyword_argument');
+        const keyword = name => args.find(arg => arg.type === 'keyword_argument' &&
+            pythonSourceName(arg.childForFieldName('name')?.text) === name)?.childForFieldName('value');
+        const at = where => (where ? positional[where.position] || keyword(where.keyword) : null);
+        const before = sites.length;
+        const seen = new Set();
+        for (const shape of shapes) {
+            // `create=True` / `raising=False`: the name may be absent.
+            if (shape.optional && at(shape.optional.at)?.type === shape.optional.value) continue;
+            const targetNode = at(shape.targetAt);
+            if (shape.object && (!shape.target || at(shape.objectWhen))) {
+                const memberNode = at(shape.memberAt);
+                const member = memberNode ? classifyNameExpression(memberNode, patchCtx) : null;
+                const key = `member:${memberNode?.startIndex}`;
+                if (member && (member.name || (member.patterns && !member.dynamic)) && !seen.has(key)) {
+                    seen.add(key);
+                    push(node, 'runtime-member', memberNode, targetNode, undefined, patchCtx);
+                }
+                continue;
+            }
+            for (const alternative of stringAlternatives(targetNode, patchCtx) || []) {
+                const target = _runtimeTarget(alternative, spelledOnly);
+                if (!target || seen.has(target.runtimeTarget)) continue;
+                seen.add(target.runtimeTarget);
+                sites.push({ kind: 'runtime-target', ...(target.name && { name: target.name }),
+                    patterns: target.patterns, dynamic: false, runtimeTarget: target.runtimeTarget,
+                    line: node.startPosition.row + 1, expression: String(node.text).slice(0, EXPRESSION_CAP) });
+            }
+        }
+        if (sites.length > before) facts.reflectionUses++;
+    };
     const visitNode = node => {
         if (node.type === 'subscript_expression') {
             // obj["on" + evt] / this[`handle${t}`] (JS/TS computed member
@@ -965,46 +1076,18 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         if (api.pythonBindingIdentity) {
             const fn = _calleeNode(node.childForFieldName('function'));
             const identities = pythonPossibleIdentities(fn, scopeMemo);
-            const args = _callArgs(node) || [];
-            const keyword = name => args.find(arg => arg.type === 'keyword_argument' &&
-                pythonSourceName(arg.childForFieldName('name')?.text) === name)?.childForFieldName('value');
-            for (const identity of identities) {
-                const isPatch = identity === 'unittest.mock.patch';
-                const isObjectPatch = identity === 'unittest.mock.patch.object';
-                const isMonkeyPatch = identity === 'pytest.MonkeyPatch.instance.setattr';
-                if (isPatch || isObjectPatch || isMonkeyPatch) {
-                    const positional = args.filter(arg => arg.type !== 'keyword_argument');
-                    const nameNode = positional[0] || keyword('target');
-                    const optional = isPatch || isObjectPatch ? keyword('create')?.type === 'true'
-                        : keyword('raising')?.type === 'false';
-                    const memberNode = positional[1] || keyword(isObjectPatch ? 'attribute' : 'name');
-                    const member = classifyNameExpression(memberNode, ctx);
-                    if (!optional && (isObjectPatch || (isMonkeyPatch && !stringAlternatives(nameNode, ctx))) && member.name) {
-                        facts.reflectionUses++;
-                        push(node, 'runtime-member', memberNode, nameNode);
-                        continue;
-                    }
-                    const alternatives = stringAlternatives(nameNode, ctx);
-                    const target = alternatives?.length === 1 && !alternatives[0].includes(WILD)
-                        ? alternatives[0].join('') : null;
-                    if (!optional && target?.includes('.')) {
-                        const name = target.slice(target.lastIndexOf('.') + 1);
-                        facts.reflectionUses++;
-                        const spellings = new Set([name]);
-                        // A private source member is spelled _Owner__member by
-                        // runtime APIs. The final owner-aware matcher decides it;
-                        // this index must first make its source spelling reachable.
-                        for (let offset = 1; offset < name.length - 1; offset++) {
-                            if (name[offset] === '_' && name[offset + 1] === '_') spellings.add(name.slice(offset));
-                        }
-                        sites.push({ kind: 'runtime-target', name, patterns: [...spellings], dynamic: false,
-                            runtimeTarget: target, line: node.startPosition.row + 1,
-                            expression: String(node.text).slice(0, EXPRESSION_CAP) });
-                    }
-                    continue;
-                }
-            }
-            call.possibleCallees = identities.filter(identity => identity.startsWith('builtins.')).map(identity => identity.slice(9));
+            const builtins = identities.filter(identity => identity.startsWith('builtins.'));
+            // Test doubles that patch an attribute by name (unittest.mock,
+            // pytest's monkeypatch, pytest-mock). One shape is read once,
+            // however many identities of the callee share it.
+            const shapes = new Set(identities.map(pythonPatchApi).filter(Boolean));
+            // No identity is proven for the callee: the member it is written
+            // with decides, and only a dotted path or a literal member name
+            // makes a site of it.
+            const spelled = shapes.size === 0 && builtins.length === 0 ? pythonPatchSpelling(fn, scopeMemo) : null;
+            if (spelled) shapes.add(spelled);
+            if (shapes.size > 0) patchSites(node, shapes, !!spelled);
+            call.possibleCallees = builtins.map(identity => identity.slice(9));
             call.calleeText = call.possibleCallees[0] || '';
         }
         // Match on the callee spelling first; arguments are read only for a
@@ -1031,6 +1114,37 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
                 }
                 return;
             }
+        }
+        // Test doubles that replace a member by its name (trait `patches`):
+        // the member must exist, so the call is a runtime use of it. The
+        // callee is matched as written, on any receiver; the arguments must
+        // have the shape of the API: an owner that is no literal, and a
+        // name this reader can spell.
+        for (const rule of api.patches || []) {
+            const written = call.bare ? call.calleeText : call.member;
+            if (!written || !rule.name.test(written)) continue;
+            if (call.bare ? !rule.bare : (rule.owner && !rule.owner.test(_calleeName(call.object)))) continue;
+            const args = _callArgs(node) || [];
+            const nameNode = args[rule.nameArg];
+            if (!nameNode) continue;
+            const object = position => (position != null ? _unwrap(args[position]) : null);
+            let ownerNode = object(rule.ownerArg);
+            if (rule.ownerArg != null && (!ownerNode || PATCH_LITERALS.has(ownerNode.type))) continue;
+            if (rule.valueArg != null && (!object(rule.valueArg) || PATCH_LITERALS.has(object(rule.valueArg).type))) continue;
+            if (rule.ownerOfCall) {
+                // `mock(owner).expects('name')`: the owner is what the
+                // receiver was built from.
+                const built = _calleeNode(call.object);
+                const builder = built && CALL_NODE_TYPES.includes(built.type) ? _calleeParts(built, true, false) : null;
+                if (builder && rule.ownerOfCall.test(builder.member || builder.calleeText || '')) {
+                    ownerNode = (_callArgs(built) || [])[0] || null;
+                }
+            }
+            const member = classifyNameExpression(nameNode, ctx);
+            if (!member.name && !(member.patterns && !member.dynamic)) continue;
+            facts.reflectionUses++;
+            push(node, 'runtime-member', nameNode, ownerNode);
+            return;
         }
         // `eval(cmd)`: the receiver is this file's own top-level namespace,
         // so even a fully dynamic name is bounded to it.

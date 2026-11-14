@@ -1,7 +1,33 @@
 'use strict';
 
-// A data-only TOML reader for the PEP 621 entrypoint subtree. Other values
-// remain opaque; malformed or nonliteral entrypoint values return unknown.
+// A data-only TOML reader for the entrypoint subtrees of pyproject.toml: the
+// PEP 621 tables and the tables build backends read their own entry points
+// from. Other values remain opaque; malformed or nonliteral entrypoint values
+// return unknown.
+const PROJECT_TABLES = ['scripts', 'gui-scripts', 'entry-points'];
+// `[tool.<backend>.<table>]`: scripts by name, plugin groups by group.
+const TOOL_TABLES = new Map([
+    ['poetry', ['scripts', 'plugins']],
+    ['flit', ['scripts', 'entrypoints']],
+]);
+
+/**
+ * What a value at this key path is: 'value' (an entry point reference),
+ * 'reference' / 'type' (Poetry's table form of one script: `{ callable =
+ * ".." }`, or `{ reference = "..", type = "console" }`, where type "file"
+ * makes the reference a file path), 'ignored' (another key of that table) or
+ * null (not entry point data).
+ */
+function entryRole(parts) {
+    if (parts[0] === 'project') return PROJECT_TABLES.includes(parts[1]) ? 'value' : null;
+    if (parts[0] !== 'tool' || !TOOL_TABLES.get(parts[1])?.includes(parts[2])) return null;
+    if (parts[1] === 'poetry' && parts[2] === 'scripts' && parts.length === 5) {
+        return parts[4] === 'callable' || parts[4] === 'reference' ? 'reference'
+            : parts[4] === 'type' ? 'type' : 'ignored';
+    }
+    return 'value';
+}
+
 function entrypointToml(source) {
     const tokens = [];
     let line = 1;
@@ -63,8 +89,9 @@ function entrypointToml(source) {
         }
         return parts;
     };
-    const entryPath = parts => parts[0] === 'project' &&
-        (['scripts', 'gui-scripts'].includes(parts[1]) || parts[1] === 'entry-points');
+    const entryPath = parts => entryRole(parts) !== null;
+    const tableTypes = new Map();
+    const tableOf = parts => parts.slice(0, 4).join('\u0000');
     const readValue = (parts, depth = 0) => {
         const token = tokens[at++];
         if (!token || depth > 32) { if (entryPath(parts)) rows.push({ unknown: true, line: token?.line }); return; }
@@ -85,10 +112,19 @@ function entrypointToml(source) {
                 if (parts.join('.') === 'project.dynamic' && item.kind === 'string' &&
                     ['scripts', 'gui-scripts', 'entry-points'].includes(item.value)) rows.push({ unknown: true, line: item.line });
             }
-            if (entryPath(parts)) rows.push({ unknown: true, line: token.line });
+            if (entryPath(parts) && entryRole(parts) !== 'ignored') rows.push({ unknown: true, line: token.line });
         } else if (entryPath(parts)) {
-            rows.push(token.kind === 'string' && token.value != null
-                ? { value: token.value, line: token.line } : { unknown: true, line: token.line });
+            const role = entryRole(parts);
+            if (role === 'ignored') return;
+            const literal = token.kind === 'string' && token.value != null;
+            if (role === 'type') {
+                // An unreadable type leaves the reference an entry point.
+                if (literal) tableTypes.set(tableOf(parts), token.value);
+                return;
+            }
+            rows.push(literal
+                ? { value: token.value, line: token.line, ...(role === 'reference' && { table: tableOf(parts) }) }
+                : { unknown: true, line: token.line });
         }
     };
     while (at < tokens.length) {
@@ -104,7 +140,9 @@ function entrypointToml(source) {
         if (parts.length && tokens[at]?.kind === '=') { at++; readValue([...section, ...parts]); }
         else while (tokens[at] && tokens[at].kind !== 'newline') at++;
     }
-    return rows;
+    // A table's keys come in any order: its type is known once every key is read.
+    return rows.filter(row => !row.table || tableTypes.get(row.table) !== 'file')
+        .map(row => (row.table ? { value: row.value, line: row.line } : row));
 }
 
 module.exports = { entrypointToml };

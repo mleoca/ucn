@@ -2994,5 +2994,423 @@
     "name": "_target",
     "breaks": true,
     "native": "python3"
+  },
+  {
+    "id": "double-mocker-patch",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "def test_it(mocker):\n    mocked = mocker.patch(\"app._target\", return_value=4)\n    assert mocked() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-setattr-string",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(\"app._target\", lambda: 4)\n    assert vars(app)[\"_target\"]() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-setattr-object",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, \"_target\", lambda: 4)\n    assert vars(app)[\"_target\"]() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-delattr-string",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.delattr(\"app._target\")\n    assert \"_target\" not in vars(app)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-delattr-object",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.delattr(app, \"_target\")\n    assert \"_target\" not in vars(app)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-mocker-patch-object",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(mocker):\n    mocked = mocker.patch.object(app, \"_target\", return_value=4)\n    assert mocked() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-mocker-spy",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(mocker):\n    spy = mocker.spy(app, \"_target\")\n    assert vars(app)[\"_target\"]() == 7 and spy.call_count == 1\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-context",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    with monkeypatch.context() as scoped:\n        scoped.setattr(app, \"_target\", lambda: 4)\n        assert vars(app)[\"_target\"]() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-annotated-parameter",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\nfrom pytest import MonkeyPatch\ndef install(patcher: MonkeyPatch):\n    patcher.setattr(\"app._target\", lambda: 4)\ndef test_it(monkeypatch):\n    install(monkeypatch)\n    assert vars(app)[\"_target\"]() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-fixture-stored-on-self",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\nimport pytest\nclass TestIt:\n    @pytest.fixture(autouse=True)\n    def _fixtures(self, monkeypatch):\n        self.patcher = monkeypatch\n    def test_it(self):\n        self.patcher.setattr(app, \"_target\", lambda: 4)\n        assert vars(app)[\"_target\"]() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-helper-parameter",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef install(patcher):\n    patcher.setattr(\"app._target\", lambda: 4)\ndef test_it(monkeypatch):\n    install(monkeypatch)\n    assert vars(app)[\"_target\"]() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-patch-fstring-target",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "from unittest.mock import patch\nMOD = \"app\"\ndef exercise():\n    with patch(f\"{MOD}._target\", return_value=4) as mocked: assert mocked()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "double-patch-concatenated-target",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "from unittest.mock import patch\nMOD = \"app\"\ndef exercise():\n    with patch(MOD + \"._target\", return_value=4) as mocked: assert mocked()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "double-patch-unread-module-part",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "from unittest.mock import patch\ndef exercise(module=\"app\"):\n    with patch(f\"{module}._target\", return_value=4) as mocked: assert mocked()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "double-mocker-fstring-target",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "MOD = \"app\"\ndef test_it(mocker):\n    mocked = mocker.patch(f\"{MOD}._target\", return_value=4)\n    assert mocked() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-mocker-create-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "def test_it(mocker):\n    mocked = mocker.patch(\"app._target\", return_value=4, create=True)\n    assert mocked() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-raising-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, \"_target\", lambda: 4, raising=False)\n    monkeypatch.setattr(\"app._target\", lambda: 5, raising=False)\n    assert vars(app)[\"_target\"]() == 5\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-monkeypatch-delattr-raising-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.delattr(app, \"_target\", raising=False)\n    monkeypatch.delattr(\"app._target\", raising=False)\n    assert \"_target\" not in vars(app)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-patch-fstring-other-module-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _target():\n    return 9\n",
+      "use.py": "from unittest.mock import patch\nMOD = \"other\"\ndef exercise():\n    with patch(f\"{MOD}._target\", return_value=4) as mocked: assert mocked()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "double-monkeypatch-other-member-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.setenv(\"_target\", \"1\")\n    monkeypatch.setitem({}, \"app._target\", 1)\n    assert app._unused() == 3\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "poetry-scripts",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.poetry.scripts]\nsample = \"app:_target\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"poetry\"][\"scripts\"][\"sample\"]; value=value if isinstance(value,str) else value[\"\"]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "poetry-scripts-callable-table",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.poetry.scripts]\nsample = { callable = \"app:_target\", extras = [\"speed\"] }\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"poetry\"][\"scripts\"][\"sample\"]; value=value if isinstance(value,str) else value[\"callable\"]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "poetry-scripts-reference-table",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.poetry.scripts.sample]\ntype = \"console\"\nreference = \"app:_target\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"poetry\"][\"scripts\"][\"sample\"]; value=value if isinstance(value,str) else value[\"reference\"]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "poetry-plugins",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.poetry.plugins.\"sample.plugins\"]\nsample = \"app:_target\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"poetry\"][\"plugins\"][\"sample.plugins\"][\"sample\"]; value=value if isinstance(value,str) else value[\"\"]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "flit-scripts",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.flit.scripts]\nsample = \"app:_target\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"flit\"][\"scripts\"][\"sample\"]; value=value if isinstance(value,str) else value[\"\"]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "flit-entrypoints",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.flit.entrypoints.\"sample.plugins\"]\nsample = \"app:_target\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"flit\"][\"entrypoints\"][\"sample.plugins\"][\"sample\"]; value=value if isinstance(value,str) else value[\"\"]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "poetry-file-script-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.poetry.scripts]\nsample = { reference = \"app:_target\", type = \"file\" }\n"
+    },
+    "run": "import app",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "poetry-other-table-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.poetry.dependencies]\nsample = \"app:_target\"\n\n[tool.poetry.group.dev.dependencies]\nother = \"app:_target\"\n"
+    },
+    "run": "import app",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
   }
 ]

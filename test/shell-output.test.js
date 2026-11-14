@@ -79,6 +79,90 @@ describe('fix #504: result summaries survive bounded output with their warnings'
     });
 });
 
+describe('fix #505: a notice of withheld output says which lines are shown', () => {
+    const { applyOutputBudget } = require('../core/output-budget');
+    const warnings = [
+        'WARNING: 4 computed dispatch calls choose members at runtime.',
+        'WARNING: 2 dynamic reflection calls have no static member spelling.',
+        'WARNING: source coverage is incomplete; candidate names in skipped source were suppressed.',
+    ];
+    it('the count or verdict line under the notice is named as shown, never as withheld', () => {
+        const seen = new Set();
+        for (const [command, summary] of [['deadcode', 'Dead code: 8 unused symbol(s)'], ['plan', 'VERDICT: review']]) {
+            const text = [summary, '', '  candidate detail\n'.repeat(100), ...warnings].join('\n');
+            for (let limit = 1; limit <= 400; limit++) {
+                for (const surface of ['cli', 'mcp']) {
+                    const result = applyOutputBudget(text, { command, maxChars: limit, surface, peerText: text,
+                        trailingChars: surface === 'cli' ? 1 : 0 });
+                    const [notice, ...shown] = result.text.split('\n');
+                    if (!/withheld/.test(notice)) continue;
+                    const label = `${command} ${surface} ${limit}: ${result.text}`;
+                    assert.doesNotMatch(result.text, /candidate detail/, label);
+                    const hasResult = shown.includes(summary);
+                    assert.equal(/answer withheld|^withheld; >=\d+$/i.test(notice), !hasResult, label);
+                    assert.equal(/result line/.test(notice), hasResult, label);
+                    const counted = notice.match(/(\d+) of (\d+) trust line\(s\) shown/);
+                    if (shown.length > 0) assert.ok(counted, label);
+                    // The count line is the answer, not one of the lines that qualify it.
+                    if (counted) assert.deepEqual([Number(counted[1]), Number(counted[2])],
+                        [shown.filter(line => warnings.includes(line)).length, warnings.length], label);
+                    seen.add(`${hasResult ? 'result' : 'none'}+${counted ? counted[1] : '-'}`);
+                }
+            }
+        }
+        // Nothing shown, the result alone, and the result with a warning.
+        for (const state of ['none+-', 'none+0', 'result+0', 'result+1']) assert.ok(seen.has(state), state);
+    });
+
+    it('a result with nothing to qualify it, and an answer with no result line', () => {
+        const alone = 'VERDICT: no-static-dependents\n' + '  basis line\n'.repeat(60);
+        const tight = applyOutputBudget(alone, { command: 'plan', maxChars: 40, surface: 'mcp' });
+        assert.doesNotMatch(tight.text, /trust line/);
+        const callers = ['CALLERS (60)', ...Array.from({ length: 60 }, (_, i) => `  [${i}] f${i}.js:1: target()`),
+            `ACCOUNT: ${'x'.repeat(120)}`, `CONTRACT: ${'y'.repeat(120)}`].join('\n');
+        const cut = applyOutputBudget(callers, { command: 'show', maxChars: 260, surface: 'cli' });
+        assert.match(cut.text, /^\.\.\. OUTPUT TRUNCATED \(\d+→260\): answer withheld; 1 of 2 trust line\(s\) shown\. Raise --max-chars to at least \d+\.\nACCOUNT: /);
+    });
+
+    it('CLI and MCP deadcode print the count under a notice that says so', async () => {
+        const files = { 'package.json': '{"name":"sample"}' };
+        for (let i = 0; i < 12; i++) files[`unused${i}.js`] = `function unusedNumber${i}() { return ${i}; }\n`;
+        files['dispatch.js'] = 'const handlers = { a() { return 1; }, b() { return 2; } };\n' +
+            'function route(name, target, key) { return handlers[name]() + target[key]; }\nmodule.exports = { route };\n';
+        files['reflect.py'] = 'def read(obj, name):\n    return getattr(obj, name)\n';
+        const dir = tmp(files);
+        const { McpClient } = require('./helpers');
+        const client = new McpClient();
+        try {
+            const full = run(dir, 'deadcode', '--no-cache');
+            assert.equal(full.status, 0, full.stderr);
+            const count = full.stdout.split('\n')[0];
+            assert.match(count, /^Dead code: \d+ unused symbol\(s\)$/);
+            const trust = full.stdout.split('\n').filter(line => line.startsWith('WARNING: '));
+            assert.ok(trust.length >= 2, full.stdout);
+            // Room for the count and one warning, not for every warning.
+            const limit = 150 + count.length + trust[0].length;
+            const shell = run(dir, 'deadcode', '--no-cache', `--max-chars=${limit}`);
+            await client.start(); await client.initialize();
+            const tool = await client.callTool({ command: 'deadcode', project_dir: dir, max_chars: limit });
+            assert.equal(tool.isError, false);
+            for (const [surface, text, flag] of [['cli', shell.stdout.trimEnd(), '--max-chars'], ['mcp', tool.text, 'max_chars']]) {
+                const lines = text.split('\n');
+                assert.match(lines[0], new RegExp(`^\\.\\.\\. OUTPUT TRUNCATED \\(\\d+→${limit}\\): result line and 1 of ${trust.length} ` +
+                    `trust line\\(s\\) shown; rest withheld\\. Raise ${flag} to at least \\d+\\.$`), `${surface}: ${text}`);
+                assert.deepEqual(lines.slice(1), [count, trust[0]], surface);
+                // The budget the notice names carries the count and every warning.
+                const needed = Number(lines[0].match(/at least (\d+)/)[1]);
+                const enough = surface === 'cli'
+                    ? run(dir, 'deadcode', '--no-cache', `--max-chars=${needed}`).stdout
+                    : (await client.callTool({ command: 'deadcode', project_dir: dir, max_chars: needed })).text;
+                assert.doesNotMatch(enough, /withheld/, surface);
+                for (const line of [count, ...trust]) assert.ok(enough.split('\n').includes(line), `${surface}: ${line}`);
+            }
+        } finally { client.stop(); rm(dir); }
+    });
+});
+
 describe('release shell contracts', () => {
     it('lists accessor dependency sites with filterable unverified tags', () => {
         const dir = tmp({ 'lib.ts': [

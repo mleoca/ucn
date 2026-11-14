@@ -1017,7 +1017,11 @@ function clearAllCaches() {
 // package reflection qualifiers retain Unicode names and lexical ownership.
 // v336 (fixes #501/#503): binding-resolved Python registration/reflection,
 // nested runtime owner paths, JS computed calls, and owned Rust attributes.
-const CACHE_FORMAT_VERSION = 336;
+// v337 (fix #505): `reflectionSites` hold the attributes a test double
+// patches by name: pytest's `monkeypatch` and pytest-mock's `mocker`
+// fixtures, a patch target with a runtime part (`runtimeTarget` is then a
+// glob, `*.name`), a patch call on a receiver with no proven identity.
+const CACHE_FORMAT_VERSION = 337;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

@@ -97,27 +97,41 @@ describe('fix #501 correction: runtime identity and metadata boundaries', () => 
             assert.deepStrictEqual(assess(loaded, '_target'), assess(idx(dir), '_target'));
         } finally { rm(dir); }
     });
+    const witness = (row, python) => {
+        const { spawnSync } = require('child_process');
+        const dir = tmp(row.files);
+        try {
+            const isNode = path.basename(row.native) === 'node';
+            const command = isNode ? process.execPath : python;
+            const args = isNode ? ['-e', row.run] : ['-B', '-c', row.run];
+            const options = { cwd: dir, encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } };
+            const before = spawnSync(command, args, options);
+            assert.strictEqual(before.status, 0, `${row.id} baseline: ${before.stdout}${before.stderr}`);
+            fs.writeFileSync(path.join(dir, row.file), row.after);
+            const deleted = spawnSync(command, args, options);
+            assert.strictEqual(deleted.status !== 0, row.breaks, `${row.id} deletion: ${deleted.stdout}${deleted.stderr}`);
+            fs.writeFileSync(path.join(dir, row.file), row.files[row.file]);
+            const repaired = spawnSync(command, args, options);
+            assert.strictEqual(repaired.status, 0, `${row.id} repaired: ${repaired.stdout}${repaired.stderr}`);
+        } finally { rm(dir); }
+    };
     it('native witnesses agree before deletion, after deletion, and after repair', t => {
         const { spawnSync } = require('child_process');
         const python = process.env.PYTHON || 'python3';
         if (spawnSync(python, ['--version']).error) { t.skip('Python runtime unavailable'); return; }
-        for (const row of cases) {
-            const dir = tmp(row.files);
-            try {
-                const isNode = path.basename(row.native) === 'node';
-                const command = isNode ? process.execPath : python;
-                const args = isNode ? ['-e', row.run] : ['-B', '-c', row.run];
-                const options = { cwd: dir, encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } };
-                const before = spawnSync(command, args, options);
-                assert.strictEqual(before.status, 0, `${row.id} baseline: ${before.stderr}`);
-                fs.writeFileSync(path.join(dir, row.file), row.after);
-                const deleted = spawnSync(command, args, options);
-                assert.strictEqual(deleted.status !== 0, row.breaks, `${row.id} deletion: ${deleted.stderr}`);
-                fs.writeFileSync(path.join(dir, row.file), row.files[row.file]);
-                const repaired = spawnSync(command, args, options);
-                assert.strictEqual(repaired.status, 0, `${row.id} repaired: ${repaired.stderr}`);
-            } finally { rm(dir); }
-        }
+        for (const row of cases) if (!row.requires) witness(row, python);
+    });
+    // Rows that run under a test runner name the modules they import
+    // (`requires`). PYTHON selects an interpreter that has them.
+    it('native test-runner witnesses agree before deletion, after deletion, and after repair', t => {
+        const { spawnSync } = require('child_process');
+        const python = process.env.PYTHON || 'python3';
+        const rows = cases.filter(row => row.requires);
+        assert.ok(rows.length > 0);
+        const modules = [...new Set(rows.flatMap(row => row.requires))].sort();
+        const probe = spawnSync(python, ['-B', '-c', `import ${modules.join(', ')}`]);
+        if (probe.error || probe.status !== 0) { t.skip(`${python} cannot import ${modules.join(', ')}`); return; }
+        for (const row of rows) witness(row, python);
     });
 });
 
@@ -360,6 +374,273 @@ describe('fix #501: binding-aware runtime liveness', () => {
             fs.writeFileSync(path.join(dir, 'nested.py'), 'class Outer:\n    class Inner:\n        pass\n');
             assert.strictEqual(assessDeletion(idx(dir), JSON.parse(JSON.stringify(nested))).verdict, 'review');
         } finally { rm(dir); }
+    });
+});
+
+describe('fix #505: attributes a test double patches by name, backend entry point tables', () => {
+    const target = 'def _target():\n    return 7\n\ndef keep():\n    return 3\n';
+    // [label, use.py, the patch needs the declaration]
+    const rows = [
+        ['mocker.patch', 'def test_it(mocker):\n    mocker.patch("app._target", return_value=4)\n', true],
+        ['monkeypatch.setattr, string target', 'def test_it(monkeypatch):\n    monkeypatch.setattr("app._target", lambda: 4)\n', true],
+        ['monkeypatch.setattr, object target', 'import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, "_target", lambda: 4)\n', true],
+        ['patch, f-string target', 'from unittest.mock import patch\nMOD = "app"\ndef exercise():\n    with patch(f"{MOD}._target"): pass\n', true],
+        ['patch, concatenated target', 'from unittest.mock import patch\nMOD = "app"\ndef exercise():\n    with patch(MOD + "._target"): pass\n', true],
+        ['patch, target with an unread module part', 'from unittest.mock import patch\ndef exercise(module):\n    with patch("%s._target" % module): pass\n    with patch("{}._target".format(module)): pass\n', true],
+        ['monkeypatch.delattr, string target', 'def test_it(monkeypatch):\n    monkeypatch.delattr("app._target")\n', true],
+        ['monkeypatch.delattr, object target', 'import app\ndef test_it(monkeypatch):\n    monkeypatch.delattr(app, "_target")\n', true],
+        ['mocker.patch.object', 'import app\ndef test_it(mocker):\n    mocker.patch.object(app, "_target")\n', true],
+        ['mocker.spy', 'import app\ndef test_it(mocker):\n    mocker.spy(app, "_target")\n', true],
+        ['module_mocker', 'def test_it(module_mocker):\n    module_mocker.patch("app._target")\n', true],
+        ['monkeypatch.context()', 'import app\ndef test_it(monkeypatch):\n    with monkeypatch.context() as scoped:\n        scoped.setattr(app, "_target", lambda: 4)\n', true],
+        ['fixture alias and bound method', 'import app\ndef test_it(monkeypatch):\n    replace = monkeypatch.setattr\n    replace(app, "_target", lambda: 4)\n', true],
+        ['annotated parameter', 'from pytest import MonkeyPatch\ndef install(patcher: MonkeyPatch):\n    patcher.setattr("app._target", lambda: 4)\n', true],
+        ['annotated parameter, implementation module', 'import app\nfrom _pytest.monkeypatch import MonkeyPatch\ndef install(patcher: MonkeyPatch):\n    patcher.delattr(app, "_target")\n', true],
+        ['annotated mocker', 'from pytest_mock import MockerFixture\ndef install(doubles: MockerFixture):\n    doubles.patch("app._target")\n', true],
+        ['the mock distribution', 'import mock\ndef exercise():\n    with mock.patch("app._target"): pass\n', true],
+        ['fixture stored on self', 'import app\nclass TestIt:\n    def test_it(self):\n        self.patcher.setattr(app, "_target", lambda: 4)\n', true],
+        ['fixture stored on self, patch.object', 'import app\nclass TestIt:\n    def test_it(self):\n        self.doubles.patch.object(app, "_target")\n', true],
+        ['helper parameter', 'def install(patcher):\n    patcher.setattr("app._target", lambda: 4)\n', true],
+        ['member name bound at module scope', 'import app\nNAME = "_target"\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, NAME, lambda: 4)\n', true],
+        ['target bound at module scope', 'TARGET = "app._target"\ndef test_it(mocker):\n    mocker.patch(TARGET)\n', true],
+        ['targets of a literal loop', 'def test_it(mocker):\n    for name in ["_target", "keep"]:\n        mocker.patch(f"app.{name}")\n', true],
+        ['mocker create', 'def test_it(mocker):\n    mocker.patch("app._target", create=True)\n', false],
+        ['mocker.patch.object create', 'import app\ndef test_it(mocker):\n    mocker.patch.object(app, "_target", create=True)\n', false],
+        ['monkeypatch raising=False', 'import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, "_target", lambda: 4, raising=False)\n    monkeypatch.setattr("app._target", lambda: 4, raising=False)\n', false],
+        ['monkeypatch.delattr raising=False', 'import app\ndef test_it(monkeypatch):\n    monkeypatch.delattr(app, "_target", raising=False)\n    monkeypatch.delattr("app._target", raising=False)\n', false],
+        ['f-string target of another module', 'from unittest.mock import patch\nMOD = "other"\ndef exercise():\n    with patch(f"{MOD}._target"): pass\n', false],
+        ['f-string target with a runtime member', 'from unittest.mock import patch\ndef exercise(name):\n    with patch(f"app.{name}"): pass\n', false],
+        ['another member of the fixture', 'def test_it(monkeypatch):\n    monkeypatch.setenv("_target", "1")\n    monkeypatch.setitem({}, "app._target", 1)\n', false],
+        ['a path that is not dotted, on an unproven receiver', 'def test_it(client):\n    client.patch("/app/_target")\n    client.patch(f"/app/{1}._target")\n', false],
+        ['a function this file defines as patch', 'def patch(target): return target\ndef exercise():\n    return patch("app._target")\n', false],
+        ['ordinary strings', 'NOTE = "app._target"\ndef exercise(log):\n    log.info("app._target")\n', false],
+    ];
+    for (const [label, use, live] of rows) it(label, () => {
+        const dir = tmp({ 'app.py': target, 'use.py': use });
+        try {
+            const index = idx(dir);
+            const answer = assess(index, '_target');
+            // A reach by name is never a proven dependent.
+            assert.strictEqual(answer.verdict, live ? 'review' : 'no-static-dependents', JSON.stringify(answer));
+            if (live) assert.strictEqual(answer.reason, 'reflection');
+            assert.strictEqual(claimed(index).some(row => row.endsWith(':_target')), !live);
+            // The function beside it is untouched by the patch.
+            assert.strictEqual(assess(index, 'keep').verdict,
+                label === 'targets of a literal loop' ? 'review' : 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+    // [label, test file, the double needs the member]
+    const doubles = [
+        ['jest.spyOn on an instance', 'jest.spyOn(service, "_target").mockReturnValue(2);', true],
+        ['jest.spyOn on a prototype', 'jest.spyOn(lib.Service.prototype, "_target");', true],
+        ['jest.spyOn on an accessor', 'jest.spyOn(service, "_target", "get");', true],
+        ['vi.spyOn', 'vi.spyOn(service, "_target");', true],
+        ['a global spyOn', 'spyOn(service, "_target");', true],
+        ['sinon.stub', 'sinon.stub(service, "_target").returns(2);', true],
+        ['sinon.spy', 'sinon.spy(service, "_target");', true],
+        ['sinon.replace', 'sinon.replace(service, "_target", () => 2);', true],
+        ['sinon.replaceGetter', 'sinon.replaceGetter(service, "_target", () => 2);', true],
+        ['a sandbox under any name', 'const box = sinon.createSandbox();\nbox.stub(service, "_target");', true],
+        ['a sandbox stored on this', 'class Suite { run() { this.box.stub(service, "_target"); } }', true],
+        ['sinon.mock().expects', 'sinon.mock(service).expects("_target").never();', true],
+        ['node:test mock.method', 'mock.method(service, "_target", () => 2);', true],
+        ['node:test context mock', 'function run(t) { t.mock.method(service, "_target"); }', true],
+        ['a template literal name', 'jest.spyOn(service, `_target`);', true],
+        ['a name bound in the same scope', 'const name = "_target";\njest.spyOn(service, name);', true],
+        ['String.prototype.replace', 'const text = "a-b".replace("-", "_target");', false],
+        ['a stub function imported by name', 'stub(service, "_target");\nreplace(service, "_target", () => 2);', true],
+        ['a two-argument replace', 'registry.replace(service, "_target");', false],
+        ['a text replacement with three arguments', 'const text = registry.replace(service.text, "_target", "other");', false],
+        ['a one-argument stub', 'recorder.stub("_target");', false],
+        ['a literal where the owner goes', 'recorder.spy("event", "_target");', false],
+        ['a method member of no mock', 'registry.method(service, "_target");', false],
+        ['a name read from a parameter', 'function run(name) { jest.spyOn(service, name); }', false],
+        ['sinon.define', 'sinon.define(service, "_target", 1);', false],
+        ['an ordinary string', 'const NOTE = "_target";\nconsole.log("spyOn(service, _target)");', false],
+    ];
+    for (const [language, extension, member] of [['javascript', 'js', '_target() { return 7; }'],
+        ['typescript', 'ts', 'private _target(): number { return 7; }']]) {
+        for (const [label, use, live] of doubles) it(`${language}: ${label}`, () => {
+            const dir = tmp({
+                'package.json': '{"name":"sample"}', '.ucn.json': '{"kind":"application"}',
+                [`lib.${extension}`]: `export class Service {\n  ${member.replace('_target()', label.includes('accessor') || label.includes('Getter') ? 'get _target()' : '_target()')}\n  keep() { return 3; }\n}\n`,
+                [`lib.test.${extension}`]: `import * as lib from "./lib";\nconst service = new lib.Service();\n${use}\n`,
+            });
+            try {
+                const index = idx(dir);
+                const answer = assess(index, '_target');
+                assert.strictEqual(answer.verdict, live ? 'review' : 'no-static-dependents', JSON.stringify(answer));
+                if (live) assert.strictEqual(answer.reason, 'reflection');
+                assert.strictEqual(claimed(index).some(row => row.endsWith(':_target')), !live);
+                assert.strictEqual(assess(index, 'keep').verdict, 'no-static-dependents');
+            } finally { rm(dir); }
+        });
+    }
+    it('a double of a module function holds an exported declaration of an application', () => {
+        const dir = tmp({ 'package.json': '{"name":"sample"}', '.ucn.json': '{"kind":"application"}',
+            'lib.js': 'function _target() { return 7; }\nfunction keep() { return 3; }\nmodule.exports = { _target, keep };\n',
+            'lib.test.js': 'const lib = require("./lib");\njest.spyOn(lib, "_target");\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(assess(index, '_target').reason, 'reflection');
+            assert.strictEqual(assess(index, 'keep').verdict, 'no-static-dependents');
+            assert.deepStrictEqual(claimed(index).map(row => row.split(':').pop()), ['keep']);
+        } finally { rm(dir); }
+    });
+    it('the judged rows of the case table are decided by the patch or the metadata alone', () => {
+        const judged = require('./runtime-liveness-cases.json').filter(row => /^(?:double|poetry|flit)-/.test(row.id));
+        assert.ok(judged.length >= 28);
+        for (const row of judged) {
+            const dir = tmp(row.files);
+            try {
+                const answer = assess(idx(dir), row.name, row.file);
+                const expected = !row.breaks ? 'claimed' : row.id.startsWith('double-') ? 'reflection' : 'runtime-entrypoint';
+                assert.strictEqual(answer.reason, expected, `${row.id}: ${JSON.stringify(answer)}`);
+            } finally { rm(dir); }
+        }
+    });
+    it('a target with a runtime part reaches the declaration its path can spell', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '', 'pkg/core.py': 'class Service:\n    def _target(self): return 7\n\ndef _target(): return 7\n',
+            'pkg/other.py': 'def _target(): return 7\n', 'lib/core.py': 'def _target(): return 7\n',
+            'use.py': 'from unittest.mock import patch\ndef exercise(package):\n    with patch(f"{package}.core.Service._target"): pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const verdicts = index.symbols.get('_target')
+                .map(def => `${def.relativePath}:${def.className || ''}:${assessDeletion(index, def).reason}`).sort();
+            assert.deepStrictEqual(verdicts, ['lib/core.py::claimed', 'pkg/core.py::claimed',
+                'pkg/core.py:Service:reflection', 'pkg/other.py::claimed']);
+        } finally { rm(dir); }
+    });
+    it('a patch target is listed as an unverified caller, and the account is conserved', () => {
+        for (const use of ['from unittest.mock import patch\nMOD = "app"\ndef exercise():\n    with patch(f"{MOD}._target"): pass\n',
+            'def test_it(mocker):\n    mocker.patch("app._target")\n',
+            'def test_it(monkeypatch):\n    monkeypatch.setattr("app._target", lambda: 4)\n']) {
+            const dir = tmp({ 'app.py': target, 'use.py': use });
+            try {
+                const index = idx(dir);
+                index._beginOp();
+                try {
+                    const context = index.context('_target');
+                    assert.deepStrictEqual(context.callers, []);
+                    assert.deepStrictEqual(context.unverifiedCallers.map(c => `${c.relativePath}:${c.reason}`),
+                        ['use.py:reflection-pattern'], use);
+                    const account = context.meta.account;
+                    assert.strictEqual(account.conserved, true, JSON.stringify(account));
+                    assert.strictEqual(account.unaccounted, 0, JSON.stringify(account));
+                } finally { index._endOp(); }
+            } finally { rm(dir); }
+        }
+    });
+    it('patch sites survive a parallel build and a cache round trip', () => {
+        const files = { 'app.py': target,
+            'test_use.py': 'import app\nMOD = "app"\ndef test_it(monkeypatch, mocker):\n    monkeypatch.setattr(app, "keep", lambda: 4)\n    mocker.patch(f"{MOD}._target")\n' };
+        for (let i = 0; i < 8; i++) files[`f${i}.py`] = `def f${i}(): return ${i}\n`;
+        const dir = tmp(files);
+        try {
+            const sequential = idx(dir);
+            const sites = entry => JSON.stringify(entry.reflectionSites);
+            const expected = sites(sequential.files.get(path.join(dir, 'test_use.py')));
+            assert.match(expected, /"runtimeTarget":"app\._target"/);
+            assert.match(expected, /"kind":"runtime-member"/);
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.strictEqual(parallel.lastBuildParallelEligible, true);
+            assert.strictEqual(sites(parallel.files.get(path.join(dir, 'test_use.py'))), expected);
+            parallel.saveCache();
+            const loaded = new ProjectIndex(dir, { quiet: true });
+            assert.ok(loaded.loadCache());
+            assert.strictEqual(sites(loaded.files.get(path.join(dir, 'test_use.py'))), expected);
+            assert.deepStrictEqual(assess(loaded, '_target'), assess(sequential, '_target'));
+            assert.strictEqual(assess(loaded, 'keep').reason, 'reflection');
+        } finally { rm(dir); }
+    });
+    it('a type is cited at a use of its own name, never at a call that shares a member name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"sample"}',
+            'a_first.ts': 'function wrap({ children }: { children: () => string }) {\n  return children();\n}\nexport const value = wrap({ children: () => "x" });\n',
+            'src/boundary.tsx': 'import { Component, type ReactNode } from "react";\n\ninterface Props {\n  children: ReactNode;\n}\n\ninterface State {\n  failed: boolean;\n}\n\n' +
+                'export class Boundary extends Component<Props, State> {\n  render() { return this.props.children; }\n}\n\ninterface Spare {\n  children: ReactNode;\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const props = assess(index, 'Props');
+            assert.deepStrictEqual([props.verdict, props.reason, props.site],
+                ['has-static-dependents', 'has-usages', { file: 'src/boundary.tsx', line: 11 }]);
+            // No use of the type, and no call reaches its member: the audit
+            // withholds it, and the answer cites nothing.
+            const spare = assess(index, 'Spare');
+            assert.deepStrictEqual([spare.verdict, spare.reason, spare.site], ['review', 'unresolved-member-use', undefined]);
+            assert.ok(!claimed(index).some(row => row.endsWith(':Spare')));
+            assert.strictEqual(output.formatPlan({ operation: 'delete', ...spare }).includes('first use:'), false);
+        } finally { rm(dir); }
+    });
+    const memberCalls = {
+        python: [{ 'lib.py': 'class Service:\n    @staticmethod\n    def run(): return 1\n\nclass Other:\n    @staticmethod\n    def run(): return 2\n',
+            'use.py': 'from lib import Service\ndef go():\n    return Service.run()\n' }, 'use.py', 3],
+        typescript: [{ 'package.json': '{"name":"sample"}', 'lib.ts': 'export class Service { static run() { return 1; } }\nclass Other { static run() { return 2; } }\n',
+            'use.ts': 'import { Service } from "./lib";\nexport function go() { return Service.run(); }\n' }, 'use.ts', 2],
+        java: [{ 'Service.java': 'class Service { static int run() { return 1; } }\n', 'Other.java': 'class Other { static int run() { return 2; } }\n',
+            'Use.java': 'class Use { int go() { return Service.run(); } }\n' }, 'Use.java', 1],
+        rust: [{ 'Cargo.toml': '[package]\nname = "sample"\nversion = "0.1.0"\n',
+            'src/lib.rs': 'struct Service;\nimpl Service { fn run() -> i32 { 1 } }\nstruct Other;\nimpl Other { fn run() -> i32 { 2 } }\nfn go() -> i32 { Service::run() }\n' }, 'src/lib.rs', 5],
+        csharp: [{ 'Lib.cs': 'static class Service { public static int Run() { return 1; } }\nstatic class Other { public static int Run() { return 2; } }\nclass Use { int Go() { return Service.Run(); } }\n' }, 'Lib.cs', 3],
+    };
+    for (const [language, [files, file, line]] of Object.entries(memberCalls)) {
+        it(`${language}: a proven call of a member is a dependent of its type, a namesake member is not`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                // The type itself (Rust also records its impl block).
+                const typeOf = name => assessDeletion(index, index.symbols.get(name).find(def => ['class', 'struct'].includes(def.type)));
+                const service = typeOf('Service');
+                assert.deepStrictEqual([service.verdict, service.reason, service.site],
+                    ['has-static-dependents', 'member-in-use', { file, line }]);
+                const other = typeOf('Other');
+                assert.deepStrictEqual([other.verdict, other.reason, other.site], ['review', 'unresolved-member-use', undefined]);
+                assert.deepStrictEqual(claimed(index, { includeExported: true }).filter(row => /:(?:Service|Other)$/.test(row)), []);
+            } finally { rm(dir); }
+        });
+    }
+    const metadata = [
+        '[tool.poetry.scripts]\nsample = "app:_target"\n',
+        '[tool.poetry.scripts]\nsample = { callable = "app:_target", extras = ["speed"] }\n',
+        '[tool.poetry.scripts]\nsample = { reference = "app:_target", type = "console" }\n',
+        '[tool.poetry.scripts.sample]\ntype = "console"\nreference = "app:_target"\n',
+        '[tool.poetry]\nscripts.sample = "app:_target"\n',
+        '[tool.poetry.plugins."sample.plugins"]\nsample = "app:_target"\n',
+        '[tool.flit.scripts]\nsample = "app:_target"\n',
+        '[tool.flit.entrypoints."sample.plugins"]\nsample = "app:_target"\n',
+    ];
+    for (const source of metadata) it(`runtime entrypoint in pyproject.toml: ${source.split('\n').slice(0, 2).join(' ')}`, () => {
+        const dir = tmp({ 'app.py': target, 'pyproject.toml': source });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(assess(index, '_target').reason, 'runtime-entrypoint');
+            assert.strictEqual(assess(index, 'keep').verdict, 'no-static-dependents');
+            assert.ok(!claimed(index).some(row => row.endsWith(':_target')));
+            fs.writeFileSync(path.join(dir, 'pyproject.toml'), source.replaceAll('app:', 'other:'));
+            assert.strictEqual(assess(index, '_target').verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+    it('a file script, another key of a script table and another tool table register nothing', () => {
+        for (const source of [
+            '[tool.poetry.scripts]\nsample = { reference = "app:_target", type = "file" }\n',
+            '[tool.poetry.scripts.sample]\nreference = "app:_target"\ntype = "file"\n',
+            '[tool.poetry.scripts]\nsample = { callable = "app:keep", extras = ["app:_target"], note = "app:_target" }\n',
+            '[tool.poetry.dependencies]\nsample = "app:_target"\n',
+            '[tool.unrelated.scripts]\nsample = "app:_target"\n',
+        ]) {
+            const dir = tmp({ 'app.py': target, 'pyproject.toml': source });
+            try { assert.strictEqual(assess(idx(dir), '_target').verdict, 'no-static-dependents', source); } finally { rm(dir); }
+        }
+    });
+    it('an unreadable backend entry point withholds, as a PEP 621 one does', () => {
+        for (const source of ['[tool.poetry.scripts]\nsample = ["app:_target"]\n', '[tool.poetry.plugins."sample.plugins"]\nsample = 3\n']) {
+            const dir = tmp({ 'app.py': target, 'pyproject.toml': source });
+            try { assert.strictEqual(assess(idx(dir), '_target').reason, 'runtime-entrypoint', source); } finally { rm(dir); }
+        }
     });
 });
 

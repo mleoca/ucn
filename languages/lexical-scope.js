@@ -148,13 +148,15 @@ function pyCaptureNames(pattern, out) {
 
 /**
  * Bindings of `name` in one Python function/class body (not nested scopes,
- * but walrus targets inside comprehensions bind here).
+ * but walrus targets inside comprehensions bind here). A null `name` reports
+ * the bindings of every name to `onBinding`, in the order one name's are
+ * reported; the returned facts then describe no single name.
  */
 function pyScopeBindings(scopeNode, body, name, isFunction, includeClasses = false, onBinding) {
     const info = { bound: false, defRows: [], other: false, import: false,
         global: false, nonlocal: false, starImport: false };
     const note = (node, kind) => {
-        if (!node || node.text !== name) return;
+        if (!node || (name !== null && node.text !== name)) return;
         onBinding?.(node, kind);
         info.bound = true;
         if (kind === 'def') info.defRows.push(node.startPosition.row);
@@ -1385,6 +1387,23 @@ function pythonScopeBindingKinds(node, name) {
     return sites;
 }
 
+/**
+ * The same sites for every name the scope binds, from one walk of it:
+ * Map<name, {node, kind}[]>, each list in pythonScopeBindingKinds' order.
+ */
+function pythonScopeBindingTable(node) {
+    let scope = node;
+    while (scope && !['module', 'function_definition', 'class_definition'].includes(scope.type)) scope = scope.parent;
+    const table = new Map();
+    if (!scope || scope.type === 'class_definition') return table;
+    const isFunction = scope.type === 'function_definition';
+    pyScopeBindings(scope, isFunction ? scope.childForFieldName('body') : scope, null, isFunction, true, (site, kind) => {
+        const sites = table.get(site.text);
+        if (sites) sites.push({ node: site, kind }); else table.set(site.text, [{ node: site, kind }]);
+    });
+    return table;
+}
+
 /** Declaration tokens binding one name in a Python function's own scope. */
 function pythonBindingSites(scope, name) {
     const sites = [];
@@ -1512,4 +1531,4 @@ function localImportStatement(node, language, name = node?.text) {
 
 module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding,
     localImportStatement,
-    pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds, goExpressionTypeArgument, jsPatternTarget };
+    pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds, pythonScopeBindingTable, goExpressionTypeArgument, jsPatternTarget };

@@ -26,6 +26,21 @@ function runtimeTargetReaches(index, symbol, target) {
     const normalizedOwners = owners.map(pythonSourceName);
     const member = [...normalizedOwners.map((name, position) => mangle(name, normalizedOwners[position - 1])),
         mangle(pythonSourceName(symbol.name), normalizedOwners[normalizedOwners.length - 1])].join('.');
+    if (spelling.includes('*')) {
+        // A path with a runtime part (`*.name`, `pkg.*.Owner.name`): reached
+        // when the glob spells this declaration under one of the module
+        // paths it can be imported by. A dot never occurs in an identifier,
+        // so a written `*` is only ever the runtime part.
+        const { globMatches } = require('./reflection');
+        const parts = module.split('.');
+        const paths = parts.map((_, position) => parts.slice(position).join('.'));
+        // An owner that cannot be placed keeps every path its member may have.
+        if (unknownOwner) {
+            return globMatches(spelling.slice(spelling.lastIndexOf('.') + 1),
+                mangle(pythonSourceName(symbol.name), pythonSourceName(symbol.className)));
+        }
+        return paths.some(prefix => globMatches(spelling, `${prefix}.${member}`));
+    }
     if (unknownOwner && spelling.endsWith(`.${mangle(pythonSourceName(symbol.name), pythonSourceName(symbol.className))}`)) {
         const parts = module.split('.');
         if (parts.some((_, position) => spelling.startsWith(`${parts.slice(position).join('.')}.`))) return true;

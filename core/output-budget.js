@@ -22,7 +22,8 @@ const CONTRACT_LINE_RE = /^\s*(?:(?:Summary|ACCOUNT|CONTRACT|WARNING|FILTERED|CA
 // TRUST level of its own, which is orientation, not a verdict).
 const TRUST_LINE_RE = /^(?:(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|VALUE ACCOUNT|TYPE ACCOUNT):|TRUST: (?:BLOCKED|REVIEW_REQUIRED|READY_FOR_TOOLCHAIN)\b)/;
 // A count or deletion verdict is the answer the warnings qualify. Preserve
-// it with those warnings, or explicitly withhold the answer when both cannot fit.
+// it with those warnings; when both cannot fit, the notice says which of
+// them the lines under it are.
 const RESULT_LINE_RE = /^(?:Dead code: \d+ unused symbol\(s\)|No dead code found\.|VERDICT: (?:no-static-dependents|has-static-dependents|review)\b)/;
 const MAX_PRESERVED_CONTRACT_LINES = 24;
 const MAX_PRESERVED_CONTRACT_CHARS = 8000;
@@ -54,7 +55,7 @@ function contractCandidates(fullText) {
         const priority = TRUST_LINE_RE.test(evidenceLine) || RESULT_LINE_RE.test(evidenceLine)
             ? 0
             : /^\d+ test-file usage\(s\) hidden\b/.test(evidenceLine) ? 1 : 2;
-        candidates.push({ line, priority, sourceIndex });
+        candidates.push({ line, priority, sourceIndex, ...(RESULT_LINE_RE.test(evidenceLine) && { result: true }) });
     }
     return candidates;
 }
@@ -455,12 +456,20 @@ function applyOutputBudget(text, {
 
     // The notice and the trust lines alone do not fit: the answer is
     // withheld rather than shown without its contract, and the notice says
-    // so with the budget that would carry them.
+    // so with the budget that would carry them. A count or verdict line
+    // (RESULT_LINE_RE) is the answer itself: when it is among the lines
+    // kept, the notice says that it is shown and that the rest is not.
     const withheld = () => {
         const flag = surface === 'mcp' ? 'max_chars' : '--max-chars';
-        const noticeFor = (shown, needed, target = surface, fullChars = text.length) =>
-            `... OUTPUT TRUNCATED (${fullChars}→${hardLimit}): answer withheld; ` +
-            `${shown} of ${trust.length} trust line(s) shown. Raise ${target === 'mcp' ? 'max_chars' : '--max-chars'} to at least ${needed}.`;
+        const qualifiers = trust.filter(candidate => !candidate.result).length;
+        const noticeFor = (shown, needed, target = surface, fullChars = text.length) => {
+            const lines = qualifiers > 0 ? `${shown.qualifiers} of ${qualifiers} trust line(s) shown` : '';
+            const state = shown.results > 0
+                ? `result line${lines ? ` and ${lines}` : ' shown'}; rest withheld`
+                : `answer withheld${lines ? `; ${lines}` : ''}`;
+            return `... OUTPUT TRUNCATED (${fullChars}→${hardLimit}): ${state}. ` +
+                `Raise ${target === 'mcp' ? 'max_chars' : '--max-chars'} to at least ${needed}.`;
+        };
         // Smallest budget whose shortest layout carries every trust line.
         let needed = terminalChars + lineCost(minimalNotice) + trustChars;
         // Raising the limit can add a digit to the notice itself. Compute
@@ -472,20 +481,22 @@ function applyOutputBudget(text, {
             if (required <= needed) break;
             needed = required;
         }
-        let shown = 0;
+        const shown = { results: 0, qualifiers: 0 };
         const noticeCost = text => paired ? Math.max(text.length,
             text.replace(surface === 'mcp' ? 'max_chars' : '--max-chars', surface === 'mcp' ? '--max-chars' : 'max_chars').length) : text.length;
         // Native full sizes can have different digit widths. Pair the whole
         // notice before choosing trust lines, just as for ordinary notices.
         const fullNoticeCost = shown => Math.max(noticeFor(shown, needed).length,
             paired ? noticeFor(shown, needed, surface === 'mcp' ? 'cli' : 'mcp', peerText.length).length : 0);
-        let used = fullNoticeCost(trust.length);
+        // Room for the longest notice these lines can end with.
+        let used = Math.max(fullNoticeCost({ results: trust.length - qualifiers, qualifiers }),
+            fullNoticeCost({ results: 0, qualifiers }));
         const kept = [];
         for (const candidate of trust) {
             if (used + lineCost(candidate.line) + 1 > limit) break;
             kept.push(candidate.line);
             used += lineCost(candidate.line) + 1;
-            shown++;
+            if (candidate.result) shown.results++; else shown.qualifiers++;
         }
         const notice = noticeFor(shown, needed);
         if (fullNoticeCost(shown) > limit) {
