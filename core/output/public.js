@@ -357,7 +357,7 @@ function formatPublicText(command, result, params = {}, execution = {}) {
         case 'check':
             text = modeOf('check', result) === 'symbol'
                 ? legacy.formatVerify(result)
-                : legacy.formatCheck(result);
+                : legacy.formatCheck(result, { all: !!params.all, allHint: hints.all });
             break;
         case 'plan': text = legacy.formatPlan(result, { surface: execution.surface }); break;
         case 'repo': text = formatRepo(result, params, hints); break;

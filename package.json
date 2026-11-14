@@ -22,7 +22,7 @@
     "eval:consistency": "node eval/run-consistency-eval.js --project .",
     "profile:callers": "node eval/profile-callers.js",
     "profile:check": "node eval/profile-check.js",
-    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js eval/outcome-policy.js eval/outcome-mutations.js eval/deletion-matrix-cases.js eval/check-matrix-cases.js eval/check-outgoing-cases.js eval/test-unit-matrix-cases.js eval/profile-callers.js eval/profile-check.js eval/oracles/*.js",
+    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js eval/outcome-policy.js eval/outcome-mutations.js eval/deletion-matrix-cases.js eval/check-matrix-cases.js eval/check-outgoing-cases.js eval/check-call-settlement-cases.js eval/test-unit-matrix-cases.js eval/profile-callers.js eval/profile-check.js eval/oracles/*.js",
     "verify": "npm run lint && npm test",
     "trust:gate:semantic": "node eval/run-oracle-eval.js --release --min-precision 0.98 --max-unscored-ratio 0.10",
     "trust:gate:deadcode": "node eval/run-deadcode-eval.js --release --sample 100 --arm default",

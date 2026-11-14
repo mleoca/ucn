@@ -149,6 +149,65 @@ const SECTION_HEADER_RE = /^(?:[A-Z][A-Z-]*(?: [A-Z][A-Z-]*)*(?: — [A-Z][A-Z -
 // breaks must not push what is ready, or what to review, out of the answer.
 const SECTION_AWARE_COMMANDS = new Set(['show', 'impact', 'check']);
 
+// The list of action items under a `check` answer.
+const ITEM_SECTION_HEADER_RE = /^Action items:$/;
+// Lines every item section keeps before any section takes more.
+const ITEM_SECTION_HEAD = 2;
+
+/**
+ * Cut sections of items (`check`): what a reader acts on is which items
+ * there are, so the item lines come before the lines under them. Every
+ * section first keeps a short head; then the sections take their remaining
+ * item lines in the order they are printed (the worst verdict first); then
+ * the lines under the items shown, in the same order. A cut section ends
+ * with a `+N more` line that counts every line left out.
+ */
+function itemSectionsCut(blocks, sections, budget, used, lineCost, moreLine, indentOf) {
+    const states = new Map();
+    for (const section of sections) {
+        const shallowest = Math.min(...section.body.map(indentOf));
+        const owner = [];
+        let last = -1;
+        section.body.forEach((line, at) => {
+            if (indentOf(line) === shallowest) last = at;
+            owner.push(last);
+        });
+        states.set(section, { owner, taken: new Set(), full: false });
+    }
+    const take = (section, at) => {
+        const state = states.get(section);
+        if (state.full || state.taken.has(at)) return !state.full;
+        // A line under an item is shown only with its item.
+        if (state.owner[at] !== at && !state.taken.has(state.owner[at])) return true;
+        const cost = lineCost(section.body[at]) + 1;
+        if (used + cost > budget) { state.full = true; return false; }
+        used += cost;
+        state.taken.add(at);
+        return true;
+    };
+    for (const section of sections) {
+        for (let at = 0; at < Math.min(ITEM_SECTION_HEAD, section.body.length); at++) take(section, at);
+    }
+    for (const section of sections) {
+        const { owner } = states.get(section);
+        for (let at = 0; at < section.body.length; at++) if (owner[at] === at && !take(section, at)) break;
+    }
+    for (const section of sections) {
+        const { owner } = states.get(section);
+        for (let at = 0; at < section.body.length; at++) if (owner[at] !== at && !take(section, at)) break;
+    }
+    const out = [];
+    for (const block of blocks) {
+        if (block.kind === 'fixed') { out.push(block.line); continue; }
+        out.push(block.header);
+        const { taken } = states.get(block);
+        for (let at = 0; at < block.body.length; at++) if (taken.has(at)) out.push(block.body[at]);
+        const omitted = block.body.length - taken.size;
+        if (omitted > 0) out.push(moreLine(omitted));
+    }
+    return out.join('\n');
+}
+
 /**
  * Cut a relationship answer to `budget` chars keeping a representative head
  * of EVERY tier section instead of the first sections only: a long CONFIRMED
@@ -160,13 +219,16 @@ const SECTION_AWARE_COMMANDS = new Set(['show', 'impact', 'check']);
  * no sections or its fixed parts alone do not fit (caller falls back to a
  * head cut).
  */
-function sectionAwareCut(text, budget, lineCost = line => line.length) {
+function sectionAwareCut(text, budget, lineCost = line => line.length, options = {}) {
     const lines = text.split('\n');
     const blocks = []; // { kind: 'fixed', line } | { kind: 'section', header, body }
     let current = null;
     let sawSection = false;
+    // `items`: a section is a list of items, each a line with the lines
+    // under it (the verdict sections of `check` and its action items).
+    const items = options.items === true;
     for (const line of lines) {
-        if (SECTION_HEADER_RE.test(line)) {
+        if (SECTION_HEADER_RE.test(line) || (items && ITEM_SECTION_HEADER_RE.test(line))) {
             current = { kind: 'section', header: line, body: [] };
             blocks.push(current);
             sawSection = true;
@@ -192,10 +254,11 @@ function sectionAwareCut(text, budget, lineCost = line => line.length) {
         used += moreLine(section.body.length).length + gapLine.length + 2;
     }
     if (used > budget) return null;
+    const indentOf = line => line.length - line.trimStart().length;
+    if (items) return itemSectionsCut(blocks, sections, budget, used, lineCost, moreLine, indentOf);
     // Selection order per section: the first numbered site entry and the
     // sub-headers above it come first, so a long preamble list (competing
     // definitions) cannot crowd every site out; then lines in source order.
-    const indentOf = line => line.length - line.trimStart().length;
     const orders = new Map();
     for (const section of sections) {
         const first = section.body.findIndex(line => /^\s+\[\d+\]/.test(line));
@@ -545,7 +608,7 @@ function applyOutputBudget(text, {
         // their room taken from the sections.
         let sectionBudget = limit - lineCost(longNotice) - 2;
         for (let attempt = 0; attempt < 2; attempt++) {
-            const sectioned = sectionAwareCut(text, sectionBudget, lineCost);
+            const sectioned = sectionAwareCut(text, sectionBudget, lineCost, { items: canonical === 'check' });
             if (sectioned === null) break;
             const visible = new Set(sectioned.split('\n').map(line => line.trim()));
             const missing = trust.filter(candidate => !visible.has(candidate.line));

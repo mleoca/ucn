@@ -25,9 +25,11 @@
  *              the reason is named and the sites are listed.
  *   ready      no unresolved exposure remains in the modeled checks.
  *
- * A changed outgoing call is checked too. Positive argument fit preserves
- * a baseline invocation only in an unchanged written context; it is not a
- * compiler proof for arbitrary new calls or surrounding expressions.
+ * A changed outgoing call is checked too (core/outgoing-check.js): one that
+ * cannot fit its callee is a break; one that fits is settled only when
+ * nothing the language's checker enforces on it is left unproven
+ * (core/call-fit.js), and otherwise counts among the item's unverified
+ * outgoing calls, each with the one reason it is not settled.
  *
  * TRUST is the worst verdict among the items. BLOCKED means a definite
  * break, or that the check itself could not run. It never means "there is
@@ -39,12 +41,16 @@
 const { diffImpact, composeAccount, callNotResolvedEntries } = require('./analysis');
 const { providedNames } = require('./change-kinds');
 const { outgoingChecker } = require('./outgoing-check');
+const { outgoingSummary, outgoingSummaryText } = require('./output/check');
 const fs = require('fs');
 const path = require('path');
 const { isValueDefinition, isTestPath } = require('./shared');
 const { langTraits } = require('../languages');
 const { assessDeletion, definiteDependentsOf, REASON_TEXT } = require('./deletion');
-const { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, newOwnerUnreached, HAZARD_TEXT } = require('./capture');
+const { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, newOwnerUnreached,
+    decoratorsRegisterNothing, HAZARD_TEXT } = require('./capture');
+const { isFrameworkEntrypoint } = require('./entrypoints');
+const { scanTextOnly } = require('./source-universe');
 const { reviewItemsOf } = require('./review-items');
 const { createTestModel, linkFiles, commandsFor, testSiteKey } = require('./test-units');
 // Reasons a file has no command that are about the file, not the runner.
@@ -53,6 +59,9 @@ const { resolveTarget, flaggedPaths } = require('./snapshot');
 const { projectKind, submoduleOf } = require('./deletion');
 
 const VERDICT_RANK = { ready: 0, review: 1, blocked: 2 };
+// Item reasons that are about the calls an item makes: each has its own
+// action line, which names the calls.
+const OUTGOING_REASONS = new Set(['outgoing-signature-mismatch', 'outgoing-call-unverified']);
 
 // What moved in a callable's contract, in words.
 const CHANGE_TEXT = Object.freeze({
@@ -166,6 +175,61 @@ function callersOf(index, name, definition) {
     };
 }
 
+/** Lines of read, unanalyzed source that spell `name`, once per check. */
+function unanalyzedLinesOf(index, name) {
+    const memo = index._opMemo?.('checkUnanalyzedLines', () => new Map());
+    if (memo?.has(name)) return memo.get(name);
+    let lines;
+    // Unreadable is unknown: not shown to be new.
+    try { lines = scanTextOnly(index, name).lines || 0; } catch (_) { lines = 1; }
+    memo?.set(name, lines);
+    return lines;
+}
+
+/** Does a reflection site spell exactly `name`, and nothing wider? */
+function namesOnly(site, name) {
+    if (site.dynamic || site.name !== name) return false;
+    if ((site.patterns || []).some(pattern => pattern !== name)) return false;
+    const target = site.runtimeTarget;
+    return target == null || (!String(target).includes('*') && (target === name || String(target).endsWith(`.${name}`)));
+}
+
+/**
+ * The reason a deletion assessment of an added declaration withholds, read
+ * as the project was before the change wrote its own reflective sites. A
+ * site on a line the change added that names exactly the new declaration
+ * (a test double that patches it) is new code naming new code: nothing
+ * that existed reaches the declaration through it. Any other site, on any
+ * line, is asked as it stands.
+ */
+function shieldBeforeChange(index, definition, addedLinesByFile) {
+    const hidden = [];
+    for (const entry of index.files.values()) {
+        const added = addedLinesByFile.get(entry.relativePath);
+        if (!added || !Array.isArray(entry.reflectionSites)) continue;
+        const kept = entry.reflectionSites.filter(site => !(added.has(site.line) && namesOnly(site, definition.name)));
+        if (kept.length !== entry.reflectionSites.length) {
+            hidden.push([entry, entry.reflectionSites]);
+            entry.reflectionSites = kept;
+        }
+    }
+    if (hidden.length === 0) return 'reflection';
+    // The pattern index is derived from the sites: it is rebuilt for the
+    // question and dropped after it, so nothing computed without the
+    // change's sites outlives the question.
+    const { resetReflectionIndex } = require('./reflection');
+    resetReflectionIndex(index);
+    try {
+        const assessment = assessDeletion(index, definition);
+        return assessment.verdict === 'review' ? assessment.reason : null;
+    } catch (_) {
+        return 'reflection';
+    } finally {
+        for (const [entry, sites] of hidden) entry.reflectionSites = sites;
+        resetReflectionIndex(index);
+    }
+}
+
 /**
  * Verdict of an ADDED declaration.
  * @returns {{verdict, reasons: string[], hazards?: string[], outside?: object[]}}
@@ -173,22 +237,35 @@ function callersOf(index, name, definition) {
 function assessAddition(index, entry, definition, addedLinesByFile, account, judge, nonCallable = false) {
     if (!definition) return { verdict: 'review', reasons: ['declaration-not-indexed'] };
     const ownerExisted = ownerExistedBefore(index, definition, addedLinesByFile);
-    const occurrences = !ownerExisted && newOwnerUnreached(index, definition, addedLinesByFile)
+    const unreached = !ownerExisted && newOwnerUnreached(index, definition, addedLinesByFile);
+    const occurrences = unreached
         ? { outside: [], total: 0 }
         : occurrencesOutsideChange(index, entry.name, addedLinesByFile, definition);
     const summary = summarizeAccount(account);
     const reasons = [];
+    // A member of an owner nothing reaches is reached through its owner
+    // only: what source that is read and not analyzed says of the member's
+    // spelling is about other things; what it says of the owner's is not.
+    const unanalyzedLines = unreached ? unanalyzedLinesOf(index, definition.className) : summary.unanalyzedLines;
     if (occurrences.outside.length > 0) reasons.push('name-in-use');
-    else if (summary.available && (summary.unanalyzedLines > 0 || summary.unsearchablePaths > 0 ||
+    else if (summary.available && (unanalyzedLines > 0 || summary.unsearchablePaths > 0 ||
         summary.unparsedFiles > 0 || summary.unreadableFiles > 0)) reasons.push('novelty-unknown');
     let shield;
     try {
         const assessment = assessDeletion(index, definition);
         shield = assessment.verdict === 'review' ? assessment.reason : null;
+        if (shield === 'reflection') shield = shieldBeforeChange(index, definition, addedLinesByFile);
     } catch (_) { shield = null; }
     let contract;
     try {
         contract = require('./deadcode').contractFactsOf(index, definition, index.files.get(definition.file)?.language);
+        // A decorator registers what it decorates only when it can: one
+        // resolved to an identity that hands the declaration back is no
+        // registration, and no framework rule names this declaration.
+        if (contract.registered && (definition.decorators || []).length > 0 &&
+            decoratorsRegisterNothing(index, definition) && !isFrameworkEntrypoint(definition, index)) {
+            contract = { ...contract, registered: false };
+        }
     } catch (_) { contract = null; }
     let shape;
     try { shape = ownerExisted ? shapeChangeOf(index, definition, addedLinesByFile) : null; } catch (_) { shape = 'shape'; }
@@ -866,7 +943,10 @@ function checkTarget(index, options, repoRoot) {
         const blocking = result.mismatches.filter(row => !row.unchecked).length;
         item.signatureMismatches += blocking;
         if (result.mismatches.length) item.mismatches = [...(item.mismatches || []), ...result.mismatches];
-        if (result.unsettled.length) item.outgoingReview = result.unsettled;
+        if (result.unsettled.length) {
+            item.outgoingReview = result.unsettled;
+            item.outgoingCalls = outgoingSummary(result.unsettled);
+        }
         if (blocking) {
             item.verdict = 'blocked';
             item.reasons = [...new Set(['outgoing-signature-mismatch', ...item.reasons])];
@@ -1194,11 +1274,34 @@ function checkTarget(index, options, repoRoot) {
             }
             continue;
         }
-        if (it.signatureMismatches > 0) {
+        // A break the toolchain reports, on either side of the declaration:
+        // call sites that do not fit it, and calls it makes that do not fit
+        // their callee (those rows name the callee as `target`).
+        const blocking = (it.mismatches || []).filter(row => !row.unchecked);
+        const made = blocking.filter(row => row.target);
+        const received = it.signatureMismatches - made.length;
+        if (received > 0) {
             actions.push({
                 severity: 'error',
                 kind: 'signature_drift',
-                message: `${it.name}: ${it.signatureMismatches} call site(s) no longer fit the signature`,
+                message: `${it.name}: ${received} call site(s) do not fit its signature`,
+            });
+        }
+        if (made.length > 0) {
+            const shown = made.slice(0, 3).map(row =>
+                `${row.target} at ${row.file}:${row.line} (${row.problem || `expected ${row.expected}, got ${row.actual}`})`);
+            actions.push({
+                severity: 'error',
+                kind: 'outgoing_call_mismatch',
+                message: `${it.name}: ${made.length} call(s) it makes do not fit the callee: ${shown.join('; ')}` +
+                    (made.length > shown.length ? ` (+${made.length - shown.length} more)` : ''),
+            });
+        }
+        if (it.outgoingCalls) {
+            actions.push({
+                severity: 'warn',
+                kind: 'outgoing_calls_unverified',
+                message: `${it.name}: ${outgoingSummaryText(it.outgoingCalls)}; the compiler or type checker decides them`,
             });
         }
         if (it.kind === 'deleted' && it.verdict === 'blocked') {
@@ -1237,7 +1340,7 @@ function checkTarget(index, options, repoRoot) {
                 });
             }
         }
-        if (it.kind === 'added' && it.verdict === 'blocked') {
+        if (it.kind === 'added' && it.reasons.includes('literal-lacks-new-member')) {
             actions.push({
                 severity: 'error',
                 kind: 'addition_breaks',
@@ -1246,7 +1349,7 @@ function checkTarget(index, options, repoRoot) {
         }
         if (it.kind === 'added') {
             for (const code of it.reasons) {
-                if (code === 'literal-lacks-new-member') continue;
+                if (code === 'literal-lacks-new-member' || OUTGOING_REASONS.has(code)) continue;
                 actions.push({
                     severity: 'warn',
                     kind: 'addition_hazard',

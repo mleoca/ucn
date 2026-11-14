@@ -399,9 +399,15 @@ describe('check: a verdict per changed symbol, by what the change did', () => {
         ['a new file under new names is ready',
             dir => write(dir, 'fresh.py', 'def brand_new_thing(a):\n    return a\n'),
             'READY_FOR_TOOLCHAIN', ['brand_new_thing:added=ready']],
-        ['a new function is novel but its new invocation still needs review',
+        // The parameter has no written type and the result goes to a
+        // callable whose own result is read from its body.
+        ['a new function and a new call of it that nothing constrains are ready',
             dir => write(dir, 'app.py', APP +
                 '\n\ndef brand_new_thing(a):\n    return a\n\n\ndef brand_new_user():\n    return brand_new_thing(1)\n'),
+            'READY_FOR_TOOLCHAIN', ['brand_new_thing:added=ready', 'brand_new_user:added=ready']],
+        ['a new call whose value goes into a written type needs review',
+            dir => write(dir, 'app.py', APP +
+                '\n\ndef brand_new_thing(a):\n    return a\n\n\ndef brand_new_user() -> int:\n    return brand_new_thing(1)\n'),
             'REVIEW_REQUIRED', ['brand_new_thing:added=ready', 'brand_new_user:added=review(outgoing-call-unverified)']],
     ];
     for (const [label, change, trust, expected] of SCENARIOS) {
@@ -553,6 +559,46 @@ describe('check: the answer survives a character budget', () => {
             const tiny = applyOutputBudget(full, { command: 'check', maxChars: 300 }).text;
             assert.ok(tiny.length <= 300);
             assert.match(tiny, /TRUST: BLOCKED — UCN evidence is not semantic proof; compiler and tests are required/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #506: a budget keeps the symbols of a check before the lines under them', () => {
+    const { applyOutputBudget } = require('../core/output-budget');
+    it('lists every symbol to review that fits, then what is ready, then the detail', () => {
+        const names = Array.from({ length: 14 }, (_, at) => `fresh_helper_${String(at).padStart(2, '0')}`);
+        const dir = repo({ 'lib.py': 'def typed(value: int) -> int:\n    return value\n' });
+        try {
+            write(dir, 'app.py', 'from lib import typed\n' + names.map(name =>
+                `\n\ndef ${name}():\n    value = typed(1)\n    return value\n`).join('') +
+                '\n\ndef fresh_plain():\n    return 1\n');
+            const result = checked(dir);
+            const full = output.formatPublicText('check', result, {}, { surface: 'cli' });
+            const peerText = output.formatPublicText('check', result, {}, { surface: 'mcp' });
+            const itemsOf = text => text.split('\n').filter(line => /^ {2}fresh_\w+ \(app\.py:\d+\)/.test(line)).length;
+            assert.strictEqual(itemsOf(full), 15);
+            const details = text => (text.match(/outgoing call\(s\) not verified \(result-use-unverified 1\); use (?:--all|all=true)/g) || []).length;
+            const at = budget => applyOutputBudget(full, { command: 'check', maxChars: budget, surface: 'cli', peerText }).text;
+            // A small budget: the symbols come first, in the order printed,
+            // and every section keeps a head.
+            const small = at(1800);
+            assert.ok(small.length <= 1800, String(small.length));
+            assert.ok(itemsOf(small) >= 8 && details(small) <= 1, small);
+            assert.match(small, /^REVIEW \(14\) — [^\n]*\n {2}fresh_helper_00 \(app\.py:\d+\)/m);
+            assert.match(small, /^READY \(1\) — [^\n]*\n {2}fresh_plain \(app\.py:\d+\) \[ADDED, ORPHAN\]/m);
+            assert.match(small, /^Action items:\n {2}⚠ fresh_helper_00: 1 outgoing call\(s\) not verified/m);
+            assert.match(small, /^ {2}\.\.\. \+\d+ more$/m);
+            assert.match(small, /^TRUST: REVIEW_REQUIRED — /m);
+            // A larger one: every symbol before the lines under them.
+            const larger = at(2700);
+            assert.ok(larger.length <= 2700, String(larger.length));
+            assert.strictEqual(itemsOf(larger), 15, larger);
+            assert.ok(details(larger) < 14, larger);
+            assert.strictEqual(at(2700), larger, 'the same cut twice');
+            // The other surface keeps the same lines.
+            const mcp = applyOutputBudget(peerText, { command: 'check', maxChars: 2700, surface: 'mcp', peerText: full }).text;
+            assert.strictEqual(itemsOf(mcp), 15, mcp);
+            assert.strictEqual(details(mcp), details(larger));
         } finally { rm(dir); }
     });
 });
@@ -1081,7 +1127,7 @@ describe('check: what the project\'s own judge looks at', () => {
             const live = idx(dir);
             const pick = result => result.changed.find(item => item.name === 'pick').verdict;
             const initial = execute(live, 'check', {}).result;
-            assert.strictEqual(pick(initial), 'review');
+            assert.strictEqual(pick(initial), 'ready');
             assert.ok(!initial.changed.find(item => item.name === 'pick').reasons.includes('inferred-return-contract'));
             // Now the callee is declared never to return: the same call ends the path.
             write(dir, 'helpers.ts', 'export function stop(): never {\n  throw new Error("stop");\n}\n');
@@ -1443,4 +1489,87 @@ describe('check: an addition is inert only when nothing that existed can reach i
             } finally { rm(dir); }
         });
     }
+});
+
+describe('fix #506: what a decorator registers, and which reflection reaches an addition', () => {
+    const BASE = { 'app.py': 'def existing(level, label):\n    return level, label\n\n\nclass Old:\n    amount = 1\n',
+        'tests/test_app.py': 'from app import existing\n\n\ndef test_existing():\n    assert existing(1, 2)\n' };
+    const added = (files, change) => {
+        const dir = repo(files);
+        try {
+            change(dir);
+            return verdicts(checked(dir));
+        } finally { rm(dir); }
+    };
+
+    it('a decorator resolved to an identity that hands the declaration back registers nothing', () => {
+        const found = added(BASE, dir => {
+            write(dir, 'app.py', BASE['app.py'] + '\n\nfrom dataclasses import dataclass\nimport functools\n\n\n' +
+                '@dataclass(frozen=True)\nclass Reading:\n    label: str\n    level: float\n    amount: float = 0.0\n\n\n' +
+                '@functools.lru_cache(maxsize=None)\ndef cached(n):\n    return n\n');
+            write(dir, 'tests/test_app.py', BASE['tests/test_app.py'] + '\nimport pytest\n\n\n' +
+                '@pytest.mark.parametrize("value", [1, 2])\ndef test_values(value):\n    assert value\n\n\n' +
+                '@pytest.fixture\ndef sample():\n    return 1\n');
+        });
+        // The class, and its fields whose names the project already uses:
+        // nothing that existed can hold a value of a class that is new.
+        for (const ready of ['Reading:added=ready', 'label:added=ready', 'level:added=ready', 'amount:added=ready',
+            'cached:added=ready', 'test_values:added=ready']) assert.ok(found.includes(ready), found.join('  '));
+        // A fixture is requested by its name: the framework reaches it.
+        assert.ok(found.includes('sample:added=review(registered)'), found.join('  '));
+    });
+
+    it('a decorator whose identity is not proven, or that a project module supplies, still may register', () => {
+        // The name `dataclass` is the project's own here.
+        const own = added({ ...BASE, 'dataclasses.py': 'REGISTRY = []\n\n\ndef dataclass(cls):\n    REGISTRY.append(cls)\n    return cls\n' },
+            dir => write(dir, 'app.py', BASE['app.py'] + '\n\nfrom dataclasses import dataclass\n\n\n@dataclass\nclass Reading:\n    level: float = 0.0\n'));
+        assert.ok(own.includes('Reading:added=review(registered)'), own.join('  '));
+        assert.ok(own.includes('level:added=review(name-in-use)'), own.join('  '));
+        // A local rebinding is no identity; a registering decorator in the stack decides.
+        const rebound = added(BASE, dir => write(dir, 'app.py', BASE['app.py'] +
+            '\n\nfrom dataclasses import dataclass\n\nHANDLERS = []\n\n\ndef register(cls):\n    HANDLERS.append(cls)\n    return cls\n\n\n' +
+            '@register\n@dataclass\nclass Reading:\n    level: float = 0.0\n'));
+        assert.ok(rebound.includes('Reading:added=review(registered)'), rebound.join('  '));
+    });
+
+    it('a member of a new owner is judged by its owner\'s name in source that is read and not analyzed', () => {
+        const fresh = 'class FreshRecord:\n    low: float = 1.0\n';
+        // The member's spelling in a file of another language is about something else.
+        const member = added({ ...BASE, 'notes.rb': 'low = 1\n' }, dir => write(dir, 'fresh.py', fresh));
+        assert.ok(member.includes('low:added=ready'), member.join('  '));
+        // The owner's spelling there may be a use of the owner.
+        const owner = added({ ...BASE, 'notes.rb': 'FreshRecord.new\n' }, dir => write(dir, 'fresh.py', fresh));
+        assert.ok(owner.includes('low:added=review(novelty-unknown)'), owner.join('  '));
+        assert.ok(owner.includes('FreshRecord:added=review(novelty-unknown)'), owner.join('  '));
+    });
+
+    it('a field added to a dataclass that existed is still part of how it is constructed', () => {
+        const base = { 'app.py': 'from dataclasses import dataclass\n\n\n@dataclass\nclass Reading:\n    level: float\n\n\ndef make():\n    return Reading(1.0)\n' };
+        const found = added(base, dir => edit(dir, 'app.py', '    level: float\n', '    level: float\n    freshly_named: int\n'));
+        assert.ok(found.includes('freshly_named:added=review(field-of-existing-type)'), found.join('  '));
+    });
+
+    it('a test double the change wrote for the declaration it adds is no reach from existing code', () => {
+        const base = { 'app.py': 'def public():\n    return 1\n', 'tests/test_app.py': 'import app\n\n\ndef test_public():\n    assert app.public() == 1\n' };
+        const own = added(base, dir => {
+            write(dir, 'app.py', base['app.py'] + '\n\ndef _only_patched():\n    return 0\n\n\ndef _by_path():\n    return 0\n');
+            write(dir, 'tests/test_app.py', base['tests/test_app.py'] + '\n\ndef test_only(monkeypatch, mocker):\n' +
+                '    monkeypatch.setattr(app, "_only_patched", lambda: 2)\n    mocker.patch("app._by_path", return_value=3)\n');
+        });
+        assert.ok(own.includes('_only_patched:added=ready'), own.join('  '));
+        assert.ok(own.includes('_by_path:added=ready'), own.join('  '));
+        // A site that existed names the declaration before it was there:
+        // existing code reaches the new one.
+        const existing = { ...base, 'tests/test_app.py': base['tests/test_app.py'] +
+            '\n\ndef test_absent(monkeypatch):\n    monkeypatch.setattr(app, "_only_patched", lambda: 2)\n' };
+        const prior = added(existing, dir => write(dir, 'app.py', base['app.py'] + '\n\ndef _only_patched():\n    return 0\n'));
+        assert.ok(prior.includes('_only_patched:added=review(reflection-reachable)'), prior.join('  '));
+        // A name built at runtime on an added line names more than the declaration.
+        const pattern = added(base, dir => {
+            write(dir, 'app.py', base['app.py'] + '\n\ndef _load_cache():\n    return 0\n');
+            write(dir, 'tests/test_app.py', base['tests/test_app.py'] + '\n\ndef test_any(monkeypatch):\n' +
+                '    for kind in ("cache", "disk"):\n        monkeypatch.setattr(app, "_load_" + kind, lambda: 2)\n');
+        });
+        assert.ok(pattern.includes('_load_cache:added=review(reflection-reachable)'), pattern.join('  '));
+    });
 });

@@ -146,6 +146,18 @@ function ownersOf(index, definition) {
         type.startLine <= definition.startLine && (type.endLine || type.startLine) >= definition.startLine);
 }
 
+/**
+ * Does a declaration carry no decorator that could register it? None at
+ * all, or only decorators the language resolves to an identity known to
+ * register nothing (trait `decoratorsRegisterNothing`).
+ */
+function decoratorsRegisterNothing(index, declaration) {
+    if (!(declaration.decorators || []).length) return true;
+    const proof = langTraits(index.files.get(declaration.file)?.language)?.decoratorsRegisterNothing;
+    if (typeof proof !== 'function') return false;
+    try { return proof(index, declaration) === true; } catch (_) { return false; }
+}
+
 /** A member of a wholly new, unreachable owner cannot capture a namesake. */
 function newOwnerUnreached(index, definition, addedLinesByFile) {
     if (!definition.className) return false;
@@ -160,7 +172,7 @@ function newOwnerUnreached(index, definition, addedLinesByFile) {
     let unreachable = false;
     const added = addedLinesByFile.get(owner.relativePath);
     if (added?.has(owner.nameLine || owner.startLine) && !owner.extends && !owner.implements &&
-        !(owner.decorators || []).length && !(owner.attributes || []).length) {
+        decoratorsRegisterNothing(index, owner) && !(owner.attributes || []).length) {
         // Name reach is the module/import scope of THIS owner, not the
         // global spelling of a field. Bases, registrations and reflection
         // remain separately guarded by the ordinary capture assessment.
@@ -360,4 +372,5 @@ function captureHazards(index, definition, facts = {}) {
     return hazards;
 }
 
-module.exports = { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, newOwnerUnreached, HAZARD_TEXT };
+module.exports = { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, newOwnerUnreached,
+    decoratorsRegisterNothing, HAZARD_TEXT };

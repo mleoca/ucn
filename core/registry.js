@@ -394,7 +394,7 @@ const FLAG_APPLICABILITY = {
     tests:        ['name', 'file', 'exclude', 'className', 'line', 'callsOnly', 'depth', 'includeMethods', 'all'],
     deps:         ['file', 'exclude', 'depth', 'direction', 'all', 'detailed', 'cycles'],
     api:          ['file', 'in', 'limit', 'includeTests'],
-    check:        ['name', 'file', 'className', 'line', 'includeMethods', 'base', 'staged', 'limit', 'strict'],
+    check:        ['name', 'file', 'className', 'line', 'includeMethods', 'base', 'staged', 'limit', 'strict', 'all'],
     plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue', 'delete'],
     repo:         ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in', 'functions', 'hot', 'deep', 'sections'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],

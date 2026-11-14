@@ -867,6 +867,140 @@ function registrationUnknown(declaration) {
     });
 }
 
-module.exports = { pythonIdentity, pythonPossibleIdentities, pythonRuntimeOwners, pythonBoundValue,
+// Decorators that hand back the declaration, or a wrapper of it, and record
+// it nowhere: nothing can reach the declaration through them. A decorator
+// outside this list may register what it decorates (a route, a fixture, a
+// signal receiver, a plugin hook).
+const INERT_DECORATORS = new Set(['builtins.property', 'builtins.classmethod', 'builtins.staticmethod',
+    'dataclasses.dataclass', 'functools.lru_cache', 'functools.cache', 'functools.cached_property',
+    'functools.wraps', 'functools.total_ordering', 'contextlib.contextmanager', 'contextlib.asynccontextmanager',
+    'typing.final', 'typing.overload', 'typing.override', 'typing.runtime_checkable', 'typing.no_type_check',
+    'enum.unique']);
+// Every member of these namespaces is one: a pytest mark attaches data to a
+// test that is collected by its name whether or not it is marked.
+const INERT_DECORATOR_NAMESPACES = ['pytest.mark.'];
+
+/**
+ * Is every decorator of a declaration one that registers nothing? Each is
+ * resolved through the file's own bindings to the identity it names (the
+ * callee, for a decorator written as a call); an identity that is not
+ * proven, that a module of the project supplies, or that is not known to
+ * be inert answers false.
+ *
+ * @param {object} index
+ * @param {object} symbol - the indexed declaration (a function or a class)
+ */
+function pythonDecoratorsRegisterNothing(index, symbol) {
+    let declaration;
+    try {
+        const tree = index._getParsedTree(symbol.file, index._readFile(symbol.file), index.files.get(symbol.file)?.language);
+        declaration = tree?.rootNode.descendantsOfType(['function_definition', 'class_definition']).find(node =>
+            node.childForFieldName('name')?.text === symbol.name &&
+            node.startPosition.row + 1 >= symbol.startLine && node.endPosition.row + 1 <= (symbol.endLine || symbol.startLine)) || null;
+    } catch { return false; }
+    if (!declaration) return false;
+    const decorated = declaration.parent;
+    if (decorated?.type !== 'decorated_definition') return true;
+    const resolved = index.files.get(symbol.file)?.moduleResolved || {};
+    const memo = new Map();
+    return decorated.namedChildren.filter(node => node.type === 'decorator').every(decorator => {
+        let expression = decorator.namedChild(0);
+        if (expression?.type === 'call') expression = expression.childForFieldName('function');
+        let identity;
+        try { identity = pythonIdentity(expression, memo); } catch { identity = null; }
+        if (!identity) return false;
+        // A module of the project under a standard name is not the standard one.
+        if (Object.keys(resolved).some(module => resolved[module] && (identity === module || identity.startsWith(`${module}.`)))) return false;
+        const canonical = identity.replace(/^typing_extensions\./, 'typing.');
+        return INERT_DECORATORS.has(canonical) || INERT_DECORATOR_NAMESPACES.some(namespace => canonical.startsWith(namespace));
+    });
+}
+
+// Names the interpreter supplies beside its callable builtins: exception and
+// warning classes, constants, and what a checker or the site module adds.
+const AMBIENT_NAMES = new Set(['ArithmeticError', 'AssertionError', 'AttributeError', 'BaseException',
+    'BaseExceptionGroup', 'BlockingIOError', 'BrokenPipeError', 'BufferError', 'BytesWarning',
+    'ChildProcessError', 'ConnectionAbortedError', 'ConnectionError', 'ConnectionRefusedError',
+    'ConnectionResetError', 'DeprecationWarning', 'EOFError', 'Ellipsis', 'EncodingWarning',
+    'EnvironmentError', 'Exception', 'ExceptionGroup', 'False', 'FileExistsError', 'FileNotFoundError',
+    'FloatingPointError', 'FutureWarning', 'GeneratorExit', 'IOError', 'ImportError', 'ImportWarning',
+    'IndentationError', 'IndexError', 'InterruptedError', 'IsADirectoryError', 'KeyError',
+    'KeyboardInterrupt', 'LookupError', 'MemoryError', 'ModuleNotFoundError', 'NameError', 'None',
+    'NotADirectoryError', 'NotImplemented', 'NotImplementedError', 'OSError', 'OverflowError',
+    'PendingDeprecationWarning', 'PermissionError', 'ProcessLookupError', 'PythonFinalizationError',
+    'RecursionError', 'ReferenceError', 'ResourceWarning', 'RuntimeError', 'RuntimeWarning',
+    'StopAsyncIteration', 'StopIteration', 'SyntaxError', 'SyntaxWarning', 'SystemError', 'SystemExit',
+    'TabError', 'TimeoutError', 'True', 'TypeError', 'UnboundLocalError', 'UnicodeDecodeError',
+    'UnicodeEncodeError', 'UnicodeError', 'UnicodeTranslateError', 'UnicodeWarning', 'UserWarning',
+    'ValueError', 'Warning', 'WindowsError', 'ZeroDivisionError', 'reveal_type', 'reveal_locals']);
+// A name a program installs into the builtins by convention (gettext).
+const INSTALLED_NAMES = new Set(['_']);
+
+/** Does any Python file of the project name the builtins namespace? */
+function projectNamesBuiltins(index) {
+    const memo = index._opMemo?.('pythonNamesBuiltins', () => ({}));
+    if (memo && memo.value !== undefined) return memo.value;
+    const { langTraits } = require('../languages');
+    let named = false;
+    for (const [file, entry] of index.files) {
+        if (!langTraits(entry.language)?.reflectionApi?.pythonBindingIdentity) continue;
+        let source;
+        try { source = index._readFile(file); } catch { named = true; break; }
+        if (/\b(?:builtins|__builtins__|__builtin__)\b/.test(source.normalize('NFKC'))) { named = true; break; }
+    }
+    if (memo) memo.value = named;
+    return named;
+}
+
+/**
+ * Is a bare name read shown to have no binding? True only when the scope
+ * it resolves in is decidable and binds nothing of that name: no local or
+ * enclosing binding, no module-level binding or import, no star import
+ * that could supply it, no `global` declaration, no write to a namespace,
+ * no builtin of that name, and no file of the project that names the
+ * builtins namespace (a program can install names into it), and no `exec`
+ * or `eval` in the file. A local the function binds only after the read is
+ * unbound there too.
+ *
+ * @param {Set<string>} ambientCallables - trait `ambientCallables`
+ */
+function pythonNameUnbound(identifier, index = null, ambientCallables = null) {
+    if (identifier?.type !== 'identifier') return false;
+    const name = pythonSourceName(identifier.text);
+    if (!name || /^__\w+__$/.test(name) || AMBIENT_NAMES.has(name) || INSTALLED_NAMES.has(name)) return false;
+    // Without the language's callable builtins nothing is shown.
+    if (!ambientCallables || ambientCallables.has(name)) return false;
+    const memo = new Map();
+    let resolved;
+    try {
+        // Code the file runs from text can bind any name.
+        if (effectsOf(identifier).calls.some(call => {
+            const callee = call.childForFieldName('function');
+            return callee?.type === 'identifier' && ['exec', 'eval'].includes(pythonSourceName(callee.text));
+        })) return false;
+        // A local of the function that holds the read, bound only by
+        // statements written after it: nothing has bound it when the read
+        // runs. A loop can run a later statement first, and a deferred body
+        // runs after the function did.
+        const scope = sourceScope(identifier, memo);
+        // A lambda or a comprehension that holds the read binds the name.
+        if (!scope || !['function_definition', 'module'].includes(scope.type)) return false;
+        if (scope.type === 'function_definition') {
+            if (effectsOf(identifier).escaped.has(name) || deferredRead(identifier, scope)) return false;
+            const sites = bindingSites(scope, identifier.text);
+            if (sites.length === 0 || sites.some(binding => binding.node.startIndex < identifier.endIndex)) return false;
+            for (let parent = identifier.parent; parent && !sameNode(parent, scope); parent = parent.parent) {
+                if (['for_statement', 'while_statement'].includes(parent.type)) return false;
+            }
+            return true;
+        }
+        resolved = resolveIdentity(identifier, memo);
+    } catch { return false; }
+    if (!resolved.certain || resolved.origins.length > 0) return false;
+    return !index || !projectNamesBuiltins(index);
+}
+
+module.exports = { pythonIdentity, pythonPossibleIdentities, pythonRuntimeOwners, pythonBoundValue, pythonNameUnbound,
+    pythonDecoratorsRegisterNothing,
     pythonSourceName, pythonNormalizedNames, pythonProjectIdentityAffected, registrationUnknown,
     pythonPatchApi, pythonPatchSpelling, pythonPossibleValues };

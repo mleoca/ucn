@@ -88,13 +88,41 @@ describe('fix #504: usable test selectors and qualified empty audit results', ()
     });
 
     it('names each changed outgoing call that requires review', () => {
-        const text = output.formatCheck({ base: 'HEAD', changed: [{
+        const result = { base: 'HEAD', changed: [{
             name: 'run', file: 'app.ts', line: 2, verdict: 'review',
             reasons: ['outgoing-call-unverified'],
             outgoingReview: [{ file: 'app.ts', line: 4, column: 3,
                 name: 'scale', reason: 'outgoing-target-unresolved' }],
-        }] });
-        assert.match(text, /app\.ts:4:4 {2}scale: outgoing-target-unresolved/);
+        }] };
+        assert.match(output.formatCheck(result, { all: true }), /app\.ts:4:4 {2}scale: outgoing-target-unresolved/);
+    });
+
+    it('fix #506: unverified outgoing calls are one line per symbol, each call a row when all is asked for', () => {
+        const rows = [
+            { file: 'app.py', line: 4, column: 11, name: 'Box', reason: 'call-interface-unverified' },
+            { file: 'app.py', line: 4, column: 11, name: '__init__', reason: 'call-interface-unverified' },
+            { file: 'app.py', line: 5, column: 4, name: 'scale', reason: 'result-use-unverified' },
+            { file: 'app.py', line: 6, column: 4, name: 'add', reason: 'argument-compatibility-unverified' },
+            { file: 'app.py', line: 7, column: 4, name: 'add', reason: 'argument-compatibility-unverified' },
+        ];
+        const result = { base: 'HEAD', changed: [{
+            name: 'run', file: 'app.py', line: 2, verdict: 'blocked', signatureMismatches: 1,
+            reasons: ['outgoing-signature-mismatch'],
+            mismatches: [{ file: 'app.py', line: 3, expression: 'add(1)', expected: '2 arg(s)', actual: 1, target: 'add' }],
+            outgoingReview: rows,
+        }] };
+        const text = output.formatCheck(result, { allHint: 'use --all' });
+        // Two rows of one construction are one call; reasons by count, then name.
+        assert.match(text, /^ {4}↳ 4 outgoing call\(s\) not verified \(argument-compatibility-unverified 2, call-interface-unverified 1, result-use-unverified 1\); use --all to list each$/m);
+        assert.doesNotMatch(text, /app\.py:5:5/);
+        // The definite mismatch keeps its row and names the callee; the tag
+        // of a drifted signature is for call sites of the item itself.
+        assert.match(text, /↳ app\.py:3 {2}add\(1\) {2}add: {2}expected 2 arg\(s\), got 1/);
+        assert.doesNotMatch(text, /SIG-DRIFT/);
+        const all = output.formatCheck(result, { all: true, allHint: 'use --all' });
+        for (const row of rows) assert.ok(all.includes(`↳ ${row.file}:${row.line}:${row.column + 1}  ${row.name}: ${row.reason}`), all);
+        assert.doesNotMatch(all, /outgoing call\(s\) not verified/);
+        assert.strictEqual(output.formatCheck(result, { allHint: 'use --all' }), text, 'the same answer twice');
     });
 });
 

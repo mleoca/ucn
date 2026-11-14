@@ -61,7 +61,7 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `--include-bundled` | Index `*.min.js` and `*.bundle.js`, respecting user exclusions and bypassing the shared cache. By default they are searched for each name and listed only when the name occurs in them. `*.map` files are data and stay unindexed. MCP: `include_bundled=true`. |
 | `--depth=N` | Trace, dependency, or test traversal depth, 0 to 100. Omitted: `trace` 3, `trace --to=entrypoints` 5, `deps` 2, `tests` 0 (direct links only). |
 | `--direction=<value>` | Trace (`callees`/`callers`) or dependency (`imports`/`importers`/`both`) direction. |
-| `--all` | Lift result and formatter caps where a command supports it, including every unverified list of `show` and `impact`; the truncation notice says when it does. |
+| `--all` | Lift result and formatter caps where a command supports it, including every unverified list of `show` and `impact` and each unverified outgoing call of target-less `check`; the truncation notice says when it does. |
 | `--max-chars=N` | Text budget in characters (10K targeted / 3K broad by default; 100K ceiling), including notices and trust lines. Trust lines are reserved first; a limit too small for them withholds the answer and names the budget that carries them. MCP: `max_chars`. CLI JSON is uncapped even with an explicit budget; `meta.maxChars` is `"not-applied"`. |
 | `--compact` / `--no-compact` | Token-efficient or full presentation (`show`/`impact` default compact, `usages` full). |
 | `--range=N-M` | Explicit line range with `source <file>` or `source --file=<path>`. |
@@ -128,6 +128,20 @@ Target-less `impact` and `check` diff the working tree against `HEAD` and includ
 ### check
 
 `check <handle>` validates confirmed call-site arity and compares the declaration with its version at `--base` (default `HEAD`): call sites the old declaration bound are checked against the new signature and the remaining overloads. A site that fits no overload is a mismatch, never an excluded other-target line; one that another overload may take after the change is uncertain. Target-less `check` composes the diff impact, signature validation and affected tests for the pending change; modified or deleted type declarations, and deleted values, make it `BLOCKED` until reviewed with the language toolchain, because arity checks cannot validate shape or inheritance compatibility. A modified field, constant or module value is a `value_change` warning with its value access sites (`REVIEW_REQUIRED`). A changed line belongs to each callable whose own source changed: a member added to a one-line class is `ADDED`, and the members beside it on that line stay unchanged.
+
+Calls in changed lines are checked against the project declarations they bind. A call that cannot fit (count, keyword names) is a break: the item is `BLOCKED` with reason `outgoing-signature-mismatch`, its row names the callee, and the action line says which call does not fit. A member call is checked when its receiver's type is established, a receiver typed by its construction included; in a language with overloads a count that fits no overload leaves the binding open and is review. A call that fits is settled, or it is one of the item's unverified outgoing calls (`outgoing-call-unverified`), each with one reason:
+
+| Reason | What is not shown |
+|--------|-------------------|
+| `argument-compatibility-unverified` | An argument's type fits its parameter. Shown for: a parameter with no written type (Python, TypeScript; a literal default types it), a small integer, plain string or boolean literal into a written builtin type, the caller's own parameter under the same written type, an argument the change did not write. |
+| `result-use-unverified` | Where the call's value goes accepts it. Shown for: a discarded value, a value returned from a callable whose result type is read from its body, a value returned as the same written type. An unannotated Python result follows the arguments an untyped parameter received. |
+| `call-interface-unverified` | The declaration's parameters are the call interface: a constructor, an overloaded or redeclared name, a decorated, abstract or hidden member, a member of a derived owner, a free function with a receiver parameter. |
+| `call-requirements-unverified` | What the language requires of a new call beyond its binding (access, safety, checked exceptions, constraints, type arguments, a type-only import). Go, Rust, Java, C#, C and C++ settle a changed call only when the base revision made it in the same written context. |
+| `argument-count-not-static` | A spread or unpacking: the checker counts a fixed-length value, the engine does not. |
+| `unresolved-callee` | Python: a bare name with no local, enclosing or module binding, no import or star import that supplies it and no builtin; also a local bound only below the call. |
+| `uncertain-receiver`, `possible-dispatch`, `outgoing-target-unresolved`, constructor reasons | Which project declaration the call reaches. |
+
+Text prints one line per symbol, `N outgoing call(s) not verified (reason count, ...)`, and the same line among the action items; `--all` prints a row per call. JSON always carries the rows (`outgoingReview`) and the counts (`outgoingCalls: { unverified, reasons }`). An added declaration whose decorators all resolve to identities that register nothing (`dataclasses.dataclass`, `functools.lru_cache`, `pytest.mark.*`) is not `registered`; members of an added class no existing code names are judged by the class's name, not their own; a test double written by the change for the declaration it adds is no `reflection-reachable` hazard.
 
 ### plan
 

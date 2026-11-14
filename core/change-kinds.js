@@ -1104,4 +1104,5 @@ function parseRevision(content, language) {
 module.exports = {
     callableContract, classifyChange, baseCounterpart, parseRevision,
     declaresPlainReturn, moduleStatements, providedNames, moduleChange,
+    bindingTargets, identifiersOf, callableNodeOf, rangeOf,
 };

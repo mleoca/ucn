@@ -378,8 +378,8 @@ module.exports = [
         },
         "name": "useScale",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "useScale:modified=review(outgoing-call-unverified)"
+        "answer": "BLOCKED",
+        "detail": "useScale:modified=blocked(outgoing-signature-mismatch)"
     },
     {
         "id": "outgoing-py-constructor-missing",
@@ -593,8 +593,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "BLOCKED",
+        "detail": "changed:modified=blocked(outgoing-signature-mismatch)"
     },
     {
         "id": "outgoing-review-py-receiver-rebound",
@@ -607,8 +607,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "BLOCKED",
+        "detail": "changed:modified=blocked(outgoing-signature-mismatch)"
     },
     {
         "id": "outgoing-review-ts-suppression-removed",
@@ -1336,8 +1336,8 @@ module.exports = [
         },
         "expect": "clean",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "outgoing-review2-family-pragma-order",

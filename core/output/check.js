@@ -23,7 +23,33 @@ function callersText(it) {
     return callers;
 }
 
-function itemLines(it) {
+/** `3 outgoing call(s) not verified (reason 2, reason 1)`. */
+function outgoingSummaryText(summary) {
+    return `${summary.unverified} outgoing call(s) not verified (` +
+        `${summary.reasons.map(entry => `${entry.reason} ${entry.calls}`).join(', ')})`;
+}
+
+/**
+ * The calls behind the rows of an item's outgoing review: how many call
+ * sites are not verified, and how many of them each reason holds (a site
+ * can have several). Reasons are in a fixed order: most sites first, then
+ * by name.
+ */
+function outgoingSummary(rows) {
+    const sites = new Set();
+    const byReason = new Map();
+    for (const row of rows) {
+        const site = `${row.file}\0${row.line}\0${row.column ?? ''}`;
+        sites.add(site);
+        if (!byReason.has(row.reason)) byReason.set(row.reason, new Set());
+        byReason.get(row.reason).add(site);
+    }
+    const reasons = [...byReason].map(([reason, held]) => ({ reason, calls: held.size }))
+        .sort((a, b) => b.calls - a.calls || (a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : 0));
+    return { unverified: sites.size, reasons };
+}
+
+function itemLines(it, options = {}) {
     const tags = [];
     if (it.kind && it.kind !== 'changed') tags.push(it.kind.toUpperCase());
     if (it.verdict === 'ready' && it.kind === 'modified') {
@@ -33,7 +59,10 @@ function itemLines(it) {
     if (it.verdict !== 'ready') {
         for (const reason of it.reasons || []) if (reason !== 'signature-mismatch') tags.push(reason);
     }
-    if (it.signatureMismatches > 0) tags.push(`SIG-DRIFT(${it.signatureMismatches})`);
+    // Call sites that do not fit this declaration. A call it makes that
+    // does not fit its callee is named by its own reason and row.
+    const made = (it.mismatches || []).filter(row => row.target && !row.unchecked).length;
+    if (it.signatureMismatches - made > 0) tags.push(`SIG-DRIFT(${it.signatureMismatches - made})`);
     if (it.orphan) tags.push('ORPHAN');
     if (it.symbolType) tags.push(it.symbolType);
     // Caller evidence matters where the callers do.
@@ -48,10 +77,21 @@ function itemLines(it) {
         const problem = m.expected ? `expected ${m.expected}, got ${m.actual}` : (m.reason || 'arity mismatch');
         const where = m.file ? `${m.file}:${m.line}` : '';
         const expression = m.expression ? `  ${String(m.expression).trim()}` : '';
-        lines.push(`    ↳ ${where}${expression}  ${problem}${m.unchecked ? '  (not checked by the toolchain)' : ''}`);
+        // A call the item makes: the callee it does not fit.
+        const callee = m.target ? `  ${m.target}:` : '';
+        lines.push(`    ↳ ${where}${expression}${callee}  ${problem}${m.unchecked ? '  (not checked by the toolchain)' : ''}`);
     }
-    for (const site of it.outgoingReview || []) {
-        lines.push(`    ↳ ${site.file}:${site.line}${site.column != null ? `:${site.column + 1}` : ''}  ${site.name}: ${site.reason}`);
+    // Calls the item makes that are not verified: one line with the count
+    // and the reasons; each call is a row of its own when everything is
+    // asked for. A definite mismatch is always listed above.
+    const review = it.outgoingReview || [];
+    if (review.length > 0 && options.all) {
+        for (const site of review) {
+            lines.push(`    ↳ ${site.file}:${site.line}${site.column != null ? `:${site.column + 1}` : ''}  ${site.name}: ${site.reason}`);
+        }
+    } else if (review.length > 0) {
+        lines.push(`    ↳ ${outgoingSummaryText(it.outgoingCalls || outgoingSummary(review))}` +
+            `${options.allHint ? `; ${options.allHint} to list each` : ''}`);
     }
     const sites = it.sites || [];
     const definite = it.verdict === 'blocked';
@@ -64,7 +104,12 @@ function itemLines(it) {
     return lines;
 }
 
-function formatCheck(result) {
+/**
+ * @param {object} result - core/check.js check()
+ * @param {object} [options] - { all: list every unverified outgoing call,
+ *   allHint: how this surface asks for that }
+ */
+function formatCheck(result, options = {}) {
     if (!result) return 'No check result.';
     if (result.ok === false) {
         // The gate could not run — never render this like a clean tree.
@@ -117,7 +162,7 @@ function formatCheck(result) {
             const group = items.filter(it => (it.verdict || 'review') === verdict);
             if (group.length === 0) continue;
             lines.push(`${title} (${group.length}) — ${meaning}:`);
-            for (const it of group) lines.push(...itemLines(it));
+            for (const it of group) lines.push(...itemLines(it, options));
         }
     }
 
@@ -166,4 +211,4 @@ function formatCheckJson(result) {
     return JSON.stringify(result, null, 2);
 }
 
-module.exports = { formatCheck, formatCheckJson };
+module.exports = { formatCheck, formatCheckJson, outgoingSummary, outgoingSummaryText };

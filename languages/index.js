@@ -199,6 +199,38 @@ const STRUCTURAL_TRAITS = {
     hasArityOverloads: false,
     // Bounded literal proofs for changed project calls; absent means unknown.
     checkLiteralArguments: null,
+    // What a checker requires of a call beyond the binding of its callee.
+    // true: a call that binds one project declaration is available as it
+    // is written. false: access, safety, exception or constraint rules can
+    // still refuse it, and none of them is modeled.
+    callAvailableByBinding: true,
+    // What a checker makes of a parameter with no written type. null:
+    // every parameter has one, or none is checked. Otherwise
+    // { defaultTypes: the type a literal default gives the parameter, by
+    // the literal's kind; openDefaults: defaults that leave it open;
+    // resultFollowsArguments: an unannotated result is read again from
+    // the arguments of each call }. A parameter with neither a type nor a
+    // default takes any argument.
+    untypedParameters: null,
+    // (callee identifier node, index) => true when the bare name is shown
+    // to have no binding where it is written: no local, enclosing or
+    // module binding, no import that can supply it, no builtin. null: the
+    // names a file can use are not all written in it.
+    unboundCallee: null,
+    // true where the receiver is an ordinary first parameter named by
+    // convention (`self`, `cls`): a function that is not a member takes
+    // that parameter as an argument like any other.
+    receiverParameterByConvention: false,
+    // Files that only declare what other files implement (Python stubs,
+    // TypeScript ambient declarations): a checker reads a name's interface
+    // there. null: the language has none.
+    declarationFilePattern: null,
+    // (index, declaration) => true when every decorator of the declaration
+    // is shown, by the identity its binding resolves to, to register
+    // nothing: it hands back the declaration or a wrapper and records it
+    // nowhere. null: a decorator's identity is not resolved, so any
+    // decorator may register what it decorates.
+    decoratorsRegisterNothing: null,
     checkDirectiveComment: null,
     checkFileDirectiveComment: null,
     checkDirectiveTarget: null,
@@ -600,6 +632,13 @@ const NOMINAL_TRAITS = {
     hasArityOverloads: false,
     // Bounded literal proofs for changed project calls; absent means unknown.
     checkLiteralArguments: null,
+    // See STRUCTURAL_TRAITS.
+    callAvailableByBinding: false,
+    untypedParameters: null,
+    unboundCallee: null,
+    decoratorsRegisterNothing: null,
+    declarationFilePattern: null,
+    receiverParameterByConvention: false,
     checkDirectiveComment: null,
     checkFileDirectiveComment: null,
     checkDirectiveTarget: null,
@@ -987,6 +1026,9 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             checkLiteralArguments: { smallInteger: ['number'], string: ['string'], boolean: ['boolean'] },
+            untypedParameters: { defaultTypes: { integer: 'number', float: 'number', string: 'string', boolean: 'boolean' },
+                openDefaults: [], resultFollowsArguments: false },
+            declarationFilePattern: /\.d\.[cm]?ts$/,
             checkDirectiveComment: text => require('./javascript').checkDirectiveComment(text),
             checkFileDirectiveComment: text => require('./javascript').checkFileDirectiveComment(text),
             checkDirectiveTarget: 'next-line',
@@ -1025,6 +1067,9 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             checkLiteralArguments: { smallInteger: ['number'], string: ['string'], boolean: ['boolean'] },
+            untypedParameters: { defaultTypes: { integer: 'number', float: 'number', string: 'string', boolean: 'boolean' },
+                openDefaults: [], resultFollowsArguments: false },
+            declarationFilePattern: /\.d\.[cm]?ts$/,
             checkDirectiveComment: text => require('./javascript').checkDirectiveComment(text),
             checkFileDirectiveComment: text => require('./javascript').checkFileDirectiveComment(text),
             checkDirectiveTarget: 'next-line',
@@ -1063,6 +1108,15 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             checkLiteralArguments: { smallInteger: ['int', 'float'], string: ['str'], boolean: ['bool'] },
+            // An unannotated parameter takes its type from a literal default
+            // (`factor=2` is an int); `None` leaves it open, and so does no
+            // default. An unannotated result is inferred per call site.
+            untypedParameters: { defaultTypes: { integer: 'int', float: 'float', string: 'str', boolean: 'bool' },
+                openDefaults: ['None'], resultFollowsArguments: true },
+            unboundCallee: (identifier, index) => require('../core/python-binding-identity').pythonNameUnbound(identifier, index, PY_AMBIENT_CALLABLES),
+            declarationFilePattern: /\.pyi$/,
+            receiverParameterByConvention: true,
+            decoratorsRegisterNothing: (index, declaration) => require('../core/python-binding-identity').pythonDecoratorsRegisterNothing(index, declaration),
             checkDirectiveComment: text => require('./python').checkDirectiveComment(text),
             checkFileDirectiveComment: text => require('./python').checkFileDirectiveComment(text),
             testUnits: (fileEntry, helpers) => require('./python').testUnits(fileEntry, helpers),
