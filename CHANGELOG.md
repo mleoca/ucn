@@ -2,6 +2,73 @@
 
 One section per released version, written from the commit subjects by `scripts/changelog.js` when the version is cut.
 
+## 5.6.0 - 2026-11-14
+
+### Features
+
+- one parameter table writes the MCP schema, the CLI parser and the engine's refusals and defaults, a line listing under a budget keeps the rows that fit, and each version gets its notes from the commits (9dd9646)
+- one model of a test, and the command that runs it only where the runner is proven (3adc8e4)
+- check answers by what a change did, and --staged reads the git index (a86c449)
+- plan --delete answers whether a declaration can be deleted (69adaf6)
+- one deletion rule for the audit and for a single declaration (eda1e6e)
+
+### Fixes
+
+- bind repo summaries to saved state and preserve reflection syntax (7025e00)
+- preserve bounded surface contracts and release version identity (0032bda)
+- preserve constructor uncertainty and complete unverified output (78efe1b)
+- a constructed receiver has the class its name denotes where it is written, every unverified list takes its rows from --top and --all, and each unverified reason says how often it was a real call (93f74b9)
+- find reference-only tests and honor inherited JUnit runners (d7efdc4)
+- a type inside generic types is the nesting it is written in, a method's modifiers do to its mark what each framework says, and what a test executes is test code whatever its file is called (c666151)
+- a parameter type and a base are what their names denote where they are written, a test a method may have replaced says so, and two inherited tests of one name are two (5c1ea4e)
+- a method of the same name with other parameters is another method, and each runner says what an override does to an inherited test (c810e87)
+- a declaration is kept apart from its state, a class has what its lookup order finds first, and a table runs a test only through a row that does (7b32ad2)
+- an unknown switch is not an absent one, a configuration is read only as one written-out object, and a count says when tests are missing from it (3d445ca)
+- a test is what its names hold after every write, its body any expression, and its command what the runner's own configuration leaves (9d41a4e)
+- a test's marks and names are read as syntax, in the scope of the call, by each runner's own rule (48485f8)
+- a test is one declaration, runs where its class is, and is the runner's by binding (35e8339)
+- a suppression belongs to the call that was measured, and the last file pragma decides (0b0775c)
+- check reads a suppression as the checker does, holds a constructor to its statics, and keeps nothing between checks (ab067d5)
+- check claims a break only where the toolchain looks, and ready only where nothing can hold the change (ef25de7)
+- check reads what ends a path, a type's shape and the whole git index (6060e66)
+- contract shapes the deletion verdict cleared, judged by the compilers (fc2ad44)
+- a member a project contract requires is not dead (db52388)
+- bound the site sample and let a readable-again file be searched again (979c4be)
+- close four gaps in the per-name completeness model (c15e395)
+- make completeness a claim about one name, not about the repository (8f7a8d4)
+
+### Performance
+
+- repo reads its HOT ranking and its eval and reflection counts from the index instead of recomputing them, and a chain of reflective accesses records every access (c06afe0)
+
+### Refactoring
+
+- one count of what there is to review (b56a49b)
+
+### Documentation
+
+- the README states the test-unit matrix result under the matrix's rules for skipped and conditional tests and each runner's selection scope (1855204)
+- the README reports the November 14 release dry run and the three toolchain matrices, states the live partition of the ripgrep example, and the skill and tool description name the per-test commands and the deletion assessment (1d1d514)
+
+### Tests
+
+- reject altered or bypassed release gate commands (d1edfca)
+- the release-gate guard reads each job's steps and time limit for every planned runner, so a partial enrolment of the matrices and the outcome gate fails and a complete one passes (47fa591)
+- a declaration whose whole file is gone is assessed by what still names it (6ff794d)
+
+### Evaluation
+
+- a query class under one second blocks a release only above both 20% and 100 ms (71a00ba)
+- pin an application with vendored bundles on the scheduled board (7d793b0)
+- score outcome tasks only where the judge looks, pin exceptions exactly (bfc1188)
+- measure whether answers can be acted on (f349427)
+
+### Maintenance
+
+- the release gate runs the three toolchain matrices and the outcome gate, in the publish job and in the pre-tag dry run, with the toolchains they were qualified with (e35c42c)
+- the test-unit matrix runs every case without a marker of continuous integration, so a runner on GitHub Actions accepts what it accepts on a developer's machine (de29521)
+- the deletion, check and test-unit matrices run in the Eval workflow on a runner of their own, and each report names the toolchain versions that judged (e2d520b)
+
 ## 5.5.3 - 2026-11-09
 
 ### Fixes
