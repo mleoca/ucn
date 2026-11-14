@@ -2,6 +2,17 @@
 
 One section per released version, written from the commit subjects by `scripts/changelog.js` when the version is cut.
 
+## 5.6.1 - 2026-11-14
+
+### Fixes
+
+- deletion verdicts hold for mock-patch targets and packaging entry points and cite only proven uses, check judges the calls a change adds, a change selects tests by its declaration, and the pre-commit check repeats less work (525369e)
+
+### Documentation
+
+- the README reports the check and test-unit matrices at their current size, 507 single changes and 344 test projects (30923d8)
+- the README's ripgrep example states only what its animation shows (8e51ac2)
+
 ## 5.6.0 - 2026-11-14
 
 ### Features
