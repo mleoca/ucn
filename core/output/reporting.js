@@ -218,6 +218,8 @@ function formatDeadcode(results, options = {}) {
         !results.excludedDynamicDispatch && !results.excludedRequiredSlot &&
         results.projectKind !== 'application' && !results.computedDispatch?.count &&
         !results.reflection?.withheld && !results.reflection?.dynamicCount && !results.reflection?.literalCount &&
+        !results.reflection?.withheldByTable?.length && !results.macroPaste?.withheld &&
+        !results.macroPaste?.blind?.count && !results.macroRulesBlind?.count &&
         results.coverage?.complete !== false) {
         return 'No dead code found.';
     }
@@ -233,6 +235,8 @@ function formatDeadcode(results, options = {}) {
         } else {
             lines.push(`Dead code: ${results.length} unused symbol(s)\n`);
         }
+    } else {
+        lines.push('Dead code: 0 unused symbol(s)\n');
     }
 
     let currentFile = null;

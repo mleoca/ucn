@@ -20,12 +20,11 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
+const { codeUnitCompare, lineInRanges } = require('./shared');
 const { paramDefault } = require('./registry');
 const { isTestFile } = require('./discovery');
-const { getCachedCalls } = require('./callers');
 const { getLanguageAdapter } = require('../languages');
-const { createTestModel, addTestCaseRows, linkFiles, commandsFor } = require('./test-units');
+const { createTestModel, addTestCaseRows, linkFiles, commandsFor, testSite, testSiteKey } = require('./test-units');
 
 /**
  * Contract-mode caller expansion for the tree commands. Memoizes the full
@@ -34,10 +33,10 @@ const { createTestModel, addTestCaseRows, linkFiles, commandsFor } = require('./
  * frontier display and the affected-tests possible closure need them all.
  */
 function _contractCallers(index, funcDef, { includeMethods, callerCache, pin }) {
-    const nodeKey = `${funcDef.file}:${funcDef.startLine}`;
-    const cacheKey = funcDef.bindingId
-        ? `${funcDef.name}:${funcDef.bindingId}`
-        : `${funcDef.name}:${nodeKey}`;
+    if (funcDef.syntheticScope) return { confirmed: [], unverified: [], raw: [] };
+    const nodeKey = declarationKey(funcDef);
+    const definitionKey = `${funcDef.name}:${nodeKey}`;
+    const cacheKey = `${pin ? 'pinned:' : ''}${definitionKey}`;
     let res = callerCache.get(cacheKey);
     if (!res) {
         const raw = index.findCallers(funcDef.name, {
@@ -85,56 +84,40 @@ function _aggregateExcluded(treeAccount, raw) {
  * to its symbol-table definition (pseudo-definition when absent). Shared by
  * the confirmed trunk and the expand-unverified path.
  */
+function declarationKey(def) {
+    return [def.file, def.name, def.type || '', def.className || '', def.namespace || '',
+        def.sourceSpan?.start ?? def.startLine, def.sourceSpan?.end ?? def.endLine].join(':');
+}
+
+function callerDefinition(index, site) {
+    const candidates = (index.symbols.get(site.callerName) || []).filter(def =>
+        def.file === site.callerFile && def.startLine === site.callerStartLine);
+    const { containsCall } = require('./callable-scope');
+    const exact = candidates.filter(def => containsCall(def, testSite(site)) === true)
+        .sort((a, b) => (a.sourceSpan.end - a.sourceSpan.start) - (b.sourceSpan.end - b.sourceSpan.start));
+    if (exact.length > 0) return exact[0];
+    return candidates.length === 1 ? candidates[0] : null;
+}
+
 function _resolveCallerEntries(index, callers, exclude) {
     const uniqueCallers = new Map();
-    for (const c of callers) {
-        if (exclude.length > 0 && !index.matchesFilters(c.relativePath, { exclude })) continue;
-        const hasNamedCaller = !!c.callerName;
-        const callerName = c.callerName || '(module/anonymous scope)';
-        const callerStartLine = hasNamedCaller ? c.callerStartLine : c.line;
-        const callerKey = hasNamedCaller && c.callerStartLine
-            ? `${c.callerFile}:${c.callerStartLine}`
-            : `${c.callerFile}:${callerName}:${callerStartLine || c.line || 0}`;
-        if (!uniqueCallers.has(callerKey)) {
-            uniqueCallers.set(callerKey, {
-                name: callerName,
-                file: c.callerFile,
-                relativePath: c.relativePath,
-                startLine: callerStartLine,
-                endLine: hasNamedCaller ? c.callerEndLine : c.line,
-                callSites: 1,
-                reason: c.reason,
-                syntheticScope: !hasNamedCaller,
-            });
-        } else {
-            uniqueCallers.get(callerKey).callSites++;
-        }
+    for (const site of callers) {
+        if (exclude.length > 0 && !index.matchesFilters(site.relativePath, { exclude })) continue;
+        const named = callerDefinition(index, site);
+        const def = named || {
+            name: site.callerName || '(module/anonymous scope)',
+            file: site.callerFile || site.file, relativePath: site.relativePath,
+            startLine: site.callerStartLine || site.line, endLine: site.callerEndLine || site.line,
+            type: 'function', syntheticScope: true,
+        };
+        const key = named ? declarationKey(named) : `${declarationKey(def)}:${testSiteKey(site)}`;
+        if (uniqueCallers.has(key)) uniqueCallers.get(key).callSites++;
+        else uniqueCallers.set(key, { def, callSites: 1, reason: site.reason });
     }
-
-    const callerEntries = [];
-    for (const [, caller] of uniqueCallers) {
-        const defs = index.symbols.get(caller.name);
-        let callerDef = defs?.find(d => d.file === caller.file && d.startLine === caller.startLine);
-        if (!callerDef) {
-            // Pseudo-definition for callers not in symbol table
-            callerDef = {
-                name: caller.name,
-                file: caller.file,
-                relativePath: caller.relativePath,
-                startLine: caller.startLine,
-                endLine: caller.endLine,
-                type: 'function'
-            };
-        }
-        if (caller.syntheticScope) callerDef.syntheticScope = true;
-        callerEntries.push({ def: callerDef, callSites: caller.callSites, reason: caller.reason });
-    }
-
-    // Stable sort by file + line
-    callerEntries.sort((a, b) =>
-        codeUnitCompare(a.def.file, b.def.file) || a.def.startLine - b.def.startLine
-    );
-    return callerEntries;
+    return [...uniqueCallers.values()].sort((a, b) =>
+        codeUnitCompare(a.def.file, b.def.file) || a.def.startLine - b.def.startLine ||
+        (a.def.sourceSpan?.start || 0) - (b.def.sourceSpan?.start || 0) ||
+        codeUnitCompare(declarationKey(a.def), declarationKey(b.def)));
 }
 
 /**
@@ -176,7 +159,7 @@ function trace(index, name, options = {}) {
 
     const buildTree = (funcDef, currentDepth, dir) => {
         const funcName = funcDef.name;
-        const key = `${funcDef.file}:${funcDef.startLine}`;
+        const key = declarationKey(funcDef);
         if (currentDepth > maxDepth) {
             return null;
         }
@@ -381,7 +364,7 @@ function blast(index, name, options = {}) {
         };
 
         const buildCallerTree = (funcDef, currentDepth, chainUnverified) => {
-            const key = `${funcDef.file}:${funcDef.startLine}`;
+            const key = declarationKey(funcDef);
             if (currentDepth > maxDepth) return null;
             if (visited.has(key)) {
                 return {
@@ -413,9 +396,12 @@ function blast(index, name, options = {}) {
                 ...(chainUnverified && { chainUnverified: true }),
                 children: []
             };
+            if (collect && !chainUnverified) collect.onNode?.(funcDef);
 
             if (currentDepth < maxDepth) {
-                const { confirmed, unverified, raw } = _contractCallers(index, funcDef, { includeMethods, callerCache });
+                const { confirmed, unverified, raw } = _contractCallers(index, funcDef, {
+                    includeMethods, callerCache, pin: options._pinDefinitions,
+                });
                 treeAccount.nodesExpanded++;
                 _aggregateExcluded(treeAccount, raw);
                 if (currentDepth === 0) rootRaw = raw;
@@ -430,8 +416,7 @@ function blast(index, name, options = {}) {
                     if (currentDepth === 0) rootFiltered += before - callers.length;
                 }
                 const recursiveCallers = callers.filter(c =>
-                    c.callerFile === funcDef.file &&
-                    c.callerStartLine === funcDef.startLine);
+                    declarationKey(callerDefinition(index, c) || {}) === declarationKey(funcDef));
                 if (recursiveCallers.length > 0) {
                     callers = callers.filter(c => !recursiveCallers.includes(c));
                     node.selfRecursive = true;
@@ -479,7 +464,7 @@ function blast(index, name, options = {}) {
                     treeAccount.truncatedChildren += node.truncatedChildren;
                     // Count truncated callers in summary
                     for (const { def: cDef } of callerEntries.slice(maxChildren)) {
-                        const tKey = `${cDef.file}:${cDef.startLine}`;
+                        const tKey = declarationKey(cDef);
                         if (!visited.has(tKey)) {
                             if (chainUnverified) {
                                 possiblyAffectedSet.add(tKey);
@@ -505,7 +490,7 @@ function blast(index, name, options = {}) {
                         }
                     }
                     for (const { def: cDef } of unvEntries.slice(maxChildren)) {
-                        const tKey = `${cDef.file}:${cDef.startLine}`;
+                        const tKey = declarationKey(cDef);
                         if (!visited.has(tKey)) possiblyAffectedSet.add(tKey);
                     }
                 }
@@ -518,6 +503,14 @@ function blast(index, name, options = {}) {
         };
 
         const tree = buildCallerTree(def, 0, false);
+
+        if (options._testSitesOnly) {
+            // Internal check selection needs only the declarations observed
+            // by _collect. Caller tiering above still uses collectAccount;
+            // the root account/frontier below are public presentation, not
+            // evidence that can change the confirmed traversal.
+            return { root: name, file: def.relativePath, line: def.startLine, maxDepth };
+        }
 
         // Root text-ground account (the context/impact contract at hop 1).
         // Ground call-lines no candidate claimed are frontier entries too —
@@ -635,8 +628,7 @@ function reverseTrace(index, name, options = {}) {
                 if (isExpansion) treeAccount.filteredEdges += before - conf.length - unv.length;
             }
             const recursive = conf.filter(c =>
-                c.callerFile === funcDef.file &&
-                c.callerStartLine === funcDef.startLine);
+                declarationKey(callerDefinition(index, c) || {}) === declarationKey(funcDef));
             if (recursive.length > 0) {
                 conf = conf.filter(c => !recursive.includes(c));
                 if (isExpansion) treeAccount.recursiveEdges += recursive.length;
@@ -645,7 +637,7 @@ function reverseTrace(index, name, options = {}) {
         };
 
         const buildCallerTree = (funcDef, currentDepth, chainUnverified) => {
-            const key = `${funcDef.file}:${funcDef.startLine}`;
+            const key = declarationKey(funcDef);
             if (currentDepth > maxDepth) return null;
             if (visited.has(key)) {
                 return {
@@ -705,7 +697,7 @@ function reverseTrace(index, name, options = {}) {
                     node.truncatedChildren = callerEntries.length - maxChildren;
                     // Count entry points in truncated branches so summary is accurate
                     for (const { def: cDef } of callerEntries.slice(maxChildren)) {
-                        const cKey = `${cDef.file}:${cDef.startLine}`;
+                        const cKey = declarationKey(cDef);
                         if (!visited.has(cKey)) {
                             const tiers = nodeCallers(cDef, false);
                             if (tiers.confirmed.length === 0 && tiers.unverified.length === 0 &&
@@ -846,510 +838,151 @@ function affectedTests(index, name, options = {}) {
     index._beginOp();
     try {
         const maxDepth = Math.max(0, options.depth ?? 3);
-        // Step 1: confirmed closure via blast (contract mode, no truncation).
-        // The collector records, per trunk name, (a) whether the engine
-        // searched its callers and (b) where the confirmed edges sit — the
-        // coverage bands below must agree with that answer instead of
-        // re-deciding it with a text scan (fix #246: the scan credited call
-        // sites the same payload's account excluded, and missed confirmed
-        // edges text can't see — renamed destructure aliases, callback refs).
-        const expandedNames = new Set();
-        const confirmedSitesByName = new Map(); // name → Map(relPath → Set(line))
+        // Traverse production callers only to the requested depth. Every
+        // declaration reached, including a boundary declaration, then has
+        // its immediate test sites adjudicated against its own identity.
+        // Inspecting those sites never extends the production closure.
+        const callerCache = options._callerCache || new Map();
+        const definitions = new Map();
+        const keyOf = declarationKey;
         const blastResult = index.blast(name, {
-            depth: maxDepth,
-            file: options.file,
-            className: options.className,
-            // A pin on the declaration's line: one of several same-name
-            // definitions in a file.
-            line: options.line,
-            _callerCache: options._callerCache,
-            all: true,
-            exclude: options.exclude,
-            includeMethods: options.includeMethods,
-            _collect: {
-                onExpand: (funcDef) => expandedNames.add(funcDef.name),
-                onConfirmed: (funcDef, c) => {
-                    let byFile = confirmedSitesByName.get(funcDef.name);
-                    if (!byFile) { byFile = new Map(); confirmedSitesByName.set(funcDef.name, byFile); }
-                    let lines = byFile.get(c.relativePath);
-                    if (!lines) { lines = new Set(); byFile.set(c.relativePath, lines); }
-                    lines.add(c.line);
-                },
-            },
+            depth: maxDepth, file: options.file, className: options.className,
+            line: options.line, _callerCache: callerCache, _pinDefinitions: true,
+            all: true, exclude: options.exclude, includeMethods: options.includeMethods,
+            _collect: { onNode: def => definitions.set(keyOf(def), def) },
+            _testSitesOnly: options._testSitesOnly,
         });
         if (!blastResult) return null;
-
-        // Step 2: Collect confirmed-affected function names (and node keys).
-        // Also record each name's CLASS identity from the tree — interior
-        // names were scanned bare (post-#239), so a test of a DIFFERENT
-        // class's same-named method got credited as coverage (fix #244:
-        // `asyncio.run(...)` credited as covering Mgr.run).
-        const affectedNames = new Set();
-        const confirmedKeys = new Set();
-        const nameToClasses = new Map(); // name → Set(className|null)
-        affectedNames.add(name);
-        const collectNames = (node) => {
-            if (!node) return;
-            affectedNames.add(node.name);
-            confirmedKeys.add(`${node.file}:${node.line}`);
-            const defs = index.symbols.get(node.name);
-            const d = defs?.find(x => x.relativePath === node.file && x.startLine === node.line);
-            let set = nameToClasses.get(node.name);
-            if (!set) { set = new Set(); nameToClasses.set(node.name, set); }
-            set.add(d?.className || null);
-            for (const child of node.children || []) collectNames(child);
-        };
-        collectNames(blastResult.tree);
-
-        // Step 2b: possible closure — BFS seeded by the frontier's enclosing
-        // functions, following both edge tiers, bounded by the same depth.
-        // Names reached only this way are possibly affected, never confirmed.
+        const affectedNames = new Set([...definitions.values()].map(def => def.name));
+        const possiblyNames = new Set();
         const exclude = options.exclude;
         const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
         const includeMethods = options.includeMethods ?? true;
-        const possiblyNames = new Set();
-        // The one model of what a test is (core/test-units.js); a caller
-        // that asks about several names hands in its own.
         const model = options._testModel || createTestModel(index);
-        // Code a test executes in a file whose name is no test file's: the
-        // lines the model says so (a test of its own, the body of a test a
-        // class of another file inherits), or null.
-        const modelRanges = filePath => {
+        // The same multi-symbol operation reuses path classification. No
+        // source/configuration fact survives the outermost operation.
+        let testPaths = index._opMemos.get('affected-test-paths');
+        if (!testPaths) {
+            testPaths = new Map();
+            index._opMemos.set('affected-test-paths', testPaths);
+        }
+        const testInfo = filePath => {
+            const entry = index.files.get(filePath);
+            if (!entry) return null;
+            if (!testPaths.has(filePath)) {
+                testPaths.set(filePath, isTestFile(entry.relativePath, entry.language));
+            }
+            if (testPaths.get(filePath)) return { entry, ranges: null };
             const ranges = model.testRangesOf(filePath);
-            return ranges.length > 0 ? ranges : null;
+            return ranges.length ? { entry, ranges } : null;
         };
-        // Test FILES containing an unverified call site of an affected name
-        // (relativePath → funcName → Set(lines)) — merged into
-        // possiblyAffectedTests after the scan (fix #244).
-        const frontierTestHits = new Map();
-        {
-            const callerCache = options._callerCache || new Map();
-            const possibleVisited = new Set();
-            const queue = [];
-            const enqueueCaller = (c, depth) => {
-                if (!c.callerName || !c.callerFile) return;
-                if (excludeArr.length > 0 && !index.matchesFilters(c.relativePath, { exclude: excludeArr })) return;
-                const defs = index.symbols.get(c.callerName);
-                let cDef = defs?.find(d => d.file === c.callerFile && d.startLine === c.callerStartLine);
-                if (!cDef) {
-                    cDef = {
-                        name: c.callerName,
-                        file: c.callerFile,
-                        relativePath: c.relativePath,
-                        startLine: c.callerStartLine,
-                        endLine: c.callerEndLine,
-                        type: 'function'
-                    };
-                }
-                queue.push({ def: cDef, depth });
-            };
-            for (const fe of blastResult.unverifiedFrontier || []) {
-                enqueueCaller(fe, fe.hop);
-                // A frontier caller that is ITSELF a test function landed in
-                // neither band (fix #244, the unittest setUp idiom):
-                // isProductionName filters it from possiblyAffected, and the
-                // test scan greps for calls OF it — tests are never called.
-                // Route its FILE into possiblyAffectedTests directly.
-                // Anonymous test callbacks (`it('...', () => { x.save() })`)
-                // have no enclosing NAMED caller at all — the site's file is
-                // still test evidence, so route by the site file whenever it
-                // is a test file (fix #246; the caller-file and site file are
-                // the same file by construction when both exist).
-                const siteFile = fe.callerFile || fe.file;
-                if (siteFile) {
-                    const cfe = index.files.get(siteFile);
-                    if (cfe) {
-                        let isTestCaller = isTestFile(cfe.relativePath, cfe.language);
-                        if (!isTestCaller && fe.callerName) {
-                            const defs = index.symbols.get(fe.callerName);
-                            const d = defs?.find(x => x.file === fe.callerFile && x.startLine === fe.callerStartLine);
-                            const kindOf = getLanguageAdapter(cfe.language)?.getEntryPointKind;
-                            if (d && kindOf && kindOf(d) === 'test') isTestCaller = true;
-                        }
-                        if (!isTestCaller && fe.line != null) {
-                            // Inline #[cfg(test)] regions of production files
-                            // are test code too — but only within the ranges.
-                            const ranges = inlineTestRanges(cfe);
-                            if (ranges.length > 0 && lineInRanges(fe.line, ranges)) isTestCaller = true;
-                        }
-                        if (!isTestCaller && fe.line != null) {
-                            // A line the test model says a test executes.
-                            const ranges = modelRanges(siteFile);
-                            if (ranges && lineInRanges(fe.line, ranges)) isTestCaller = true;
-                        }
-                        if (isTestCaller &&
-                            (excludeArr.length === 0 || index.matchesFilters(cfe.relativePath, { exclude: excludeArr }))) {
-                            const affName = fe.atNode?.name || name;
-                            let entry = frontierTestHits.get(siteFile);
-                            if (!entry) {
-                                entry = { rel: cfe.relativePath, byName: new Map() };
-                                frontierTestHits.set(siteFile, entry);
-                            }
-                            let hitLines = entry.byName.get(affName);
-                            if (!hitLines) { hitLines = new Set(); entry.byName.set(affName, hitLines); }
-                            if (fe.line != null) hitLines.add(fe.line);
-                        }
-                    }
-                }
+        const absoluteOf = new Map();
+        const confirmedRows = new Map();
+        const possibleRows = new Map();
+        const addSite = (site, functionName, confirmed) => {
+            const filePath = site.file || site.callerFile;
+            const info = testInfo(filePath);
+            if (!info || (info.ranges && !lineInRanges(site.line, info.ranges)) ||
+                (excludeArr.length && !index.matchesFilters(info.entry.relativePath, { exclude: excludeArr }))) return;
+            absoluteOf.set(info.entry.relativePath, filePath);
+            const rows = confirmed ? confirmedRows : possibleRows;
+            let row = rows.get(info.entry.relativePath);
+            if (!row) {
+                row = { file: info.entry.relativePath, linkedFunctions: [], matches: [] };
+                rows.set(row.file, row);
             }
-            while (queue.length > 0) {
-                const { def: d, depth } = queue.shift();
-                if (depth > maxDepth) continue;
-                const k = `${d.relativePath || path.relative(index.root, d.file)}:${d.startLine}`;
-                if (possibleVisited.has(k)) continue;
-                possibleVisited.add(k);
-                if (!confirmedKeys.has(k) && !affectedNames.has(d.name)) {
-                    possiblyNames.add(d.name);
-                }
-                if (depth < maxDepth) {
-                    const { confirmed, unverified } = _contractCallers(index, d, { includeMethods, callerCache });
-                    for (const c of confirmed) enqueueCaller(c, depth + 1);
-                    for (const c of unverified) enqueueCaller(c, depth + 1);
-                }
+            if (!row.linkedFunctions.includes(functionName)) row.linkedFunctions.push(functionName);
+            if (!row.matches.some(match => testSiteKey(match) === testSiteKey(site) && match.functionName === functionName)) {
+                row.matches.push({
+                    ...testSite(site),
+                    content: (site.content || index.getLineContent(filePath, site.line) || '').trim(),
+                    matchType: 'call', functionName,
+                    ...(!confirmed && { evidenceTier: 'unverified', reason: site.reason || 'unverified-chain' }),
+                });
             }
-            // A name in both bands is confirmed — the possible band only adds.
-            for (const n of affectedNames) possiblyNames.delete(n);
-        }
-
-        // Step 3: Scan test files for all affected names using AST
-        // Only count call and test-case matches as real coverage — not imports or bare references.
-        const className = options.className || null;
-        const absoluteOf = new Map(); // relative test path -> absolute
-        const results = [];
-        const possibleResults = [];
-        const scanNames = [...affectedNames, ...possiblyNames];
-        const dispatchNamesCache = new Map(); // `${class}:${name}` → Set(classNames)
-        // Files whose name is no test file's that hold a call of a scanned
-        // name: a confirmed edge of the engine, or (a name whose callers
-        // the engine did not search) a call by that name. Only these are
-        // asked of the test model.
-        const callSiteFiles = new Set();
-        for (const byFile of confirmedSitesByName.values()) {
-            for (const relativePath of byFile.keys()) callSiteFiles.add(relativePath);
-        }
-        for (const funcName of scanNames) {
-            if (expandedNames.has(funcName)) continue;
-            for (const calling of index.getCalleeFiles(funcName) || []) {
-                const entry = index.files.get(calling);
-                if (entry) callSiteFiles.add(entry.relativePath);
-            }
-        }
-        for (const [filePath, fileEntry] of index.files) {
-            let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
-            // Rust inline #[cfg(test)] modules: source files with #[test]-marked symbols
-            // or symbols inside a #[cfg(test)] mod block (BUG-CY). Such files
-            // are test code ONLY within the inline test ranges — production
-            // lines were counted as test matches (fix #244, false coverage).
-            let testRanges = null;
-            if (!isTest && fileEntry.language === 'rust') {
-                const ranges = inlineTestRanges(fileEntry);
-                if (ranges.length > 0) {
-                    isTest = true;
-                    testRanges = ranges;
-                }
-            }
-            // A file's name does not decide what a test executes: the body
-            // of a test a class inherits stands where its base class is,
-            // and a runner takes tests from files of any name. Such a file
-            // is test code within the lines the test model names.
-            if (!isTest && callSiteFiles.has(fileEntry.relativePath)) {
-                const ranges = modelRanges(filePath);
-                if (ranges) {
-                    isTest = true;
-                    testRanges = ranges;
-                }
-            }
-            if (!isTest) continue;
-            if (excludeArr.length > 0 && !index.matchesFilters(fileEntry.relativePath, { exclude: excludeArr })) continue;
-            try {
-                const content = index._readFile(filePath);
-                const fileMatches = new Map();
-
-                for (const funcName of scanNames) {
-                    // Confirmed trunk edges of this name in THIS file — the
-                    // engine's answer for the sites the text scan is about
-                    // to re-derive (fix #246).
-                    const engineFileSites = confirmedSitesByName.get(funcName)?.get(fileEntry.relativePath) || null;
-                    // Whether the engine searched this name's callers at all
-                    // (depth-limit nodes were never adjudicated — the text
-                    // scan remains their best-effort fallback).
-                    const engineAdjudicated = expandedNames.has(funcName);
-
-                    // The engine searched this name's callers and confirmed
-                    // none in this file: a call here is not credited (below),
-                    // and an import or a bare reference links nothing by
-                    // itself, so there is nothing a scan could add.
-                    if (engineAdjudicated && !engineFileSites) continue;
-
-                    // Fast pre-check
-                    if (!content.includes(funcName) && !engineFileSites) continue;
-
-                    // AST-based usage detection
-                    const astUsages = index._getCachedUsages(filePath, funcName) || [];
-                    if (astUsages.length === 0 && !engineFileSites) continue;
-
-                    // className scoping: the user's pin applies to the ROOT
-                    // symbol's own name only (fix #239, G3-go-measured) — a
-                    // bare call to a standalone wrapper (SaveAll) can never
-                    // carry the root's class receiver. INTERIOR names with a
-                    // single unambiguous class identity in the blast tree
-                    // scope to it (fix #244): a test of a different class's
-                    // same-named method is not coverage of THIS closure.
-                    // Standalone/mixed-identity names keep the bare scan.
-                    let scopeToClass = null;
-                    if (funcName === name) {
-                        scopeToClass = className || null;
-                    } else {
-                        const classes = nameToClasses.get(funcName);
-                        if (classes && classes.size === 1) {
-                            const only = classes.values().next().value;
-                            if (only) scopeToClass = only;
-                        }
-                    }
-
-                    // A test file that DEFINES funcName itself owns bare-name
-                    // calls of it (#215/#222(3) scope physics — fix #244: a
-                    // private same-name helper let the coverage band claim
-                    // 100% while the same payload's account excluded the
-                    // site as other-definition). Exception: when the local
-                    // def IS part of the blast closure (Rust inline-test
-                    // files define the symbol AND test it), bare calls bind
-                    // the affected symbol — genuine coverage.
-                    const localDefs = (fileEntry.symbols || []).filter(s => s.name === funcName);
-                    const localShadow = localDefs.length > 0 &&
-                        localDefs.every(s => !confirmedKeys.has(`${fileEntry.relativePath}:${s.startLine}`)) &&
-                        !(fileEntry.importBindings || []).some(b => b.name === funcName);
-
-                    // Build instance type map for className scoping (if applicable).
-                    // Scoping accepts the class plus its non-overriding
-                    // descendants — instances of a subclass that doesn't
-                    // override funcName dispatch to the target (fix #246).
-                    let instanceTypeMap = null;
-                    let dispatchNames = null;
-                    if (scopeToClass) {
-                        const dnKey = `${scopeToClass}:${funcName}`;
-                        dispatchNames = dispatchNamesCache.get(dnKey);
-                        if (!dispatchNames) {
-                            dispatchNames = classDispatchNames(index, scopeToClass, funcName);
-                            dispatchNamesCache.set(dnKey, dispatchNames);
-                        }
-                        instanceTypeMap = new Map();
-                        for (const dn of dispatchNames) {
-                            for (const [recv, cls] of _buildInstanceTypeMapForTracing(index, filePath, content, dn)) {
-                                if (!instanceTypeMap.has(recv)) instanceTypeMap.set(recv, cls);
-                            }
-                        }
-                    }
-
-                    const seenLines = new Set();
-                    for (const usage of astUsages) {
-                        if (usage.usageType === 'definition') continue;
-                        // Inline-test-promoted file: only lines inside the
-                        // test ranges are test code (fix #244).
-                        if (testRanges && !lineInRanges(usage.line, testRanges)) continue;
-                        // The engine confirmed this exact site as a caller
-                        // edge — its receiver physics subsume every text
-                        // heuristic below (fix #246: exact-class scoping
-                        // rejected a non-overriding subclass receiver the
-                        // engine had confirmed).
-                        const engineConfirmedHere = engineFileSites ? engineFileSites.has(usage.line) : false;
-                        // Local same-name shadow: bare calls bind the test
-                        // file's OWN definition, never the affected symbol.
-                        if (localShadow && !engineConfirmedHere && !usage.receiver && usage.usageType !== 'import') continue;
-                        const lineKey = `${usage.line}:${usage.usageType}`;
-                        if (seenLines.has(lineKey)) continue;
-                        seenLines.add(lineKey);
-
-                        let matchType;
-                        if (usage.usageType === 'import') {
-                            matchType = 'import';
-                        } else if (usage.usageType === 'call') {
-                            matchType = 'call';
-                        } else {
-                            matchType = 'reference';
-                        }
-                        // A confirmed usage-style edge (callback reference,
-                        // method value — fix #221) IS coverage: the test
-                        // executes the symbol through the reference.
-                        if (engineConfirmedHere && matchType === 'reference') matchType = 'call';
-
-                        if (matchType === 'call' && !engineConfirmedHere && engineAdjudicated) {
-                            // The engine searched this name's callers and did
-                            // NOT confirm this site — the same payload's
-                            // account holds it excluded-with-reason or
-                            // unverified. Crediting it as confirmed coverage
-                            // would contradict the account (fix #246);
-                            // unverified sites surface in
-                            // possiblyAffectedTests via the frontier.
-                            continue;
-                        }
-
-                        // className scoping for calls (text physics — only
-                        // depth-limit names reach this un-adjudicated)
-                        if (scopeToClass && matchType === 'call' && !engineConfirmedHere) {
-                            if (!_receiverMatchesClassTracing(usage, dispatchNames, instanceTypeMap,
-                                index.getLineContent(filePath, usage.line), funcName)) continue;
-                        }
-
-                        // className scoping for references: require class-associated receiver
-                        if (scopeToClass && matchType === 'reference') {
-                            if (!usage.receiver) continue;
-                            if (!dispatchNames.has(usage.receiver) &&
-                                !(instanceTypeMap && dispatchNames.has(instanceTypeMap.get(usage.receiver)))) {
-                                continue;
-                            }
-                        }
-
-                        const lineContent = index.getLineContent(filePath, usage.line);
-                        if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
-                        fileMatches.get(funcName).push({
-                            line: usage.line, content: lineContent.trim(),
-                            matchType, functionName: funcName
-                        });
-                    }
-
-                    // Confirmed engine sites the text scan could not see —
-                    // renamed destructure aliases (`{ save: persist }`),
-                    // beyondText lines — are coverage too (fix #246). The
-                    // dedup map below collapses any line the loop already
-                    // matched (call outranks reference).
-                    if (engineFileSites) {
-                        for (const ln of [...engineFileSites].sort((a, b) => a - b)) {
-                            if (testRanges && !lineInRanges(ln, testRanges)) continue;
-                            const lineKey = `${ln}:call`;
-                            if (seenLines.has(lineKey)) continue;
-                            seenLines.add(lineKey);
-                            if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
-                            fileMatches.get(funcName).push({
-                                line: ln,
-                                content: (index.getLineContent(filePath, ln) || '').trim(),
-                                matchType: 'call', functionName: funcName
-                            });
-                        }
-                    }
-
-                    // The tests that hold a call, and the titled ones that
-                    // name the function around one (core/test-units.js).
-                    if (fileMatches.has(funcName)) {
-                        addTestCaseRows(model, index, filePath, funcName, fileMatches.get(funcName), {
-                            counts: match => match.matchType === 'call',
-                            titleNeedsMatch: true,
-                            extra: { functionName: funcName },
-                        });
-                    }
-                }
-                if (fileMatches.size > 0) absoluteOf.set(fileEntry.relativePath, filePath);
-
-                if (fileMatches.size > 0) {
-                    const linkedFunctions = [...fileMatches.keys()];
-                    const allMatches = [];
-                    for (const matches of fileMatches.values()) allMatches.push(...matches);
-                    // Deduplicate same line+function (test-case line might overlap with call line)
-                    const dedupMap = new Map();
-                    for (const m of allMatches) {
-                        const key = `${m.line}:${m.functionName}`;
-                        const existing = dedupMap.get(key);
-                        if (!existing || _matchPriority(m.matchType) > _matchPriority(existing.matchType)) {
-                            dedupMap.set(key, m);
-                        }
-                    }
-                    const deduped = [...dedupMap.values()].sort((a, b) => a.line - b.line);
-
-                    // Only count functions with call or test-case matches as
-                    // statically linked. Import-only or reference-only records
-                    // are useful evidence, but are not an exercising path.
-                    const realLinkedAll = linkedFunctions.filter(fn => {
-                        const fnMatches = deduped.filter(m => m.functionName === fn);
-                        return fnMatches.some(m => m.matchType === 'call' || m.matchType === 'test-case');
-                    });
-                    const staticallyLinkedFunctions = realLinkedAll.filter(fn => affectedNames.has(fn));
-                    const possiblyLinkedFunctions = realLinkedAll.filter(fn => possiblyNames.has(fn));
-
-                    if (staticallyLinkedFunctions.length > 0) {
-                        // Confirmed band: matches for confirmed-linked names
-                        const realMatches = deduped.filter(m =>
-                            affectedNames.has(m.functionName) &&
-                            (m.matchType === 'call' || m.matchType === 'test-case' ||
-                             staticallyLinkedFunctions.includes(m.functionName))
-                        );
-                        results.push({
-                            file: fileEntry.relativePath,
-                            linkedFunctions: staticallyLinkedFunctions,
-                            ...(possiblyLinkedFunctions.length > 0 && { possiblyLinkedFunctions }),
-                            matchCount: realMatches.length,
-                            matches: realMatches
-                        });
-                    } else if (possiblyLinkedFunctions.length > 0) {
-                        // Possible band: file reaches the change only through
-                        // unverified chains.
-                        const possibleMatches = deduped.filter(m =>
-                            possiblyNames.has(m.functionName) &&
-                            (m.matchType === 'call' || m.matchType === 'test-case' ||
-                             possiblyLinkedFunctions.includes(m.functionName))
-                        );
-                        possibleResults.push({
-                            file: fileEntry.relativePath,
-                            linkedFunctions: possiblyLinkedFunctions,
-                            matchCount: possibleMatches.length,
-                            matches: possibleMatches
-                        });
-                    }
-                }
-            } catch (e) { /* skip unreadable */ }
-        }
-
-        // Merge frontier test hits: a test file whose own test function IS
-        // the unverified caller never surfaces via the scan (the scan greps
-        // for calls of scanNames; the test's name is not among them) — add
-        // it to the possible band with its unverified call sites (fix #244).
-        // A file already present for OTHER names still gets this name listed
-        // as possibly covered (fix #246 — the file-level dedup silently
-        // dropped per-name possible coverage).
-        for (const [absFile, entry] of frontierTestHits) {
-            const inResults = results.find(r => r.file === entry.rel);
-            const inPossible = possibleResults.find(r => r.file === entry.rel);
-            if (inResults || inPossible) {
-                const existing = inResults || inPossible;
-                const have = new Set([
-                    ...existing.linkedFunctions,
-                    ...(existing.possiblyLinkedFunctions || []),
-                ]);
-                const extra = [...entry.byName.keys()].filter(n => !have.has(n)).sort(codeUnitCompare);
-                if (extra.length > 0) {
-                    if (inResults) {
-                        existing.possiblyLinkedFunctions = [
-                            ...(existing.possiblyLinkedFunctions || []),
-                            ...extra,
-                        ].sort(codeUnitCompare);
-                    } else {
-                        existing.linkedFunctions = [...existing.linkedFunctions, ...extra].sort(codeUnitCompare);
-                    }
-                }
-                continue;
-            }
-            const linked = [...entry.byName.keys()].sort(codeUnitCompare);
+        };
+        const finishRows = rows => [...rows.values()].map(row => {
+            const filePath = absoluteOf.get(row.file);
             const matches = [];
-            for (const fn of linked) {
-                for (const ln of [...entry.byName.get(fn)].sort((a, b) => a - b)) {
-                    matches.push({
-                        line: ln,
-                        content: (index.getLineContent(absFile, ln) || '').trim(),
-                        matchType: 'call',
-                        functionName: fn,
-                    });
+            for (const functionName of row.linkedFunctions.sort(codeUnitCompare)) {
+                const own = row.matches.filter(match => match.functionName === functionName);
+                // Imports remain useful context once an actual test site
+                // links this file. They never create a link or select units.
+                const ranges = testInfo(filePath)?.ranges;
+                for (const usage of index._getCachedUsages(filePath, functionName) || []) {
+                    if (usage.usageType !== 'import' ||
+                        (ranges && !lineInRanges(usage.line, ranges)) ||
+                        own.some(match => match.line === usage.line)) continue;
+                    own.push({ line: usage.line,
+                        content: (index.getLineContent(filePath, usage.line) || '').trim(),
+                        matchType: 'import', functionName });
                 }
+                addTestCaseRows(model, index, filePath, functionName, own, {
+                    counts: match => match.matchType === 'call', titleNeedsMatch: true,
+                    extra: { functionName },
+                });
+                matches.push(...own);
             }
-            possibleResults.push({
-                file: entry.rel,
-                linkedFunctions: linked,
-                matchCount: matches.length,
-                matches,
-            });
+            row.matches = matches.sort((a, b) => a.line - b.line ||
+                codeUnitCompare(a.functionName, b.functionName) || codeUnitCompare(a.matchType, b.matchType));
+            row.matchCount = row.matches.length;
+            return row;
+        });
+        const queue = [];
+        const enqueue = (site, depth) => {
+            if (!site.callerName || !site.callerFile || depth > maxDepth) return;
+            if (excludeArr.length && !index.matchesFilters(site.relativePath, { exclude: excludeArr })) return;
+            const def = callerDefinition(index, site);
+            // Anonymous/module sites are test evidence but not declarations
+            // whose spelling can seed another production traversal.
+            if (def) queue.push({ def, depth });
+        };
+        for (const def of definitions.values()) {
+            const { confirmed, unverified } = _contractCallers(index, def, { includeMethods, callerCache, pin: true });
+            for (const site of confirmed) addSite(site, def.name, true);
+            if (!options._testSitesOnly) {
+                for (const site of unverified) addSite(site, def.name, false);
+            }
+            // Possible descendants are seeded by blast's bounded frontier
+            // below, never by the extra boundary site inspection.
+        }
+        if (options._testSitesOnly) {
+            // check unions the confirmed physical sites of every changed
+            // declaration, then links their test units once. Preserve the
+            // synthetic case-header sites used by that final link, but do
+            // not traverse the unused possible band or project per-root
+            // units, inherited rows and commands that check discards.
+            return { testFiles: finishRows(confirmedRows) };
+        }
+        for (const site of blastResult.unverifiedFrontier || []) {
+            addSite(site, site.atNode?.name || name, false);
+            enqueue(site, site.hop);
+        }
+        const visited = new Set();
+        for (let next = 0; next < queue.length; next++) {
+            const { def, depth } = queue[next];
+            const key = keyOf(def);
+            if (visited.has(key) || definitions.has(key)) continue;
+            visited.add(key);
+            possiblyNames.add(def.name);
+            const { confirmed, unverified } = _contractCallers(index, def, { includeMethods, callerCache, pin: true });
+            for (const site of [...confirmed, ...unverified]) {
+                addSite(site, def.name, false);
+                if (depth < maxDepth) enqueue(site, depth + 1);
+            }
+        }
+        for (const n of affectedNames) possiblyNames.delete(n);
+        const results = finishRows(confirmedRows);
+        // Keep uncertainty even when the same file also has a confirmed
+        // link: its possible sites may belong to other test units.
+        const possibleResults = finishRows(possibleRows);
+        for (const row of results) {
+            const possible = possibleRows.get(row.file);
+            if (possible) row.possiblyLinkedFunctions = [...possible.linkedFunctions];
         }
 
         // What each file is to its runner, which tests hold the links, and
         // how many tests that is.
-        for (const [absFile, entry] of frontierTestHits) absoluteOf.set(entry.rel, absFile);
         const confirmedTests = new Set();
         const conditionalTests = new Set();
         const describeBand = (rows, confirmed) => {
@@ -1358,8 +991,7 @@ function affectedTests(index, name, options = {}) {
                 const absFile = absoluteOf.get(row.file);
                 if (!absFile) continue;
                 linesByFile.set(absFile, row.matches
-                    .filter(match => match.matchType === 'call' || match.matchType === 'test-case')
-                    .map(match => match.line));
+                    .filter(match => match.matchType === 'call' || match.matchType === 'test-case'));
             }
             const byFile = new Map(rows.map(row => [row.file, row]));
             for (const [absFile, linked] of linkFiles(model, index, linesByFile)) {
@@ -1416,26 +1048,18 @@ function affectedTests(index, name, options = {}) {
         // Compute static-linkage stats.
         // Filter out test function names from affectedNames — they are callers,
         // not production symbols that need test coverage.
-        const isProductionName = (n) => {
-            // Check if this name is only found in test files. Inline test
-            // functions (#[test] fns in Rust's #[cfg(test)] mods, Go Test*)
-            // live in production-path FILES but are tests themselves — the
-            // language's getEntryPointKind says so; they need no coverage.
-            for (const [filePath, fe] of index.files) {
-                if (isTestFile(fe.relativePath, fe.language)) continue;
-                const langModule = getLanguageAdapter(fe.language);
-                const kindOf = langModule?.getEntryPointKind;
-                // A declaration the test model found test code in (asked
-                // above, where the file held a call): a test, not a
-                // production symbol.
-                const ranges = model.ranges.get(filePath) || [];
-                if (fe.symbols?.some(s => s.name === n && (!kindOf || kindOf(s) !== 'test') &&
-                    !(ranges.length > 0 && lineInRanges(s.startLine, ranges)))) {
-                    return true;
-                }
+        const isProductionName = n => (index.symbols.get(n) || []).some(symbol => {
+            const fe = index.files.get(symbol.file);
+            if (!fe) return false;
+            if (!testPaths.has(symbol.file)) {
+                testPaths.set(symbol.file, isTestFile(fe.relativePath, fe.language));
             }
-            return false;
-        };
+            if (testPaths.get(symbol.file)) return false;
+            const kindOf = getLanguageAdapter(fe.language)?.getEntryPointKind;
+            if (kindOf && kindOf(symbol) === 'test') return false;
+            const ranges = model.ranges.get(symbol.file) || [];
+            return !lineInRanges(symbol.startLine, ranges);
+        });
         const productionNames = new Set();
         for (const n of affectedNames) {
             if (isProductionName(n)) productionNames.add(n);
@@ -1487,72 +1111,6 @@ function affectedTests(index, name, options = {}) {
             warnings: blastResult.warnings,
         };
     } finally { index._endOp(); }
-}
-
-/**
- * Build instance type map for className scoping in affectedTests.
- * Same logic as _buildInstanceTypeMap in search.js.
- */
-function _buildInstanceTypeMapForTracing(index, filePath, content, targetClassName) {
-    const typeMap = new Map();
-    const calls = getCachedCalls(index, filePath);
-    if (calls) {
-        for (const call of calls) {
-            if (call.isMethod && call.receiver && call.receiverType === targetClassName) {
-                typeMap.set(call.receiver, targetClassName);
-            }
-            if (call.name === targetClassName && !call.isMethod) {
-                const lineContent = index.getLineContent(filePath, call.line);
-                const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
-                if (assignMatch) typeMap.set(assignMatch[1], targetClassName);
-            }
-            if (call.isMethod && call.receiver === targetClassName) {
-                const lineContent = index.getLineContent(filePath, call.line);
-                const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
-                if (assignMatch) typeMap.set(assignMatch[1], targetClassName);
-            }
-        }
-    }
-    const classUsages = index._getCachedUsages(filePath, targetClassName);
-    if (classUsages) {
-        for (const u of classUsages) {
-            if (u.usageType === 'import' || u.usageType === 'definition') continue;
-            const lineContent = index.getLineContent(filePath, u.line);
-            const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
-            if (assignMatch && assignMatch[1] !== targetClassName) {
-                typeMap.set(assignMatch[1], targetClassName);
-            }
-        }
-    }
-    return typeMap;
-}
-
-/**
- * Check if a usage's receiver matches any of the target dispatch class names
- * (the class + its non-overriding descendants — fix #246) for affectedTests.
- * Same logic as _receiverMatchesClass in search.js.
- */
-function _receiverMatchesClassTracing(usage, dispatchNames, instanceTypeMap, lineContent, searchTerm) {
-    if (usage.receiver && dispatchNames.has(usage.receiver)) return true;
-    if (usage.receiver && instanceTypeMap && dispatchNames.has(instanceTypeMap.get(usage.receiver))) return true;
-    if (usage.receiver) return false;
-    if (lineContent && searchTerm) {
-        for (const className of dispatchNames) {
-            const pat = new RegExp(
-                '\\b' + escapeRegExp(className) + '\\s*(?:(?:\\([^)]*\\)|\\{[^}]*\\})\\s*\\.\\s*' +
-                escapeRegExp(searchTerm) + '\\s*\\(|' +
-                'new\\s+' + escapeRegExp(className) + '\\s*\\([^)]*\\)\\s*\\.\\s*' +
-                escapeRegExp(searchTerm) + '\\s*\\()'
-            );
-            if (pat.test(lineContent)) return true;
-        }
-    }
-    return false;
-}
-
-function _matchPriority(matchType) {
-    const p = { 'test-case': 5, 'call': 4, 'import': 3, 'string-ref': 2, 'reference': 1 };
-    return p[matchType] || 0;
 }
 
 module.exports = { trace, blast, reverseTrace, affectedTests };

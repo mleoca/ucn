@@ -2,10 +2,10 @@
  * core/test-units.js — what a test is, where it is, and how to run it.
  *
  * One identity for a test, shared by `tests`, the affected-test selection
- * and `check`: a UNIT is (file, suite chain, name, line), read from the
+ * and `check`: a UNIT is (file, suite chain, name, source extent), read from the
  * declaration the language's runner collects (the language module's
- * `testUnits`). A line of test code belongs to the innermost unit whose
- * source range holds it; code outside every unit belongs to the file.
+ * `testUnits`). A site of test code belongs to the innermost unit whose
+ * source range holds it; an ambiguous line alone does not select a sibling.
  *
  * A RUNNER is named only on evidence: the test file imports the runner's
  * own module, or the nearest build manifest names it. A SELECTOR (the
@@ -1556,6 +1556,44 @@ function topLevelTestClasses(model, filePath) {
  * @param {object} index - ProjectIndex
  * @returns {object} per-operation test model
  */
+// Positions are query facts, never persisted test-reader state. Caller
+// provenance identifies the physical token even when its displayed line
+// holds several calls or tests.
+function testSite(site) {
+    if (typeof site === 'number') return { line: site };
+    const point = site.provenance?.facts?.site || {};
+    return {
+        line: site.line,
+        ...(Number.isInteger(site.column ?? point.column) && { column: site.column ?? point.column }),
+        ...(Number.isInteger(site.callStart ?? point.start) && { callStart: site.callStart ?? point.start }),
+        ...(Number.isInteger(site.callEnd ?? point.end) && { callEnd: site.callEnd ?? point.end }),
+    };
+}
+
+function testSiteKey(site) {
+    const point = testSite(site);
+    return `${point.line}:${point.column ?? ''}:${point.callStart ?? ''}`;
+}
+
+function containsTestSite(row, site) {
+    const point = testSite(site);
+    if (row.startLine > point.line || row.endLine < point.line) return false;
+    return require('./callable-scope').containsCall(row, point) !== false;
+}
+
+function containsTestUnit(outer, inner) {
+    if (outer.sourceSpan && inner.sourceSpan) {
+        return outer.sourceSpan.start <= inner.sourceSpan.start && outer.sourceSpan.end >= inner.sourceSpan.end;
+    }
+    return outer.startLine <= inner.startLine && outer.endLine >= inner.endLine;
+}
+
+function innermostTestRows(rows, site) {
+    const candidates = rows.filter(row => containsTestSite(row, site));
+    return candidates.filter(row => !candidates.some(other => other !== row &&
+        containsTestUnit(row, other) && !containsTestUnit(other, row)));
+}
+
 function createTestModel(index, options = {}) {
     const model = {
         manifests: createManifests(index),
@@ -1663,6 +1701,11 @@ function createTestModel(index, options = {}) {
                 const out = [];
                 for (const other of symbols) {
                     if (other === symbol) continue;
+                    if (other.sourceSpan && symbol.sourceSpan) {
+                        if (!containsTestUnit(other, symbol) || containsTestUnit(symbol, other)) continue;
+                        if (CONTAINER_KINDS.has(other.type) || CALLABLE_KINDS.has(other.type)) out.push(other);
+                        continue;
+                    }
                     const end = other.endLine ?? other.startLine;
                     const ownEnd = symbol.endLine ?? symbol.startLine;
                     if (other.startLine > symbol.startLine || end < ownEnd) continue;
@@ -2697,6 +2740,7 @@ function createTestModel(index, options = {}) {
                 (byFixture && states.some(each => each.regime === 'unittest'));
             const unit = {
                 ...base,
+                ...(!base.inherited && rowFile === filePath && row.sourceSpan && { sourceSpan: row.sourceSpan }),
                 ...(skipped && { skipped: true }),
                 ...(sometimes && { conditional: true }),
                 ...(dynamic && { dynamic }),
@@ -2777,14 +2821,14 @@ function createTestModel(index, options = {}) {
                     inherited: {
                         file: relativeOf(base.filePath), filePath: base.filePath, owner: base.cls.name,
                         ownerLine: base.cls.startLine, line: test.alias ? test.of : test.line,
-                        startLine: test.startLine, endLine: test.endLine,
+                        startLine: test.startLine, endLine: test.endLine, sourceSpan: test.sourceSpan,
                     },
                 }, test, around, reopened(test) || (standing.regime === 'unittest' ? null : byForce(test)), base.filePath);
             }
             if (units.length > before) {
                 units.push({
                     kind: 'suite', name: cls.name, suite: cls.suite,
-                    line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
+                    line: cls.line, startLine: cls.startLine, endLine: cls.endLine, sourceSpan: cls.sourceSpan,
                 });
             }
         }
@@ -2808,7 +2852,7 @@ function createTestModel(index, options = {}) {
                 kind: 'test', name: entry.name, suite: [], line: entry.line, startLine: entry.line, endLine: entry.line,
                 inherited: {
                     file: relativeOf(target), filePath: target, owner: null, ownerLine: 0,
-                    line: fn.line, startLine: fn.startLine, endLine: fn.endLine,
+                    line: fn.line, startLine: fn.startLine, endLine: fn.endLine, sourceSpan: fn.sourceSpan,
                 },
             }, row, [], (on === 'unknown' ? 'collection-switch' : null) || byForce(row), target);
         }
@@ -2875,7 +2919,7 @@ function createTestModel(index, options = {}) {
             const relativePath = index.files.get(filePath).relativePath;
             const runner = model.runnerOf(filePath) || {};
             const classesHere = [...(found.classes || [])];
-            const within = (unit, cls) => unit.startLine >= cls.startLine && unit.endLine <= cls.endLine;
+            const within = (unit, cls) => containsTestUnit(cls, unit);
             // A setup that can stop a test, in a class the test's class
             // derives from: the test runs only sometimes.
             const guardedAbove = cls => cls.bases.length > 0 &&
@@ -2943,7 +2987,7 @@ function createTestModel(index, options = {}) {
                 if (inherited.tests.some(({ test }) => !test.needsClassMark || cls.marked) && !own) {
                     units.push({
                         kind: 'suite', name: cls.name, suite: cls.suite,
-                        line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
+                        line: cls.line, startLine: cls.startLine, endLine: cls.endLine, sourceSpan: cls.sourceSpan,
                     });
                 }
                 for (const { test, base, body, uncertain, maybe, again } of inherited.tests) {
@@ -2969,7 +3013,7 @@ function createTestModel(index, options = {}) {
                             alternatives: maybe.map(other => ({
                                 file: index.files.get(other.at.filePath).relativePath,
                                 filePath: other.at.filePath, ownerLine: other.at.cls.startLine,
-                                startLine: other.row.startLine, endLine: other.row.endLine,
+                                startLine: other.row.startLine, endLine: other.row.endLine, sourceSpan: other.row.sourceSpan,
                             })),
                         }),
                     };
@@ -2979,7 +3023,7 @@ function createTestModel(index, options = {}) {
                     if (body && body.at.cls === cls && !uncertain && !again) {
                         units.push({
                             kind: 'test', name: test.name, suite, ...(cls.namespace && { namespace: cls.namespace }),
-                            line: body.row.line, startLine: body.row.startLine, endLine: body.row.endLine, ...state,
+                            line: body.row.line, startLine: body.row.startLine, endLine: body.row.endLine, sourceSpan: body.row.sourceSpan, ...state,
                         });
                         continue;
                     }
@@ -2994,7 +3038,7 @@ function createTestModel(index, options = {}) {
                             file: index.files.get(at.filePath).relativePath,
                             filePath: at.filePath, owner: at.cls.name,
                             ownerLine: at.cls.startLine, line: where.line,
-                            startLine: where.startLine, endLine: where.endLine,
+                            startLine: where.startLine, endLine: where.endLine, sourceSpan: where.sourceSpan,
                         },
                     });
                 }
@@ -3010,7 +3054,7 @@ function createTestModel(index, options = {}) {
                         units.push({
                             kind: 'test', name: row.name, suite: [...cls.suite, cls.name],
                             ...(cls.namespace && { namespace: cls.namespace }),
-                            line: row.line, startLine: row.startLine, endLine: row.endLine,
+                            line: row.line, startLine: row.startLine, endLine: row.endLine, sourceSpan: row.sourceSpan,
                             ...(cls.skipped && { skipped: true }),
                             ...((cls.sometimes || cls.guard || guardedAbove(cls)) && { conditional: true }),
                             dynamic: 'declared-in-a-base-class',
@@ -3019,7 +3063,7 @@ function createTestModel(index, options = {}) {
                     if (added && !own && inherited.tests.length === 0) {
                         units.push({
                             kind: 'suite', name: cls.name, suite: cls.suite,
-                            line: cls.line, startLine: cls.startLine, endLine: cls.endLine,
+                            line: cls.line, startLine: cls.startLine, endLine: cls.endLine, sourceSpan: cls.sourceSpan,
                         });
                     }
                 }
@@ -3089,8 +3133,9 @@ function createTestModel(index, options = {}) {
      * empty answer: the line belongs to no unit (file-level code).
      * @returns {Array<{filePath: string, unit: object}>}
      */
-    model.runsAt = (filePath, line) => {
+    model.runsAt = (filePath, site) => {
         const out = [];
+        const point = testSite(site);
         // The units of a file that may run this code. A module its runner
         // does not collect by its name declares none: it is not read for
         // the answer.
@@ -3101,19 +3146,22 @@ function createTestModel(index, options = {}) {
             }
             return model.unitsOf(file).units;
         };
-        const unit = model.unitAt(filePath, line);
+        const unit = model.unitAt(filePath, point);
         if (unit && unit.kind === 'test') out.push({ filePath, unit });
-        const holder = (model.declared(filePath)?.classes || [])
-            .filter(cls => cls.startLine <= line && cls.endLine >= line)
-            .sort((a, b) => b.startLine - a.startLine)[0];
+        const holders = innermostTestRows(model.declared(filePath)?.classes || [], point);
+        const holder = holders.length === 1 ? holders[0] : null;
         // The method that holds the line: a test's declaration, or a method
         // a deriving class's test takes its body from.
-        const template = holder && [...holder.tests, ...(holder.memberRows || [])]
-            .find(row => row.startLine <= line && row.endLine >= line);
+        const templates = holder ? innermostTestRows([...holder.tests, ...(holder.memberRows || [])], point) : [];
+        // Test/member rows can describe the same body; distinct spans must
+        // not be collapsed merely because their declaration lines match.
+        const template = templates.length > 0 && templates.every(row => row.name === templates[0].name &&
+            row.sourceSpan?.start === templates[0].sourceSpan?.start) ? templates[0] : null;
         const importers = [...(index.exportGraph?.get(filePath) || [])];
         if (template) {
             const held = from => !!from && from.filePath === filePath && from.ownerLine === holder.startLine &&
-                from.startLine === template.startLine && from.endLine === template.endLine;
+                from.startLine === template.startLine && from.endLine === template.endLine &&
+                (!from.sourceSpan || !template.sourceSpan || from.sourceSpan.start === template.sourceSpan.start);
             for (const file of [...new Set([...descendantFiles(holder.name), ...importers, filePath])].sort(codeUnitCompare)) {
                 for (const candidate of unitsIn(file)) {
                     // Every test whose body this is: the one a deriving
@@ -3127,13 +3175,14 @@ function createTestModel(index, options = {}) {
             }
         }
         // A function another module imports under a test's name runs there.
-        const fn = holder ? null : (model.declared(filePath)?.functions || [])
-            .find(other => other.startLine <= line && other.endLine >= line);
+        const functions = holder ? [] : innermostTestRows(model.declared(filePath)?.functions || [], point);
+        const fn = functions.length === 1 ? functions[0] : null;
         if (fn) {
             for (const file of [...new Set([...importers, filePath])].sort(codeUnitCompare)) {
                 for (const candidate of unitsIn(file)) {
                     const from = candidate.inherited;
-                    if (from && from.filePath === filePath && from.owner == null && from.startLine === fn.startLine) {
+                    if (from && from.filePath === filePath && from.owner == null && from.startLine === fn.startLine &&
+                        (!from.sourceSpan || !fn.sourceSpan || from.sourceSpan.start === fn.sourceSpan.start)) {
                         out.push({ filePath: file, unit: candidate });
                     }
                 }
@@ -3228,23 +3277,27 @@ function createTestModel(index, options = {}) {
             rows.sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
             for (const row of rows) {
                 if (row.startLine == null || row.endLine == null || covered(row)) continue;
-                if (model.runsAt(filePath, row.startLine).length > 0) ranges.push([row.startLine, row.endLine]);
+                if (model.runsAt(filePath, { line: row.startLine,
+                    column: row.sourceSpan?.startColumn, callStart: row.sourceSpan?.start }).length > 0) {
+                    ranges.push([row.startLine, row.endLine]);
+                }
             }
         }
         model.ranges.set(filePath, ranges);
         return ranges;
     };
 
-    /** The innermost unit holding a line: a test before a suite. */
-    model.unitAt = (filePath, line) => {
-        let best = null;
-        for (const unit of model.unitsOf(filePath).units) {
-            if (unit.startLine > line) break;
-            if (unit.endLine < line || unit.inherited) continue;
-            if (!best || (unit.kind === 'test' && best.kind !== 'test') ||
-                (unit.kind === best.kind && unit.line >= best.line)) best = unit;
-        }
-        return best;
+    /** Innermost units at a physical site. A line alone may be ambiguous. */
+    model.unitsAt = (filePath, site) => {
+        const candidates = model.unitsOf(filePath).units.filter(unit =>
+            !unit.inherited && containsTestSite(unit, site));
+        return candidates.filter(unit => !candidates.some(other => other !== unit &&
+            containsTestUnit(unit, other) &&
+            (!containsTestUnit(other, unit) || (other.kind === 'test' && unit.kind !== 'test'))));
+    };
+    model.unitAt = (filePath, site) => {
+        const units = model.unitsAt(filePath, site);
+        return units.length === 1 ? units[0] : null;
     };
 
     /** Tests a unit stands for: itself, or every test a suite holds. */
@@ -3253,7 +3306,7 @@ function createTestModel(index, options = {}) {
         if (!unit) return units.filter(candidate => candidate.kind === 'test');
         if (unit.kind === 'test') return [unit];
         return units.filter(candidate => candidate.kind === 'test' &&
-            candidate.startLine >= unit.startLine && candidate.endLine <= unit.endLine);
+            containsTestUnit(unit, candidate));
     };
 
     /**
@@ -3372,6 +3425,7 @@ function addTestCaseRows(model, index, filePath, term, matches, options) {
         taken.add(unit.startLine);
         added.push({
             line: unit.startLine,
+            ...(unit.sourceSpan && { column: unit.sourceSpan.startColumn, callStart: unit.sourceSpan.start }),
             content: (index.getLineContent(filePath, unit.startLine) || '').trim(),
             matchType: 'test-case',
             ...(options.extra || {}),
@@ -3399,7 +3453,7 @@ function addTestCaseRows(model, index, filePath, term, matches, options) {
         return;
     }
     for (const match of counted) {
-        const unit = model.unitAt(filePath, match.line);
+        const unit = model.unitAt(filePath, match);
         if (unit && unit.kind === 'test') add(unit);
     }
     if (options.titles !== false && term) {
@@ -3408,7 +3462,7 @@ function addTestCaseRows(model, index, filePath, term, matches, options) {
         for (const unit of model.unitsOf(filePath).units) {
             if (!unit.titled || unit.name == null || !named.test(unit.name)) continue;
             if (options.titleNeedsMatch &&
-                !counted.some(match => match.line >= unit.startLine && match.line <= unit.endLine)) continue;
+                !counted.some(match => containsTestSite(unit, match))) continue;
             add(unit);
         }
     }
@@ -3422,7 +3476,8 @@ function addTestCaseRows(model, index, filePath, term, matches, options) {
  */
 function testKey(relativePath, unit) {
     return [relativePath, ...unit.suite, unit.name == null ? '' : unit.name, `@${unit.startLine}`,
-        ...(unit.inherited ? [`<${unit.inherited.file}:${unit.inherited.startLine}`] : [])].join('\0');
+        ...(unit.sourceSpan ? [`#${unit.sourceSpan.start}`] : []),
+        ...(unit.inherited ? [`<${unit.inherited.file}:${unit.inherited.startLine}:${unit.inherited.sourceSpan?.start ?? ''}`] : [])].join('\0');
 }
 
 /**
@@ -3462,9 +3517,28 @@ function linkFile(model, index, filePath, lines, extra = []) {
         for (const test of model.testsWithin(filePath, unit)) count(test);
     };
     let fileLevel = false;
-    for (const line of [...new Set(lines)].sort((a, b) => a - b)) {
-        const runs = model.runsAt(filePath, line);
+    const sites = new Map(lines.map(site => [testSiteKey(site), {
+        ...testSite(site), wholeLine: typeof site === 'number',
+    }]));
+    for (const site of [...sites.values()].sort((a, b) => a.line - b.line || (a.column || 0) - (b.column || 0))) {
+        if (site.wholeLine) {
+            // Legacy numeric inputs deliberately select the whole source
+            // line (the matrix uses every line of a file). Precise callers
+            // pass objects, so a missing position never implies this scope.
+            const units = model.unitsAt(filePath, site);
+            if (units.length > 1) {
+                for (const unit of units) take(unit);
+                continue;
+            }
+        }
+        const runs = model.runsAt(filePath, site);
         if (runs.length === 0) {
+            if (model.unitsAt(filePath, site).length > 1) {
+                // A line without a physical position cannot select one of
+                // several test bodies. Keep the file, withhold exact units.
+                more = true;
+                continue;
+            }
             fileLevel = true;
             continue;
         }
@@ -3616,7 +3690,7 @@ function unitLabel(unit) {
 
 module.exports = {
     createTestModel, selectorText, unitLabel, shellWord, globMatches, testCountText, standsForSeveral,
-    addTestCaseRows, linkFile, linkFiles, commandsFor,
+    addTestCaseRows, linkFile, linkFiles, commandsFor, testSite, testSiteKey,
     // Exposed for tests.
     scriptRunners, nodeTestOptions, configWords, tableText, namesRequirement, focusedOut,
     shellSplit, configArguments, pytestOptions, markSelects, pathGlob, nodeTestPaths, nodeRunsFile,

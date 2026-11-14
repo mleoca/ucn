@@ -287,7 +287,10 @@ const RUST_TRANSPARENT_FN_ATTRIBUTES = new Set([
 ]);
 
 function rustAttributePath(node) {
-    return node && ['identifier', 'scoped_identifier'].includes(node.type) ? node.text.replace(/\s+/g, '') : null;
+    // Raw identifiers change the spelling, not the attribute's identity.
+    return node && ['identifier', 'scoped_identifier'].includes(node.type)
+        ? node.text.replace(/\s+/g, '').split('::').map(part => part.startsWith('r#') ? part.slice(2) : part).join('::')
+        : null;
 }
 
 /** Outer attribute paths of an item; `cfg_attr(pred, a, b)` yields a, b. */
@@ -314,7 +317,7 @@ function rustOuterAttributePaths(itemNode) {
                 continue;
             }
             if (group === 0 || !expectPath) continue;
-            if (token.type === 'identifier' || token.type === '::') current += token.text;
+            if (token.type === 'identifier' || token.type === '::') current += rustAttributePath(token) || token.text;
             else { if (current) paths.push(current); current = ''; expectPath = false; }
         }
         if (current) paths.push(current);
@@ -602,93 +605,42 @@ function extractVisibility(text) {
 /**
  * Extract attributes from a function node (e.g., #[test], #[tokio::main])
  * @param {Node} node - AST node
- * @param {string} code - Source code
  * @returns {string[]} Array of attribute names
  */
-function extractAttributes(node, codeOrLines) {
+function outerAttributeNodes(node) {
     const attributes = [];
-    const lines = Array.isArray(codeOrLines) ? codeOrLines : codeOrLines.split('\n');
-
-    // Look at lines before the function for attributes
-    const startLine = node.startPosition.row;
-    for (let i = startLine - 1; i >= 0 && i >= startLine - 5; i--) {
-        const line = lines[i]?.trim();
-        if (!line) break;
-        if (line.startsWith('#[')) {
-            // Extract attribute name (e.g., #[test] -> test, #[tokio::main] -> tokio::main)
-            const match = line.match(/#\[([^\]]+)\]/);
-            if (match) {
-                const attrContent = match[1];
-                // Get just the attribute name (without arguments)
-                const attrName = attrContent.split('(')[0].trim();
-                // Skip compiler hint attributes that aren't semantically meaningful for display
-                const SKIP_ATTRS = new Set(['allow', 'deny', 'warn', 'forbid', 'cfg_attr', 'doc']);
-                if (!SKIP_ATTRS.has(attrName)) {
-                    attributes.push(attrName);
-                }
-            }
-        } else if (!line.startsWith('//')) {
-            // Stop at non-comment, non-attribute lines
-            break;
-        }
+    for (let sibling = node.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
+        if (sibling.type === 'line_comment' || sibling.type === 'block_comment') continue;
+        if (sibling.type !== 'attribute_item') break;
+        const attribute = sibling.namedChildren.find(child => child.type === 'attribute');
+        if (attribute) attributes.unshift(attribute);
     }
-
     return attributes;
 }
 
-/**
- * Extract attributes WITH their argument tokens (for routing decorator detection).
- * Returns array of { name, args: rawArgString } objects.
- *   #[get("/users")] → [{ name: 'get', args: '"/users"' }]
- *   #[tokio::main] → [{ name: 'tokio::main', args: null }]
- *
- * @param {Node} node - Function AST node
- * @param {string|string[]} codeOrLines - Source code or pre-split lines
- * @returns {Array<{name: string, args: string|null}>}
- */
-function extractAttributesWithArgs(node, codeOrLines) {
-    const result = [];
-    const lines = Array.isArray(codeOrLines) ? codeOrLines : codeOrLines.split('\n');
+function extractAttributes(node) {
+    const skip = new Set(['allow', 'deny', 'warn', 'forbid', 'cfg_attr', 'doc']);
+    // Preserve the established nearest-first modifier ordering. Ownership
+    // comes from adjacent AST siblings, never preceding source lines.
+    return extractAttributesWithArgs(node).reverse().map(attribute => attribute.name)
+        .filter(name => !skip.has(name));
+}
 
-    const startLine = node.startPosition.row;
-    for (let i = startLine - 1; i >= 0 && i >= startLine - 5; i--) {
-        const line = lines[i]?.trim();
-        if (!line) break;
-        if (line.startsWith('#[')) {
-            // Match #[name(...args...)] or #[name]
-            // Need to handle nested parens; use a simple bracket-matching approach.
-            // (The line is trimmed: only a line ending in ']' can match; a
-            // macro expansion's generated line can be very long.)
-            const m = line.charCodeAt(line.length - 1) === 93 ? line.match(/^#\[(.+)\]\s*$/) : null;
-            if (m) {
-                const attrContent = m[1];
-                const parenIdx = attrContent.indexOf('(');
-                if (parenIdx === -1) {
-                    result.unshift({ name: attrContent.trim(), args: null });
-                } else {
-                    const name = attrContent.slice(0, parenIdx).trim();
-                    // Extract content within outer parens (find matching close)
-                    let depth = 0;
-                    let endIdx = -1;
-                    for (let k = parenIdx; k < attrContent.length; k++) {
-                        const ch = attrContent[k];
-                        if (ch === '(') depth++;
-                        else if (ch === ')') {
-                            depth--;
-                            if (depth === 0) { endIdx = k; break; }
-                        }
-                    }
-                    const args = endIdx > parenIdx
-                        ? attrContent.slice(parenIdx + 1, endIdx).trim()
-                        : attrContent.slice(parenIdx + 1).trim();
-                    result.unshift({ name, args });
-                }
-            }
-        } else if (!line.startsWith('//')) {
-            break;
+/** Written outer attributes attached to this item, in source order. */
+function extractAttributesWithArgs(node) {
+    const attributes = [];
+    for (const attribute of outerAttributeNodes(node)) {
+        let name = rustAttributePath(attribute.namedChild(0));
+        if (!name) continue;
+        const argumentsNode = attribute.childForFieldName('arguments');
+        // The existing attribute record keeps name-value attributes whole
+        // (notably path = "module.rs", which module resolution consumes).
+        if (!argumentsNode && attribute.children.some(child => child.type === '=')) {
+            name += attribute.text.slice(attribute.namedChild(0).endIndex - attribute.startIndex).trimEnd();
         }
+        attributes.push({ name, args: argumentsNode ? argumentsNode.text.slice(1, -1).trim() : null });
     }
-    return result;
+    return attributes;
 }
 
 // --- Module-scope constants for state object detection ---
@@ -701,30 +653,14 @@ function extractAttributesWithArgs(node, codeOrLines) {
  * functions inside a `mod tests` block as test entry points even when
  * they don't carry a direct `#[test]` attribute (BUG-CY).
  */
-function _isInsideCfgTestModule(node, lines) {
-    let parent = node.parent;
-    while (parent) {
-        if (parent.type === 'mod_item') {
-            const startRow = parent.startPosition.row;
-            // Look at preceding lines for #[cfg(test)] or #[cfg(any(test,...))] / #[cfg(all(...,test,...))]
-            for (let i = startRow - 1; i >= 0 && i >= startRow - 5; i--) {
-                const line = lines[i]?.trim();
-                if (!line) break;
-                if (line.startsWith('#[')) {
-                    // Match #[cfg(...)] forms that include a `test` predicate.
-                    // Conservatively look for the literal token `test` inside the cfg(...) args.
-                    const m = line.match(/#\[\s*cfg\s*\(([^\]]*)\)\s*\]/);
-                    if (m) {
-                        const args = m[1];
-                        // Word-boundary match for `test` to avoid matching e.g. `testing_module`.
-                        if (/\btest\b/.test(args)) return true;
-                    }
-                } else if (!line.startsWith('//')) {
-                    break;
-                }
-            }
-        }
-        parent = parent.parent;
+function _isInsideCfgTestModule(node) {
+    const namesTest = part => part.type === 'identifier' && rustAttributePath(part) === 'test' ||
+        part.namedChildren.some(namesTest);
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type !== 'mod_item') continue;
+        if (outerAttributeNodes(parent).some(attribute =>
+            rustAttributePath(attribute.namedChild(0)) === 'cfg' &&
+            attribute.childForFieldName('arguments')?.namedChildren.some(namesTest))) return true;
     }
     return false;
 }
@@ -6404,6 +6340,67 @@ const RUST_INERT_ATTRIBUTES = new Set(['test', 'ignore', 'should_panic', 'cfg', 
     'forbid', 'expect', 'doc', 'inline', 'cold', 'must_use', 'deprecated', 'track_caller', 'no_mangle', 'case',
     'values', 'timeout']);
 
+/** The comma-separated syntax groups of an attribute's token tree. */
+function rustAttributeGroups(argumentsNode) {
+    const groups = [[]];
+    for (const child of argumentsNode?.children || []) {
+        if (['(', ')', '[', ']', '{', '}', 'line_comment', 'block_comment'].includes(child.type)) continue;
+        if (child.type === ',') groups.push([]);
+        else groups[groups.length - 1].push(child);
+    }
+    return groups.filter(group => group.length > 0);
+}
+
+/** An attribute written inside cfg_attr is token-tree syntax, not an attribute node. */
+function rustNestedAttribute(nodes) {
+    let name = '';
+    let args = null;
+    for (const node of nodes) {
+        if (node.type === 'token_tree') { args = node; break; }
+        if (['identifier', 'scoped_identifier', '::'].includes(node.type)) name += rustAttributePath(node) || node.text;
+        else break;
+    }
+    return { name, args };
+}
+
+// Only configuration facts intrinsic to a test build are decided here.
+// Feature, target and user cfg values remain unknown, including their negations.
+function rustTestCfgValue(nodes) {
+    if (nodes.length === 1 && nodes[0].type === 'identifier' && rustAttributePath(nodes[0]) === 'test') return true;
+    const { name, args } = rustNestedAttribute(nodes);
+    if (!args) return null;
+    const values = rustAttributeGroups(args).map(rustTestCfgValue);
+    if (name === 'all') return values.includes(false) ? false : values.includes(null) ? null : true;
+    if (name === 'any') return values.includes(true) ? true : values.includes(null) ? null : false;
+    if (name === 'not' && values.length === 1) return values[0] === null ? null : !values[0];
+    return null;
+}
+
+/** Possible attributes cfg_attr adds to this exact declaration, never a neighbor. */
+function rustConditionalTestAttributes(node) {
+    const attributes = [];
+    const expand = (name, args, active) => {
+        if (active === false) return;
+        if (name !== 'cfg_attr') {
+            if (name) attributes.push({ name, certain: active === true });
+            return;
+        }
+        const [condition, ...nested] = rustAttributeGroups(args);
+        const value = condition ? rustTestCfgValue(condition) : null;
+        const enabled = value === false ? false : active === null || value === null ? null : true;
+        for (const group of nested) {
+            const attribute = rustNestedAttribute(group);
+            expand(attribute.name, attribute.args, enabled);
+        }
+    };
+    for (const attribute of outerAttributeNodes(node)) {
+        if (rustAttributePath(attribute.namedChild(0)) === 'cfg_attr') {
+            expand('cfg_attr', attribute.childForFieldName('arguments'), true);
+        }
+    }
+    return attributes;
+}
+
 /**
  * The tests a Rust file declares, as the test harness lists them: a
  * function carrying #[test] or an attribute whose path ends in ::test
@@ -6415,11 +6412,26 @@ const RUST_INERT_ATTRIBUTES = new Set(['test', 'ignore', 'should_panic', 'cfg', 
 function testUnits(fileEntry, helpers) {
     const units = [];
     const holding = new Set();
+    const attributesOf = symbol => symbol.attributesWithArgs || [];
+    let conditionalAttributes;
+    const conditionalAttributesOf = symbol => {
+        if (!attributesOf(symbol).some(attribute => attribute.name === 'cfg_attr')) return [];
+        if (!conditionalAttributes) {
+            conditionalAttributes = new Map();
+            for (const node of helpers.tree()?.rootNode.descendantsOfType('function_item') || []) {
+                conditionalAttributes.set(node.startIndex, rustConditionalTestAttributes(node));
+            }
+        }
+        return conditionalAttributes.get(symbol.sourceSpan?.start) || [];
+    };
     for (const symbol of fileEntry.symbols || []) {
-        if (symbol.type !== 'function') continue;
-        const attributes = symbol.attributesWithArgs || [];
+        if (symbol.type !== 'function' || symbol.macroExpansion) continue;
+        const attributes = attributesOf(symbol);
         // The attribute's path: `ignore = "why"` is the attribute `ignore`.
-        const names = attributes.map(attribute => String(attribute.name).split(/[\s=(]/)[0]);
+        const directNames = attributes.map(attribute => String(attribute.name).split(/[\s=(]/)[0]);
+        const conditional = conditionalAttributesOf(symbol);
+        const names = [...directNames, ...conditional.map(attribute => attribute.name)];
+        const ignored = directNames.includes('ignore') || conditional.some(attribute => attribute.name === 'ignore' && attribute.certain);
         const plain = names.some(name => /(^|::)test$/.test(name));
         const cases = names.some(name => RUST_CASE_ATTRIBUTES.has(name.split('::').pop()));
         if (!plain && !cases) continue;
@@ -6428,6 +6440,8 @@ function testUnits(fileEntry, helpers) {
         const gates = chain.filter(outer => (outer.modifiers || []).includes('cfg')).length;
         const ownGate = attributes.some(attribute => /^cfg(_attr)?$/.test(String(attribute.name)) &&
             String(attribute.args || '').replace(/[\s()]/g, '') !== 'test');
+        const outerGate = chain.some(outer => attributesOf(outer).some(attribute =>
+            /^cfg(_attr)?$/.test(String(attribute.name)) && String(attribute.args || '').replace(/[\s()]/g, '') !== 'test'));
         const inTestModule = (symbol.modifiers || []).includes('cfg_test_module');
         // An attribute that is none of the language's is a macro that rewrites the function.
         const rewritten = names.some(name => !/(^|::)test$/.test(name) &&
@@ -6437,11 +6451,11 @@ function testUnits(fileEntry, helpers) {
         units.push({
             kind: 'test', name: symbol.name, suite: chain.map(outer => outer.name),
             line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
-            endLine: symbol.endLine ?? symbol.startLine,
+            endLine: symbol.endLine ?? symbol.startLine, sourceSpan: symbol.sourceSpan,
             // Declared, and left out of a run unless asked for.
-            ...(names.includes('ignore') && { ignored: true, skipped: true }),
-            ...((ownGate || gates > (inTestModule ? 1 : 0)) && { conditional: true, notInEveryBuild: true }),
-            ...(!(ownGate || gates > (inTestModule ? 1 : 0)) && rewritten && { conditional: true }),
+            ...(ignored && { ignored: true, skipped: true }),
+            ...((ownGate || outerGate || gates > (inTestModule ? 1 : 0)) && { conditional: true, notInEveryBuild: true }),
+            ...(!(ownGate || outerGate || gates > (inTestModule ? 1 : 0)) && rewritten && { conditional: true }),
             // What a macro makes of the function is not read: none, one
             // or several tests.
             ...(rewritten && { several: true }),
@@ -6452,7 +6466,7 @@ function testUnits(fileEntry, helpers) {
         units.push({
             kind: 'suite', name: outer.name, suite: helpers.enclosing(outer).map(up => up.name),
             line: outer.nameLine || outer.startLine, startLine: outer.startLine,
-            endLine: outer.endLine ?? outer.startLine,
+            endLine: outer.endLine ?? outer.startLine, sourceSpan: outer.sourceSpan,
         });
     }
     // Tests a macro makes are not listed: a function a macro of the

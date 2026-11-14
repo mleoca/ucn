@@ -13,11 +13,10 @@
  *   no-static-dependents   the name has no use in project source outside its
  *                          own declarations, and no shield applies: nothing
  *                          the engine can see depends on it;
- *   has-static-dependents  a call or other use of the name exists OUTSIDE
- *                          the declaration. The first such site is given.
- *                          Evidence is by name, as in the audit: with two
- *                          declarations of one name it does not say which
- *                          of them the use reaches;
+ *   has-static-dependents  a confirmed call or an unambiguous use exists
+ *                          OUTSIDE the declaration. The first such site is
+ *                          given. Unresolved name-only evidence remains
+ *                          review and never borrows another target's site;
  *   review                 no use outside the declaration was found, but a
  *                          zero is not evidence here: a shield applies
  *                          (consumers outside the repository, a contract, a
@@ -68,7 +67,10 @@ const DEPENDENT_REASONS = new Set(['has-callers', 'has-usages', 'member-in-use']
 /** Why the pipeline did or did not claim a declaration, in one sentence. */
 const REASON_TEXT = Object.freeze({
     'claimed': 'the name has no use in project source outside its own declarations, and no shield applies',
-    'has-callers': 'a call of this name exists outside the declaration',
+    'has-callers': 'a call is proven to reach this declaration from outside it',
+    'unresolved-use': 'uses of the name exist, but none is proven to reach this declaration',
+    'identifier-normalization': 'Python normalizes a source identifier spelling that the caller graph does not model',
+    'builtin-namespace-effect': 'project source can change the builtin namespace that this declaration relies on',
     'has-usages': 'the name is used outside the declaration',
     'member-in-use': 'a member of this type is called outside the declaration',
     'used-only-within-itself': 'every use found is inside the declaration itself, and the audit does not clear a name that is in use',
@@ -80,6 +82,7 @@ const REASON_TEXT = Object.freeze({
     'runtime-contract': 'invoked by the language runtime, the compiler or an assignment, not by name',
     'registered': 'decorated or registered with a framework, which may invoke it without naming it',
     'entry-point': 'an entry point the runtime or a test runner invokes',
+    'runtime-entrypoint': 'packaging metadata registers this declaration, or its runtime entrypoints cannot be resolved',
     'constructor': 'a constructor: part of its type\'s allocation protocol, assessed with the type',
     'reflection': 'reflection in the project can reach this name',
     'dynamic-dispatch': 'member of a registry that is called through a computed key',
@@ -177,7 +180,21 @@ function callSiteOutside(index, declaration, indexed, names) {
 function useOutsideDeclaration(index, declaration, indexed, deadcode, options) {
     const name = declaration.name;
     const call = callSiteOutside(index, declaration, indexed, [name]);
-    if (call) return { reason: 'has-callers', site: call };
+    if (!indexed) {
+        const definite = definiteDependentsOf(index, declaration).find(site => site.kind === 'call');
+        if (definite) return { reason: 'has-callers', site: { file: definite.file, line: definite.line } };
+    }
+    const duplicateName = (index.symbols.get(name) || []).some(def => !sameDeclaration(def, declaration));
+    if (call || duplicateName) {
+        const callers = index.findCallers(name, { targetDefinitions: [declaration], collectAccount: true,
+            includeMethods: true, maxResults: Infinity });
+        const proven = callers.filter(c => c.tier !== 'unverified' &&
+            !withinDeclaration(declaration, indexed, c.file || path.join(index.root, c.relativePath), c.line))
+            .map(c => ({ file: c.relativePath || relativeOf(index, c.file), line: c.line })).sort(compareSites);
+        if (proven.length) return { reason: 'has-callers', site: proven[0] };
+        // A callee index is a name inventory, not selected-target evidence.
+        // Its conservative audit veto survives without a misleading site.
+    }
     let found = null;
     deadcode(index, {
         names: new Set([name]),
@@ -196,13 +213,16 @@ function useOutsideDeclaration(index, declaration, indexed, deadcode, options) {
             } else if (reason === 'has-usages') {
                 const sites = ((detail && detail.usages) || [])
                     .filter(usage => !withinDeclaration(declaration, indexed, usage.file, usage.line))
+                    .filter(usage => !(index.getCachedCalls(usage.file) || []).some(candidate =>
+                        candidate.line === usage.line && !candidate.isFunctionReference &&
+                        (candidate.name === name || candidate.resolvedName === name)))
                     .map(usage => ({ file: relativeOf(index, usage.file), line: usage.line }))
                     .sort(compareSites);
-                if (sites.length > 0) found = { reason, site: sites[0] };
+                if (sites.length > 0) found = duplicateName ? { reason: 'unresolved-use' } : { reason, site: sites[0] };
             }
         },
     });
-    return found;
+    return found || (call ? { reason: 'unresolved-use' } : null);
 }
 
 /**

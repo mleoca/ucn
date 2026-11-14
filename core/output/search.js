@@ -438,6 +438,9 @@ function formatTests(tests, name) {
             }
             if (testFile.run) lines.push(`  run: ${selectorText(testFile.run)}`);
             else if (testFile.role === 'tests' && testFile.runWithheld) lines.push(`  no command: ${testFile.runWithheld}`);
+            for (const unit of testFile.units || []) {
+                if (unit.selector) lines.push(`  run test: ${selectorText(unit.selector)}`);
+            }
             lines.push('');
         }
     }

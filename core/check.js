@@ -21,10 +21,13 @@
  *   blocked    a break was observed: a confirmed call site that no longer
  *              fits the signature, an import of a name its module no
  *              longer has, a bare call nothing is left to answer.
- *   review     the change can reach existing code and the engine cannot
- *              settle whether it breaks: the reason is named and the sites
- *              are listed.
- *   ready      nothing that existed before depends on what changed.
+ *   review     change exposure or call requirements are not settled:
+ *              the reason is named and the sites are listed.
+ *   ready      no unresolved exposure remains in the modeled checks.
+ *
+ * A changed outgoing call is checked too. Positive argument fit preserves
+ * a baseline invocation only in an unchanged written context; it is not a
+ * compiler proof for arbitrary new calls or surrounding expressions.
  *
  * TRUST is the worst verdict among the items. BLOCKED means a definite
  * break, or that the check itself could not run. It never means "there is
@@ -35,14 +38,15 @@
 
 const { diffImpact, composeAccount, callNotResolvedEntries } = require('./analysis');
 const { providedNames } = require('./change-kinds');
+const { outgoingChecker } = require('./outgoing-check');
 const fs = require('fs');
 const path = require('path');
 const { isValueDefinition, isTestPath } = require('./shared');
 const { langTraits } = require('../languages');
 const { assessDeletion, definiteDependentsOf, REASON_TEXT } = require('./deletion');
-const { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, HAZARD_TEXT } = require('./capture');
+const { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, newOwnerUnreached, HAZARD_TEXT } = require('./capture');
 const { reviewItemsOf } = require('./review-items');
-const { createTestModel, linkFiles, commandsFor } = require('./test-units');
+const { createTestModel, linkFiles, commandsFor, testSiteKey } = require('./test-units');
 // Reasons a file has no command that are about the file, not the runner.
 const FILE_WOULD_NOT_RUN = new Set(['declared-indirectly', 'collection-switched-off', 'conditional-tests']);
 const { resolveTarget, flaggedPaths } = require('./snapshot');
@@ -65,6 +69,7 @@ const MODULE_TEXT = Object.freeze({
     'no-longer-provided': 'other files import a name from this module that it no longer provides',
     'import-removed-still-used': 'an import was removed and the file still uses the name it bound',
     'imports-removed': 'a module the file imported or included without binding a name is no longer imported',
+    'checking-context-changed': 'checker directives changed; previously unchecked source may now be checked',
     'module-level-code': 'code outside any declaration changed; what runs when the module loads is not modeled',
     'name-in-use': 'a new import binds a name the file already used',
     'downstream-exposure': 'a name left the exports of a library: consumers outside the repository may use it',
@@ -167,7 +172,10 @@ function callersOf(index, name, definition) {
  */
 function assessAddition(index, entry, definition, addedLinesByFile, account, judge, nonCallable = false) {
     if (!definition) return { verdict: 'review', reasons: ['declaration-not-indexed'] };
-    const occurrences = occurrencesOutsideChange(index, entry.name, addedLinesByFile, definition);
+    const ownerExisted = ownerExistedBefore(index, definition, addedLinesByFile);
+    const occurrences = !ownerExisted && newOwnerUnreached(index, definition, addedLinesByFile)
+        ? { outside: [], total: 0 }
+        : occurrencesOutsideChange(index, entry.name, addedLinesByFile, definition);
     const summary = summarizeAccount(account);
     const reasons = [];
     if (occurrences.outside.length > 0) reasons.push('name-in-use');
@@ -182,7 +190,6 @@ function assessAddition(index, entry, definition, addedLinesByFile, account, jud
     try {
         contract = require('./deadcode').contractFactsOf(index, definition, index.files.get(definition.file)?.language);
     } catch (_) { contract = null; }
-    const ownerExisted = ownerExistedBefore(index, definition, addedLinesByFile);
     let shape;
     try { shape = ownerExisted ? shapeChangeOf(index, definition, addedLinesByFile) : null; } catch (_) { shape = 'shape'; }
     const hazards = captureHazards(index, definition, { ownerExisted, contract, shield, nonCallable, shape });
@@ -403,6 +410,7 @@ function assessModuleChange(index, moved, judge) {
     // Loose code in a test file is the test: nothing imports it for
     // what it does when it loads.
     if (moved.codeChanged && !isTestPath(moved.relativePath)) reasons.push('module-level-code');
+    if (moved.checkingChanged) reasons.push('checking-context-changed');
     if ((moved.shadowed || []).length > 0) reasons.push('name-in-use');
     return {
         verdict: reasons.length > 0 ? 'review' : 'ready', reasons,
@@ -686,6 +694,7 @@ function check(live, options = {}) {
         }
         throw e;
     }
+    target.index._beginOp();
     try {
         const result = checkTarget(target.index, options, target.repoRoot);
         const notes = [...target.notes];
@@ -703,6 +712,7 @@ function check(live, options = {}) {
         if (notes.length > 0 && result && result.ok !== false) result.notes = notes;
         return result;
     } finally {
+        target.index._endOp();
         target.dispose();
     }
 }
@@ -848,6 +858,26 @@ function checkTarget(index, options, repoRoot) {
     const changed = limit ? allChanged.slice(0, limit) : allChanged;
 
     const items = [];
+    const outgoing = outgoingChecker(index, judge, addedLinesByFile);
+    const withOutgoing = (item, fn) => {
+        if (fn._kind === 'deleted') return item;
+        const result = outgoing(definitionOf(index, fn), fn.change, fn._kind === 'added');
+        if (!result.mismatches.length && !result.unsettled.length) return item;
+        const blocking = result.mismatches.filter(row => !row.unchecked).length;
+        item.signatureMismatches += blocking;
+        if (result.mismatches.length) item.mismatches = [...(item.mismatches || []), ...result.mismatches];
+        if (result.unsettled.length) item.outgoingReview = result.unsettled;
+        if (blocking) {
+            item.verdict = 'blocked';
+            item.reasons = [...new Set(['outgoing-signature-mismatch', ...item.reasons])];
+        } else {
+            if (item.verdict === 'ready') item.verdict = 'review';
+            item.reasons = [...new Set([...item.reasons,
+                ...(result.mismatches.length ? ['site-not-checked'] : []),
+                ...(result.unsettled.length ? ['outgoing-call-unverified'] : [])])];
+        }
+        return item;
+    };
 
     for (const fn of changed) {
         const filePath = fn.relativePath || fn.file || '';
@@ -897,7 +927,7 @@ function checkTarget(index, options, repoRoot) {
                 item.verdict = 'review';
                 item.reasons = [valueDeclaration ? 'value-change' : 'declaration-change'];
             }
-            items.push(item);
+            items.push(withOutgoing(item, fn));
             continue;
         }
 
@@ -920,7 +950,7 @@ function checkTarget(index, options, repoRoot) {
                 // The contract every caller relies on is untouched.
                 item.verdict = 'ready';
                 item.reasons = [];
-                items.push(item);
+                items.push(withOutgoing(item, fn));
                 continue;
             }
             // The base revision decides which call sites the changed
@@ -975,7 +1005,7 @@ function checkTarget(index, options, repoRoot) {
                 }
             }
             item.reviewItems = reviewItemsOf(unverifiedCallers);
-            items.push(item);
+            items.push(withOutgoing(item, fn));
             continue;
         }
 
@@ -1010,7 +1040,7 @@ function checkTarget(index, options, repoRoot) {
             try { isEntry = isEntry || !!adapter?.isEntryPoint?.(definition); } catch (_) { /* keep */ }
             item.orphan = !isEntry;
         }
-        items.push(item);
+        items.push(withOutgoing(item, fn));
     }
 
     // Deleted callables: the base revision's declaration, assessed against
@@ -1067,6 +1097,7 @@ function checkTarget(index, options, repoRoot) {
                 className: fn.className || undefined,
                 _callerCache: callerCache,
                 _testModel: model,
+                _testSitesOnly: true,
             });
         } catch (e) {
             t = null;
@@ -1074,12 +1105,14 @@ function checkTarget(index, options, repoRoot) {
         for (const tf of (t && t.testFiles) || []) {
             let held = linesByFile.get(tf.file);
             if (!held) {
-                held = { row: tf, lines: new Set(), linked: new Set() };
+                held = { row: tf, lines: new Map(), linked: new Set() };
                 linesByFile.set(tf.file, held);
             }
             for (const name of tf.linkedFunctions || []) held.linked.add(name);
             for (const match of tf.matches || []) {
-                if (match.matchType === 'call' || match.matchType === 'test-case') held.lines.add(match.line);
+                if (match.matchType === 'call' || match.matchType === 'test-case') {
+                    held.lines.set(testSiteKey(match), match);
+                }
             }
         }
     }
@@ -1092,7 +1125,7 @@ function checkTarget(index, options, repoRoot) {
     // no link stands in.
     const linesOf = new Map();
     for (const [rel, held] of linesByFile) {
-        if (absoluteTest.has(rel)) linesOf.set(absoluteTest.get(rel), [...held.lines]);
+        if (absoluteTest.has(rel)) linesOf.set(absoluteTest.get(rel), [...held.lines.values()]);
     }
     testFiles = [];
     supportFiles = [];

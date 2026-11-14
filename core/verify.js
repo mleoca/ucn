@@ -1777,10 +1777,19 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
         if (!argsNode) return { args: [], argCount: 0, isMethodCall, ...ctx };
 
         let args = [];
+        const argumentFacts = [];
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const argNode = argsNode.namedChild(i);
             if (argNode.type.includes('comment')) continue;
             args.push(argNode.text.trim());
+            let value = argNode.type === 'keyword_argument' ? argNode.childForFieldName('value') : argNode;
+            // C# wraps each ordinary value in an argument node. Named or
+            // ref/out arguments remain outside the literal proof domain.
+            if (value?.type === 'argument' && value.namedChildCount === 1 && value.childCount === 1) {
+                value = value.namedChild(0);
+            }
+            argumentFacts.push({ kind: classifyArgNode(value), nodeType: value?.type, text: value?.text,
+                ...(argNode.type === 'keyword_argument' && { keyword: argNode.childForFieldName('name')?.text }) });
         }
 
         // Python argument structure (fix #281): keyword arguments bind by
@@ -1850,7 +1859,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             }
         }
 
-        return {
+        return Object.defineProperty({
             // Where the call is in the source: the same node, whoever reads
             // the file next (an alias, the second call on a line).
             span: { start: callNode.startIndex, end: callNode.endIndex },
@@ -1863,7 +1872,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             isMethodCall,
             ...(indirectKind && { indirectKind }),
             ...ctx,
-        };
+        }, 'argumentFacts', { value: argumentFacts });
     } catch (e) {
         return { args: null, argCount: 0 };
     }
@@ -1967,7 +1976,7 @@ function classifyArgNode(node) {
     }
     // Numbers
     if (t === 'number' || t === 'integer' || t === 'float' || t === 'number_literal' ||
-        t === 'integer_literal' || t === 'float_literal' || t === 'decimal_integer_literal' ||
+        t === 'integer_literal' || t === 'int_literal' || t === 'float_literal' || t === 'decimal_integer_literal' ||
         t === 'hex_integer_literal' || t === 'real_literal') {
         return 'number_literal';
     }
@@ -2139,10 +2148,11 @@ function bindKeywordCall(params, analysis) {
  * @param {object} options - { file }
  * @returns {object} Verification results with mismatches
  */
-function verify(index, name, options = {}) {
+function verify(index, name, options = {}, direct = null) {
     index._beginOp();
     try {
-    const { def, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
+    const { def, warnings } = direct ? { def: direct.definition, warnings: [] }
+        : index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return { found: false, function: name };
     }
@@ -2179,6 +2189,7 @@ function verify(index, name, options = {}) {
     const rawParamLists = ctorParamLists ||
         (callableIdentityParams?.length ? callableIdentityParams : null) ||
         [(arrowTypes?.paramsStructured) || def.paramsStructured || []];
+    if (direct) direct.parameterLists = rawParamLists.map(stripSelf);
     const params = stripSelf(rawParamLists[0]);
     const arities = rawParamLists.map(l => {
         const list = stripSelf(l);
@@ -2207,10 +2218,11 @@ function verify(index, name, options = {}) {
     // (the target-less check already resolved its base through the diff).
     const repoFile = index.repoPathOf ? index.repoPathOf(def.file) : def.file;
     if (options.base && options.checkBaseRef) assertGitCommit(repoFile, baseRef);
-    const baseRead = startBaseRead(def.file, baseRef, repoFile);
+    const baseRead = direct ? null : startBaseRead(def.file, baseRef, repoFile);
     let sweep;
     try {
-        sweep = contractedCallerSweep(index, name, def, {
+        sweep = direct ? { confirmed: direct.sites, unverified: [], account: null, rebound: [], baseChanges: [] }
+            : contractedCallerSweep(index, name, def, {
             baseChanges: () => baseDeclarationChanges(index, name, def, baseRef, baseRead),
         });
     } finally {
@@ -2296,6 +2308,7 @@ function verify(index, name, options = {}) {
         const occurrence = verifyLineSeen.get(siteKey) || 0;
         verifyLineSeen.set(siteKey, occurrence + 1);
         const analysis = analyzeCallSite(index, call, name, occurrence);
+        if (direct) (direct.callShapes ||= []).push(analysis);
 
         // Carry callerFile/callerStartLine so tagInTestCase can resolve the
         // enclosing function in a later pass.
@@ -2356,9 +2369,10 @@ function verify(index, name, options = {}) {
         }
 
         // Check if arg count is valid
-        const countOk = hasRest
-            ? argCount >= minArgs
-            : (argCount >= minArgs && argCount <= expectedParamCount);
+        const countOk = direct && !inheritedCtorOnly
+            ? arities.some(arity => argCount >= arity.min && (arity.hasRest || argCount <= arity.max))
+            : hasRest ? argCount >= minArgs
+                : (argCount >= minArgs && argCount <= expectedParamCount);
         if (call.rebind && call.rebind.kind !== 'no-overload' && (countOk || call.rebind.kind !== 'count')) {
             // Bound the base declaration; the new one may still take it, or
             // another overload may: the compiler decides (fix #394).
@@ -2441,7 +2455,7 @@ function verify(index, name, options = {}) {
             ...carry,
         });
     }
-    clearTreeCache(index);
+    if (!direct) clearTreeCache(index);
 
     // Feature A: tag each entry with `inTestCase` based on its enclosing function.
     // Done after the per-call loop because tagInTestCase prefers a single pass
@@ -6961,4 +6975,15 @@ function _methodGroupPass(index, name, renameTo, renamedDefs, changes, usages) {
 
 const IDENTITY_TYPE_KINDS_FOR_CREF = new Set(['class', 'struct', 'interface', 'record', 'enum', 'trait', 'type']);
 
-module.exports = { verify, plan, baseCounterpartOf, sitesReboundByChange, computePlanCallSites, analyzeCallSite, analyzeCallSiteAST, analyzeCallShape, classifyArgNode, findCallNode, clearTreeCache, identifyCallPatterns };
+/** Check already-resolved call sites using exactly the signature rules of verify. */
+function verifyCallSites(index, definition, sites) {
+    const direct = { definition, sites };
+    const result = verify(index, definition.name, {}, direct);
+    Object.defineProperties(result, {
+        parameterLists: { value: direct.parameterLists },
+        callShapes: { value: direct.callShapes },
+    });
+    return result;
+}
+
+module.exports = { verify, verifyCallSites, plan, baseCounterpartOf, sitesReboundByChange, computePlanCallSites, analyzeCallSite, analyzeCallSiteAST, analyzeCallShape, classifyArgNode, findCallNode, clearTreeCache, identifyCallPatterns };

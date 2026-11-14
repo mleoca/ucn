@@ -21,6 +21,9 @@ const CONTRACT_LINE_RE = /^\s*(?:(?:Summary|ACCOUNT|CONTRACT|WARNING|FILTERED|CA
 // The pre-commit check's verdict line is one of them (`repo` prints a
 // TRUST level of its own, which is orientation, not a verdict).
 const TRUST_LINE_RE = /^(?:(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|VALUE ACCOUNT|TYPE ACCOUNT):|TRUST: (?:BLOCKED|REVIEW_REQUIRED|READY_FOR_TOOLCHAIN)\b)/;
+// A count or deletion verdict is the answer the warnings qualify. Preserve
+// it with those warnings, or explicitly withhold the answer when both cannot fit.
+const RESULT_LINE_RE = /^(?:Dead code: \d+ unused symbol\(s\)|No dead code found\.|VERDICT: (?:no-static-dependents|has-static-dependents|review)\b)/;
 const MAX_PRESERVED_CONTRACT_LINES = 24;
 const MAX_PRESERVED_CONTRACT_CHARS = 8000;
 
@@ -45,10 +48,10 @@ function contractCandidates(fullText) {
         // Shell-shaped MCP/interactive results prefix disclosures with '# '.
         // Match their contents but retain the prefix in the preserved text.
         const evidenceLine = contractLine.replace(/^\s*# /, '').trim();
-        if (!CONTRACT_LINE_RE.test(evidenceLine)) continue;
+        if (!CONTRACT_LINE_RE.test(evidenceLine) && !RESULT_LINE_RE.test(evidenceLine)) continue;
         const line = contractLine.trim();
         if (!line) continue;
-        const priority = TRUST_LINE_RE.test(evidenceLine)
+        const priority = TRUST_LINE_RE.test(evidenceLine) || RESULT_LINE_RE.test(evidenceLine)
             ? 0
             : /^\d+ test-file usage\(s\) hidden\b/.test(evidenceLine) ? 1 : 2;
         candidates.push({ line, priority, sourceIndex });
@@ -319,7 +322,7 @@ function applyOutputBudget(text, {
     }
     const supportsAll = FLAG_APPLICABILITY[canonical]?.includes('all') &&
         !(canonical === 'deps' && params.cycles);
-    const noticesFor = (target, fullChars) => {
+    const noticesFor = (target, fullChars, budget = hardLimit) => {
         const allHint = supportsAll
             ? (target === 'mcp'
                 ? 'Use all=true or max_chars=<n> (100K maximum).'
@@ -333,21 +336,24 @@ function applyOutputBudget(text, {
             ? `Raise ${raiseHint}.`
             : `Narrow with ${compactScope || raiseHint}; raise ${raiseHint}.`;
         return {
-            longNotice: `... OUTPUT TRUNCATED: ${fullChars} chars total; hard limit ${hardLimit}. ` +
+            longNotice: `... OUTPUT TRUNCATED: ${fullChars} chars total; hard limit ${budget}. ` +
                 `${narrowingHint(command, target, params)} ${allHint}`,
-            compactNotice: `... OUTPUT TRUNCATED (${fullChars}→${hardLimit}). ${compactGuidance}`,
-            shortNotice: `... OUTPUT TRUNCATED. Raise ${raiseHint}.`,
+            compactNotice: `... OUTPUT TRUNCATED (${fullChars}→${budget}). ${compactGuidance}`,
+            shortNotice: `... OUTPUT TRUNCATED (${fullChars}→${budget}). Raise ${raiseHint}.`,
+            // At the tightest budgets, disclosures outrank the repeated
+            // raise-budget guidance; retain the full size and limit.
+            minimalNotice: `... OUTPUT TRUNCATED (${fullChars}→${budget}).`,
             raiseHint,
         };
     };
     const ownNotices = noticesFor(surface, text.length);
     if (paired) {
         const peerNotices = noticesFor(surface === 'mcp' ? 'cli' : 'mcp', peerText.length);
-        for (const name of ['longNotice', 'compactNotice', 'shortNotice']) {
+        for (const name of ['longNotice', 'compactNotice', 'shortNotice', 'minimalNotice']) {
             costs.set(ownNotices[name], Math.max(ownNotices[name].length, peerNotices[name].length));
         }
     }
-    const { longNotice, compactNotice, shortNotice, raiseHint } = ownNotices;
+    const { longNotice, compactNotice, shortNotice, minimalNotice, raiseHint } = ownNotices;
     const compactBudget = limit < 500;
 
     // Trust lines (ACCOUNT/CONTRACT/WARNING/...) qualify the answer: room for
@@ -456,7 +462,16 @@ function applyOutputBudget(text, {
             `... OUTPUT TRUNCATED (${fullChars}→${hardLimit}): answer withheld; ` +
             `${shown} of ${trust.length} trust line(s) shown. Raise ${target === 'mcp' ? 'max_chars' : '--max-chars'} to at least ${needed}.`;
         // Smallest budget whose shortest layout carries every trust line.
-        const needed = terminalChars + lineCost(shortNotice) + trustChars;
+        let needed = terminalChars + lineCost(minimalNotice) + trustChars;
+        // Raising the limit can add a digit to the notice itself. Compute
+        // the advertised budget using that budget's notice, for both peers.
+        for (;;) {
+            const noticeChars = Math.max(noticesFor(surface, text.length, needed).minimalNotice.length,
+                paired ? noticesFor(surface === 'mcp' ? 'cli' : 'mcp', peerText.length, needed).minimalNotice.length : 0);
+            const required = terminalChars + noticeChars + trustChars;
+            if (required <= needed) break;
+            needed = required;
+        }
         let shown = 0;
         const noticeCost = text => paired ? Math.max(text.length,
             text.replace(surface === 'mcp' ? 'max_chars' : '--max-chars', surface === 'mcp' ? '--max-chars' : 'max_chars').length) : text.length;
@@ -507,7 +522,9 @@ function applyOutputBudget(text, {
 
     if (compactBudget) {
         // Tiny transports: every disclosure outranks body detail.
-        return pick(() => layout(compactNotice, '', '\n', limit), () => layout(shortNotice, '', '\n', limit)) ||
+        return pick(() => layout(compactNotice, '', '\n', limit),
+            () => layout(shortNotice, '', '\n', limit),
+            () => layout(minimalNotice, '', '\n', limit)) ||
             (trust.length > 0 ? withheld() : bare());
     }
 
@@ -547,7 +564,8 @@ function applyOutputBudget(text, {
     const optionalShare = Math.max(0, Math.min(MAX_PRESERVED_CONTRACT_CHARS, Math.floor(limit * 0.5)) - trustChars);
     return pick(() => layout(longNotice, heading, '\n\n', optionalShare),
         () => layout(compactNotice, '', '\n', optionalShare),
-        () => layout(shortNotice, '', '\n', optionalShare)) ||
+        () => layout(shortNotice, '', '\n', optionalShare),
+        () => layout(minimalNotice, '', '\n', optionalShare)) ||
         (trust.length > 0 ? withheld() : bare());
 }
 

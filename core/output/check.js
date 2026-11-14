@@ -10,8 +10,8 @@
 
 const SECTIONS = [
     ['blocked', 'BLOCKED', 'a break was observed'],
-    ['review', 'REVIEW', 'can reach existing code; not settled by the engine'],
-    ['ready', 'READY', 'nothing that existed depends on the change'],
+    ['review', 'REVIEW', 'change exposure or call requirements not settled'],
+    ['ready', 'READY', 'no unresolved exposure in the modeled checks'],
 ];
 // Occurrences of a name are context, not a worklist: a head is enough.
 const NAME_SITE_LIMIT = 10;
@@ -49,6 +49,9 @@ function itemLines(it) {
         const where = m.file ? `${m.file}:${m.line}` : '';
         const expression = m.expression ? `  ${String(m.expression).trim()}` : '';
         lines.push(`    ↳ ${where}${expression}  ${problem}${m.unchecked ? '  (not checked by the toolchain)' : ''}`);
+    }
+    for (const site of it.outgoingReview || []) {
+        lines.push(`    ↳ ${site.file}:${site.line}${site.column != null ? `:${site.column + 1}` : ''}  ${site.name}: ${site.reason}`);
     }
     const sites = it.sites || [];
     const definite = it.verdict === 'blocked';

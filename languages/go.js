@@ -3952,7 +3952,7 @@ function testUnits(fileEntry, helpers) {
             // A file under a build constraint is compiled only sometimes.
             ...((fileEntry.buildConstraint || platform) && { conditional: true, notInEveryBuild: true }),
             line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
-            endLine: symbol.endLine ?? symbol.startLine,
+            endLine: symbol.endLine ?? symbol.startLine, sourceSpan: symbol.sourceSpan,
         });
     }
     // Go has no test that is not a declaration: no unit, no test.

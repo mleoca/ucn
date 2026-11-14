@@ -139,6 +139,7 @@ const STRUCTURAL_TRAITS = {
     physicalCallTokenSyntax: true,
     scopeAlternativeBindings: false,
     nameReferenceFamily: 'js',
+    discardIdentifierNames: [],
     staticValueImportSyntax: null,
     implicitEnumCaseLabels: false,
     valuePatternConstants: false,
@@ -196,6 +197,13 @@ const STRUCTURAL_TRAITS = {
     memberHidingModifier: null,
     virtualMemberModifiers: null,
     hasArityOverloads: false,
+    // Bounded literal proofs for changed project calls; absent means unknown.
+    checkLiteralArguments: null,
+    checkDirectiveComment: null,
+    checkFileDirectiveComment: null,
+    checkDirectiveTarget: null,
+    checkDirectiveBarrier: null,
+    checkTypedComment: null,
     userDefinedConversions: null,
     overloadPhases: null,
     overloadFileSymbols: false,
@@ -537,6 +545,7 @@ const NOMINAL_TRAITS = {
     physicalCallTokenSyntax: true,
     scopeAlternativeBindings: false,
     nameReferenceFamily: null,
+    discardIdentifierNames: [],
     staticValueImportSyntax: null,
     implicitEnumCaseLabels: false,
     valuePatternConstants: false,
@@ -589,6 +598,13 @@ const NOMINAL_TRAITS = {
     // the caller contract: a pinned overload is only confirmed when the call
     // site provably binds it.
     hasArityOverloads: false,
+    // Bounded literal proofs for changed project calls; absent means unknown.
+    checkLiteralArguments: null,
+    checkDirectiveComment: null,
+    checkFileDirectiveComment: null,
+    checkDirectiveTarget: null,
+    checkDirectiveBarrier: null,
+    checkTypedComment: null,
     // User-defined conversions keep otherwise incompatible argument types
     // possible; selecting an overload still needs a positive conversion proof.
     userDefinedConversions: null,
@@ -919,6 +935,11 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-javascript'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            checkTypedComment: text => /@ts-check\b|@(?:param|type|returns?)\s*\{/.test(text),
+            checkDirectiveComment: text => require('./javascript').checkDirectiveComment(text),
+            checkFileDirectiveComment: text => require('./javascript').checkFileDirectiveComment(text),
+            checkDirectiveTarget: 'next-line',
+            checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
@@ -948,6 +969,11 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-typescript').typescript,
         traits: {
             ...STRUCTURAL_TRAITS,
+            checkLiteralArguments: { smallInteger: ['number'], string: ['string'], boolean: ['boolean'] },
+            checkDirectiveComment: text => require('./javascript').checkDirectiveComment(text),
+            checkFileDirectiveComment: text => require('./javascript').checkFileDirectiveComment(text),
+            checkDirectiveTarget: 'next-line',
+            checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
@@ -981,6 +1007,11 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-typescript').tsx,
         traits: {
             ...STRUCTURAL_TRAITS,
+            checkLiteralArguments: { smallInteger: ['number'], string: ['string'], boolean: ['boolean'] },
+            checkDirectiveComment: text => require('./javascript').checkDirectiveComment(text),
+            checkFileDirectiveComment: text => require('./javascript').checkFileDirectiveComment(text),
+            checkDirectiveTarget: 'next-line',
+            checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
@@ -1014,6 +1045,9 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-python'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            checkLiteralArguments: { smallInteger: ['int', 'float'], string: ['str'], boolean: ['bool'] },
+            checkDirectiveComment: text => require('./python').checkDirectiveComment(text),
+            checkFileDirectiveComment: text => require('./python').checkFileDirectiveComment(text),
             testUnits: (fileEntry, helpers) => require('./python').testUnits(fileEntry, helpers),
             testRunnerFamily: 'python',
             testFileNames: [/^test_[^/]*\.py$/, /_test\.py$/],
@@ -1129,7 +1163,8 @@ const LANGUAGES = {
                     owners: ['Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag', 'ReprEnum'] },
             ]),
             reflectionApi: {
-                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval|exec|globals|vars)\b/,
+                pythonBindingIdentity: true,
+                hintPattern: /\b(?:getattr|setattr|hasattr|delattr|eval|exec|globals|vars|patch|MonkeyPatch)\b/,
                 functions: [{ callee: /^(?:getattr|setattr|hasattr|delattr)$/, nameArg: 1, receiverArg: 0 }],
                 namespaceLookups: { calls: /^eval$/, subscriptOf: /^(?:globals|vars)\(\)$/ },
                 // `exec(code)` runs statements; it names nothing a lookup
@@ -1148,6 +1183,7 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-go'),
         traits: {
             ...NOMINAL_TRAITS,
+            checkLiteralArguments: { smallInteger: ['int', 'int8', 'int16', 'int32', 'int64', 'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr', 'float32', 'float64'], string: ['string'], boolean: ['bool'] },
             testUnits: (fileEntry, helpers) => require('./go').testUnits(fileEntry, helpers),
             testGate: (fileEntry, helpers) => require('./go').testGate(fileEntry, helpers),
             testRunnerFamily: 'go',
@@ -1155,6 +1191,7 @@ const LANGUAGES = {
             selfParam: null,
             packageScope: 'directory',
             nameReferenceFamily: 'go',
+            discardIdentifierNames: ['_'],
             closedQueryBodies: ['function_declaration', 'method_declaration', 'func_literal'],
             hasReceiverPackageCalls: true,
             exportVisibility: 'capitalization',
@@ -1186,6 +1223,7 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-rust'),
         traits: {
             ...NOMINAL_TRAITS,
+            checkLiteralArguments: { smallInteger: ['i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'u8', 'u16', 'u32', 'u64', 'u128', 'usize'], string: ['&str'], boolean: ['bool'] },
             testUnits: (fileEntry, helpers) => require('./rust').testUnits(fileEntry, helpers),
             testRunnerFamily: 'rust',
             testFileNames: [/(^|\/)tests\/[^/]+\.rs$/],
@@ -1384,6 +1422,7 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c'),
         traits: {
             ...NOMINAL_TRAITS,
+            checkLiteralArguments: { smallInteger: ['int', 'short', 'long', 'long long', 'unsigned', 'unsigned int', 'unsigned short', 'unsigned long', 'unsigned long long', 'float', 'double'] },
             selfParam: null,
             packageScope: 'file',
             nameReferenceFamily: 'c',
@@ -1596,6 +1635,11 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-html'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            checkTypedComment: text => /@ts-check\b|@(?:param|type|returns?)\s*\{/.test(text),
+            checkDirectiveComment: text => require('./javascript').checkDirectiveComment(text),
+            checkFileDirectiveComment: text => require('./javascript').checkFileDirectiveComment(text),
+            checkDirectiveTarget: 'next-line',
+            checkDirectiveBarrier: text => text.startsWith('/*'),
             lenientCallArity: true,
             // Embedded scripts supply their own parse trees.
             physicalCallTokenSyntax: false,

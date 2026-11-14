@@ -1336,6 +1336,71 @@ func ExampleDiv() {
 
     // ------------------------------------------------------------------- cargo
     {
+        id: 'cargo-raw-attribute-identities', runner: 'cargo-test',
+        sometimes: ['src/lib.rs::raw_test', 'src/lib.rs::raw_cfg', 'src/lib.rs::nested'],
+        files: {
+            'Cargo.toml': CARGO('case_raw_attributes'),
+            'src/lib.rs': `${RS}
+#[cfg_attr(test, r#test)] fn raw_test() { mark("src/lib.rs::raw_test"); }
+#[r#cfg_attr(test, test)] fn raw_cfg() { mark("src/lib.rs::raw_cfg"); }
+#[cfg_attr(test, r#cfg_attr(test, test))] fn nested() { mark("src/lib.rs::nested"); }
+#[cfg_attr(not(r#test), test)] fn absent() { mark("src/lib.rs::absent"); }
+#[r#test] fn plain() { mark("src/lib.rs::plain"); }
+#[r#test] #[r#ignore = "r#test"] fn skipped() { mark("src/lib.rs::skipped"); }
+`,
+        },
+    },
+    {
+        id: 'cargo-cfg-attr-registration', runner: 'cargo-test',
+        sometimes: ['src/lib.rs::in_test_build', 'src/lib.rs::unconditional', 'src/lib.rs::nested'],
+        files: {
+            'Cargo.toml': CARGO('case_cfg_registration'),
+            'src/lib.rs': `${RS}
+#[cfg_attr(test, test)] fn in_test_build() { mark("src/lib.rs::in_test_build"); } fn ordinary() {}
+#[cfg_attr(all(), test)] fn unconditional() { mark("src/lib.rs::unconditional"); }
+#[cfg_attr(test, cfg_attr(all(), test))] fn nested() { mark("src/lib.rs::nested"); }
+#[test] fn plain() { mark("src/lib.rs::plain"); }
+`,
+        },
+    },
+    ...[false, true].map(enabled => ({
+        id: `cargo-cfg-attr-feature-${enabled ? 'enabled' : 'disabled'}`, runner: 'cargo-test',
+        sometimes: ['src/lib.rs::when_enabled', 'src/lib.rs::when_disabled'],
+        files: {
+            'Cargo.toml': `${CARGO('case_cfg_feature')}\n[features]\noptional = []\ndefault = ${enabled ? '["optional"]' : '[]'}\n`,
+            'src/lib.rs': `${RS}
+#[cfg_attr(feature = "optional", test)] fn when_enabled() { mark("src/lib.rs::when_enabled"); }
+#[cfg_attr(not(feature = "optional"), test)] fn when_disabled() { mark("src/lib.rs::when_disabled"); }
+#[test] fn plain() { mark("src/lib.rs::plain"); }
+`,
+        },
+    })),
+    {
+        id: 'cargo-cfg-attr-false-conditions', runner: 'cargo-test',
+        files: {
+            'Cargo.toml': CARGO('case_cfg_false'),
+            'src/lib.rs': `${RS}
+#[cfg_attr(any(), test)] fn never() { mark("src/lib.rs::never"); }
+#[cfg_attr(not(test), test)] fn outside_test_build() { mark("src/lib.rs::outside_test_build"); }
+#[cfg_attr(test, cfg_attr(any(), test))] fn nested_false() { mark("src/lib.rs::nested_false"); }
+#[test] fn plain() { mark("src/lib.rs::plain"); }
+`,
+        },
+    },
+    {
+        id: 'cargo-cfg-attr-ignore', runner: 'cargo-test',
+        sometimes: ['src/lib.rs::skipped', 'src/lib.rs::maybe', 'src/lib.rs::active'],
+        files: {
+            'Cargo.toml': `${CARGO('case_cfg_ignore')}\n[features]\noptional = []\n`,
+            'src/lib.rs': `${RS}
+#[cfg_attr(test, test, ignore = "why")] fn skipped() { mark("src/lib.rs::skipped"); }
+#[cfg_attr(test, test)] #[cfg_attr(feature = "optional", ignore)] fn maybe() { mark("src/lib.rs::maybe"); }
+#[cfg_attr(test, test)] #[cfg_attr(any(), ignore)] fn active() { mark("src/lib.rs::active"); }
+#[test] fn plain() { mark("src/lib.rs::plain"); }
+`,
+        },
+    },
+    {
         id: 'cargo-library', runner: 'cargo-test',
         files: {
             'Cargo.toml': CARGO('case_library'),

@@ -3143,3 +3143,370 @@ describe('test units: the judge holds a weaker claim to what it says', () => {
         assert.ok(!('CI' in here) && !('GITHUB_ACTIONS' in here));
     });
 });
+
+describe('fix #503: test-link identity at the bounded frontier', () => {
+    const fixtures = [
+        {
+            language: 'Python', file: 'library.py', leaf: 'leaf', frontier: 'main', real: 'tests/test_real.py', foreign: 'tests/test_foreign.py',
+            files: {
+                'library.py': 'def leaf():\n    return 1\n\ndef bridge():\n    return leaf()\n\ndef main():\n    return bridge()\n',
+                'other.py': 'def main():\n    return 9\n',
+                'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+                'tests/test_real.py': 'from library import main\n\ndef test_real():\n    assert main() == 1\n',
+                'tests/test_foreign.py': 'import other\nfrom library import bridge\n\ndef test_foreign():\n    assert other.main() == 9\n',
+            },
+            alias: 'from library import main as launch\n\ndef test_real():\n    assert launch() == 1\n',
+            callback: 'from library import main\n\ndef invoke(fn):\n    return fn()\n\ndef test_real():\n    assert invoke(main) == 1\n',
+            retarget: text => text.replace('from library import main', 'from other import main'),
+        },
+        {
+            language: 'JavaScript', file: 'library.js', leaf: 'leaf', frontier: 'main', real: 'test/real.test.js', foreign: 'test/foreign.test.js',
+            files: {
+                'library.js': 'export function leaf() { return 1; }\nexport function bridge() { return leaf(); }\nexport function main() { return bridge(); }\n',
+                'other.js': 'export function main() { return 9; }\n',
+                'package.json': '{"type":"module"}',
+                'test/real.test.js': 'import test from "node:test";\nimport {main} from "../library.js";\ntest("real", () => { main(); });\n',
+                'test/foreign.test.js': 'import test from "node:test";\nimport * as other from "../other.js";\nimport {bridge} from "../library.js";\ntest("foreign", () => { other.main(); });\n',
+            },
+            alias: 'import test from "node:test";\nimport {main as launch} from "../library.js";\ntest("real", () => { launch(); });\n',
+            callback: 'import test from "node:test";\nimport {main} from "../library.js";\ntest("real", main);\n',
+            retarget: text => text.replace('../library.js', '../other.js'),
+        },
+        {
+            language: 'Go', file: 'library.go', leaf: 'Leaf', frontier: 'Dispatch', real: 'real_test.go', foreign: 'foreign_test.go',
+            files: {
+                'go.mod': 'module linkfixture\n\ngo 1.20\n',
+                'library.go': 'package linkfixture\nfunc Leaf() int { return 1 }\nfunc Bridge() int { return Leaf() }\nfunc Dispatch() int { return Bridge() }\n',
+                'foreign/foreign.go': 'package foreign\nfunc Dispatch() int { return 9 }\n',
+                'real_test.go': 'package linkfixture\nimport "testing"\nfunc TestReal(t *testing.T) { if Dispatch() != 1 { t.Fatal("wrong") } }\n',
+                'foreign_test.go': 'package linkfixture\nimport ("testing"; "linkfixture/foreign")\nfunc TestForeign(t *testing.T) { if foreign.Dispatch() != 9 { t.Fatal("wrong") } }\n',
+            },
+            callback: 'package linkfixture\nimport "testing"\nfunc TestReal(t *testing.T) { callback := Dispatch; if callback() != 1 { t.Fatal("wrong") } }\n',
+            retarget: text => text.replace('import "testing"', 'import ("testing"; "linkfixture/foreign")').replace(':= Dispatch', ':= foreign.Dispatch').replace('if Dispatch()', 'if foreign.Dispatch()'),
+        },
+    ];
+    for (const fixture of fixtures) for (const form of ['direct', 'alias', 'callback']) {
+        if (form === 'alias' && !fixture.alias) continue;
+        it(`${fixture.language} ${form}: exact sites, bounded depth, and actual index histories agree`, () => {
+            const files = { ...fixture.files, [fixture.real]: fixture[form] || fixture.files[fixture.real] };
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const query = (engine, reverse = false) => {
+                    const answers = {};
+                    for (const depth of reverse ? [3, 2, 1] : [1, 2, 3]) {
+                        const result = engine.affectedTests(fixture.leaf, { file: fixture.file, depth });
+                        answers[depth] = result;
+                    }
+                    answers.direct = engine.tests(fixture.frontier, { file: fixture.file, callsOnly: true });
+                    return JSON.stringify(answers);
+                };
+                const initial = query(index);
+                const rows = JSON.parse(initial);
+                assert.deepStrictEqual(rows[1].testFiles.map(row => row.file), [], 'depth does not expand the production closure');
+                for (const depth of [2, 3]) {
+                    assert.deepStrictEqual(rows[depth].testFiles.map(row => row.file), [fixture.real]);
+                    assert.ok(rows[depth].testFiles[0].units?.some(unit => unit.kind === 'test'));
+                }
+                assert.deepStrictEqual(rows.direct.map(row => row.file), [fixture.real], 'file eligibility is not call identity');
+                assert.strictEqual(query(index, true), initial, 'query order');
+                index.saveCache();
+                index.saveUsageCache();
+                const { ProjectIndex } = require('../core/project');
+                const loaded = new ProjectIndex(dir);
+                assert.strictEqual(loaded.loadCache(), true);
+                assert.strictEqual(query(loaded), initial, 'saved and loaded cache');
+                fs.writeFileSync(path.join(dir, fixture.real), fixture.retarget(files[fixture.real]));
+                index.build(null, { quiet: true });
+                loaded.build(null, { quiet: true });
+                const fresh = query(idx(dir));
+                assert.strictEqual(query(index), fresh, 'live rebuild');
+                assert.strictEqual(query(loaded), fresh, 'loaded rebuild');
+                assert.deepStrictEqual(JSON.parse(fresh)[2].testFiles, [], 'retargeted import loses the old dependency');
+                assert.deepStrictEqual(JSON.parse(fresh).direct, [], 'a foreign callback reference is not direct evidence');
+            } finally { rm(dir); }
+        });
+    }
+    it('reuses exact caller decisions across roots of one operation', () => {
+        const fixture = fixtures[0];
+        const dir = tmp(fixture.files);
+        try {
+            const index = idx(dir), callerCache = new Map(), model = createTestModel(index);
+            const original = index.findCallers.bind(index);
+            const calls = [];
+            index.findCallers = (name, options) => { calls.push(options.targetDefinitions); return original(name, options); };
+            index._beginOp();
+            try {
+                const first = index.affectedTests('leaf', { file: 'library.py', depth: 2, _callerCache: callerCache, _testModel: model });
+                const count = calls.length;
+                assert.ok(calls.every(defs => defs?.length === 1), 'every declaration is pinned');
+                assert.deepStrictEqual(index.affectedTests('leaf', { file: 'library.py', depth: 2, _callerCache: callerCache, _testModel: model }), first);
+                assert.strictEqual(calls.length, count, 'repeated roots do not repeat caller walks');
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+    it('find keeps production definitions ahead of tied test doubles, including a capped result', () => {
+        const files = { 'zproduction.py': 'def locate_record():\n    return 1\n' };
+        for (let n = 0; n < 6; n++) files[`tests/test_double_${n}.py`] = 'def locate_record():\n    return 1\n';
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.find('locate_record')[0].relativePath, 'zproduction.py');
+            assert.strictEqual(index.find('locate_record', { limit: 5 })[0].relativePath, 'zproduction.py');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #503: mixed evidence in one test file', () => {
+    it('keeps the possible test unit when a different unit in its file is confirmed', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}',
+            'library.js': 'export function target() { return 1; }\n',
+            'test/library.test.js': 'import test from "node:test";\nimport {target} from "../library.js";\ntest("certain", () => { target(); });\ntest("possible", () => { unknown.target(); });\n',
+        });
+        try {
+            const result = idx(dir).affectedTests('target', { file: 'library.js', depth: 1 });
+            assert.deepStrictEqual(result.testFiles.flatMap(row => row.units || []).map(unit => unit.name), ['certain']);
+            assert.deepStrictEqual(result.possiblyAffectedTests.flatMap(row => row.units || []).map(unit => unit.name), ['possible']);
+            assert.ok(result.possiblyAffectedTests[0].matches.some(match => match.evidenceTier === 'unverified'));
+            assert.strictEqual(result.summary.totalTests, 1);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #503: exclusions belong to the selected declaration and site', () => {
+    it('keeps a true callback beside a foreign callback on one line and both targets in an unpinned query', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}',
+            'library.js': 'export function target() { return 1; }\n',
+            'other.js': 'export function target() { return 9; }\n',
+            'test/mixed.test.js': 'import test from "node:test";\nimport {target} from "../library.js";\nimport * as foreign from "../other.js";\nfunction invoke(fn) { return fn(); }\ntest("mixed", () => { invoke(target); invoke(foreign.target); });\n',
+            'test/foreign.test.js': 'import test from "node:test";\nimport {target} from "../other.js";\ntest("foreign", () => { target(); });\n',
+        });
+        try {
+            const index = idx(dir);
+            const pinned = index.tests('target', { file: 'library.js', callsOnly: true });
+            assert.deepStrictEqual(pinned.map(row => row.file), ['test/mixed.test.js']);
+            assert.deepStrictEqual(pinned[0].units.map(unit => unit.name), ['mixed']);
+            assert.deepStrictEqual(index.tests('target', { callsOnly: true }).map(row => row.file),
+                ['test/foreign.test.js', 'test/mixed.test.js']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #503 correction: physical declaration and test-site identity', () => {
+    for (const methods of [false, true]) {
+        it(`keeps distinct ${methods ? 'same-name methods' : 'functions'} declared on one line`, () => {
+            const lib = methods
+                ? 'export function leaf(){return 1;}\nexport class A { run(){return leaf();} } export class B { run(){return leaf();} }\n'
+                : 'export function leaf(){return 1;}\nexport function first(){return leaf();} export function second(){return leaf();}\n';
+            const dir = tmp({
+                'package.json': '{"type":"module"}', 'lib.js': lib,
+                'test/first.test.js': `import test from 'node:test';\nimport {${methods ? 'A' : 'first'}} from '../lib.js';\ntest('first',()=>${methods ? 'new A().run()' : 'first()'});\n`,
+                'test/second.test.js': `import test from 'node:test';\nimport {${methods ? 'B' : 'second'}} from '../lib.js';\ntest('second',()=>${methods ? 'new B().run()' : 'second()'});\n`,
+            });
+            try {
+                const index = idx(dir);
+                for (const depth of [1, 2, 3]) {
+                    assert.deepStrictEqual(index.affectedTests('leaf', { file: 'lib.js', depth }).testFiles.map(row => row.file),
+                        ['test/first.test.js', 'test/second.test.js']);
+                }
+                const expected = JSON.stringify(index.affectedTests('leaf', { file: 'lib.js', depth: 2 }));
+                index.saveCache(); index.saveUsageCache();
+                const { ProjectIndex } = require('../core/project');
+                const loaded = new ProjectIndex(dir);
+                assert.strictEqual(loaded.loadCache(), true);
+                assert.strictEqual(JSON.stringify(loaded.affectedTests('leaf', { file: 'lib.js', depth: 2 })), expected);
+            } finally { rm(dir); }
+        });
+    }
+    for (const reverse of [false, true]) {
+        it(`selects the reached test on a shared line (${reverse ? 'target first' : 'target last'}) and its native selector fails`, () => {
+            const cases = ["test('unrelated',()=>assert.equal(9,9));", "test('target',()=>assert.equal(leaf(),1));"];
+            if (reverse) cases.reverse();
+            const dir = tmp({
+                'package.json': '{"type":"module"}', 'lib.js': 'export function leaf(){return 1;}\n',
+                'test/shared.test.js': "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport {leaf} from '../lib.js';\n" + cases.join(' ') + '\n',
+            });
+            try {
+                const index = idx(dir);
+                const nativeEnv = { ...process.env };
+                delete nativeEnv.NODE_TEST_CONTEXT;
+                const direct = index.tests('leaf', { file: 'lib.js' });
+                const affected = index.affectedTests('leaf', { file: 'lib.js', depth: 1 }).testFiles;
+                for (const files of [direct, affected]) {
+                    assert.deepStrictEqual(files.flatMap(row => row.units || []).map(unit => unit.name), ['target']);
+                    const selector = files[0].units[0].selector;
+                    assert.ok(selector);
+                    execFileSync('/bin/sh', ['-c', selectorText(selector)], { cwd: dir, stdio: 'pipe', env: nativeEnv });
+                    fs.writeFileSync(path.join(dir, 'lib.js'), 'export function leaf(){return 2;}\n');
+                    assert.throws(() => execFileSync('/bin/sh', ['-c', selectorText(selector)], { cwd: dir, stdio: 'pipe', env: nativeEnv }),
+                        error => error.status !== 0);
+                    fs.writeFileSync(path.join(dir, 'lib.js'), 'export function leaf(){return 1;}\n');
+                }
+                const model = createTestModel(index), file = path.join(dir, 'test/shared.test.js');
+                assert.strictEqual(model.unitAt(file, 4), null, 'a line alone cannot choose either sibling');
+                const uncertain = linkFile(model, index, file, [{ line: 4 }]);
+                assert.deepStrictEqual(uncertain.units, []);
+                assert.ok(uncertain.moreTests, 'unknown source position withholds an exact unit');
+            } finally { rm(dir); }
+        });
+    }
+    it('retains two reached tests on one line and keeps an unrelated sibling out', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}', 'lib.js': 'export function leaf(){return 1;}\n',
+            'test/shared.test.js': "import test from 'node:test';\nimport {leaf} from '../lib.js';\ntest('first',()=>leaf()); test('unrelated',()=>9); test('second',()=>leaf());\n",
+        });
+        try {
+            const index = idx(dir);
+            for (const files of [index.tests('leaf', { file: 'lib.js' }), index.affectedTests('leaf', { file: 'lib.js', depth: 1 }).testFiles]) {
+                assert.deepStrictEqual(files.flatMap(row => row.units || []).map(unit => unit.name), ['first', 'second']);
+            }
+        } finally { rm(dir); }
+    });
+    for (const fixture of [
+        { name: 'Go', files: { 'go.mod': 'module positions\n\ngo 1.20\n', 'lib.go': 'package positions\nfunc leaf() int { return 1 }\n',
+            'lib_test.go': 'package positions\nimport "testing"\nfunc TestTarget(t *testing.T) { leaf() }; func TestUnrelated(t *testing.T) {}\n' }, target: 'TestTarget', file: 'lib.go' },
+        { name: 'Rust', files: { 'Cargo.toml': '[package]\nname="positions"\nversion="0.1.0"\nedition="2021"\n',
+            'src/lib.rs': 'fn leaf() -> i32 { 1 }\n#[cfg(test)] mod tests { use super::*; #[test] fn target() { leaf(); } #[test] fn unrelated() {} }\n' }, target: 'target', file: 'src/lib.rs' },
+        { name: 'Java', files: { 'Lib.java': 'class Lib { static int leaf() { return 1; } }\n',
+            'LibTest.java': 'import org.junit.jupiter.api.Test;\nclass LibTest { @Test void target() { Lib.leaf(); } @Test void unrelated() {} }\n' }, target: 'target', file: 'Lib.java' },
+        { name: 'C#', files: { 'Lib.cs': 'class Lib { public static int leaf() { return 1; } }\n',
+            'LibTest.cs': 'using Xunit;\npublic class LibTest { [Fact] public void Target() { Lib.leaf(); } [Fact] public void Unrelated() {} }\n' }, target: 'Target', file: 'Lib.cs' },
+    ]) {
+        it(`${fixture.name}: shared-line units use the reached body`, () => {
+            const dir = tmp(fixture.files);
+            try {
+                const index = idx(dir);
+                for (const files of [index.tests('leaf', { file: fixture.file }), index.affectedTests('leaf', { file: fixture.file, depth: 1 }).testFiles]) {
+                    assert.deepStrictEqual(files.flatMap(row => row.units || []).map(unit => unit.name), [fixture.target]);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #503 correction: newly registered Rust tests', () => {
+    it('check reviews the test and keeps an ordinary following addition ready', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="attribute_owner"\nversion="0.1.0"\n',
+            'src/lib.rs': 'fn original() {}\n',
+        });
+        try {
+            git(dir, 'init', '-q'); git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'base');
+            fs.writeFileSync(path.join(dir, 'src/lib.rs'), 'fn original() {}\n#[test] fn registered() {}\nfn ordinary() {}\n');
+            const result = execute(idx(dir), 'check', {});
+            assert.ok(result.ok, result.error);
+            const registered = result.result.changed.find(row => row.name === 'registered');
+            const ordinary = result.result.changed.find(row => row.name === 'ordinary');
+            assert.strictEqual(registered.verdict, 'review');
+            assert.ok(registered.reasons.includes('registered'));
+            assert.strictEqual(ordinary.verdict, 'ready');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #503 correction: same-line callers are not self-recursion', () => {
+    it('crosses between two declarations sharing a line without consuming the recursion edge', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}',
+            'lib.js': 'export function leaf(){return 1;}\nexport function first(){return second();} export function second(){return leaf();}\n',
+            'test/first.test.js': "import test from 'node:test';\nimport {first} from '../lib.js';\ntest('first',()=>first());\n",
+            'test/second.test.js': "import test from 'node:test';\nimport {second} from '../lib.js';\ntest('second',()=>second());\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(index.affectedTests('leaf', { file: 'lib.js', depth: 1 }).testFiles.map(row => row.file), ['test/second.test.js']);
+            const deeper = index.affectedTests('leaf', { file: 'lib.js', depth: 2 });
+            assert.deepStrictEqual(deeper.testFiles.map(row => row.file), ['test/first.test.js', 'test/second.test.js']);
+            assert.strictEqual(deeper.treeAccount.recursiveEdges, 0);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #503 correction: Rust cfg_attr test declarations', () => {
+    const manifest = '[package]\nname="conditional_units"\nversion="0.1.0"\nedition="2021"\n';
+    for (const [attribute, listed] of [
+        ['cfg_attr(test, test)', true],
+        ['cfg_attr(all(), test)', true],
+        ['cfg_attr(test, cfg_attr(all(), test))', true],
+        ['cfg_attr(test, r#test)', true],
+        ['r#cfg_attr(test, test)', true],
+        ['cfg_attr(test, r#cfg_attr(test, test))', true],
+        ['cfg_attr(r#test, test)', true],
+        ['cfg_attr(not(r#test), test)', false],
+        ['cfg_attr(feature = "optional", test)', true],
+        ['cfg_attr(not(feature = "optional"), test)', true],
+        ['cfg_attr(any(test, feature = "optional"), test)', true],
+        ['cfg_attr(all(test, feature = "optional"), test)', true],
+        ['cfg_attr(any(), test)', false],
+        ['cfg_attr(not(test), test)', false],
+        ['cfg_attr(test, cfg_attr(any(), test))', false],
+        ['cfg_attr(any(), cfg_attr(feature = "optional", test))', false],
+    ]) {
+        it(`${attribute}: ${listed ? 'retains the possible test without an exact command' : 'does not declare a test in a test build'}`, () => {
+            const dir = tmp({
+                'Cargo.toml': manifest,
+                'src/lib.rs': `fn leaf() -> i32 { 1 }\n#[${attribute}] fn conditional_test() { assert_eq!(leaf(), 1); }\nfn ordinary() {}\n`,
+            });
+            try {
+                const index = idx(dir);
+                for (const depth of [0, 1, 2, 3]) {
+                    const response = execute(index, 'tests', { name: 'leaf', file: 'src/lib.rs', line: 1, depth });
+                    assert.ok(response.ok, response.error);
+                    const files = depth === 0 ? response.result : response.result.testFiles;
+                    const units = files.flatMap(file => file.units || []);
+                    assert.deepStrictEqual(units.map(unit => unit.name), listed ? ['conditional_test'] : []);
+                    for (const unit of units) {
+                        assert.strictEqual(unit.conditional, true);
+                        assert.strictEqual(unit.selector, undefined);
+                        assert.strictEqual(unit.selectorWithheld, 'conditional-compilation');
+                    }
+                }
+                const model = createTestModel(index), file = path.join(dir, 'src/lib.rs');
+                assert.deepStrictEqual(linkFile(model, index, file, [1, 2, 3]).units.map(unit => unit.name),
+                    listed ? ['conditional_test'] : [], 'the attribute cannot make the following function a test');
+            } finally { rm(dir); }
+        });
+    }
+
+    it('an unknown conditional ignore does not claim a test is skipped; a known ignore does', () => {
+        const found = answerFor({
+            'Cargo.toml': manifest,
+            'src/lib.rs': '#[cfg_attr(test, test, ignore = "why")] fn skipped() {}\n' +
+                '#[cfg_attr(test, test)] #[cfg_attr(feature = "optional", ignore)] fn maybe() {}\n' +
+                '#[cfg_attr(test, test)] #[cfg_attr(any(), ignore)] fn active() {}\n',
+        }, 'src/lib.rs');
+        assert.deepStrictEqual(found.units.map(unit => [unit.name, !!unit.skipped]),
+            [['skipped', true], ['maybe', false], ['active', false]]);
+        assert.ok(found.units.every(unit => unit.conditional && !unit.selector));
+    });
+
+    it('normalizes raw direct and name-value attributes without changing their arguments', () => {
+        const found = answerFor({
+            'Cargo.toml': manifest,
+            'src/lib.rs': '#[r#test] fn active() {}\n#[r#test] #[r#ignore = "r#test"] fn skipped() {}\n',
+        }, 'src/lib.rs');
+        assert.deepStrictEqual(found.units.map(unit => [unit.name, !!unit.skipped]),
+            [['active', false], ['skipped', true]]);
+    });
+
+    it('reads cfg_attr from source after a cache load and keeps generated declarations unlisted', () => {
+        const dir = tmp({
+            'Cargo.toml': manifest,
+            'src/lib.rs': 'fn leaf() -> i32 { 1 }\n#[cfg_attr(test, test)] fn direct() { leaf(); }\n' +
+                'macro_rules! make { () => { #[cfg_attr(test, test)] fn generated() { leaf(); } }; }\nmake!();\n',
+        });
+        try {
+            const index = idx(dir);
+            const expected = index.tests('leaf', { file: 'src/lib.rs' });
+            assert.deepStrictEqual(expected.flatMap(file => file.units || []).map(unit => unit.name), ['direct']);
+            assert.ok(expected.some(file => file.moreTests));
+            index.saveCache(); index.saveUsageCache();
+            const { ProjectIndex } = require('../core/project');
+            const loaded = new ProjectIndex(dir);
+            assert.strictEqual(loaded.loadCache(), true);
+            assert.deepStrictEqual(loaded.tests('leaf', { file: 'src/lib.rs' }), expected);
+        } finally { rm(dir); }
+    });
+});

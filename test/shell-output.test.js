@@ -19,6 +19,66 @@ const fixture = {
     'app.js': 'const { helper } = require("./lib");\nfunction run() { return helper(1); }',
 };
 
+describe('fix #504: result summaries survive bounded output with their warnings', () => {
+    const { applyOutputBudget } = require('../core/output-budget');
+    it('keeps the result and every warning, or explicitly withholds across both surfaces', () => {
+        const warnings = [
+            'WARNING: 4 computed dispatch calls choose members at runtime.',
+            'WARNING: 2 dynamic reflection calls have no static member spelling.',
+            'WARNING: source coverage is incomplete; candidate names in skipped source were suppressed.',
+        ];
+        const summaries = [
+            ['deadcode', 'Dead code: 8 unused symbol(s)'],
+            ['plan', 'VERDICT: review'],
+        ];
+        for (const [command, summary] of summaries) {
+            const text = [summary, '', '  candidate detail\n'.repeat(100), ...warnings].join('\n');
+            for (const limit of [1, 60, 150, 300, 400, 500, 520, 600, 1000]) {
+                const results = ['cli', 'mcp'].map(surface => applyOutputBudget(text, {
+                    command, maxChars: limit, surface, peerText: text,
+                    trailingChars: surface === 'cli' ? 1 : 0,
+                }));
+                for (const result of results) {
+                    assert.ok(result.text.length <= limit);
+                    const lines = result.text.split('\n').map(line => line.trim());
+                    if (![summary, ...warnings].every(line => lines.includes(line))) {
+                        assert.ok(result.text === '' || /withheld/.test(result.text), result.text);
+                        assert.strictEqual(result.contractMetadataComplete, false);
+                        assert.doesNotMatch(result.text, /candidate detail/);
+                    } else {
+                        assert.strictEqual(result.contractMetadataComplete, true);
+                    }
+                    const total = result.text.match(/OUTPUT TRUNCATED(?: \((\d+)→|: (\d+) chars total)/);
+                    if (limit >= 300) assert.ok(total, result.text);
+                    if (total) assert.strictEqual(Number(total[1] || total[2]), text.length);
+                }
+                const required = result => result.text.split('\n').filter(line =>
+                    line === summary || warnings.includes(line));
+                assert.deepStrictEqual(required(results[0]), required(results[1]));
+                assert.strictEqual(results[0].contractMetadataComplete, results[1].contractMetadataComplete);
+            }
+        }
+    });
+
+    it('advertises enough room when the required budget gains another digit', () => {
+        for (const length of [870, 900, 920, 950, 970, 990]) {
+            const full = 'Dead code: 1 unused symbol(s)\n' + '  details\n'.repeat(200) +
+                'WARNING: ' + 'x'.repeat(length);
+            for (const surface of ['cli', 'mcp']) {
+                const options = { command: 'deadcode', surface, peerText: full,
+                    trailingChars: surface === 'cli' ? 1 : 0 };
+                const small = applyOutputBudget(full, { ...options, maxChars: 300 });
+                const needed = Number(small.text.match(/at least (\d+)/)?.[1]);
+                assert.ok(needed > 300, small.text);
+                const enough = applyOutputBudget(full, { ...options, maxChars: needed });
+                assert.doesNotMatch(enough.text, /withheld/);
+                assert.ok(enough.text.includes('WARNING: ' + 'x'.repeat(length)));
+                assert.ok(enough.text.includes('Dead code: 1 unused symbol(s)'));
+            }
+        }
+    });
+});
+
 describe('release shell contracts', () => {
     it('lists accessor dependency sites with filterable unverified tags', () => {
         const dir = tmp({ 'lib.ts': [

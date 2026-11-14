@@ -18,6 +18,37 @@ const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = req
 
 const os = require('os');
 
+describe('fix #501: JSX intrinsic names conserve non-call occurrences', () => {
+    for (const extension of ['js', 'ts', 'tsx', 'html']) it(`literal bracket callers and callees agree in ${extension}`, () => {
+        const source = 'class Container { _target() { return 7; } }\nconst item=new Container();\nfunction exercise(){return item["_target"]();}\n';
+        const dir = tmp({ [`app.${extension}`]: extension === 'html' ? `<script>\n${source}</script>` : source });
+        try {
+            const index = idx(dir);
+            const result = index.about('_target', { file: `app.${extension}` });
+            assert.strictEqual(result.callers.total, 1);
+            assert.strictEqual(result.callers.unverified.total, 0);
+            assert.strictEqual(result.account.confirmed, 1);
+            assert.strictEqual(result.account.conserved, true);
+            const caller = index.symbols.get('exercise')[0];
+            const callees = index.findCallees(caller, { collectAccount: true });
+            assert.ok(callees.some(callee => callee.name === '_target' && callee.tier === 'confirmed'));
+        } finally { rm(dir); }
+    });
+    it('does not turn an intrinsic main element into a caller of Python main', () => {
+        const dir = tmp({ 'server.py': 'def main():\n    return 7\n',
+            'view.tsx': 'export function View() { return <main><span /></main>; }\n' });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'about', { name: 'main', file: 'server.py' });
+            assert.ok(result.ok);
+            assert.strictEqual(result.result.callers.total, 0);
+            assert.strictEqual(result.result.callers.unverified.total, 0);
+            assert.ok(result.result.account.groundTotal > 1);
+            assert.strictEqual(result.result.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #467: instance method wrappers remain reviewable', () => {
     for (const extension of ['js', 'ts', 'tsx', 'html']) {
         it(`preserves the post-write call and its callee uncertainty in ${extension}`, () => {

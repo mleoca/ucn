@@ -1015,7 +1015,9 @@ function clearAllCaches() {
 // every file's text on each query).
 // v335: reflection/eval facts follow commented and parenthesized callees;
 // package reflection qualifiers retain Unicode names and lexical ownership.
-const CACHE_FORMAT_VERSION = 335;
+// v336 (fixes #501/#503): binding-resolved Python registration/reflection,
+// nested runtime owner paths, JS computed calls, and owned Rust attributes.
+const CACHE_FORMAT_VERSION = 336;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

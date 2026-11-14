@@ -7,6 +7,7 @@
 
 const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
 const { referenceScope, scopeFields } = require('./lexical-scope');
+const { jsStaticKey } = require('./static-js');
 
 
 const {
@@ -4356,13 +4357,14 @@ function findCallsInCode(code, parser) {
                     argCount: node.childForFieldName('arguments')?.namedChildCount ?? 0,
                     enclosingFunction,
                 });
-            } else if (funcNode.type === 'member_expression') {
+            } else if (funcNode.type === 'member_expression' ||
+                (funcNode.type === 'subscript_expression' && jsStaticKey(funcNode.childForFieldName('index')) != null)) {
                 // Method call: obj.foo() or foo.call/apply/bind()
-                const propNode = funcNode.childForFieldName('property');
+                const propNode = funcNode.childForFieldName('property') || funcNode.childForFieldName('index');
                 let objNode = funcNode.childForFieldName('object');
 
                 if (propNode) {
-                    const propName = propNode.text;
+                    const propName = funcNode.type === 'subscript_expression' ? jsStaticKey(propNode) : propNode.text;
 
                     // Handle .call(), .apply(), .bind() - these are calls TO the object.
                     // boundCall marks the indirection (fix #221, family B): the line
@@ -5726,6 +5728,19 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
     const scopeMemo = options.lexicalScopes ? new Map() : null;
 
     visitNameNodes(tree, code, name, (node) => {
+        // A literal bracket key is the member token of an ordinary call.
+        // Keep it in the same ground-set bucket as the dotted spelling.
+        const literal = node.type === 'string' ? node : node.parent?.type === 'string' ? node.parent : null;
+        const computed = literal?.parent;
+        if (computed?.type === 'subscript_expression' &&
+            sameNode(computed.childForFieldName('index'), literal) && jsStaticKey(literal) === name) {
+            const call = computed.parent;
+            const receiver = computed.childForFieldName('object');
+            usages.push({ line: node.startPosition.row + 1, column: node.startPosition.column,
+                usageType: call?.type === 'call_expression' && sameNode(call.childForFieldName('function'), computed) ? 'call' : 'reference',
+                ...(['identifier', 'this', 'super'].includes(receiver?.type) && { receiver: receiver.text }) });
+            return true;
+        }
         // Look for identifier, property_identifier (method names in obj.method() calls),
         // private_property_identifier (#method definitions and calls),
         // type_identifier (TypeScript type annotations), shorthand_property_identifier_pattern
@@ -5879,7 +5894,7 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
             }
             // JSX component usage: <Component /> or <Component>...</Component>
             else if (parent.type === 'jsx_self_closing_element' || parent.type === 'jsx_opening_element') {
-                usageType = 'call';  // Treat JSX component usage as a "call"
+                usageType = /^[A-Z]/.test(node.text) ? 'call' : 'intrinsic';
             }
         }
 
@@ -6898,6 +6913,9 @@ function testUnits(fileEntry, helpers) {
             kind: api.kind, name: title, titled: true, suite: ctx.suites.map(suite => suite.name),
             line: node.startPosition.row + 1, startLine: node.startPosition.row + 1,
             endLine: node.endPosition.row + 1,
+            sourceSpan: { start: node.startIndex, end: node.endIndex,
+                startLine: node.startPosition.row + 1, endLine: node.endPosition.row + 1,
+                startColumn: node.startPosition.column, endColumn: node.endPosition.column },
             parent: outer ? outer.index : -1,
             ...(api.only && { only: true }),
             ...(skipped && { skipped: true }),
@@ -7118,14 +7136,28 @@ const TS_DIRECTIVE_BLOCK = /^(?:\/|\*)*\s*@(?:ts-expect-error|ts-ignore)/;
 // A file pragma: `// @name`, the name ending at a space or a colon.
 const TS_FILE_PRAGMA = /^\/\/\/?\s*@([^\s:]+)/;
 
+function lineCheckDirective(text) {
+    return text.startsWith('//') ? TS_DIRECTIVE_LINE.test(text)
+        : TS_DIRECTIVE_BLOCK.test(text.slice(text.lastIndexOf('\n') + 1).trimStart());
+}
+
+/** The same scanner grammar used by check suppression and diff context. */
+function checkFileDirectiveComment(text) {
+    const pragma = text.startsWith('//') ? TS_FILE_PRAGMA.exec(text) : null;
+    const name = pragma ? pragma[1].toLowerCase() : null;
+    return name === 'ts-nocheck' || name === 'ts-check' ? 'leading' : null;
+}
+function checkDirectiveComment(text) {
+    return lineCheckDirective(text) || checkFileDirectiveComment(text) !== null;
+}
+
 /** Lines that hold a directive comment, and whether the file is unchecked. */
 function checkDirectives(root) {
     const lines = new Set();
     let unchecked = false;
     for (const comment of root.descendantsOfType('comment')) {
         const text = comment.text;
-        const directive = text.startsWith('//') ? TS_DIRECTIVE_LINE.test(text)
-            : TS_DIRECTIVE_BLOCK.test(text.slice(text.lastIndexOf('\n') + 1).trimStart());
+        const directive = lineCheckDirective(text);
         if (directive) lines.add(comment.endPosition.row + 1);
     }
     // `@ts-nocheck` and `@ts-check` are pragmas of the `//` comments
@@ -7343,6 +7375,8 @@ module.exports = {
     classMemberRole,
     typedLiteralMembers,
     checkSuppressedAt,
+    checkDirectiveComment,
+    checkFileDirectiveComment,
     checkedImportAt,
     CLASS_DECLARATION_NODES,
     findFunctions,

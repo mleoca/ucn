@@ -10033,3 +10033,51 @@ describe('fix #469: external inherent dispatch is independent of target pin shap
         } finally { rm(dir); }
     });
 });
+
+describe('fix #503 correction: Rust attributes belong to AST items', () => {
+    it('shields a same-line test without donating its attribute to the following function', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="attribute_owner"\nversion="0.1.0"\n',
+            'src/lib.rs': '#[test] fn registered() {}\nfn unused() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const registered = index.symbols.get('registered')[0];
+            const unused = index.symbols.get('unused')[0];
+            assert.ok(registered.modifiers.includes('test'));
+            assert.deepStrictEqual(registered.attributesWithArgs, [{ name: 'test', args: null }]);
+            assert.ok(!unused.modifiers.includes('test'));
+            const assess = name => execute(index, 'plan', { name, file: 'src/lib.rs', delete: true }).result;
+            assert.strictEqual(assess('registered').verdict, 'review');
+            assert.strictEqual(assess('unused').verdict, 'no-static-dependents');
+            const names = index.deadcode({}).map(row => row.name);
+            assert.ok(!names.includes('registered'));
+            assert.ok(names.includes('unused'));
+            index.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.strictEqual(loaded.loadCache(), true);
+            assert.deepStrictEqual(loaded.symbols.get('registered')[0].attributesWithArgs, registered.attributesWithArgs);
+            assert.strictEqual(execute(loaded, 'plan', { name: 'registered', file: 'src/lib.rs', delete: true }).result.verdict, 'review');
+        } finally { rm(dir); }
+    });
+    it('keeps neighboring same-line attributes and test-module ownership separate', () => {
+        const dir = tmp({
+            'src/lib.rs': '#[test] fn first() {} #[ignore = "later"] #[test] fn second() {} fn plain() {}\n#[cfg(test)] mod tests { fn helper() {} }\nfn outside() {}\n',
+            'src/extra.rs': '#[inline(always)] fn extra() {}\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            const facts = index => [...index.symbols].flatMap(([name, defs]) => defs.map(def =>
+                [name, def.modifiers || [], def.attributesWithArgs || []]));
+            assert.deepStrictEqual(facts(parallel), facts(sequential));
+            assert.deepStrictEqual(sequential.symbols.get('first')[0].modifiers, ['test']);
+            assert.deepStrictEqual(sequential.symbols.get('second')[0].modifiers, ['test', 'ignore = "later"']);
+            assert.deepStrictEqual(sequential.symbols.get('plain')[0].modifiers, []);
+            assert.ok(sequential.symbols.get('helper')[0].modifiers.includes('cfg_test_module'));
+            assert.ok(!sequential.symbols.get('outside')[0].modifiers.includes('cfg_test_module'));
+        } finally { rm(dir); }
+    });
+});

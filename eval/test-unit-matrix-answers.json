@@ -29,6 +29,41 @@
     "all: cargo test --bin case_binlib",
     "all: cargo test --lib -- shared::"
   ],
+  "cargo-cfg-attr-false-conditions": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  T plain => cargo test --lib -- plain --exact",
+    "all: cargo test --lib"
+  ],
+  "cargo-cfg-attr-feature-disabled": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  T when_enabled [conditional] => (withheld: conditional-compilation)",
+    "  T when_disabled [conditional] => (withheld: conditional-compilation)",
+    "  T plain => cargo test --lib -- plain --exact",
+    "all: cargo test --lib"
+  ],
+  "cargo-cfg-attr-feature-enabled": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  T when_enabled [conditional] => (withheld: conditional-compilation)",
+    "  T when_disabled [conditional] => (withheld: conditional-compilation)",
+    "  T plain => cargo test --lib -- plain --exact",
+    "all: cargo test --lib"
+  ],
+  "cargo-cfg-attr-ignore": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  T skipped [conditional] [skipped] => (withheld: conditional-compilation)",
+    "  T maybe [conditional] => (withheld: conditional-compilation)",
+    "  T active [conditional] => (withheld: conditional-compilation)",
+    "  T plain => cargo test --lib -- plain --exact",
+    "all: cargo test --lib"
+  ],
+  "cargo-cfg-attr-registration": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  T in_test_build [conditional] => (withheld: conditional-compilation)",
+    "  T unconditional [conditional] => (withheld: conditional-compilation)",
+    "  T nested [conditional] => (withheld: conditional-compilation)",
+    "  T plain => cargo test --lib -- plain --exact",
+    "all: cargo test --lib"
+  ],
   "cargo-custom-targets": [
     "source/entry.rs [tests] cargo-test  run: (withheld: custom-targets)",
     "  S tests",
@@ -80,6 +115,15 @@
     "  T tests > adds_more => cargo test --lib -- util::tests::adds_more --exact",
     "all: cargo test --lib",
     "all: cargo test --lib -- util::"
+  ],
+  "cargo-raw-attribute-identities": [
+    "src/lib.rs [tests] cargo-test  run: cargo test --lib",
+    "  T raw_test [conditional] => (withheld: conditional-compilation)",
+    "  T raw_cfg [conditional] => (withheld: conditional-compilation)",
+    "  T nested [conditional] => (withheld: conditional-compilation)",
+    "  T plain => cargo test --lib -- plain --exact",
+    "  T skipped [skipped] => cargo test --lib -- skipped --exact --include-ignored",
+    "all: cargo test --lib"
   ],
   "cargo-tests-a-macro-makes": [
     "src/lib.rs [tests] cargo-test  run: cargo test --lib  [holds more tests]",

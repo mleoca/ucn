@@ -3433,7 +3433,7 @@ function testUnits(fileEntry, helpers) {
             testngState(symbol).several || (byClass && testngState(owner).several) || chain.some(otherRunner);
         const row = {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
-            startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+            startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine, sourceSpan: symbol.sourceSpan,
             ...(off && { skipped: true }),
             ...(!off && sometimes && { conditional: true }),
             // One declaration the runner reports as several tests.
@@ -3529,12 +3529,12 @@ function testUnits(fileEntry, helpers) {
             ...(maybeRefused.has(cls) && { mayRefuse: true }),
             ...([...chain, cls].some(otherRunner) && { runner: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
-            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
+            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine, sourceSpan: cls.sourceSpan,
             members: methodsOf(cls).map(symbol => symbol.name),
             // Where each method's body stands, for a test it gives the body to.
             memberRows: methodsOf(cls).map(symbol => ({
                 name: symbol.name, ...signatureOf(symbol), line: symbol.nameLine || symbol.startLine,
-                startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+                startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine, sourceSpan: symbol.sourceSpan,
                 ...(symbol.type !== 'constructor' && classCandidate(symbol) && { candidate: true }),
             })),
             // TestNG's @Test on the class makes its public methods tests,
@@ -3548,7 +3548,7 @@ function testUnits(fileEntry, helpers) {
             units.push({
                 kind: 'suite', name: cls.name, suite: chain.map(outer => outer.name),
                 line: cls.nameLine || cls.startLine, startLine: cls.startLine,
-                endLine: cls.endLine ?? cls.startLine,
+                endLine: cls.endLine ?? cls.startLine, sourceSpan: cls.sourceSpan,
             });
         }
     }

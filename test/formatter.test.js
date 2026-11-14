@@ -16,6 +16,88 @@ const { ProjectIndex } = require('../core/project');
 const output = require('../core/output');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, CLI_PATH } = require('./helpers');
 
+describe('fix #504: usable test selectors and qualified empty audit results', () => {
+    it('prints the selected test command as well as the broader file command', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}',
+            'lib.js': 'export function scale(value) { return value * 2; }',
+            'test/scale.test.js': [
+                "import { test } from 'node:test';",
+                "import { scale } from '../lib.js';",
+                "test('scales input', () => { scale(2); });",
+                "test('unrelated', () => { });",
+            ].join('\n'),
+        });
+        try {
+            const result = idx(dir).tests('scale');
+            const text = output.formatTests(result, 'scale');
+            assert.match(text, /run: node --test test\/scale\.test\.js/);
+            assert.match(text, /run test: node --test --test-name-pattern='\^scales input\$' test\/scale\.test\.js/);
+            assert.doesNotMatch(text, /run test:.*unrelated/);
+            const json = JSON.parse(output.formatTestsJson(result, 'scale'));
+            assert.strictEqual(json.testFiles[0].units.length, 1);
+        } finally { rm(dir); }
+    });
+
+    it('does not invent selectors for units whose runner cannot select them', () => {
+        const result = [{ file: 'test/sample.cs', role: 'tests', matches: [],
+            runWithheld: 'fixture arguments cannot be selected',
+            units: [{ name: 'example', selector: null }] }];
+        const text = output.formatTests(result, 'target');
+        assert.match(text, /no command: fixture arguments cannot be selected/);
+        assert.doesNotMatch(text, /run test:/);
+    });
+
+    it('retains the zero candidate result beside a coverage warning', () => {
+        const result = [];
+        result.coverage = { complete: false, claimsWithdrawn: true, reasons: { unreadable: 1 } };
+        const text = output.formatDeadcode(result);
+        assert.match(text, /^Dead code: 0 unused symbol\(s\)/);
+        assert.match(text, /WARNING: dead-code claims withdrawn/);
+    });
+
+    it('keeps ignored-option notes with result counts and full sizes in tiny budgets', () => {
+        const { applyOutputBudget } = require('../core/output-budget');
+        const summary = 'Dead code: 100 unused symbol(s)';
+        const note = 'Note: framework ignored (not applicable to deadcode).';
+        const text = [summary, '', 'lib.js', '  unused()\n'.repeat(100), note].join('\n');
+        for (const surface of ['cli', 'mcp']) {
+            const trailingChars = surface === 'cli' ? 1 : 0;
+            const result = applyOutputBudget(text, { command: 'deadcode', surface,
+                maxChars: 120, trailingChars, peerText: text });
+            assert.ok(result.text.length + trailingChars <= 120, result.text);
+            const lines = result.text.split('\n');
+            assert.ok(lines.includes(summary), result.text);
+            assert.ok(lines.includes(note), result.text);
+            assert.ok(lines.includes(`... OUTPUT TRUNCATED (${text.length}→120).`), result.text);
+            assert.ok(lines.indexOf(summary) < lines.indexOf(note), result.text);
+            assert.strictEqual(result.contractMetadataComplete, true);
+        }
+    });
+
+    it('does not hide macro uncertainty when no deadcode candidate remains', () => {
+        for (const metadata of [
+            { macroPaste: { blind: { count: 1, fileCount: 1, files: ['bridge.c'] } } },
+            { macroRulesBlind: { count: 1, fileCount: 1, files: ['bridge.rs'] } },
+        ]) {
+            const text = output.formatDeadcode(Object.assign([], metadata));
+            assert.match(text, /^Dead code: 0 unused symbol\(s\)/);
+            assert.match(text, /WARNING: .*unattributed/);
+            assert.doesNotMatch(text, /^No dead code found\.$/);
+        }
+    });
+
+    it('names each changed outgoing call that requires review', () => {
+        const text = output.formatCheck({ base: 'HEAD', changed: [{
+            name: 'run', file: 'app.ts', line: 2, verdict: 'review',
+            reasons: ['outgoing-call-unverified'],
+            outgoingReview: [{ file: 'app.ts', line: 4, column: 3,
+                name: 'scale', reason: 'outgoing-target-unresolved' }],
+        }] });
+        assert.match(text, /app\.ts:4:4 {2}scale: outgoing-target-unresolved/);
+    });
+});
+
 // ============================================================================
 // EXTRACTED: Output Formatting (parser.test.js lines 605-645)
 // ============================================================================

@@ -116,7 +116,7 @@ function tagInTestCase(index, sites) {
         const classify = kindOf.get(fileEntry.language);
         if (classify && site.callerFile && site.callerStartLine != null) {
             const encl = index.findEnclosingFunction
-                ? index.findEnclosingFunction(site.callerFile, site.line, true)
+                ? index.findEnclosingFunction(site.callerFile, site.line, true, site)
                 : null;
             if (encl && classify(encl) === 'test') {
                 site.inTestCase = true;
@@ -124,7 +124,7 @@ function tagInTestCase(index, sites) {
             }
         }
         if (site.line != null && isTestFile(fileEntry.relativePath, fileEntry.language) &&
-            model.unitAt(sitePath, site.line)) {
+            model.unitAt(sitePath, site)) {
             site.inTestCase = true;
         }
     }
@@ -2639,7 +2639,7 @@ function diffImpact(index, options = {}) {
                 // A deleted declaration's name is assessed as a deletion.
                 const removedNames = moved.removedNames.filter(name => !gone.has(name));
                 if (removedNames.length > 0 || moved.importsRemoved > 0 || moved.importsAdded > 0 ||
-                    moved.codeChanged || moved.starExportRemoved || moved.reboundBindings.length > 0) {
+                    moved.codeChanged || moved.checkingChanged || moved.starExportRemoved || moved.reboundBindings.length > 0) {
                     moduleChanges.push({
                         filePath: change.filePath,
                         relativePath: change.relativePath,

@@ -185,7 +185,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'typeParameterConstraints', 'extends', 'implements', 'indent', 'isNested',
     'enclosingType', 'isMethod', 'receiver', 'memberType', 'fieldType', 'embedded',
     'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
-    'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
+    'annotationsWithArgs', 'attributesWithArgs', 'registrationUnknown', 'runtimeOwnerPath', 'nameLine', 'traitImpl',
     'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'assignedObject', 'selfNamed', 'bodyScopedName',
     'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'namespace', 'isConstructor',
     'isExtensionMethod', 'extensionReceiver', 'explicitInterface', 'primaryParams',
@@ -230,7 +230,7 @@ function materializeSymbol(fileEntry, item) {
         // Most false feature flags are omitted for compactness, but
         // functionLike=false is the semantic distinction between an
         // object-like macro and a callable macro (UCN5-170).
-        if (item[field] === false && field !== 'functionLike') continue;
+        if (item[field] === false && field !== 'functionLike' && field !== 'registrationUnknown') continue;
         symbol[field] = item[field];
     }
     return symbol;

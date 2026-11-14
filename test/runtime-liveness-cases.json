@@ -1,0 +1,2998 @@
+[
+  {
+    "id": "cfg-header-hash",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.cfg": "[options.entry_points] # registered commands\nconsole_scripts =\n sample = app:_target\n"
+    },
+    "run": "from configparser import ConfigParser; from importlib.metadata import EntryPoint; p=ConfigParser(); p.read(\"setup.cfg\"); value=p[\"options.entry_points\"][\"console_scripts\"].split(\"=\",1)[1].strip(); assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "cfg-header-semicolon",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.cfg": "[options.entry_points] ; registered commands\nconsole_scripts =\n sample = app:_target\n"
+    },
+    "run": "from configparser import ConfigParser; from importlib.metadata import EntryPoint; p=ConfigParser(); p.read(\"setup.cfg\"); value=p[\"options.entry_points\"][\"console_scripts\"].split(\"=\",1)[1].strip(); assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "cfg-plain-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.cfg": "[options.entry_points]\nconsole_scripts=\n sample=app:_target\n"
+    },
+    "run": "from configparser import ConfigParser; from importlib.metadata import EntryPoint; p=ConfigParser(); p.read(\"setup.cfg\"); value=p[\"options.entry_points\"][\"console_scripts\"].split(\"=\",1)[1].strip(); assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-literal-kwargs",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.py": "from setuptools import setup\nsetup(**{\"entry_points\":{\"console_scripts\":[\"sample=app:_target\"]}})\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-bound-kwargs",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.py": "from setuptools import setup\nsettings={\"entry_points\":{\"console_scripts\":[\"sample=app:_target\"]}}\nsetup(**settings)\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-kwargs-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.py": "from setuptools import setup\nsetup(entry_points={\"console_scripts\":[\"sample=app:_target\"]})\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-class-scope",
+    "files": {
+      "app.py": "handlers=[]\nclass Container:\n    def property(fn):\n        handlers.append(fn)\n        return fn\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0](None)==7",
+    "after": "handlers=[]\nclass Container:\n    def property(fn):\n        handlers.append(fn)\n        return fn\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-builtin-attribute-write",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.property=register\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-global-write",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import property as descriptor\ndef configure():\n    global descriptor\n    descriptor=register\nconfigure()\n@descriptor\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import property as descriptor\ndef configure():\n    global descriptor\n    descriptor=register\nconfigure()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-genuine-control",
+    "files": {
+      "app.py": "class Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert isinstance(app.Container(), app.Container)",
+    "after": "class Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-if",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nif True:\n    from builtins import getattr as read\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-try",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\ntry:\n    from builtins import getattr as read\nexcept ImportError:\n    read=None\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-plain-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nfrom builtins import getattr as read\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "patch-mangled-private",
+    "files": {
+      "app.py": "class Container:\n    def __target(self): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app.Container._Container__target\", return_value=4) as value: assert value()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "class Container: pass\n",
+    "file": "app.py",
+    "name": "__target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "patch-normal-member-control",
+    "files": {
+      "app.py": "class Container:\n    def _target(self): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app.Container._target\", return_value=4) as value: assert value()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "class Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "js-named-expression-shadow",
+    "files": {
+      "app.js": "class Container { _target(){return 3;} _other(){return 7;} }\nconst item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){key[Symbol.toPrimitive]=()=>\"_other\";return item[key]();};\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "if(require(\"./app.js\").exercise()!==7)throw Error(\"wrong result\");",
+    "after": "class Container { _target(){return 3;} }\nconst item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){key[Symbol.toPrimitive]=()=>\"_other\";return item[key]();};\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-literal-control",
+    "files": {
+      "app.js": "class Container { _target(){return 3;} _other(){return 7;} }\nconst item=new Container();\nconst key=\"_target\";\nfunction exercise(){return item[\"_other\"]();}\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "if(require(\"./app.js\").exercise()!==7)throw Error(\"wrong result\");",
+    "after": "class Container { _target(){return 3;} }\nconst item=new Container();\nconst key=\"_target\";\nfunction exercise(){return item[\"_other\"]();}\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "packaging-nested-member",
+    "files": {
+      "app.py": "class Outer:\n    class Inner:\n        @staticmethod\n        def _target(): return 7\n",
+      "pyproject.toml": "[project.scripts]\nsample=\"app:Outer.Inner._target\"\n"
+    },
+    "run": "from importlib.metadata import EntryPoint; assert EntryPoint(name=\"sample\",value=\"app:Outer.Inner._target\",group=\"console_scripts\").load()()==7",
+    "after": "class Outer:\n    class Inner: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "packaging-direct-member-control",
+    "files": {
+      "app.py": "class Container:\n    @staticmethod\n    def _target(): return 7\n",
+      "pyproject.toml": "[project.scripts]\nsample=\"app:Container._target\"\n"
+    },
+    "run": "from importlib.metadata import EntryPoint; assert EntryPoint(name=\"sample\",value=\"app:Container._target\",group=\"console_scripts\").load()()==7",
+    "after": "class Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-nested-expanded-kwargs",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "setup.py": "from setuptools import setup\nentries={\"console_scripts\":[\"sample=app:_target\"]}\nsettings={\"name\":\"sample\", **{\"entry_points\": entries}}\nsetup(**settings)\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-mutated-kwargs",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "setup.py": "from setuptools import setup\nsettings={\"name\":\"sample\"}\nsettings[\"entry_points\"]={\"console_scripts\":[\"sample=app:_target\"]}\nsetup(**settings)\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-conditional-alias",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "setup.py": "if True:\n    from setuptools import setup as publish\npublish(**{\"entry_points\":{\"console_scripts\":[\"sample=app:_target\"]}})\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-no-entrypoint-key",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "setup.py": "from setuptools import setup\nsettings={\"name\":\"sample\"}\nsetup(**settings)\n"
+    },
+    "run": "import app; assert app._unused()==3",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "setup-none-entrypoint",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "setup.py": "from setuptools import setup\nsetup(**{\"entry_points\":None})\n"
+    },
+    "run": "import app; assert app._unused()==3",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-setattr",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nsetattr(api,\"property\",register)\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nsetattr(api,\"property\",register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-builtins-dict",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__[\"property\"]=register\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-nonlocal-write",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef install():\n    from builtins import property as descriptor\n    def configure():\n        nonlocal descriptor\n        descriptor=register\n    configure()\n    @descriptor\n    def _target(): return 7\ninstall()\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef install():\n    from builtins import property as descriptor\n    def configure():\n        nonlocal descriptor\n        descriptor=register\n    configure()\ninstall()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-conditional-assignment",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "use.py": "import app\nif True:\n    read=getattr\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-branch-two-origins",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "use.py": "import app\nif True:\n    from builtins import getattr as read\nelse:\n    read=lambda *args: None\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-try-module-alias",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "use.py": "import app\ntry:\n    import builtins as api\nexcept ImportError:\n    api=None\ndef exercise(): return api.getattr(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-global-alias-write",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused(): return 3\n",
+      "use.py": "import app\nread=None\ndef configure():\n    global read\n    read=getattr\nconfigure()\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "packaging-nested-mangled-member",
+    "files": {
+      "app.py": "class Outer:\n    class __Inner:\n        @staticmethod\n        def __target(): return 7\n",
+      "pyproject.toml": "[project.scripts]\nsample=\"app:Outer._Outer__Inner._Inner__target\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; v=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"scripts\"][\"sample\"]; assert EntryPoint(name=\"sample\",value=v,group=\"console_scripts\").load()()==7",
+    "after": "class Outer:\n    class __Inner: pass\n",
+    "file": "app.py",
+    "name": "__target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "patch-leading-underscore-owner",
+    "files": {
+      "app.py": "class __Container:\n    def __target(self): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app.__Container._Container__target\",return_value=4) as mocked: assert mocked()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "class __Container: pass\n",
+    "file": "app.py",
+    "name": "__target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "patch-underscore-only-owner",
+    "files": {
+      "app.py": "class ___:\n    def __target(self): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app.___.__target\",return_value=4) as mocked: assert mocked()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "class ___: pass\n",
+    "file": "app.py",
+    "name": "__target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "patch-double-underscore-owner",
+    "files": {
+      "app.py": "class Outer__Name:\n    def __target(self): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app.Outer__Name._Outer__Name__target\",return_value=4) as mocked: assert mocked()==4\n"
+    },
+    "run": "from use import exercise; exercise()",
+    "after": "class Outer__Name: pass\n",
+    "file": "app.py",
+    "name": "__target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "js-const-function-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nconst item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){ key[Symbol.toPrimitive]=()=>\"_other\"; return item[key](); };\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nconst item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){ key[Symbol.toPrimitive]=()=>\"_other\"; return item[key](); };\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-const-generator-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nconst item=new Container();\nconst key=\"_target\";\nconst exercise=function* key(){ key[Symbol.toPrimitive]=()=>\"_other\"; yield item[key](); };\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x.next().value!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nconst item=new Container();\nconst key=\"_target\";\nconst exercise=function* key(){ key[Symbol.toPrimitive]=()=>\"_other\"; yield item[key](); };\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-const-class-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nconst item=new Container();\nconst key=\"_target\";\nconst Type=class key { static [Symbol.toPrimitive](){return \"_other\";} static run(){return item[key]();} };\nconst exercise=()=>Type.run();\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nconst item=new Container();\nconst key=\"_target\";\nconst Type=class key { static [Symbol.toPrimitive](){return \"_other\";} static run(){return item[key]();} };\nconst exercise=()=>Type.run();\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-let-function-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nlet item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){ key[Symbol.toPrimitive]=()=>\"_other\"; return item[key](); };\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nlet item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){ key[Symbol.toPrimitive]=()=>\"_other\"; return item[key](); };\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-let-generator-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nlet item=new Container();\nconst key=\"_target\";\nconst exercise=function* key(){ key[Symbol.toPrimitive]=()=>\"_other\"; yield item[key](); };\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x.next().value!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nlet item=new Container();\nconst key=\"_target\";\nconst exercise=function* key(){ key[Symbol.toPrimitive]=()=>\"_other\"; yield item[key](); };\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-let-class-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nlet item=new Container();\nconst key=\"_target\";\nconst Type=class key { static [Symbol.toPrimitive](){return \"_other\";} static run(){return item[key]();} };\nconst exercise=()=>Type.run();\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nlet item=new Container();\nconst key=\"_target\";\nconst Type=class key { static [Symbol.toPrimitive](){return \"_other\";} static run(){return item[key]();} };\nconst exercise=()=>Type.run();\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-var-function-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nvar item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){ key[Symbol.toPrimitive]=()=>\"_other\"; return item[key](); };\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nvar item=new Container();\nconst key=\"_target\";\nconst exercise=function key(){ key[Symbol.toPrimitive]=()=>\"_other\"; return item[key](); };\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-var-generator-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nvar item=new Container();\nconst key=\"_target\";\nconst exercise=function* key(){ key[Symbol.toPrimitive]=()=>\"_other\"; yield item[key](); };\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x.next().value!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nvar item=new Container();\nconst key=\"_target\";\nconst exercise=function* key(){ key[Symbol.toPrimitive]=()=>\"_other\"; yield item[key](); };\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "js-var-class-name-shadow",
+    "files": {
+      "app.js": "class Container { _other() { return 7; } }\nvar item=new Container();\nconst key=\"_target\";\nconst Type=class key { static [Symbol.toPrimitive](){return \"_other\";} static run(){return item[key]();} };\nconst exercise=()=>Type.run();\nmodule.exports.exercise=exercise;\n"
+    },
+    "run": "const x=require(\"./app.js\").exercise(); if(x!==7)throw Error(\"wrong\");",
+    "after": "class Container {}\nvar item=new Container();\nconst key=\"_target\";\nconst Type=class key { static [Symbol.toPrimitive](){return \"_other\";} static run(){return item[key]();} };\nconst exercise=()=>Type.run();\nmodule.exports.exercise=exercise;\n",
+    "file": "app.js",
+    "name": "_other",
+    "breaks": true,
+    "native": "node"
+  },
+  {
+    "id": "decorator-wildcard-import",
+    "files": {
+      "app.py": "from registry import *\n@property\ndef _target():\n    return 7\n",
+      "registry.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nproperty=register\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "from registry import *\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-global-namespace-write",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import property as descriptor\nglobals()[\"descriptor\"]=register\n@descriptor\ndef _target():\n    return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import property as descriptor\nglobals()[\"descriptor\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-builtin-vars-write",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nvars(api)[\"property\"]=register\n@api.property\ndef _target():\n    return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nvars(api)[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-conditional-expression",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nread = getattr if True else (lambda *args: None)\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-boolean-alternative",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nread = getattr or (lambda *args: None)\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-chained-assignment",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nread = other = getattr\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-tuple-assignment",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nread, other = getattr, None\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-named-expression",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\n(read := getattr)\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-wildcard-import",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.py": "from setuptools import *\nsetup(**{\"entry_points\":{\"console_scripts\":[\"sample=app:_target\"]}})\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "patch-wildcard-import",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "from unittest.mock import *\ndef exercise():\n    with patch(\"app._target\",return_value=7) as mocked:\n        return mocked()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-self-boolean",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nread=getattr\nread = read or (lambda *args: None)\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-self-tuple",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nread=getattr\nread, other = read, None\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-alias-self-conditional",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "use.py": "import app\nread=getattr\nread = read if True else (lambda *args: None)\ndef exercise():\n    return read(app,\"_target\")()\n"
+    },
+    "run": "import use; assert use.exercise()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-tuple-attribute",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.property, unused = register, None\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.property, unused = register, None\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-list-attribute",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\n[api.property, unused] = [register, None]\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\n[api.property, unused] = [register, None]\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-for-attribute",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfor api.property in [register]:\n    pass\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfor api.property in [register]:\n    pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-with-attribute",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfrom contextlib import nullcontext\nwith nullcontext(register) as api.property:\n    pass\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfrom contextlib import nullcontext\nwith nullcontext(register) as api.property:\n    pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-tuple-dictionary",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__[\"property\"], unused = register, None\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__[\"property\"], unused = register, None\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-for-dictionary",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfor api.__dict__[\"property\"] in [register]:\n    pass\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfor api.__dict__[\"property\"] in [register]:\n    pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-dictionary-update",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__.update(property=register)\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__.update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-vars-update",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nvars(api).update(property=register)\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nvars(api).update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-setattr-control",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nsetattr(api,\"property\",register)\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nsetattr(api,\"property\",register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-update-keyword",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-update-dictionary",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().update({\"property\":register})\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().update({\"property\":register})\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-tuple-namespace",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals()[\"property\"], unused = register, None\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals()[\"property\"], unused = register, None\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-for-namespace",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfor globals()[\"property\"] in [register]:\n    pass\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfor globals()[\"property\"] in [register]:\n    pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "reflection-star-unpack",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nread, *rest = (getattr, None)\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "reflection-for-alias",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nfor read in [getattr]:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "reflection-nested-unpack",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\n(read, (unused,)) = (getattr, (None,))\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "reflection-plain-alias-control",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nread=getattr\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "native": "python3",
+    "breaks": true
+  },
+  {
+    "id": "decorator-nested-target",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nunused, (api.property, other) = None, (register, None)\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nunused, (api.property, other) = None, (register, None)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-with-tuple-target",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfrom contextlib import nullcontext\nwith nullcontext((register, None)) as (api.property, unused):\n    pass\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfrom contextlib import nullcontext\nwith nullcontext((register, None)) as (api.property, unused):\n    pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-for-tuple-target",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfor api.property, unused in [(register, None)]:\n    pass\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nfor api.property, unused in [(register, None)]:\n    pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-dict-method-value",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nreplace = api.__dict__.update\nreplace(property=register)\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nreplace = api.__dict__.update\nreplace(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-vars-alias-write",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nnamespace=vars(api)\nnamespace[\"property\"]=register\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nnamespace=vars(api)\nnamespace[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-dict-dunder-set",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__.__setitem__(\"property\",register)\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.__dict__.__setitem__(\"property\",register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-mapping-escape",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef replace(mapping):\n    mapping[\"property\"]=register\nreplace(vars(api))\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef replace(mapping):\n    mapping[\"property\"]=register\nreplace(vars(api))\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-global-alias-update",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nnamespace=globals()\nnamespace.update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nnamespace=globals()\nnamespace.update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-global-dunder-set",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().__setitem__(\"property\",register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().__setitem__(\"property\",register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-global-mapping-escape",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef replace(mapping):\n    mapping[\"property\"]=register\nreplace(globals())\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef replace(mapping):\n    mapping[\"property\"]=register\nreplace(globals())\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-loop-tuple-target",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nfor unused, read in [(None, getattr)]:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-loop-two-values",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nfor read in [hasattr, getattr]:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "setup-global-namespace-update",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "setup.py": "from setuptools import setup\nsettings={}\nglobals().update({\"settings\":{\"entry_points\":{\"console_scripts\":[\"sample=app:_target\"]}}})\nsetup(**settings)\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "decorator-readonly-namespace-control",
+    "files": {
+      "app.py": "import builtins as api\nassert api.__dict__.get(\"property\") is property\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\nassert api.__dict__.get(\"property\") is property\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-list-container",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[0][\"property\"] = register\nalter([globals()])\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[0][\"property\"] = register\nalter([globals()])\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-tuple-container",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[0][\"property\"] = register\nalter((globals(),))\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[0][\"property\"] = register\nalter((globals(),))\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-dict-container",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[\"namespace\"][\"property\"] = register\nalter({\"namespace\": globals()})\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[\"namespace\"][\"property\"] = register\nalter({\"namespace\": globals()})\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-star-argument",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(ns):\n    ns[\"property\"] = register\nalter(*[globals()])\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(ns):\n    ns[\"property\"] = register\nalter(*[globals()])\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-keyword-spread",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(ns):\n    ns[\"property\"] = register\nalter(**{\"ns\": globals()})\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(ns):\n    ns[\"property\"] = register\nalter(**{\"ns\": globals()})\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-stored-container",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nbox = [globals()]\nbox[0].update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nbox = [globals()]\nbox[0].update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-nested-dict-owner",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter(box):\n    box[0][\"property\"] = register\nalter([api.__dict__])\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter(box):\n    box[0][\"property\"] = register\nalter([api.__dict__])\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-bound-literal-loop",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nchoices=[getattr]\nfor read in choices:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-nested-literal-loop",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nfor (read, *rest) in [(getattr, None)]:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-short-chain-control",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nread0=getattr\nread=read0\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-long-chain",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nread0=getattr\nread1=read0\nread2=read1\nread3=read2\nread4=read3\nread5=read4\nread6=read5\nread7=read6\nread8=read7\nread9=read8\nread10=read9\nread11=read10\nread12=read11\nread=read12\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-late-module-alias",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\ndef exercise(): return read(app,\"_target\")()\nread=getattr\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-late-module-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter():\n    ns.update(property=register)\nns=globals()\nalter()\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter():\n    ns.update(property=register)\nns=globals()\nalter()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "builtin-late-module-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter():\n    chosen.property=register\nchosen=api\nalter()\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter():\n    chosen.property=register\nchosen=api\nalter()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-long-chain-control",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nns0=globals()\nns1=ns0\nns2=ns1\nns3=ns2\nns4=ns3\nns5=ns4\nns6=ns5\nns7=ns6\nns8=ns7\nns9=ns8\nns10=ns9\nns11=ns10\nns12=ns11\nns12.update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nns0=globals()\nns1=ns0\nns2=ns1\nns3=ns2\nns4=ns3\nns5=ns4\nns6=ns5\nns7=ns6\nns8=ns7\nns9=ns8\nns10=ns9\nns11=ns10\nns12=ns11\nns12.update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-direct-control",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-readonly-control",
+    "files": {
+      "app.py": "import builtins as api\napi.__dict__.get(\"property\")\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\napi.__dict__.get(\"property\")\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-entry-function",
+    "files": {
+      "app.py": "def _ſlot(): return 7\n",
+      "pyproject.toml": "[project.scripts]\nentry = \"app:_slot\"\n"
+    },
+    "run": "from importlib.metadata import EntryPoint; import tomllib; value=tomllib.load(open(\"pyproject.toml\",\"rb\"))[\"project\"][\"scripts\"][\"entry\"]; assert EntryPoint(name=\"entry\", value=value, group=\"console_scripts\").load()()==7",
+    "after": "",
+    "file": "app.py",
+    "name": "_ſlot",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-entry-owner",
+    "files": {
+      "app.py": "class Klass:\n    @staticmethod\n    def _target(): return 7\n",
+      "pyproject.toml": "[project.scripts]\nentry = \"app:Klass._target\"\n"
+    },
+    "run": "from importlib.metadata import EntryPoint; import tomllib; value=tomllib.load(open(\"pyproject.toml\",\"rb\"))[\"project\"][\"scripts\"][\"entry\"]; assert EntryPoint(name=\"entry\", value=value, group=\"console_scripts\").load()()==7",
+    "after": "class Klass: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-patch-function",
+    "files": {
+      "app.py": "def _ſlot(): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app._slot\", return_value=9):\n        return 9\n"
+    },
+    "run": "from use import exercise; assert exercise()==9",
+    "after": "",
+    "file": "app.py",
+    "name": "_ſlot",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-reflection-function",
+    "files": {
+      "app.py": "def _ſlot(): return 7\n",
+      "use.py": "import app\ndef exercise(): return getattr(app,\"_slot\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "",
+    "file": "app.py",
+    "name": "_ſlot",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-literal-string-negative-control",
+    "files": {
+      "app.py": "def _slot(): return 7\n",
+      "use.py": "import app\ndef exercise(): return getattr(app,\"_ſlot\",None)\n"
+    },
+    "run": "from use import exercise; assert exercise() is None",
+    "after": "",
+    "file": "app.py",
+    "name": "_slot",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-nested-container-producer",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[0][\"box\"][0][\"property\"]=register\nalter([{\"box\":(globals(),)}])\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(box):\n    box[0][\"box\"][0][\"property\"]=register\nalter([{\"box\":(globals(),)}])\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-returned-container-producer",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef wrap(ns): return [ns]\nbox=wrap(globals())\nbox[0][\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef wrap(ns): return [ns]\nbox=wrap(globals())\nbox[0][\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-deferred-owner-long-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter():\n    chosen20.property=register\nchosen0=api\nchosen1=chosen0\nchosen2=chosen1\nchosen3=chosen2\nchosen4=chosen3\nchosen5=chosen4\nchosen6=chosen5\nchosen7=chosen6\nchosen8=chosen7\nchosen9=chosen8\nchosen10=chosen9\nchosen11=chosen10\nchosen12=chosen11\nchosen13=chosen12\nchosen14=chosen13\nchosen15=chosen14\nchosen16=chosen15\nchosen17=chosen16\nchosen18=chosen17\nchosen19=chosen18\nchosen20=chosen19\nalter()\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter():\n    chosen20.property=register\nchosen0=api\nchosen1=chosen0\nchosen2=chosen1\nchosen3=chosen2\nchosen4=chosen3\nchosen5=chosen4\nchosen6=chosen5\nchosen7=chosen6\nchosen8=chosen7\nchosen9=chosen8\nchosen10=chosen9\nchosen11=chosen10\nchosen12=chosen11\nchosen13=chosen12\nchosen14=chosen13\nchosen15=chosen14\nchosen16=chosen15\nchosen17=chosen16\nchosen18=chosen17\nchosen19=chosen18\nchosen20=chosen19\nalter()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-closure-late-binding",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\ndef outer():\n    def exercise(): return read(app,\"_target\")()\n    read=getattr\n    return exercise()\ndef exercise(): return outer()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-bound-iteration-long-alias",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nchoices0=[getattr]\nchoices1=choices0\nchoices2=choices1\nchoices3=choices2\nchoices4=choices3\nchoices5=choices4\nchoices6=choices5\nchoices7=choices6\nchoices8=choices7\nchoices9=choices8\nchoices10=choices9\nchoices11=choices10\nchoices12=choices11\nchoices13=choices12\nchoices14=choices13\nchoices15=choices14\nchoices16=choices15\nchoices17=choices16\nchoices18=choices17\nchoices19=choices18\nchoices20=choices19\nchoices21=choices20\nchoices22=choices21\nchoices23=choices22\nchoices24=choices23\nchoices25=choices24\nchoices26=choices25\nchoices27=choices26\nchoices28=choices27\nchoices29=choices28\nchoices30=choices29\nchoices31=choices30\nchoices32=choices31\nchoices33=choices32\nchoices34=choices33\nchoices35=choices34\nchoices36=choices35\nchoices37=choices36\nchoices38=choices37\nchoices39=choices38\nchoices40=choices39\nchoices41=choices40\nchoices42=choices41\nchoices43=choices42\nchoices44=choices43\nchoices45=choices44\nchoices46=choices45\nchoices47=choices46\nchoices48=choices47\nchoices49=choices48\nchoices50=choices49\nchoices51=choices50\nchoices52=choices51\nchoices53=choices52\nchoices54=choices53\nchoices55=choices54\nchoices56=choices55\nchoices57=choices56\nchoices58=choices57\nchoices59=choices58\nchoices60=choices59\nchoices61=choices60\nchoices62=choices61\nchoices63=choices62\nchoices64=choices63\nchoices65=choices64\nchoices66=choices65\nchoices67=choices66\nchoices68=choices67\nchoices69=choices68\nchoices70=choices69\nchoices71=choices70\nchoices72=choices71\nchoices73=choices72\nchoices74=choices73\nchoices75=choices74\nchoices76=choices75\nchoices77=choices76\nchoices78=choices77\nchoices79=choices78\nchoices80=choices79\nchoices81=choices80\nchoices82=choices81\nchoices83=choices82\nchoices84=choices83\nchoices85=choices84\nchoices86=choices85\nchoices87=choices86\nchoices88=choices87\nchoices89=choices88\nchoices90=choices89\nchoices91=choices90\nchoices92=choices91\nchoices93=choices92\nchoices94=choices93\nchoices95=choices94\nchoices96=choices95\nchoices97=choices96\nchoices98=choices97\nchoices99=choices98\nchoices100=choices99\nchoices101=choices100\nchoices102=choices101\nchoices103=choices102\nchoices104=choices103\nchoices105=choices104\nchoices106=choices105\nchoices107=choices106\nchoices108=choices107\nchoices109=choices108\nchoices110=choices109\nchoices111=choices110\nchoices112=choices111\nchoices113=choices112\nchoices114=choices113\nchoices115=choices114\nchoices116=choices115\nchoices117=choices116\nchoices118=choices117\nchoices119=choices118\nchoices120=choices119\nchoices121=choices120\nchoices122=choices121\nchoices123=choices122\nchoices124=choices123\nchoices125=choices124\nchoices126=choices125\nchoices127=choices126\nchoices128=choices127\nchoices129=choices128\nchoices130=choices129\nchoices131=choices130\nchoices132=choices131\nchoices133=choices132\nchoices134=choices133\nchoices135=choices134\nchoices136=choices135\nchoices137=choices136\nchoices138=choices137\nchoices139=choices138\nchoices140=choices139\nchoices141=choices140\nchoices142=choices141\nchoices143=choices142\nchoices144=choices143\nchoices145=choices144\nchoices146=choices145\nchoices147=choices146\nchoices148=choices147\nchoices149=choices148\nchoices150=choices149\nchoices151=choices150\nchoices152=choices151\nchoices153=choices152\nchoices154=choices153\nchoices155=choices154\nchoices156=choices155\nchoices157=choices156\nchoices158=choices157\nchoices159=choices158\nchoices160=choices159\nchoices161=choices160\nchoices162=choices161\nchoices163=choices162\nchoices164=choices163\nchoices165=choices164\nchoices166=choices165\nchoices167=choices166\nchoices168=choices167\nchoices169=choices168\nchoices170=choices169\nchoices171=choices170\nchoices172=choices171\nchoices173=choices172\nchoices174=choices173\nchoices175=choices174\nchoices176=choices175\nchoices177=choices176\nchoices178=choices177\nchoices179=choices178\nchoices180=choices179\nchoices181=choices180\nchoices182=choices181\nchoices183=choices182\nchoices184=choices183\nchoices185=choices184\nchoices186=choices185\nchoices187=choices186\nchoices188=choices187\nchoices189=choices188\nchoices190=choices189\nchoices191=choices190\nchoices192=choices191\nchoices193=choices192\nchoices194=choices193\nchoices195=choices194\nchoices196=choices195\nchoices197=choices196\nchoices198=choices197\nchoices199=choices198\nchoices200=choices199\nchoices201=choices200\nchoices202=choices201\nchoices203=choices202\nchoices204=choices203\nchoices205=choices204\nchoices206=choices205\nchoices207=choices206\nchoices208=choices207\nchoices209=choices208\nchoices210=choices209\nchoices211=choices210\nchoices212=choices211\nchoices213=choices212\nchoices214=choices213\nchoices215=choices214\nchoices216=choices215\nchoices217=choices216\nchoices218=choices217\nchoices219=choices218\nchoices220=choices219\nchoices221=choices220\nchoices222=choices221\nchoices223=choices222\nchoices224=choices223\nchoices225=choices224\nchoices226=choices225\nchoices227=choices226\nchoices228=choices227\nchoices229=choices228\nchoices230=choices229\nchoices231=choices230\nchoices232=choices231\nchoices233=choices232\nchoices234=choices233\nchoices235=choices234\nchoices236=choices235\nchoices237=choices236\nchoices238=choices237\nchoices239=choices238\nchoices240=choices239\nchoices241=choices240\nchoices242=choices241\nchoices243=choices242\nchoices244=choices243\nchoices245=choices244\nchoices246=choices245\nchoices247=choices246\nchoices248=choices247\nchoices249=choices248\nchoices250=choices249\nchoices251=choices250\nchoices252=choices251\nchoices253=choices252\nchoices254=choices253\nchoices255=choices254\nchoices256=choices255\nchoices257=choices256\nchoices258=choices257\nchoices259=choices258\nchoices260=choices259\nchoices261=choices260\nchoices262=choices261\nchoices263=choices262\nchoices264=choices263\nchoices265=choices264\nchoices266=choices265\nchoices267=choices266\nchoices268=choices267\nchoices269=choices268\nchoices270=choices269\nchoices271=choices270\nchoices272=choices271\nchoices273=choices272\nchoices274=choices273\nchoices275=choices274\nchoices276=choices275\nchoices277=choices276\nchoices278=choices277\nchoices279=choices278\nchoices280=choices279\nchoices281=choices280\nchoices282=choices281\nchoices283=choices282\nchoices284=choices283\nchoices285=choices284\nchoices286=choices285\nchoices287=choices286\nchoices288=choices287\nchoices289=choices288\nchoices290=choices289\nchoices291=choices290\nchoices292=choices291\nchoices293=choices292\nchoices294=choices293\nchoices295=choices294\nchoices296=choices295\nchoices297=choices296\nchoices298=choices297\nchoices299=choices298\nchoices300=choices299\nfor read in choices300:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-starred-iteration-value",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nchoices=[getattr]\nfor read in [*choices]:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-starred-target-value",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nfor head, *rest, read in [(None,None,None,getattr)]:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-binding",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\nｒｅａｄ=getattr\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-reflection-call",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "use.py": "import app\ndef exercise(): return ｇｅｔａｔｔｒ(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-shadow",
+    "files": {
+      "app.py": "handlers=[]\ndef propertｙ(fn):\n    handlers.append(fn)\n    return fn\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef propertｙ(fn):\n    handlers.append(fn)\n    return fn\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-builtin-control",
+    "files": {
+      "app.py": "class Container:\n    @ｐｒｏｐｅｒｔｙ\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "class Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-setup-keyword",
+    "files": {
+      "app.py": "def _target(): return 7\ndef _unused(): return 3\n",
+      "setup.py": "from setuptools import ｓｅｔｕｐ\nｓｅｔｕｐ(ｅｎｔｒｙ_ｐｏｉｎｔｓ={\"console_scripts\":[\"sample=app:_target\"]})\n"
+    },
+    "run": "import sys, types, runpy; from importlib.metadata import EntryPoint; values={}; mod=types.ModuleType(\"setuptools\"); mod.setup=lambda **kw: values.update(kw); sys.modules[\"setuptools\"]=mod; runpy.run_path(\"setup.py\"); value=values[\"entry_points\"][\"console_scripts\"][0].split(\"=\",1)[1]; assert EntryPoint(name=\"sample\",value=value,group=\"console_scripts\").load()()==7",
+    "after": "def _unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-private-owner",
+    "files": {
+      "app.py": "class Klass:\n    @staticmethod\n    def __ſlot(): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app.Klass._Klass__slot\",return_value=9) as fn: return fn()\n"
+    },
+    "run": "from use import exercise; assert exercise()==9",
+    "after": "class Klass: pass\n",
+    "file": "app.py",
+    "name": "__ſlot",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-runtime-string-control",
+    "files": {
+      "app.py": "def _slot(): return 7\n",
+      "use.py": "import app\ndef exercise(): return ｇｅｔａｔｔｒ(app,\"_ſlot\",None)\n"
+    },
+    "run": "from use import exercise; assert exercise() is None",
+    "after": "",
+    "file": "app.py",
+    "name": "_slot",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-direct-declaration",
+    "files": {
+      "app.py": "def _ſlot(): return 7\n",
+      "use.py": "import app\ndef exercise(): return app._slot()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "",
+    "file": "app.py",
+    "name": "_ſlot",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction3-normalized-direct-reference",
+    "files": {
+      "app.py": "def _slot(): return 7\n",
+      "use.py": "import app\ndef exercise(): return app._ſlot()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "",
+    "file": "app.py",
+    "name": "_slot",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-bound-get",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nreader=globals().get\nreader.__self__[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nreader=globals().get\nreader.__self__[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-bound-copy",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nreader=globals().copy\nreader.__self__.update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nreader=globals().copy\nreader.__self__.update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-method-escape",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(reader):\n    reader.__self__[\"property\"]=register\nalter(globals().get)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(reader):\n    reader.__self__[\"property\"]=register\nalter(globals().get)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-chained-method-owner",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().get.__self__.update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nglobals().get.__self__.update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-builtin-bound-get",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nreader=api.__dict__.get\nreader.__self__[\"property\"]=register\n@api.property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\nreader=api.__dict__.get\nreader.__self__[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-deep-literal-container",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nbox=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[globals()]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\nbox[0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0].update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nbox=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[globals()]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\nbox[0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0].update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "readonly-direct-get",
+    "files": {
+      "app.py": "globals().get(\"irrelevant\")\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "globals().get(\"irrelevant\")\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "readonly-direct-copy",
+    "files": {
+      "app.py": "import builtins as api\ncopy=api.__dict__.copy()\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\ncopy=api.__dict__.copy()\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-iteration-budget",
+    "files": {
+      "app.py": "def _target(): return 7\ndef unused(): return 3\n",
+      "use.py": "import app\nchoices0=[getattr]\nchoices1=choices0\nchoices2=choices1\nchoices3=choices2\nchoices4=choices3\nchoices5=choices4\nchoices6=choices5\nchoices7=choices6\nchoices8=choices7\nchoices9=choices8\nchoices10=choices9\nchoices11=choices10\nchoices12=choices11\nchoices13=choices12\nchoices14=choices13\nchoices15=choices14\nchoices16=choices15\nchoices17=choices16\nchoices18=choices17\nchoices19=choices18\nchoices20=choices19\nchoices21=choices20\nchoices22=choices21\nchoices23=choices22\nchoices24=choices23\nchoices25=choices24\nchoices26=choices25\nchoices27=choices26\nchoices28=choices27\nchoices29=choices28\nchoices30=choices29\nchoices31=choices30\nchoices32=choices31\nchoices33=choices32\nchoices34=choices33\nchoices35=choices34\nchoices36=choices35\nchoices37=choices36\nchoices38=choices37\nchoices39=choices38\nchoices40=choices39\nchoices41=choices40\nchoices42=choices41\nchoices43=choices42\nchoices44=choices43\nchoices45=choices44\nchoices46=choices45\nchoices47=choices46\nchoices48=choices47\nchoices49=choices48\nchoices50=choices49\nchoices51=choices50\nchoices52=choices51\nchoices53=choices52\nchoices54=choices53\nchoices55=choices54\nchoices56=choices55\nchoices57=choices56\nchoices58=choices57\nchoices59=choices58\nchoices60=choices59\nchoices61=choices60\nchoices62=choices61\nchoices63=choices62\nchoices64=choices63\nchoices65=choices64\nchoices66=choices65\nchoices67=choices66\nchoices68=choices67\nchoices69=choices68\nchoices70=choices69\nchoices71=choices70\nchoices72=choices71\nchoices73=choices72\nchoices74=choices73\nchoices75=choices74\nchoices76=choices75\nchoices77=choices76\nchoices78=choices77\nchoices79=choices78\nchoices80=choices79\nchoices81=choices80\nchoices82=choices81\nchoices83=choices82\nchoices84=choices83\nchoices85=choices84\nchoices86=choices85\nchoices87=choices86\nchoices88=choices87\nchoices89=choices88\nchoices90=choices89\nchoices91=choices90\nchoices92=choices91\nchoices93=choices92\nchoices94=choices93\nchoices95=choices94\nchoices96=choices95\nchoices97=choices96\nchoices98=choices97\nchoices99=choices98\nchoices100=choices99\nchoices101=choices100\nchoices102=choices101\nchoices103=choices102\nchoices104=choices103\nchoices105=choices104\nchoices106=choices105\nchoices107=choices106\nchoices108=choices107\nchoices109=choices108\nchoices110=choices109\nchoices111=choices110\nchoices112=choices111\nchoices113=choices112\nchoices114=choices113\nchoices115=choices114\nchoices116=choices115\nchoices117=choices116\nchoices118=choices117\nchoices119=choices118\nchoices120=choices119\nchoices121=choices120\nchoices122=choices121\nchoices123=choices122\nchoices124=choices123\nchoices125=choices124\nchoices126=choices125\nchoices127=choices126\nchoices128=choices127\nchoices129=choices128\nchoices130=choices129\nchoices131=choices130\nchoices132=choices131\nchoices133=choices132\nchoices134=choices133\nchoices135=choices134\nchoices136=choices135\nchoices137=choices136\nchoices138=choices137\nchoices139=choices138\nchoices140=choices139\nchoices141=choices140\nchoices142=choices141\nchoices143=choices142\nchoices144=choices143\nchoices145=choices144\nchoices146=choices145\nchoices147=choices146\nchoices148=choices147\nchoices149=choices148\nchoices150=choices149\nchoices151=choices150\nchoices152=choices151\nchoices153=choices152\nchoices154=choices153\nchoices155=choices154\nchoices156=choices155\nchoices157=choices156\nchoices158=choices157\nchoices159=choices158\nchoices160=choices159\nchoices161=choices160\nchoices162=choices161\nchoices163=choices162\nchoices164=choices163\nchoices165=choices164\nchoices166=choices165\nchoices167=choices166\nchoices168=choices167\nchoices169=choices168\nchoices170=choices169\nchoices171=choices170\nchoices172=choices171\nchoices173=choices172\nchoices174=choices173\nchoices175=choices174\nchoices176=choices175\nchoices177=choices176\nchoices178=choices177\nchoices179=choices178\nchoices180=choices179\nchoices181=choices180\nchoices182=choices181\nchoices183=choices182\nchoices184=choices183\nchoices185=choices184\nchoices186=choices185\nchoices187=choices186\nchoices188=choices187\nchoices189=choices188\nchoices190=choices189\nchoices191=choices190\nchoices192=choices191\nchoices193=choices192\nchoices194=choices193\nchoices195=choices194\nchoices196=choices195\nchoices197=choices196\nchoices198=choices197\nchoices199=choices198\nchoices200=choices199\nchoices201=choices200\nchoices202=choices201\nchoices203=choices202\nchoices204=choices203\nchoices205=choices204\nchoices206=choices205\nchoices207=choices206\nchoices208=choices207\nchoices209=choices208\nchoices210=choices209\nchoices211=choices210\nchoices212=choices211\nchoices213=choices212\nchoices214=choices213\nchoices215=choices214\nchoices216=choices215\nchoices217=choices216\nchoices218=choices217\nchoices219=choices218\nchoices220=choices219\nchoices221=choices220\nchoices222=choices221\nchoices223=choices222\nchoices224=choices223\nchoices225=choices224\nchoices226=choices225\nchoices227=choices226\nchoices228=choices227\nchoices229=choices228\nchoices230=choices229\nchoices231=choices230\nchoices232=choices231\nchoices233=choices232\nchoices234=choices233\nchoices235=choices234\nchoices236=choices235\nchoices237=choices236\nchoices238=choices237\nchoices239=choices238\nchoices240=choices239\nchoices241=choices240\nchoices242=choices241\nchoices243=choices242\nchoices244=choices243\nchoices245=choices244\nchoices246=choices245\nchoices247=choices246\nchoices248=choices247\nchoices249=choices248\nchoices250=choices249\nchoices251=choices250\nchoices252=choices251\nchoices253=choices252\nchoices254=choices253\nchoices255=choices254\nchoices256=choices255\nchoices257=choices256\nchoices258=choices257\nchoices259=choices258\nchoices260=choices259\nchoices261=choices260\nchoices262=choices261\nchoices263=choices262\nchoices264=choices263\nchoices265=choices264\nchoices266=choices265\nchoices267=choices266\nchoices268=choices267\nchoices269=choices268\nchoices270=choices269\nchoices271=choices270\nchoices272=choices271\nchoices273=choices272\nchoices274=choices273\nchoices275=choices274\nchoices276=choices275\nchoices277=choices276\nchoices278=choices277\nchoices279=choices278\nchoices280=choices279\nchoices281=choices280\nchoices282=choices281\nchoices283=choices282\nchoices284=choices283\nchoices285=choices284\nchoices286=choices285\nchoices287=choices286\nchoices288=choices287\nchoices289=choices288\nchoices290=choices289\nchoices291=choices290\nchoices292=choices291\nchoices293=choices292\nchoices294=choices293\nchoices295=choices294\nchoices296=choices295\nchoices297=choices296\nchoices298=choices297\nchoices299=choices298\nchoices300=choices299\nfor read in choices300:\n    pass\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "reflection-default-alias",
+    "files": {
+      "app.py": "def _target(): return 7\ndef unused(): return 3\n",
+      "use.py": "import app\ndef exercise(read=getattr): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-private-patch",
+    "files": {
+      "app.py": "class _Klass:\n    @staticmethod\n    def __ſlot(): return 7\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app._Klass._Klass__slot\", return_value=9):\n        return 9\n"
+    },
+    "run": "from use import exercise; assert exercise()==9",
+    "after": "class _Klass: pass\n",
+    "file": "app.py",
+    "name": "__ſlot",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-keyword-create-control",
+    "files": {
+      "app.py": "def _target(): return 7\ndef unused(): return 3\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(\"app._target\", ｃreate=True, return_value=9):\n        return 9\n"
+    },
+    "run": "from use import exercise; assert exercise()==9",
+    "after": "def unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "nfkc-keyword-target",
+    "files": {
+      "app.py": "def _target(): return 7\ndef unused(): return 3\n",
+      "use.py": "from unittest.mock import patch\ndef exercise():\n    with patch(ｔarget=\"app._target\", return_value=9):\n        return 9\n"
+    },
+    "run": "from use import exercise; assert exercise()==9",
+    "after": "def unused(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "namespace-direct-module-escape",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(api):\n    api.property=register\nalter(builtins)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(api):\n    api.property=register\nalter(builtins)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-implicit-builtins",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\n__builtins__[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\n__builtins__[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-imported-dictionary",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import __dict__ as namespace\nnamespace[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import __dict__ as namespace\nnamespace[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-imported-dictionary-container",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import __dict__ as namespace\ndef alter(box):\n    box[0][\"property\"]=register\nalter([namespace])\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import __dict__ as namespace\ndef alter(box):\n    box[0][\"property\"]=register\nalter([namespace])\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-imported-module-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter(module):\n    module.property=register\nalter(api)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter(module):\n    module.property=register\nalter(api)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-module-default",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(module=builtins):\n    module.property=register\nalter()\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(module=builtins):\n    module.property=register\nalter()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-bound-builtin-function",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(fn):\n    fn.__self__.property=register\nalter(builtins.getattr)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(fn):\n    fn.__self__.property=register\nalter(builtins.getattr)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-literal-import",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(module):\n    module.property=register\nalter(__import__(\"builtins\"))\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(module):\n    module.property=register\nalter(__import__(\"builtins\"))\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-importlib-literal-import",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom importlib import import_module\ndef alter(module):\n    module.property=register\nalter(import_module(\"builtins\"))\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom importlib import import_module\ndef alter(module):\n    module.property=register\nalter(import_module(\"builtins\"))\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-unused-module-control",
+    "files": {
+      "app.py": "import builtins\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-module-member-control",
+    "files": {
+      "app.py": "import builtins as api\ndescriptor=api.property\nclass Container:\n    @descriptor\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\ndescriptor=api.property\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction4-imported-dictionary-read-control",
+    "files": {
+      "app.py": "from builtins import __dict__ as namespace\nnamespace.get(\"property\")\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "from builtins import __dict__ as namespace\nnamespace.get(\"property\")\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "module-import-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter(receiver): receiver.property=register\nalter(api)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\ndef alter(receiver): receiver.property=register\nalter(api)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-assignment-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\napi=builtins\ndef alter(receiver): receiver.property=register\nalter(api)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\napi=builtins\ndef alter(receiver): receiver.property=register\nalter(api)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-keyword",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(receiver): receiver.property=register\nalter(receiver=builtins)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(receiver): receiver.property=register\nalter(receiver=builtins)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-star",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(receiver): receiver.property=register\nalter(*[builtins])\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(receiver): receiver.property=register\nalter(*[builtins])\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-dictionary",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(box): box[\"api\"].property=register\nalter({\"api\":builtins})\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(box): box[\"api\"].property=register\nalter({\"api\":builtins})\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-deferred-global",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(): api.property=register\nimport builtins as api\nalter()\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(): api.property=register\nimport builtins as api\nalter()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-captured-helper",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef make(receiver):\n    def alter(): receiver.property=register\n    return alter\nalter=make(builtins)\nalter()\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef make(receiver):\n    def alter(): receiver.property=register\n    return alter\nalter=make(builtins)\nalter()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-default",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(receiver=builtins): receiver.property=register\nalter()\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(receiver=builtins): receiver.property=register\nalter()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-getattr-read",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\nread=getattr\ndef alter(mapping): mapping[\"property\"]=register\nalter(read(builtins,\"__dict__\"))\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\nread=getattr\ndef alter(mapping): mapping[\"property\"]=register\nalter(read(builtins,\"__dict__\"))\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-deep-literal",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\nbox=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[builtins]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\napi=box[0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0]\napi.property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\nbox=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[builtins]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\napi=box[0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][0]\napi.property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "bound-getattr-after-module-exposure",
+    "files": {
+      "app.py": "def _target(): return 7\ndef unrelated(): return 3\n",
+      "use.py": "import app, builtins\nread=builtins.getattr\ndef inspect(api): return api.__name__\ninspect(builtins)\ndef exercise(): return read(app,\"_target\")()\n"
+    },
+    "run": "from use import exercise; assert exercise()==7",
+    "after": "def unrelated(): return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "module-clean-plain-import",
+    "files": {
+      "app.py": "import builtins\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import builtins\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "module-clean-qualified-read",
+    "files": {
+      "app.py": "import builtins as api\nclass Box:\n    @api.property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import builtins as api\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "module-clean-captured-read",
+    "files": {
+      "app.py": "import builtins\ndescriptor=builtins.property\nclass Box:\n    @descriptor\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import builtins\ndescriptor=builtins.property\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "module-clean-getattr-call",
+    "files": {
+      "app.py": "import builtins\nbuiltins.getattr(object(),\"missing\",None)\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import builtins\nbuiltins.getattr(object(),\"missing\",None)\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "implicit-builtins-mapping",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\n__builtins__[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\n__builtins__[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "imported-builtins-mapping",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import __dict__ as namespace\nnamespace[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import __dict__ as namespace\nnamespace[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "unlisted-builtin-function-module-carrier",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(api):\n    api.__self__.property=register\nalter(len)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(api):\n    api.__self__.property=register\nalter(len)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction5-function-globals",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn):\n    fn.__globals__[\"property\"]=register\nalter(register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn):\n    fn.__globals__[\"property\"]=register\nalter(register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction5-function-builtins",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn):\n    fn.__builtins__[\"property\"]=register\nalter(register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn):\n    fn.__builtins__[\"property\"]=register\nalter(register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction5-returned-bound-receiver",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef namespace(fn): return fn.__self__\ndef alter(mapping):\n    mapping.property=register\nalter(namespace(len))\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef namespace(fn): return fn.__self__\ndef alter(mapping):\n    mapping.property=register\nalter(namespace(len))\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction5-ordinary-builtin-call-control",
+    "files": {
+      "app.py": "assert len([1])==1\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "assert len([1])==1\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-builtin-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ncarrier=len\ndef alter(fn): fn.__self__.property=register\nalter(carrier)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ncarrier=len\ndef alter(fn): fn.__self__.property=register\nalter(carrier)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-builtin-direct",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nlen.__self__.property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nlen.__self__.property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-builtin-different-name",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn): fn.__self__.property=register\nalter(abs)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn): fn.__self__.property=register\nalter(abs)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-function-direct",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nregister.__globals__[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nregister.__globals__[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-function-passed",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn): fn.__globals__[\"property\"]=register\nalter(register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn): fn.__globals__[\"property\"]=register\nalter(register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-function-bound-map",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nnamespace=register.__globals__\nnamespace.update(property=register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nnamespace=register.__globals__\nnamespace.update(property=register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-function-nested-builtins",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn): fn.__globals__[\"__builtins__\"][\"property\"]=register\nalter(register)\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn): fn.__globals__[\"__builtins__\"][\"property\"]=register\nalter(register)\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-clean-len-call",
+    "files": {
+      "app.py": "value=len([])\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "value=len([])\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-clean-abs-call",
+    "files": {
+      "app.py": "value=abs(-1)\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "value=abs(-1)\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "carrier-clean-simple-function-call",
+    "files": {
+      "app.py": "def function(): return 1\nvalue=function()\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "def function(): return 1\nvalue=function()\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "imported-module-builtin-write",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\nbuiltins.property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction6-aliased-import",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins as api\napi.property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction6-explicit-carrier",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ndef alter(fn):\n    fn.__self__.property=register\nalter(len)\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction6-object-base",
+    "files": {
+      "hooks.py": "import builtins\nhandlers=[]\nclass Base:\n    def __init_subclass__(cls): handlers.append(cls)\nbuiltins.object=Base\n",
+      "app.py": "import hooks\nclass _target(object): pass\n"
+    },
+    "run": "import app; assert len(app.hooks.handlers)==1",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction6-generic-base",
+    "files": {
+      "hooks.py": "import typing\nhandlers=[]\nclass Base:\n    def __init_subclass__(cls): handlers.append(cls)\ntyping.Generic=Base\n",
+      "app.py": "import hooks\nfrom typing import Generic\nclass _target(Generic): pass\n"
+    },
+    "run": "import app; assert len(app.hooks.handlers)==1",
+    "after": "import hooks\nfrom typing import Generic\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction6-harmless-module-control",
+    "files": {
+      "hooks.py": "import builtins\ndescriptor=builtins.property\n",
+      "app.py": "import hooks\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import hooks\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-from-import",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\nbuiltins.property=register\n",
+      "app.py": "from hooks import handlers\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "from hooks import handlers\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-package-chain",
+    "files": {
+      "pkg/hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\nbuiltins.property=register\n",
+      "pkg/__init__.py": "from .hooks import handlers\n",
+      "app.py": "import pkg\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.pkg.handlers[0]()==7",
+    "after": "import pkg\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-installer",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef install(): builtins.property=register\n",
+      "app.py": "import hooks\nhooks.install()\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\nhooks.install()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-module-escape",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport builtins\ndef alter(api): api.property=register\nalter(builtins)\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-function-builtins",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nregister.__globals__[\"__builtins__\"][\"property\"]=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-clean-read",
+    "files": {
+      "hooks.py": "import builtins\nvalue=builtins.property\n",
+      "app.py": "import hooks\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import hooks\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-clean-string",
+    "files": {
+      "hooks.py": "NOTE=\"builtins.property = register\"\n",
+      "app.py": "import hooks\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import hooks\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-clean-project-field",
+    "files": {
+      "hooks.py": "class Holder: pass\nHolder.property=7\n",
+      "app.py": "import hooks\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import hooks\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "cross-file-object-base",
+    "files": {
+      "hooks.py": "handlers=[]\nclass Base:\n    def __init_subclass__(cls): handlers.append(cls)\nimport builtins\nbuiltins.object=Base\n",
+      "app.py": "import hooks\nclass _target(object): pass\n"
+    },
+    "run": "import app; assert len(app.hooks.handlers)==1",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-namespace-same-file",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__self__\").property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__self__\").property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-namespace-cross-file",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__self__\").property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-import-alias",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom builtins import getattr as read\nread(len,\"__self__\").property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-bound-alias",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nread=getattr\nread(len,\"__self__\").property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nread=getattr\nread(len,\"__self__\").property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-escaped-member",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"\\137\\137self__\").property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-adjacent-strings",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__s\" \"elf__\").property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-constant-concat",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__s\" + \"elf__\").property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-bound-name",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nKEY=\"__self__\"\ngetattr(len,KEY).property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-unknown-name",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nKEY=[\"__self__\"][0]\ngetattr(len,KEY).property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-function-globals",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(register,\"__globals__\")[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(register,\"__globals__\")[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-function-builtins",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(register,\"__builtins__\")[\"property\"]=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-module-dict",
+    "files": {
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(__import__(\"builtins\"),\"__dict__\")[\"property\"]=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-ordinary-member",
+    "files": {
+      "app.py": "assert getattr(len,\"__name__\")==\"len\"\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "assert getattr(len,\"__name__\")==\"len\"\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-missing-member",
+    "files": {
+      "app.py": "assert getattr(len,\"missing\",None) is None\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "assert getattr(len,\"missing\",None) is None\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-shadowed-getter",
+    "files": {
+      "app.py": "class Holder: pass\ndef getattr(*args): return Holder\ngetattr(None,\"__self__\").property=7\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "class Holder: pass\ndef getattr(*args): return Holder\ngetattr(None,\"__self__\").property=7\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction7-runtime-string-not-normalized",
+    "files": {
+      "app.py": "assert getattr(len,\"_＿self__\",None) is None\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "assert getattr(len,\"_＿self__\",None) is None\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-default",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__self__\",None).property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__self__\",None).property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-globals",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(register,\"__globals__\")[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(register,\"__globals__\")[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-bound-name",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nmember=\"__self__\"\ngetattr(len,member).property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nmember=\"__self__\"\ngetattr(len,member).property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-constant-concat",
+    "files": {
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__\"+\"self__\").property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\ngetattr(len,\"__\"+\"self__\").property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-clean-ordinary-member",
+    "files": {
+      "app.py": "value=getattr(len,\"__name__\")\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "value=getattr(len,\"__name__\")\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-clean-missing-member",
+    "files": {
+      "app.py": "value=getattr(object(),\"missing\",None)\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "value=getattr(object(),\"missing\",None)\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "getattr-clean-shadowed-api",
+    "files": {
+      "app.py": "def getattr(value,name): return 3\nvalue=getattr(None,\"__self__\")\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "def getattr(value,name): return 3\nvalue=getattr(None,\"__self__\")\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "project-reexport-bound-carrier",
+    "files": {
+      "helpers.py": "fn=len\n",
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\nfn.__self__.property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\nfn.__self__.property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-getattr-imported-callable",
+    "files": {
+      "helpers.py": "fn=len\n",
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\ngetattr(fn,\"__self__\").property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\ngetattr(fn,\"__self__\").property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-imported-callable-cross-file",
+    "files": {
+      "helpers.py": "fn=len\n",
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\nfn.__self__.property=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-imported-module-dict",
+    "files": {
+      "helpers.py": "import builtins\napi=builtins\n",
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import api\napi.__dict__[\"property\"]=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-getattr-imported-module-dict",
+    "files": {
+      "helpers.py": "import builtins\napi=builtins\n",
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import api\ngetattr(api,\"__dict__\")[\"property\"]=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-vars-imported-module",
+    "files": {
+      "helpers.py": "import builtins\napi=builtins\n",
+      "hooks.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import api\nvars(api)[\"property\"]=register\n",
+      "app.py": "import hooks\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.hooks.handlers[0]()==7",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-builtin-dict-read",
+    "files": {
+      "app.py": "import builtins as api\nassert api.__dict__.get(\"property\") is property\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\nassert api.__dict__.get(\"property\") is property\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-builtin-getattr-dict-read",
+    "files": {
+      "app.py": "import builtins as api\nassert getattr(api,\"__dict__\").get(\"property\") is property\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\nassert getattr(api,\"__dict__\").get(\"property\") is property\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-builtin-vars-read",
+    "files": {
+      "app.py": "import builtins as api\nassert vars(api).get(\"property\") is property\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\nassert vars(api).get(\"property\") is property\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "correction8-builtin-getattr-ordinary-read",
+    "files": {
+      "app.py": "import builtins as api\nassert getattr(api,\"property\") is property\nclass Container:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Container()",
+    "after": "import builtins as api\nassert getattr(api,\"property\") is property\nclass Container: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "unknown-owner-qualified",
+    "files": {
+      "helpers.py": "fn=abs\n",
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport helpers\nhelpers.fn.__self__.property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nimport helpers\nhelpers.fn.__self__.property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "unknown-owner-getattr",
+    "files": {
+      "helpers.py": "fn=abs\n",
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\ngetattr(fn,\"__self__\").property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\ngetattr(fn,\"__self__\").property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "unknown-owner-aliased-getattr",
+    "files": {
+      "helpers.py": "fn=abs\n",
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn as carrier\ngetattr(carrier,\"__self__\").property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn as carrier\ngetattr(carrier,\"__self__\").property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "unknown-owner-vars",
+    "files": {
+      "helpers.py": "fn=abs\n",
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\nvars(fn.__self__)[\"property\"]=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom helpers import fn\nvars(fn.__self__)[\"property\"]=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "unknown-owner-chain",
+    "files": {
+      "helpers.py": "fn=abs\n",
+      "bridge.py": "from helpers import fn\n",
+      "app.py": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom bridge import fn\nfn.__self__.property=register\n@property\ndef _target(): return 7\n"
+    },
+    "run": "import app; assert app.handlers[0]()==7",
+    "after": "handlers=[]\ndef register(fn):\n    handlers.append(fn)\n    return fn\nfrom bridge import fn\nfn.__self__.property=register\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "unknown-owner-clean-standard-read",
+    "files": {
+      "helpers.py": "fn=abs\n",
+      "app.py": "import builtins\nbuiltins.__dict__.get(\"property\")\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "import builtins\nbuiltins.__dict__.get(\"property\")\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "unknown-owner-clean-reexport-call",
+    "files": {
+      "helpers.py": "fn=abs\n",
+      "app.py": "from helpers import fn\nvalue=fn(-1)\nclass Box:\n    @property\n    def _target(self): return 7\n"
+    },
+    "run": "import app; assert app.Box()",
+    "after": "from helpers import fn\nvalue=fn(-1)\nclass Box: pass\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "modified-getattr-readonly",
+    "files": {
+      "hooks.py": "handlers=[]\nclass Base:\n    def __init_subclass__(cls): handlers.append(cls)\nimport builtins\noriginal=builtins.__dict__.get(\"getattr\")\ndef read(api,name,*defaults):\n    if original(api,\"__name__\",None) == \"builtins\" and name == \"__dict__\": api.object=Base\n    return original(api,name,*defaults)\nbuiltins.getattr=read\ngetattr(builtins,\"__dict__\").get(\"object\")\n",
+      "app.py": "import hooks\nclass _target(object): pass\n"
+    },
+    "run": "import app; assert len(app.hooks.handlers)==1",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "modified-vars-readonly",
+    "files": {
+      "hooks.py": "handlers=[]\nclass Base:\n    def __init_subclass__(cls): handlers.append(cls)\nimport builtins\noriginal=builtins.__dict__.get(\"vars\")\nlookup=builtins.__dict__.get(\"getattr\")\ndef read(*args):\n    if args and lookup(args[0],\"__name__\",None) == \"builtins\": args[0].object=Base\n    return original(*args)\nbuiltins.vars=read\nvars(builtins).get(\"object\")\n",
+      "app.py": "import hooks\nclass _target(object): pass\n"
+    },
+    "run": "import app; assert len(app.hooks.handlers)==1",
+    "after": "import hooks\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  }
+]

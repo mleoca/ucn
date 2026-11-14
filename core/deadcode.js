@@ -19,6 +19,9 @@ const { protocolMemberOf, protocolTypeOf, typedLiteralContract, rustProjectTrait
     hierarchySlotClosure, goContractClosure, structuralContractsRequiring,
     requirementIn, resetContractIndex } = require('./contract-membership');
 const { projectKind, downstreamExposureBlocks } = require('./deletion');
+const { pythonIdentity, registrationUnknown, pythonSourceName, pythonNormalizedNames,
+    pythonProjectIdentityAffected } = require('./python-binding-identity');
+const { runtimeEntrypoints, runtimeTargetReaches } = require('./runtime-entrypoints');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -32,12 +35,6 @@ const CLASS_AUDIT_KINDS = ['class', 'struct', 'interface', 'trait', 'record', 'e
 // the callable with an external runtime. They therefore remain eligible for a
 // name/usage-based dead-code proof. Every other unknown decorator/annotation
 // stays conservative: it may be the only evidence of framework registration.
-const _NON_REGISTERING_DECORATORS = new Set([
-    'property',
-    'classmethod',
-    'staticmethod',
-]);
-
 function _decoratorName(value) {
     const raw = typeof value === 'string'
         ? value
@@ -46,7 +43,33 @@ function _decoratorName(value) {
     return String(raw).trim().replace(/^@/, '').split('(')[0].trim();
 }
 
-function hasUnknownRegistrationDecorator(symbol) {
+const PYTHON_DECLARATIONS = new WeakMap();
+
+function pythonDeclaration(index, symbol) {
+    try {
+        const operation = index._opTreeCache;
+        let byFile = operation && PYTHON_DECLARATIONS.get(operation);
+        if (!byFile) {
+            byFile = new Map();
+            if (operation) PYTHON_DECLARATIONS.set(operation, byFile);
+        }
+        let byName = byFile.get(symbol.file);
+        if (!byName) {
+            byName = new Map();
+            const tree = index._getParsedTree(symbol.file, index._readFile(symbol.file), 'python');
+            for (const node of tree.rootNode.descendantsOfType(['function_definition', 'class_definition'])) {
+                const name = node.childForFieldName('name')?.text;
+                if (!byName.has(name)) byName.set(name, []);
+                byName.get(name).push(node);
+            }
+            byFile.set(symbol.file, byName);
+        }
+        return (byName.get(symbol.name) || []).find(node =>
+            node.startPosition.row + 1 >= symbol.startLine && node.endPosition.row + 1 <= symbol.endLine);
+    } catch { return null; }
+}
+
+function hasUnknownRegistrationDecorator(symbol, index) {
     const values = [
         symbol.decorators,
         symbol.decoratorsWithArgs,
@@ -54,15 +77,15 @@ function hasUnknownRegistrationDecorator(symbol) {
         symbol.attributesWithArgs,
     ].flatMap(items => Array.isArray(items) ? items : []);
 
+    if (values.length === 0) return false;
+    if (index?.files.get(symbol.file)?.language === 'python') {
+        if (typeof symbol.registrationUnknown === 'boolean') return symbol.registrationUnknown || pythonProjectIdentityAffected(index, 'builtins.*');
+        const declaration = pythonDeclaration(index, symbol);
+        return declaration ? registrationUnknown(declaration) || pythonProjectIdentityAffected(index, 'builtins.*') : true;
+    }
     return values.some(value => {
         const qualified = _decoratorName(value);
         if (!qualified) return false;
-        const bare = qualified.split(/\.|::/).pop();
-        if (_NON_REGISTERING_DECORATORS.has(bare)) return false;
-        // `@name.getter`, `@name.setter`, and `@name.deleter` install an
-        // accessor on an already local property; they are not external
-        // framework registration boundaries.
-        if (['getter', 'setter', 'deleter'].includes(bare)) return false;
         return true;
     });
 }
@@ -93,9 +116,20 @@ const _UNIVERSAL_ROOTS = new Set(['object', 'Object']);
 const _PY_NON_DISPATCHING_BASES = new Set(['Generic']);
 
 /** True when a base name resolves to NO in-project class/struct/interface/trait/record (an out-of-tree type). */
-function _baseIsExternal(index, bare, lang, fromDef) {
-    if (!bare || _UNIVERSAL_ROOTS.has(bare)) return false;
-    if (lang === 'python' && _PY_NON_DISPATCHING_BASES.has(bare)) return false;
+function _baseIsExternal(index, bare, lang, fromDef, raw) {
+    if (!bare) return false;
+    if (lang === 'python' && fromDef) {
+        const declaration = pythonDeclaration(index, fromDef);
+        let base = declaration?.childForFieldName('superclasses')?.namedChildren.find(node =>
+            node.text === raw || (node.type === 'subscript' && node.childForFieldName('value')?.text === raw));
+        while (base?.type === 'subscript') base = base.childForFieldName('value');
+        const identity = pythonIdentity(base);
+        if (identity === 'builtins.object' || identity === 'typing.Generic') return pythonProjectIdentityAffected(index, identity);
+        // A source import can reuse a builtin's spelling without its semantics.
+        if (identity && (_UNIVERSAL_ROOTS.has(bare) || _PY_NON_DISPATCHING_BASES.has(bare))) return true;
+    } else if (_UNIVERSAL_ROOTS.has(bare) &&
+        !(index.files.get(fromDef?.file)?.importBindings || []).some(binding => (binding.alias || binding.name) === bare) &&
+        !(index.symbols.get(bare) || []).some(def => def.file === fromDef?.file)) return false;
     const defs = index.symbols.get(bare);
     return !(defs && defs.some(d => _CLASS_KINDS.includes(d.type) &&
         // `class EnvironBuilder(werkzeug.test.EnvironBuilder)` must not
@@ -152,7 +186,7 @@ function _heritageReachesExternalBase(index, classDef, lang, followImplements) {
                 const bare = _bareBaseName(raw);
                 if (!bare || seen.has(bare)) continue;
                 seen.add(bare);
-                if (_baseIsExternal(index, bare, lang, def)) return true;
+                if (_baseIsExternal(index, bare, lang, def, raw)) return true;
                 for (const pd of index.symbols.get(bare) || []) {
                     if (_CLASS_KINDS.includes(pd.type)) next.push(pd);
                 }
@@ -349,7 +383,7 @@ function contractFactsOf(index, declared, lang) {
                 typedLiteralExternalMember(index, declared) ||
                 implicitStandardContract(declared, lang)),
         projectContract: requiredByProjectContract(index, declared),
-        registered: !!(isFrameworkEntrypoint(declared, index) || hasUnknownRegistrationDecorator(declared)),
+        registered: !!(isFrameworkEntrypoint(declared, index) || hasUnknownRegistrationDecorator(declared, index)),
     };
 }
 
@@ -885,6 +919,7 @@ function deadcode(index, options = {}) {
     // reports every outcome (detail: the audit row of a claim, the sites of
     // a use). Neither changes what is claimed.
     const onlyNames = options.names instanceof Set ? options.names : null;
+    const packagingEntrypoints = runtimeEntrypoints(index);
     const explain = typeof options.explain === 'function' ? options.explain : null;
     const withhold = (symbol, reason, detail) => { if (explain) explain(symbol, reason, detail); };
     // Assessment only: names whose every call site the caller has shown to
@@ -990,8 +1025,8 @@ function deadcode(index, options = {}) {
         if (!fe || sites.length === 0) continue;
         for (const site of sites) {
             if (site.dynamic) dynamicReflectionFiles.add(reflectionFile);
-            if (site.name) literalReflectionNames.add(site.name);
-            if (site.patterns && site.patterns.length > 0 && !site.name) {
+            if (site.name && !site.runtimeTarget) literalReflectionNames.add(site.name);
+            if (site.patterns && site.patterns.length > 0 && !site.name && !site.runtimeTarget) {
                 // Exact alternatives of a multi-spelling site are literals.
                 for (const pattern of site.patterns) {
                     if (!pattern.includes('*')) literalReflectionNames.add(pattern);
@@ -1283,6 +1318,18 @@ function deadcode(index, options = {}) {
                 // name inside /* ... */ counted as usage — commented-out code
                 // silently kept its symbols "alive" and hid true dead claims.
                 const lines = maskBlockComments(content, fileEntry.language).split('\n');
+                let stringTree;
+                const multilinePython = fileEntry.language === 'python' && (content.includes('"""') || content.includes("'''"));
+                const inMultilineString = (line, column) => {
+                    if (!multilinePython) return false;
+                    stringTree ||= index._getParsedTree(filePath, content, fileEntry.language);
+                    let node = stringTree.rootNode.descendantForPosition({ row: line, column });
+                    for (; node; node = node.parent) {
+                        if (node.type === 'interpolation') return false;
+                        if (node.type === 'string') return true;
+                    }
+                    return false;
+                };
                 for (const name of namesInFile) {
                     const nameLen = name.length;
                     for (let i = 0; i < lines.length; i++) {
@@ -1318,7 +1365,7 @@ function deadcode(index, options = {}) {
                             const rustAttributePath = fileEntry.language === 'rust' &&
                                 /^\s*#\[\s*serde\s*\(/.test(line) &&
                                 new RegExp(`\\b(?:serialize_with|deserialize_with|default|with)\\s*=\\s*["'][^"']*\\b${escapeRegExp(name)}\\b`).test(line);
-                            if (isInsideString(line, pos, fileEntry.language) &&
+                            if ((isInsideString(line, pos, fileEntry.language) || inMultilineString(i, pos)) &&
                                 !(fileEntry.language === 'python' && classKindNames.has(name)) &&
                                 !rustAttributePath) continue;
                             // Property/field access (preceded by '.'), not a
@@ -1639,7 +1686,18 @@ function deadcode(index, options = {}) {
             // call-pattern-based registration (Express routes, Gin handlers, etc.)
             // These functions are invoked by frameworks, not by user code.
             const hasFrameworkEntrypoint = isFrameworkEntrypoint(symbol, index);
-            const hasDecoratorMetadata = hasUnknownRegistrationDecorator(symbol);
+            const hasDecoratorMetadata = hasUnknownRegistrationDecorator(symbol, index);
+            if (lang === 'python' && packagingEntrypoints.some(entry => entry.unknown || runtimeTargetReaches(index, symbol, entry.target))) {
+                withhold(symbol, 'runtime-entrypoint');
+                continue;
+            }
+
+            if (langTraits(lang)?.reflectionApi?.pythonBindingIdentity && symbol.registrationUnknown === false &&
+                (symbol.decorators || []).length && pythonProjectIdentityAffected(index, 'builtins.*')) {
+                excludedDecorated++;
+                withhold(symbol, 'builtin-namespace-effect');
+                continue;
+            }
 
             // Unknown decorators are conservative runtime-registration
             // boundaries. A decorator necessarily consumes/replaces the
@@ -1650,6 +1708,19 @@ function deadcode(index, options = {}) {
                 !options.includeDecorated) {
                 excludedDecorated++;
                 withhold(symbol, 'registered');
+                continue;
+            }
+
+            // The caller graph retains source spellings. Python can bind a
+            // different written identifier to this runtime name via NFKC;
+            // until that graph models the equivalence, do not clear it. The
+            // inventory is AST-only and shared by every symbol in this op.
+            if (langTraits(lang)?.reflectionApi?.pythonBindingIdentity &&
+                (pythonSourceName(symbol.name) !== symbol.name ||
+                 (symbol.runtimeOwnerPath || [symbol.className]).filter(Boolean)
+                     .some(owner => pythonSourceName(owner) !== owner) ||
+                 pythonNormalizedNames(index).has(pythonSourceName(symbol.name)))) {
+                withhold(symbol, 'identifier-normalization');
                 continue;
             }
 
@@ -1707,7 +1778,7 @@ function deadcode(index, options = {}) {
                     continue;
                 }
                 if (members.some(m => isFrameworkEntrypoint(m, index) ||
-                    hasUnknownRegistrationDecorator(m))) {
+                    hasUnknownRegistrationDecorator(m, index))) {
                     if (!options.includeDecorated) {
                         excludedDecorated++;
                         withhold(symbol, 'registered');

@@ -619,7 +619,7 @@ function formatAffectedTests(result, options = {}) {
         }
         const pat = result.possiblyAffectedTests || [];
         if (pat.length > 0) {
-            lines.push(`  Additional test files (${pat.length}):`);
+            lines.push(`  Test files with possible links (${pat.length}):`);
             const MAX_POSSIBLE = options.all ? Infinity : 10;
             for (const tf of pat.slice(0, MAX_POSSIBLE)) {
                 lines.push(`    ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})`);

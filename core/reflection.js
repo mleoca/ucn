@@ -24,8 +24,9 @@
  * memoized on the index and reset with it.
  */
 
-const { langTraits } = require('../languages');
+const { langTraits, detectLanguage } = require('../languages');
 const { sameNode } = require('../languages/utils');
+const { pythonPossibleIdentities, pythonSourceName } = require('./python-binding-identity');
 
 const WILD = '\u0000*';
 const MODULE_RECEIVER = Object.freeze({ kind: 'module' });
@@ -153,7 +154,13 @@ function _stringLiteral(node) {
 function stringAlternatives(node, ctx, depth = 0) {
     node = _unwrap(node);
     if (!node || depth > 12) return null;
-    if (STRING_NODES.has(node.type)) return _stringLiteral(node);
+    if (STRING_NODES.has(node.type)) {
+        const literal = ctx?.language === 'python'
+            ? require('./runtime-entrypoints').pythonStringLiteral(node)
+            : ['javascript', 'typescript', 'tsx', 'html'].includes(ctx?.language)
+                ? require('../languages/static-js').jsString(node) : null;
+        return literal != null ? [[literal]] : _stringLiteral(node);
+    }
     switch (node.type) {
         case 'concatenated_string': {
             let acc = [[]];
@@ -835,7 +842,7 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
     const api = traits.reflectionApi;
     if (!api || !tree) return facts;
     const resolve = makeResolver();
-    const ctx = { formatCalls: api.formatCalls || null, resolve };
+    const ctx = { formatCalls: api.formatCalls || null, resolve, language };
     const sites = facts.sites;
     const push = (node, kind, nameNode, receiverNode, receiverFact) => {
         const cls = classifyNameExpression(nameNode, ctx);
@@ -876,7 +883,10 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         const { literalNameRegex } = require('./shared');
         hintSources.push(...[...qualifiers.keys()].map(name => literalNameRegex(name).source));
     }
-    const useHints = code != null && hintSources.length > 0;
+    // Aliases can call a reflective API without spelling that API at the call.
+    // Resolve the Python call ASTs whenever its binding vocabulary is present.
+    if (api.pythonBindingIdentity && code != null && !api.hintPattern.test(code.normalize('NFKC'))) return facts;
+    const useHints = !api.pythonBindingIdentity && code != null && hintSources.length > 0;
     const callTypes = constructs.length > 0 ? [...CALL_NODE_TYPES, ...NEW_NODE_TYPES] : CALL_NODE_TYPES;
     const types = [];
     if (!useHints) {
@@ -888,7 +898,7 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
     // Qualified callees (`Reflect.get`, a package's functions) need the
     // callee text of member-shaped calls; bare vocabularies (`getattr`)
     // never do.
-    const wantQualified = qualifiers.size > 0 ||
+    const wantQualified = api.pythonBindingIdentity || qualifiers.size > 0 ||
         [...(api.functions || []), ...unnamed, ...codeExecution].some(rule => rule.qualified);
     const visitNode = node => {
         if (node.type === 'subscript_expression') {
@@ -897,6 +907,28 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
             // counts; opaque keys stay the computed-dispatch disclosure.
             const index = node.childForFieldName('index');
             const inner = _unwrap(index);
+            const { jsStaticKey, jsConstValue } = require('../languages/static-js');
+            const staticName = jsStaticKey(inner);
+            if (staticName != null) {
+                // This is normal member syntax. The call extractor carries
+                // the exact receiver; reflection keeps value-position access live.
+                if (node.parent?.type !== 'call_expression' || !sameNode(node.parent.childForFieldName('function'), node)) {
+                    sites.push({ kind: 'computed', name: staticName, patterns: [staticName], dynamic: false,
+                        line: node.startPosition.row + 1, expression: node.text.slice(0, EXPRESSION_CAP),
+                        receiver: classifyReceiver(node.childForFieldName('object'), language), membersOnly: true });
+                }
+                return;
+            }
+            const object = node.childForFieldName('object');
+            const construction = object?.type === 'new_expression' ? object : jsConstValue(object, true);
+            const type = construction?.type === 'new_expression' ? construction.childForFieldName('constructor') : null;
+            if (type?.type === 'identifier' && node.parent?.type === 'call_expression' &&
+                sameNode(node.parent.childForFieldName('function'), node)) {
+                sites.push({ kind: 'computed', dynamic: true, dynamicMember: true,
+                    receiver: { kind: 'type', name: type.text }, membersOnly: true,
+                    line: node.startPosition.row + 1, expression: node.text.slice(0, EXPRESSION_CAP) });
+                return;
+            }
             // `registry[type](..)` with `type` a parameter of the enclosing
             // callable dispatches by the name its callers pass (fix #428).
             if (inner?.type === 'identifier' && node.parent?.type === 'call_expression' &&
@@ -930,15 +962,61 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         }
         const call = _calleeParts(node, wantMembers, wantQualified);
         if (!call) return;
+        if (api.pythonBindingIdentity) {
+            const fn = _calleeNode(node.childForFieldName('function'));
+            const identities = pythonPossibleIdentities(fn, scopeMemo);
+            const args = _callArgs(node) || [];
+            const keyword = name => args.find(arg => arg.type === 'keyword_argument' &&
+                pythonSourceName(arg.childForFieldName('name')?.text) === name)?.childForFieldName('value');
+            for (const identity of identities) {
+                const isPatch = identity === 'unittest.mock.patch';
+                const isObjectPatch = identity === 'unittest.mock.patch.object';
+                const isMonkeyPatch = identity === 'pytest.MonkeyPatch.instance.setattr';
+                if (isPatch || isObjectPatch || isMonkeyPatch) {
+                    const positional = args.filter(arg => arg.type !== 'keyword_argument');
+                    const nameNode = positional[0] || keyword('target');
+                    const optional = isPatch || isObjectPatch ? keyword('create')?.type === 'true'
+                        : keyword('raising')?.type === 'false';
+                    const memberNode = positional[1] || keyword(isObjectPatch ? 'attribute' : 'name');
+                    const member = classifyNameExpression(memberNode, ctx);
+                    if (!optional && (isObjectPatch || (isMonkeyPatch && !stringAlternatives(nameNode, ctx))) && member.name) {
+                        facts.reflectionUses++;
+                        push(node, 'runtime-member', memberNode, nameNode);
+                        continue;
+                    }
+                    const alternatives = stringAlternatives(nameNode, ctx);
+                    const target = alternatives?.length === 1 && !alternatives[0].includes(WILD)
+                        ? alternatives[0].join('') : null;
+                    if (!optional && target?.includes('.')) {
+                        const name = target.slice(target.lastIndexOf('.') + 1);
+                        facts.reflectionUses++;
+                        const spellings = new Set([name]);
+                        // A private source member is spelled _Owner__member by
+                        // runtime APIs. The final owner-aware matcher decides it;
+                        // this index must first make its source spelling reachable.
+                        for (let offset = 1; offset < name.length - 1; offset++) {
+                            if (name[offset] === '_' && name[offset + 1] === '_') spellings.add(name.slice(offset));
+                        }
+                        sites.push({ kind: 'runtime-target', name, patterns: [...spellings], dynamic: false,
+                            runtimeTarget: target, line: node.startPosition.row + 1,
+                            expression: String(node.text).slice(0, EXPRESSION_CAP) });
+                    }
+                    continue;
+                }
+            }
+            call.possibleCallees = identities.filter(identity => identity.startsWith('builtins.')).map(identity => identity.slice(9));
+            call.calleeText = call.possibleCallees[0] || '';
+        }
         // Match on the callee spelling first; arguments are read only for a
         // vocabulary hit (most calls in a hinted file are unrelated).
         const calleeText = () => (call.calleeText ??= _calleeName(call.fn));
         for (const rule of api.functions || []) {
-            if (!rule.callee.test(calleeText())) continue;
+            const matched = (call.possibleCallees || [calleeText()]).find(name => rule.callee.test(name));
+            if (!matched) continue;
             const args = _callArgs(node);
             if (args && args[rule.nameArg]) {
                 facts.reflectionUses++;
-                push(node, rule.kind || calleeText().split('.').pop(),
+                push(node, rule.kind || matched.split('.').pop(),
                     args[rule.nameArg], args[rule.receiverArg]);
             }
             return;
@@ -1081,10 +1159,16 @@ function reflectionPatternIndex(index) {
     let entryCount = 0;
     const moduleScoped = new Map();
     const keyParameterSites = [];
+    const dynamicMembers = [];
     for (const [file, sites] of byFile) {
         const fe = index.files.get(file);
         if (!fe) continue;
         for (const site of sites) {
+            if (site.dynamicMember) {
+                dynamicMembers.push({ pattern: '*', file, relativePath: fe.relativePath,
+                    language: fe.language, family: _family(fe.language), site });
+                continue;
+            }
             if (site.receiver?.kind === 'module') {
                 // Bounded to this file's top-level names: a fully dynamic
                 // name reaches every one of them.
@@ -1114,7 +1198,7 @@ function reflectionPatternIndex(index) {
         }
     }
     const result = { byFragment, lengths: [...lengths].sort((a, b) => a - b), entryCount, moduleScoped,
-        keyParameterSites, quoted: new Map(), keyNames: new Map() };
+        keyParameterSites, dynamicMembers, quoted: new Map(), keyNames: new Map() };
     index._reflectionPatternIndex = result;
     return result;
 }
@@ -1130,6 +1214,9 @@ function patternEntriesFor(index, name, language, file = null) {
         }
     }
     const family = language ? _family(language) : null;
+    for (const entry of pidx.dynamicMembers) {
+        if (!family || entry.family === family) out.push(entry);
+    }
     for (const entry of pidx.keyParameterSites) {
         if (family && entry.family !== family) continue;
         if (_keyParameterPasses(index, pidx, entry, name)) out.push({ ...entry, pattern: name });
@@ -1190,6 +1277,7 @@ function _reachesKey(index, fromRef, targetKey, targetName) {
  */
 function reflectionEntryReaches(index, entry, def) {
     const site = entry.site;
+    if (site.runtimeTarget) return require('./runtime-entrypoints').runtimeTargetReaches(index, def, site.runtimeTarget);
     if (site.membersOnly && !def.className && !def.receiver) return false;
     const recv = site.receiver;
     if (!recv) return true;
@@ -1228,8 +1316,9 @@ function reflectionEntryReaches(index, entry, def) {
 
 /** Reaching pattern entries for one definition (sorted file, line). */
 function reflectionPatternReferences(index, def) {
-    const lang = index.files.get(def.file)?.language;
-    const entries = patternEntriesFor(index, def.name, lang, def.file)
+    const lang = index.files.get(def.file)?.language || detectLanguage(def.file, index.root);
+    const runtimeName = langTraits(lang)?.reflectionApi?.pythonBindingIdentity ? pythonSourceName(def.name) : def.name;
+    const entries = patternEntriesFor(index, runtimeName, lang, def.file)
         .filter(entry => reflectionEntryReaches(index, entry, def));
     entries.sort((a, b) => (a.relativePath < b.relativePath ? -1 : a.relativePath > b.relativePath ? 1 : 0) ||
         a.site.line - b.site.line || (a.pattern < b.pattern ? -1 : a.pattern > b.pattern ? 1 : 0));

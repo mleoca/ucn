@@ -44,6 +44,43 @@ module.exports = { main };
 `,
 };
 
+describe('fix #502: apply proven name reach before novelty scans', () => {
+    it('keeps direct and namespace imports while skipping foreign namesakes', () => {
+        const { occurrencesOutsideChange } = require('../core/capture');
+        const dir = tmp({
+            'lib.py': 'def added():\n    return 1\n',
+            'direct.py': 'from lib import added\nvalue = added()\n',
+            'namespace.py': 'import lib\nvalue = lib.added()\n',
+            'foreign.py': 'def added():\n    return 2\nvalue = added()\n',
+        });
+        try {
+            const index = idx(dir);
+            const definition = index.symbols.get('added').find(def => def.relativePath === 'lib.py');
+            const visited = [];
+            const original = index._getCachedUsages.bind(index);
+            index._getCachedUsages = (file, ...args) => { visited.push(path.basename(file)); return original(file, ...args); };
+            const result = occurrencesOutsideChange(index, 'added', new Map([['lib.py', new Set([1, 2])]]), definition);
+            assert.deepStrictEqual([...new Set(result.outside.map(row => row.file))], ['direct.py', 'namespace.py']);
+            assert.ok(!visited.includes('foreign.py'));
+        } finally { rm(dir); }
+    });
+
+    it('retains the full search when a star reexport makes downstream reach unknown', () => {
+        const { occurrencesOutsideChange } = require('../core/capture');
+        const dir = tmp({
+            'lib.ts': 'export function added() { return 1; }\n',
+            'barrel.ts': "export * from './lib';\n",
+            'consumer.ts': "import { added } from './barrel';\nadded();\n",
+        });
+        try {
+            const index = idx(dir);
+            const definition = index.symbols.get('added')[0];
+            const result = occurrencesOutsideChange(index, 'added', new Map([['lib.ts', new Set([1])]]), definition);
+            assert.ok(result.outside.some(row => row.file === 'consumer.ts' && row.line === 2));
+        } finally { rm(dir); }
+    });
+});
+
 describe('perf: size-aware worker scheduling', () => {
     it('queues giant sources first so workers start on them together (fix #365)', () => {
         const sizes = new Map([

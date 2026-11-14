@@ -3473,7 +3473,7 @@ function testUnits(fileEntry, helpers) {
         const generated = chain.some(fixtureRows);
         const row = {
             name: symbol.name, line: symbol.nameLine || symbol.startLine,
-            startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+            startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine, sourceSpan: symbol.sourceSpan,
             ...(states.includes('skip') && { skipped: true }),
             ...(!states.includes('skip') && sometimes && { conditional: true }),
             // One declaration the runner reports as several tests: a
@@ -3539,12 +3539,12 @@ function testUnits(fileEntry, helpers) {
             ...([...chain, cls].some(each => stateOf(each, null) === 'sometimes') && { sometimes: true }),
             ...([...chain, cls].some(guarded) && { guard: true }),
             ...(cls.namespace && { namespace: cls.namespace }),
-            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
+            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine, sourceSpan: cls.sourceSpan,
             members: methodsOf(cls).map(symbol => symbol.name),
             // Where each method's body stands, for a test it gives the body to.
             memberRows: methodsOf(cls).map(symbol => ({
                 name: symbol.name, ...signatureOf(symbol), line: symbol.nameLine || symbol.startLine,
-                startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine,
+                startLine: symbol.startLine, endLine: symbol.endLine ?? symbol.startLine, sourceSpan: symbol.sourceSpan,
             })),
             ...([...chain, cls].some(fixtureRows) && { several: true, dynamic: 'generated-cases' }),
             ...(attributeNames(cls).includes('TestClass') && { marked: true }),
@@ -3554,7 +3554,7 @@ function testUnits(fileEntry, helpers) {
             units.push({
                 kind: 'suite', name: cls.name, suite: chain.map(outer => outer.name),
                 line: cls.nameLine || cls.startLine, startLine: cls.startLine,
-                endLine: cls.endLine ?? cls.startLine,
+                endLine: cls.endLine ?? cls.startLine, sourceSpan: cls.sourceSpan,
             });
         }
     }

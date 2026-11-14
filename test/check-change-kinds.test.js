@@ -399,10 +399,10 @@ describe('check: a verdict per changed symbol, by what the change did', () => {
         ['a new file under new names is ready',
             dir => write(dir, 'fresh.py', 'def brand_new_thing(a):\n    return a\n'),
             'READY_FOR_TOOLCHAIN', ['brand_new_thing:added=ready']],
-        ['a new function and the new code that calls it are ready',
+        ['a new function is novel but its new invocation still needs review',
             dir => write(dir, 'app.py', APP +
                 '\n\ndef brand_new_thing(a):\n    return a\n\n\ndef brand_new_user():\n    return brand_new_thing(1)\n'),
-            'READY_FOR_TOOLCHAIN', ['brand_new_thing:added=ready', 'brand_new_user:added=ready']],
+            'REVIEW_REQUIRED', ['brand_new_thing:added=ready', 'brand_new_user:added=review(outgoing-call-unverified)']],
     ];
     for (const [label, change, trust, expected] of SCENARIOS) {
         it(label, () => {
@@ -548,7 +548,7 @@ describe('check: the answer survives a character budget', () => {
             // Forty breaks do not push what is ready out of the answer.
             assert.match(cut, /BLOCKED \(1\) — a break was observed:\n {2}widened \(lib\.py:1\)/);
             assert.match(cut, /\.\.\. \+\d+ more/);
-            assert.match(cut, /READY \(2\) — nothing that existed depends on the change:\n {2}tidy \(lib\.py:5\) \[MODIFIED, contract unchanged\]/);
+            assert.match(cut, /READY \(2\) — no unresolved exposure in the modeled checks:\n {2}tidy \(lib\.py:5\) \[MODIFIED, contract unchanged\]/);
             // A budget too small for any section still states the verdict.
             const tiny = applyOutputBudget(full, { command: 'check', maxChars: 300 }).text;
             assert.ok(tiny.length <= 300);
@@ -983,7 +983,8 @@ describe('check: what the project\'s own judge looks at', () => {
             ['# pyright: basic\nf(1)\n', 2, false],
             ['# pyright: standard\nf(1)\n', 2, false],
             ['# pyright: strict\nf(1)\n', 2, false],
-            // A rule comment silences its own rule, wherever it stands alone on a line.
+            // Rule effects survive invalid placement; the checker reports
+            // placement separately, and module change context retains it.
             ['# pyright: reportCallIssue=false\nf(1)\n', 2, true],
             ['# pyright: reportCallIssue=none\nf(1)\n', 2, true],
             ['# pyright: reportCallIssue=warning\nf(1)\n', 2, true],
@@ -995,7 +996,10 @@ describe('check: what the project\'s own judge looks at', () => {
             ['# pyright: reportGeneralTypeIssues=false\nf(1)\n', 2, false],
             ['# pyright: reportCallIssue=false\n# pyright: strict\nf(1)\n', 3, false],
             ['# note: pyright: reportCallIssue=false\nf(1)\n', 2, false],
-            ['f(1)  # pyright: reportCallIssue=false\n', 1, false],
+            ['f(1)  # pyright: reportCallIssue=false\n', 1, true],
+            ['    # pyright: reportCallIssue=false\nf(1)\n', 2, true],
+            ['\t# pyright: reportCallIssue=false\nf(1)\n', 2, true],
+            ['# explanation # pyright: reportCallIssue=false\nf(1)\n', 2, false],
             // Not file-wide, and not this checker's.
             ['# pyright: ignore\nf(1)\n', 2, false],
             ['# mypy: ignore-errors\nf(1)\n', 2, false],
@@ -1076,13 +1080,17 @@ describe('check: what the project\'s own judge looks at', () => {
             write(dir, 'lib.ts', 'import { stop } from "./helpers";\nexport function pick(k: string) {\n  if (k === "a") return 1;\n  stop();\n  return 2;\n}\nexport const s = stop;\n');
             const live = idx(dir);
             const pick = result => result.changed.find(item => item.name === 'pick').verdict;
-            assert.strictEqual(pick(execute(live, 'check', {}).result), 'ready');
+            const initial = execute(live, 'check', {}).result;
+            assert.strictEqual(pick(initial), 'review');
+            assert.ok(!initial.changed.find(item => item.name === 'pick').reasons.includes('inferred-return-contract'));
             // Now the callee is declared never to return: the same call ends the path.
             write(dir, 'helpers.ts', 'export function stop(): never {\n  throw new Error("stop");\n}\n');
             live.build(null, { quiet: true });
             const reused = execute(live, 'check', {}).result;
             const fresh = execute(idx(dir), 'check', {}).result;
             assert.deepStrictEqual([pick(reused), pick(fresh)], ['review', 'review']);
+            assert.ok(reused.changed.find(item => item.name === 'pick').reasons.includes('inferred-return-contract'));
+            assert.ok(fresh.changed.find(item => item.name === 'pick').reasons.includes('inferred-return-contract'));
         } finally { rm(dir); }
     });
 

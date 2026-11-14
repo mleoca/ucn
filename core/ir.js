@@ -66,7 +66,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'isAsync', 'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'typeParameterConstraints', 'extends', 'implements', 'indent',
         'isNested', 'enclosingType', 'isMethod', 'memberType', 'fieldType', 'embedded',
         'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
-        'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
+        'annotationsWithArgs', 'attributesWithArgs', 'registrationUnknown', 'runtimeOwnerPath', 'nameLine', 'traitImpl',
         'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'assignedObject', 'selfNamed', 'bodyScopedName',
         'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'isConstructor',
         'isExtensionMethod', 'extensionReceiver', 'explicitInterface', 'primaryParams',

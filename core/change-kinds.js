@@ -54,6 +54,9 @@ const CASE_NODES = new Set(['switch_case', 'switch_default']);
 // after the block is reached is a property of the manager.
 const MANAGER_NODES = new Set(['with_statement', 'with_clause']);
 const CALL_NODES = new Set(['call_expression', 'call']);
+// Invocation syntax across the parsers; member references are not calls.
+const OUTGOING_CALL_NODES = new Set(['call_expression', 'call', 'method_invocation',
+    'invocation_expression', 'object_creation_expression', 'new_expression']);
 const AWAIT_NODES = new Set(['await_expression', 'await']);
 
 // Nodes that hold declarations rather than being one: a callable's
@@ -117,6 +120,29 @@ function tokensOf(node, skip, out = []) {
         return out;
     }
     for (const child of node.children) tokensOf(child, skip, out);
+    return out;
+}
+
+// A baseline invocation is reused only when the whole callable still has
+// the same written context, apart from direct primitive call arguments.
+// This is a preservation premise, not a proof that an arbitrary new call
+// is available (access, generics, receiver modes and result use included).
+const DIRECT_LITERAL_NODES = new Set(['number', 'integer', 'float', 'number_literal',
+    'integer_literal', 'int_literal', 'decimal_integer_literal', 'float_literal', 'real_literal',
+    'string', 'string_literal', 'true', 'false', 'boolean_literal']);
+function invocationTokens(node, out = []) {
+    if (!node || COMMENT_NODES.has(node.type)) return out;
+    const parent = node.parent;
+    const list = parent?.type === 'argument' && parent.childCount === 1 ? parent.parent : parent;
+    if (DIRECT_LITERAL_NODES.has(node.type) && list &&
+        ['arguments', 'argument_list'].includes(list.type)) {
+        const kind = ['true', 'false', 'boolean_literal'].includes(node.type) ? 'boolean'
+            : ['string', 'string_literal'].includes(node.type) && ['"', "'"].includes(node.text[0]) ? 'string'
+                : /^\d+$/.test(node.text) && Number(node.text) <= 127 ? 'smallInteger' : null;
+        if (kind) { out.push(['argument-literal', kind]); return out; }
+    }
+    if (node.childCount === 0) { out.push([node.type, node.text]); return out; }
+    for (const child of node.children) invocationTokens(child, out);
     return out;
 }
 
@@ -659,7 +685,102 @@ function callableContract(root, language, symbol, context = null) {
         }
         memberBindings = JSON.stringify(parts.sort());
     }
-    return { header: JSON.stringify(header), generator, returnForm, inferred, derivation, memberBindings };
+    const outgoingCalls = [];
+    const contextStatements = [];
+    // Native comment queries preserve extra-node identity. The binding's
+    // ordinary children wrappers can expose a Python inline-suite comment
+    // as a zero-child block, so type-testing that walk loses directives.
+    const bodyComments = body ? body.descendantsOfType([...COMMENT_NODES]) : [];
+    const commentSpans = new Set(bodyComments.map(comment => `${comment.startIndex}:${comment.endIndex}`));
+    const comments = bodyComments.filter(comment => traits.checkDirectiveComment?.(comment.text));
+    const visit = candidate => {
+        if (OUTGOING_CALL_NODES.has(candidate.type)) outgoingCalls.push({ node: candidate,
+            start: candidate.startIndex, end: candidate.endIndex });
+        if (!sameNode(candidate, body) && (bindingTargets(candidate).length || STATEMENT_SHAPE.test(candidate.type))) {
+            contextStatements.push(candidate);
+        }
+        return true;
+    };
+    if (body) { visit(body); walkOwn(body, visit); }
+    const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
+    // A discard occupies syntax but introduces no binding. Its spelling
+    // must not connect otherwise independent statements (Go `_ = 0`).
+    // Keep all invocation/RHS tokens: discarding a result does not erase
+    // the call that produces it.
+    const dependencyNames = candidate => [...identifiersOf(candidate)]
+        .filter(name => !(traits.discardIdentifierNames || []).includes(name));
+    const contextFacts = contextStatements.map(statement => ({
+        names: dependencyNames(statement), tokens: tokensOf(statement),
+    }));
+    const statementsByName = new Map();
+    contextFacts.forEach((fact, position) => {
+        for (const name of fact.names) {
+            if (!statementsByName.has(name)) statementsByName.set(name, []);
+            statementsByName.get(name).push(position);
+        }
+    });
+    // Checker comment position is measured against code tokens, so blank
+    // lines and ordinary comments do not change the call's applicability.
+    const sourceTokens = [];
+    const collectTokens = candidate => {
+        if (!candidate || COMMENT_NODES.has(candidate.type) ||
+            commentSpans.has(`${candidate.startIndex}:${candidate.endIndex}`)) return;
+        if (candidate.childCount === 0) { sourceTokens.push(candidate); return; }
+        for (const child of candidate.children) collectTokens(child);
+    };
+    if (comments.length) collectTokens(body);
+    const tokenPosition = offset => {
+        let low = 0;
+        let high = sourceTokens.length;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            if (sourceTokens[mid].startIndex < offset) low = mid + 1;
+            else high = mid;
+        }
+        return low;
+    };
+    const commentFacts = comments.map(comment => {
+        const at = tokenPosition(comment.startIndex);
+        return [comment.text, at,
+            sourceTokens[at - 1]?.endPosition.row === comment.startPosition.row,
+            sourceTokens[at]?.startPosition.row === comment.endPosition.row];
+    });
+    const invocationContext = JSON.stringify([invocationTokens(declaration), commentFacts]);
+    for (const call of outgoingCalls) {
+        // A call's own tokens do not establish its meaning. Follow the
+        // written bindings of its callee, receiver and arguments (including
+        // aliases), and retain the checker comments around it.
+        const names = dependencyNames(call.node);
+        const seenNames = new Set(names);
+        const selected = new Set();
+        for (let at = 0; at < names.length; at++) {
+            for (const position of statementsByName.get(names[at]) || []) {
+                if (selected.has(position)) continue;
+                selected.add(position);
+                for (const name of contextFacts[position].names) {
+                    if (!seenNames.has(name)) { seenNames.add(name); names.push(name); }
+                }
+            }
+        }
+        const nesting = [];
+        for (let parent = call.node.parent; parent && !sameNode(parent, body); parent = parent.parent) {
+            nesting.push(parent.type);
+        }
+        call.invocationKey = JSON.stringify(invocationTokens(call.node));
+        const relevantParameters = (parameters?.namedChildren || []).filter(parameter =>
+            dependencyNames(parameter).some(name => seenNames.has(name)));
+        const returnsValue = sameNode(call.node, body) || nesting.some(type => RESULT_NODES.has(type));
+        call.key = JSON.stringify([tokensOf(call.node), relevantParameters.map(parameter => tokensOf(parameter)),
+            returnsValue ? symbol.returnType || null : null, nesting,
+            [...selected].sort((a, b) => a - b).map(position => contextFacts[position].tokens),
+            commentFacts.map(([text, at, prior, next]) => [text, at - tokenPosition(call.node.startIndex), prior, next])]);
+        delete call.node;
+    }
+    const contract = { header: JSON.stringify(header), generator, returnForm, inferred, derivation, memberBindings };
+    Object.defineProperties(contract, {
+        outgoingCalls: { value: outgoingCalls }, invocationContext: { value: invocationContext },
+    });
+    return contract;
 }
 
 /**
@@ -680,7 +801,20 @@ function classifyChange(before, after, language) {
         reasons.push('inferred-return-contract');
     }
     if ((before.memberBindings || null) !== (after.memberBindings || null)) reasons.push('inferred-member-type');
-    return { kind: reasons.length > 0 ? 'contract' : 'inert', reasons };
+    const change = { kind: reasons.length > 0 ? 'contract' : 'inert', reasons };
+    // Moving or formatting a call does not make it a new call. Repeated
+    // calls are counted, so an extra occurrence is still checked.
+    const prior = new Map();
+    for (const call of before.outgoingCalls || []) prior.set(call.key, (prior.get(call.key) || 0) + 1);
+    const preserved = new Set((before.outgoingCalls || []).map(call => call.invocationKey));
+    const changedCalls = (after.outgoingCalls || []).filter(call => {
+        const left = prior.get(call.key) || 0;
+        if (left) { prior.set(call.key, left - 1); return false; }
+        call.stableInvocation = before.invocationContext === after.invocationContext && preserved.has(call.invocationKey);
+        return true;
+    });
+    Object.defineProperty(change, 'changedCalls', { value: changedCalls });
+    return change;
 }
 
 /** The declaration in the base revision that a changed one continues. */
@@ -821,6 +955,90 @@ function removedFrom(before, after) {
     return removed;
 }
 
+/** Checker comments carry semantics even when no declaration changed. */
+function checkingContext(root, traits) {
+    if (!root || !traits.checkDirectiveComment) return null;
+    const all = root.descendantsOfType([...COMMENT_NODES]);
+    const comments = all.filter(node => traits.checkDirectiveComment(node.text));
+    if (comments.length === 0) return null;
+    const barriers = all.filter(node => !traits.checkDirectiveComment(node.text) && traits.checkDirectiveBarrier?.(node.text));
+    const spans = new Set(all.map(node => `${node.startIndex}:${node.endIndex}`));
+    const code = [];
+    const scopeCounts = new Map();
+    const walk = (node, scope = []) => {
+        if (spans.has(`${node.startIndex}:${node.endIndex}`)) return;
+        if (CALLABLE_NODES.has(node.type) || ['class', 'class_declaration', 'class_definition'].includes(node.type)) {
+            const body = node.childForFieldName('body');
+            if (body) {
+                const header = tokensOf(node, body);
+                const key = JSON.stringify([scope, node.type, header]);
+                const ordinal = scopeCounts.get(key) || 0;
+                scopeCounts.set(key, ordinal + 1);
+                scope = [...scope, [node.type, header, ordinal]];
+            }
+        }
+        if (node.childCount === 0) code.push({ node, scope });
+        else for (const child of node.children) walk(child, scope);
+    };
+    walk(root);
+    // Identify the neighboring code by its line tokens and declaration,
+    // not by an absolute token offset. An inert edit in an earlier body
+    // cannot move a later directive onto different code. Repeated equal
+    // lines retain an occurrence number, so moving a suppression between
+    // identical calls still changes its attachment.
+    const lines = [];
+    for (const entry of code) {
+        let line = lines[lines.length - 1];
+        if (!line || line.row !== entry.node.startPosition.row) {
+            line = { row: entry.node.startPosition.row, entries: [] };
+            lines.push(line);
+        }
+        entry.line = line;
+        entry.column = line.entries.length;
+        line.entries.push(entry);
+    }
+    const lineCounts = new Map();
+    for (const line of lines) {
+        line.key = JSON.stringify(line.entries.map(({ node, scope }) => [node.type, node.text, scope]));
+        line.ordinal = lineCounts.get(line.key) || 0;
+        lineCounts.set(line.key, line.ordinal + 1);
+    }
+    const anchor = entry => entry ? [entry.line.key, entry.line.ordinal, entry.column] : null;
+    const position = node => {
+        let low = 0;
+        let high = code.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (code[middle].node.startIndex < node.startIndex) low = middle + 1;
+            else high = middle;
+        }
+        const at = [anchor(code[low - 1]), anchor(code[low]),
+            code[low - 1]?.node.endPosition.row === node.startPosition.row,
+            code[low]?.node.startPosition.row === node.endPosition.row];
+        return { at, nextRow: code[low]?.node.startPosition.row };
+    };
+    return JSON.stringify([
+        comments.map(node => {
+            const mode = traits.checkFileDirectiveComment?.(node.text) || 'local';
+            const { at, nextRow } = position(node);
+            let attachment;
+            if (mode === 'column-zero-file') attachment = node.startPosition.column === 0;
+            else if (mode === 'local' || mode === 'leading-or-local' && at[0] !== null) {
+                if (traits.checkDirectiveTarget === 'next-line') {
+                    // A line directive applies forward. Earlier code is
+                    // not its target; a block comment matters only if it
+                    // occupies a line between the directive and its code.
+                    const blocked = barriers.some(barrier =>
+                        barrier.startPosition.row < nextRow &&
+                        barrier.endPosition.row > node.endPosition.row);
+                    attachment = [at[1], at[2], at[3], blocked];
+                } else attachment = at;
+            } else attachment = mode === 'file' || at[0] === null;
+            return [node.text, mode, attachment];
+        }),
+    ]);
+}
+
 /**
  * What a change did to a module outside its declarations.
  *
@@ -852,6 +1070,7 @@ function moduleChange(before, after, traits) {
     const exported = explicit(before.fileEntry);
     return {
         removedNames,
+        checkingChanged: checkingContext(before.root, traits) !== checkingContext(after.root, traits),
         removedExports: removedNames.filter(name => exported.has(name)),
         // The module passed on everything another module exports, and no
         // longer does: which names that took away is not written here.

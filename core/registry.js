@@ -160,7 +160,7 @@ const PARAMS = {
         text: 'Comma-separated projection. {valueSets}. Omitted: {defaults}.',
     },
     exclude: { type: 'string', cli: ['--exclude', '--not'], repeat: true, text: 'Comma-separated patterns to exclude (e.g. "test,mock,vendor")' },
-    includeTests: { type: 'boolean', text: 'Include test files in results (excluded when omitted)' },
+    includeTests: { type: 'boolean', text: 'Include test files in the requested view. find includes test definitions by default; set false to omit them.' },
     excludeTests: { type: 'boolean', text: 'Exclude test files: the default for entrypoints (include_tests=true lists them); usages and endpoints list test files unless exclude_tests=true.' },
     includeMethods: {
         type: 'boolean',
@@ -927,7 +927,7 @@ function generateCliParamReference() {
         }
         if (spec.defaults) parts.push(`default: ${defaultsText(param, 'cli').join('; ')}`);
         if (parts.length === 0) continue;
-        const head = `  ${cliFlagsForParam(param)[0]}`.padEnd(19);
+        const head = `  ${cliFlagsForParam(param)[0]} `.padEnd(19);
         lines.push(`${head}${parts[0]}`);
         for (const part of parts.slice(1)) lines.push(`${' '.repeat(19)}${part}`);
     }

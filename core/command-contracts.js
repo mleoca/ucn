@@ -52,7 +52,7 @@ const COMMAND_CONTRACTS = Object.freeze({
             { name: 'definition', when: 'Default or `type` is a symbol kind such as function/class.', answer: 'Matching indexed definitions with location and signature metadata.' },
             { name: 'type lookup', when: '`type=type`.', answer: 'Type-definition records rather than general name matches.' },
         ],
-        defaults: ['Substring matching unless `exact=true`.', 'Tests excluded unless `includeTests=true`.', '`limit` is the single result cap; `withSource=true` attaches exact bodies.'],
+        defaults: ['Substring matching unless `exact=true`.', 'Test definitions included unless `includeTests=false`.', '`limit` is the single result cap; `withSource=true` attaches exact bodies.'],
         truth: 'Results are exact records from the static symbol index; usage counts are static indexed occurrences.',
         nonGoals: ['Text search inside comments or configuration.', 'Compiler overload resolution across external dependencies.'],
         invalidCombinations: ['A missing name is rejected.'],
@@ -183,7 +183,7 @@ const COMMAND_CONTRACTS = Object.freeze({
         target: 'Optional symbol/handle. Omitting it selects diff/precommit mode.',
         modes: [
             { name: 'symbol', when: 'A symbol target is supplied; `base` names the revision whose declaration its call sites were written against.', answer: 'Argument-count compatibility, uncertain sites, and the caller account.' },
-            { name: 'diff', when: 'No target is supplied; `base` or `staged` selects changes.', answer: 'A verdict per changed symbol by what the change did: blocked (a break was observed, every site listed), review (can reach existing code, reason named) or ready (nothing that existed depends on it); TRUST is the worst of them. Affected tests.' },
+            { name: 'diff', when: 'No target is supplied; `base` or `staged` selects changes.', answer: 'A verdict per changed symbol by what the change did: blocked (a break was observed, every site listed), review (change exposure or call requirements not settled, reason named) or ready (no unresolved exposure in the modeled checks, not compiler or runtime proof); TRUST is the worst of them. Affected tests.' },
         ],
         defaults: ['Symbol mode checks static arity, not compiler type compatibility.', '`base` defaults to HEAD in both modes.', 'Diff mode: `staged` reads the staged tree from the git index, never the worktree; `strict` makes REVIEW_REQUIRED fail as BLOCKED does.'],
         truth: 'Findings are static diagnostics with explicit uncertainty; a clean result is not a compiler/test pass.',

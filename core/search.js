@@ -18,7 +18,7 @@ const isSafeRegex = require('safe-regex2');
 const { RE2JS } = require('re2js');
 const { UcnError } = require('./errors');
 const { paramValues } = require('./registry');
-const { createTestModel, addTestCaseRows, linkFiles } = require('./test-units');
+const { createTestModel, addTestCaseRows, linkFiles, testSite, testSiteKey } = require('./test-units');
 
 // Keep the established search-input contract for the canonical catastrophic
 // nested-single-atom family even though the RE2-compatible engine could run it
@@ -208,14 +208,18 @@ function _applyFindFilters(index, matches, options) {
 
     // Rank cheaply before adjudicating callers. A broad inventory must never
     // pay for pinned caller resolution on rows the caller will not receive.
+    const definitionOrder = (a, b) =>
+        (b._fuzzyScore || 0) - (a._fuzzyScore || 0) ||
+        Number(isTestFile(a.relativePath || '', a.language)) -
+            Number(isTestFile(b.relativePath || '', b.language)) ||
+        codeUnitCompare(a.relativePath || '', b.relativePath || '') ||
+        a.startLine - b.startLine || codeUnitCompare(a.name, b.name);
     const ranked = filtered.map(symbol => ({
         symbol, counts: index.countSymbolUsages(symbol),
     }));
     if (options.limit > 0 && ranked.length > options.limit) {
         ranked.sort((a, b) => b.counts.total - a.counts.total ||
-            codeUnitCompare(a.symbol.relativePath || '', b.symbol.relativePath || '') ||
-            a.symbol.startLine - b.symbol.startLine ||
-            codeUnitCompare(a.symbol.name, b.symbol.name));
+            definitionOrder(a.symbol, b.symbol));
     }
     const survivors = options.limit > 0 ? ranked.slice(0, options.limit) : ranked;
     const withCounts = survivors.map(({ symbol: m, counts }) => {
@@ -257,7 +261,7 @@ function _applyFindFilters(index, matches, options) {
     });
 
     // Sort by usage count (most-used first)
-    withCounts.sort((a, b) => b.usageCount - a.usageCount);
+    withCounts.sort((a, b) => b.usageCount - a.usageCount || definitionOrder(a, b));
 
     return withCounts;
 }
@@ -1328,7 +1332,7 @@ function tests(index, nameOrFile, options = {}) {
     let sourceFileFilter = null;
     let targetDefs = [];
     if (options.file && !isFilePath) {
-        targetDefs = index.find(nameOrFile, { exact: true, file: options.file, className: options.className });
+        targetDefs = index.find(nameOrFile, { exact: true, file: options.file, className: options.className, skipCounts: true });
         if (targetDefs.length > 0) {
             sourceFileFilter = _buildSourceFileImporters(index, targetDefs);
         }
@@ -1336,12 +1340,11 @@ function tests(index, nameOrFile, options = {}) {
         // The execute handler validates before calling, so this path means
         // the file matched but no exact symbol — fall through gracefully.
     } else if (!isFilePath) {
-        targetDefs = index.find(nameOrFile, { exact: true, className: options.className });
+        targetDefs = index.find(nameOrFile, { exact: true, className: options.className, skipCounts: true });
     }
     // A pinned definition among same-name ones (an overload, a constructor
     // beside its class and siblings, fix #430): calls are this definition's
     // only when the caller engine attributes them to it.
-    const pinnedFamily = !isFilePath && options.definition && targetDefs.length > 1;
     if (!isFilePath && options.definition) targetDefs = [options.definition];
 
     // Find all test files
@@ -1381,6 +1384,30 @@ function tests(index, nameOrFile, options = {}) {
     const searchTerm = isFilePath
         ? path.basename(nameOrFile, path.extname(nameOrFile))
         : nameOrFile;
+    const callerSites = [];
+    const excludedCallableLines = new Map();
+    const globallyUniqueTarget = !isFilePath && targetDefs.length === 1;
+    if (!isFilePath) for (const def of targetDefs) {
+        const raw = index.findCallers(searchTerm, {
+            targetDefinitions: [def], collectAccount: true, unverifiedEnrichLimit: Infinity,
+        });
+        callerSites.push(
+            ...raw.map(site => ({ ...site, _testEvidenceTier: 'confirmed' })),
+            ...(globallyUniqueTarget ? (raw.unverifiedEntries || []).map(site => ({
+                ...site, _testEvidenceTier: 'unverified',
+            })) : []),
+        );
+        const counted = new Set();
+        for (const site of raw.accountRaw?.excludedEntries || []) {
+            const key = `${site.file}:${site.line}`;
+            if (counted.has(key)) continue;
+            counted.add(key);
+            let lines = excludedCallableLines.get(site.file);
+            if (!lines) { lines = new Map(); excludedCallableLines.set(site.file, lines); }
+            lines.set(site.line, (lines.get(site.line) || 0) + 1);
+        }
+    }
+    const acceptedCallableLines = new Set(callerSites.map(site => `${site.file}:${site.line}`));
 
     // File-path target: module specifiers are string literals, so the
     // basename usage scan is blind to import-linked tests in JS/TS
@@ -1420,7 +1447,7 @@ function tests(index, nameOrFile, options = {}) {
                 targetDefinitions: [def],
                 collectAccount: true,
             });
-            const globallyUnique = index.find(def.name, { exact: true }).length === 1;
+            const globallyUnique = index.symbols.get(def.name)?.length === 1;
             const sites = [
                 ...raw.map(site => ({ ...site, _testEvidenceTier: 'confirmed' })),
                 ...(globallyUnique ? (raw.unverifiedEntries || []).map(site => ({
@@ -1558,7 +1585,18 @@ function tests(index, nameOrFile, options = {}) {
                 // own definition (fix #246).
                 if (localShadow && !usage.receiver && usage.usageType !== 'import') continue;
 
-                if (pinnedFamily && usage.usageType === 'call') continue;
+                // File eligibility only discovers candidates. A call's
+                // spelling does not establish which declaration it reaches;
+                // exact-target caller evidence below owns every call row.
+                if (targetDefs.length > 0 && usage.usageType === 'call') continue;
+                const classBodyProof = !usage.receiver && usage.usageType === 'reference' &&
+                    classBodyReferenceTargets(index, testPath, entry.language, usage, targetDefs);
+                // Method/function values are caller candidates too. A file
+                // importing any sibling cannot resurrect a reference the
+                // engine attributed to another declaration.
+                if (usage.usageType !== 'import' &&
+                    excludedCallableLines.get(testPath)?.get(usage.line) === targetDefs.length &&
+                    !acceptedCallableLines.has(`${testPath}:${usage.line}`) && !classBodyProof) continue;
                 // A line is claimed only by a usage that is recorded: two
                 // same-kind tokens on one line (`a.m = b.m`) are judged
                 // separately, so a rejected first token never hides a
@@ -1644,6 +1682,7 @@ function tests(index, nameOrFile, options = {}) {
                         const nmUsages = index._getCachedUsages(testPath, nm) || [];
                         for (const u of nmUsages) {
                             if (u.usageType === 'definition' || u.usageType === 'import') continue;
+                            if (u.usageType === 'call') continue; // exact file-target evidence below
                             if (testRanges && !lineInRanges(u.line, testRanges)) continue;
                             const lineKey = `${u.line}:${u.usageType}:${nm}`;
                             if (seenLines.has(lineKey)) continue;
@@ -1667,9 +1706,9 @@ function tests(index, nameOrFile, options = {}) {
                 const matchType = site._testEvidenceTier === 'confirmed'
                     ? 'call'
                     : 'unverified-call';
-                if (matches.some(m => m.line === site.line && m.matchType === matchType)) continue;
+                if (matches.some(m => testSiteKey(m) === testSiteKey(site) && m.matchType === matchType)) continue;
                 matches.push({
-                    line: site.line,
+                    ...testSite(site),
                     content: (site.content || index.getLineContent(testPath, site.line) || '').trim(),
                     matchType,
                     evidenceTier: site._testEvidenceTier,
@@ -1712,35 +1751,18 @@ function tests(index, nameOrFile, options = {}) {
         }
     }
 
-    // Compiler-shaped caller supplement (trust command arm): the literal
-    // usage scan above is excellent for imports/type/string references, but
-    // receiver aliases and re-exported module calls are owned by the caller
-    // engine. Merge its CONFIRMED exact-target test sites so `tests` cannot
-    // miss calls that `about`/`impact` already know about. For a globally
+    // Callable test links use the caller engine's exact-target decisions,
+    // including aliases and function values that do not spell the target's
+    // name. The literal scan contributes imports/type/string references,
+    // never an independent call identity. For a globally
     // unique callable name, also retain account-unverified sites under the
     // explicit `unverified-call` label: independent compiler/LSP evaluation
     // shows these contain real interface/trait dispatch that a test-discovery
     // command must not silently drop. Repeated names never receive that broad
     // supplement because it would leak sibling classes/files.
     if (!isFilePath && targetDefs.length > 0) {
-        const callerSites = [];
         // A pinned definition's unverified sites were adjudicated against it
         // alone, like a globally unique name's (fix #430).
-        const globallyUniqueTarget = !!options.definition || index.find(searchTerm, { exact: true }).length === 1;
-        for (const def of targetDefs) {
-            const raw = index.findCallers(searchTerm, {
-                targetDefinitions: [def],
-                collectAccount: true,
-            });
-            callerSites.push(
-                ...raw.map(c => ({ ...c, _testEvidenceTier: 'confirmed' })),
-                ...(globallyUniqueTarget ? (raw.unverifiedEntries || []).map(c => ({
-                    ...c,
-                    _testEvidenceTier: 'unverified',
-                })) : []),
-            );
-        }
-
         for (const site of callerSites) {
             const info = testInfoOf(site.file);
             if (!info) continue;
@@ -1771,12 +1793,12 @@ function tests(index, nameOrFile, options = {}) {
                 fileResult = { file: info.entry.relativePath, matches: [] };
                 results.push(fileResult);
             }
-            if (fileResult.matches.some(m => m.line === site.line &&
+            if (fileResult.matches.some(m => testSiteKey(m) === testSiteKey(site) &&
                 ['call', 'unverified-call'].includes(m.matchType))) continue;
             fileResult.matches = fileResult.matches.filter(m =>
                 !(m.line === site.line && m.matchType === 'test-case'));
             fileResult.matches.push({
-                line: site.line,
+                ...testSite(site),
                 content: (site.content || index.getLineContent(site.file, site.line) || '').trim(),
                 matchType: site._testEvidenceTier === 'confirmed' ? 'call' : 'unverified-call',
                 evidenceTier: site._testEvidenceTier,
@@ -1871,7 +1893,7 @@ function tests(index, nameOrFile, options = {}) {
             titleNeedsMatch: !!className,
         });
         linesByFile.set(testPath,
-            fileResult.matches.filter(match => match.matchType !== 'import').map(match => match.line));
+            fileResult.matches.filter(match => match.matchType !== 'import'));
     }
     // A test a class inherits runs where the class is: the file of a class
     // that inherits a linked test is a result of its own, with the test.
@@ -2261,9 +2283,10 @@ function _deduplicateMatches(matches) {
     const byLine = new Map();
     const priority = { 'test-case': 5, 'call': 4, 'import': 3, 'string-ref': 2, 'reference': 1 };
     for (const m of matches) {
-        const existing = byLine.get(m.line);
+        const key = testSiteKey(m);
+        const existing = byLine.get(key);
         if (!existing || (priority[m.matchType] || 0) > (priority[existing.matchType] || 0)) {
-            byLine.set(m.line, m);
+            byLine.set(key, m);
         }
     }
     return [...byLine.values()].sort((a, b) => a.line - b.line);

@@ -63,7 +63,8 @@ const HAZARD_OF_SHIELD = Object.freeze({
  *   name in a shared scope)        package, an inclusion can reach it
  *                                  from anywhere.
  *
- * Returns a predicate over (relative path, line), or null for "anywhere".
+ * Returns candidate files and a predicate over (relative path, line), or
+ * null for "anywhere". Candidate files bound the scan before parsing.
  * An occurrence elsewhere is another name that happens to be spelled the
  * same: it could not have meant this declaration before, and cannot now.
  */
@@ -73,8 +74,8 @@ function reachOf(index, definition) {
     if (!entry) return null;
     const own = entry.relativePath;
     if (definition.lexicalScopeStartLine != null) {
-        return (file, line) => file === own &&
-            line >= definition.lexicalScopeStartLine && line <= definition.lexicalScopeEndLine;
+        return { files: new Set([own]), includes: (file, line) => file === own &&
+            line >= definition.lexicalScopeStartLine && line <= definition.lexicalScopeEndLine };
     }
     const traits = langTraits(entry.language) || {};
     if (traits.packageScope !== 'file' || traits.textualIncludes) return null;
@@ -87,7 +88,7 @@ function reachOf(index, definition) {
         for (const symbol of entry.symbols || []) if (!symbol.className) exported.add(symbol.name);
     }
     // A name the module does not export stays in the module.
-    if (!exported.has(definition.name)) return file => file === own;
+    if (!exported.has(definition.name)) return { files, includes: file => file === own };
     for (const other of index.files.values()) {
         const resolved = other.moduleResolved || {};
         const takesAll = (other.importDetails || []).some(detail =>
@@ -104,7 +105,7 @@ function reachOf(index, definition) {
                 binding.kind === 'namespace' || binding.kind === 'default'));
         if (takesAll || binds) files.add(other.relativePath);
     }
-    return file => files.has(file);
+    return { files, includes: file => files.has(file) };
 }
 
 /**
@@ -119,13 +120,19 @@ function reachOf(index, definition) {
  * @returns {{outside: {file, line}[], total: number}}
  */
 function occurrencesOutsideChange(index, name, addedLinesByFile, definition = null) {
-    const rows = index.usages(name, { includeTests: true, codeOnly: true }) || [];
     const reaches = reachOf(index, definition);
+    const options = { includeTests: true, codeOnly: true };
+    // Use the same proven module/lexical reach that filters the answer to
+    // avoid parsing unrelated files for every added declaration. The caller
+    // still assesses the full source-universe account before claiming novelty.
+    const rows = reaches
+        ? [...reaches.files].sort().flatMap(file => index.usages(name, { ...options, file }) || [])
+        : index.usages(name, options) || [];
     const outside = [];
     for (const row of rows) {
         const file = row.relativePath || row.file;
         if (addedLinesByFile.get(file)?.has(row.line)) continue;
-        if (reaches && !reaches(file, row.line)) continue;
+        if (reaches && !reaches.includes(file, row.line)) continue;
         outside.push({ file, line: row.line });
     }
     outside.sort((a, b) => (a.file === b.file ? a.line - b.line : (a.file < b.file ? -1 : 1)));
@@ -137,6 +144,31 @@ function ownersOf(index, definition) {
     return (index.symbols.get(definition.className) || []).filter(type =>
         type.file === definition.file && !type.className &&
         type.startLine <= definition.startLine && (type.endLine || type.startLine) >= definition.startLine);
+}
+
+/** A member of a wholly new, unreachable owner cannot capture a namesake. */
+function newOwnerUnreached(index, definition, addedLinesByFile) {
+    if (!definition.className) return false;
+    const owners = ownersOf(index, definition);
+    if (owners.length !== 1) return false;
+    const owner = owners[0];
+    // An impl block, namespace or out-of-class member group can be newly
+    // written while its type existed all along (including outside source).
+    if (!['class', 'struct', 'record', 'enum', 'interface', 'trait', 'type', 'union'].includes(owner.type)) return false;
+    const memo = index._opMemo?.('checkNewOwnerReach', () => new WeakMap());
+    if (memo?.has(owner)) return memo.get(owner);
+    let unreachable = false;
+    const added = addedLinesByFile.get(owner.relativePath);
+    if (added?.has(owner.nameLine || owner.startLine) && !owner.extends && !owner.implements &&
+        !(owner.decorators || []).length && !(owner.attributes || []).length) {
+        // Name reach is the module/import scope of THIS owner, not the
+        // global spelling of a field. Bases, registrations and reflection
+        // remain separately guarded by the ordinary capture assessment.
+        const occurrences = occurrencesOutsideChange(index, owner.name, addedLinesByFile, owner);
+        unreachable = occurrences.outside.length === 0;
+    }
+    memo?.set(owner, unreachable);
+    return unreachable;
 }
 
 /** One syntax tree per file for the questions below. */
@@ -328,4 +360,4 @@ function captureHazards(index, definition, facts = {}) {
     return hazards;
 }
 
-module.exports = { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, HAZARD_TEXT };
+module.exports = { occurrencesOutsideChange, captureHazards, shapeChangeOf, literalsLackingMember, newOwnerUnreached, HAZARD_TEXT };

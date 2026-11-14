@@ -342,6 +342,8 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 ...(paramTypes && { paramTypes }),
                 ...(docstring && { docstring }),
                 ...(decorators.length > 0 && { decorators }),
+                ...(decorators.length > 0 && { registrationUnknown: require('../core/python-binding-identity').registrationUnknown(node) }),
+                runtimeOwnerPath: require('../core/python-binding-identity').pythonRuntimeOwners(node),
                 ...(isOverloadDecorated(decorators) && { isSignature: true }),
                 ...(nameLine !== decoratorStartLine && { nameLine })
             });
@@ -389,6 +391,8 @@ function _processClass(node, classes, processedRanges, lines) {
             members,
             ...(docstring && { docstring }),
             ...(decorators.length > 0 && { decorators }),
+            ...(decorators.length > 0 && { registrationUnknown: require('../core/python-binding-identity').registrationUnknown(node) }),
+            runtimeOwnerPath: require('../core/python-binding-identity').pythonRuntimeOwners(node),
             ...(bases.length > 0 && { extends: bases.join(', ') }),
             // A protocol class is satisfied by shape: no class has to name it.
             ...(isProtocolClass(node) && { protocolClass: true }),
@@ -1317,6 +1321,8 @@ function extractClassMembers(classNode, code) {
                     ...(paramTypes && { paramTypes }),
                     ...(docstring && { docstring }),
                     ...(memberDecorators.length > 0 && { decorators: memberDecorators }),
+                    ...(memberDecorators.length > 0 && { registrationUnknown: require('../core/python-binding-identity').registrationUnknown(funcNode) }),
+                    runtimeOwnerPath: require('../core/python-binding-identity').pythonRuntimeOwners(funcNode),
                     ...(isOverloadDecorated(memberDecorators) && { isSignature: true }),
                     ...(isRequiredPythonMember(classNode, memberDecorators) && { requiredMember: true }),
                     ...(nameLine !== startLine && { nameLine })
@@ -2726,6 +2732,7 @@ function pythonModuleAliases(tree) {
 
 // Annotation positions whose value Python evaluates as an expression.
 const PY_ANNOTATION_OWNERS = new Set(['typed_parameter', 'typed_default_parameter', 'function_definition', 'assignment']);
+const annotationQuotesByTree = new WeakMap();
 
 /**
  * String annotations holding calls (fix #398F): `def f(v: "Annotated[int,
@@ -2735,9 +2742,13 @@ const PY_ANNOTATION_OWNERS = new Set(['typed_parameter', 'typed_default_paramete
  * interpolation); the result lists the byte ranges of their quotes.
  */
 function annotationStringQuotes(tree) {
+    const cached = annotationQuotesByTree.get(tree);
+    if (cached) return cached;
     const quotes = [];
-    for (const holder of getCachedNodeList(tree.rootNode).nodes) {
-        if (holder.type !== 'type') continue;
+    // The source tree is immutable. A multi-name query should discover
+    // these file-level ranges once, without rebuilding a flat node list
+    // whenever another file displaces the general traversal cache.
+    for (const holder of tree.rootNode.descendantsOfType('type')) {
         const string = holder.namedChildCount === 1 ? holder.namedChild(0) : null;
         if (string?.type !== 'string' || string.startPosition.row !== string.endPosition.row) continue;
         const owner = holder.parent;
@@ -2754,6 +2765,7 @@ function annotationStringQuotes(tree) {
         quotes.push({ open: parts[0].startIndex, close: parts[2].startIndex,
             contentStart: content.startIndex, contentEnd: content.endIndex });
     }
+    annotationQuotesByTree.set(tree, quotes);
     return quotes;
 }
 
@@ -6597,7 +6609,7 @@ function testUnits(fileEntry, helpers) {
             : (switchUnsettled || (written && written.on === 'unknown')) ? 'collection-switch' : null;
         return {
             name: symbol.name, line: symbol.nameLine || symbol.startLine, startLine: symbol.startLine,
-            endLine: symbol.endLine ?? symbol.startLine,
+            endLine: symbol.endLine ?? symbol.startLine, sourceSpan: symbol.sourceSpan,
             named: functionNamed(symbol.name), prefixed: symbol.name.startsWith('test'),
             // (Where a switch of the file is not read, off is not settled either.)
             ...(written && written.on === false && !switchUnsettled && { off: true }),
@@ -6804,7 +6816,7 @@ function testUnits(fileEntry, helpers) {
             ...((written.some(entry => entry.from.module === 'abc' && entry.from.name === 'ABC') || metaPath === 'abc.ABCMeta')
                 ? { abc: true } : metaclass ? { abc: 'unknown' } : {}),
             marks: ownMarks.marks, marksOpen: ownMarks.open,
-            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine,
+            line: cls.nameLine || cls.startLine, startLine: cls.startLine, endLine: cls.endLine ?? cls.startLine, sourceSpan: cls.sourceSpan,
             members: [...members], tests,
         });
     }
@@ -7335,6 +7347,27 @@ function annotatedReceiverType(tree, line, column, receiver) {
 const TYPE_IGNORE = /(^|#)\s*type:\s*ignore(\[[\s\w-,]*\]|\s|$)/;
 const PYRIGHT_IGNORE = /(^|#)\s*pyright:\s*ignore(?:\[([\s\w-,]*)\]|\s|$)/;
 const CHECK_MODES = new Set(['basic', 'standard', 'strict']);
+
+function checkSettingOperands(text) {
+    const value = text.slice(1).trim();
+    if (!value.startsWith('pyright:')) return null;
+    const operands = value.slice('pyright:'.length);
+    return operands.trim().startsWith('ignore') ? null : operands;
+}
+
+/** Use the same ignore grammar for suppression and changed-code context. */
+function checkDirectiveComment(text) {
+    // Ordinary type annotations also affect checking. Keep those even
+    // though they are not suppressions read by checkSuppressedAt.
+    return /^#\s*(?:type|pyright)\s*:/.test(text) ||
+        TYPE_IGNORE.test(text) || PYRIGHT_IGNORE.test(text);
+}
+
+function checkFileDirectiveComment(text) {
+    if (TYPE_IGNORE.test(text)) return 'leading-or-local';
+    if (PYRIGHT_IGNORE.test(text)) return null;
+    return checkSettingOperands(text) !== null ? 'column-zero-file' : null;
+}
 // The rule each kind of break is reported under.
 const RULE_OF = Object.freeze({
     'arity': 'reportCallIssue',
@@ -7348,12 +7381,14 @@ const RULE_OF = Object.freeze({
  *   all      a `type: ignore` comment before any token: nothing is reported;
  *   lines    line -> null (everything on it is ignored: `type: ignore`,
  *            `pyright: ignore`) or the rules a `pyright: ignore[..]` names;
- *   levels   rule -> level set by `# pyright: rule=level` comments, which
- *            apply to the file wherever they stand, alone on their line.
+ *   levels   rule -> level set by `# pyright: rule=level` comments. The
+ *            checker applies them even at an invalid position, reporting
+ *            a separate placement diagnostic; changed-code context tracks
+ *            that column-zero requirement independently.
  *            `basic`, `standard` and `strict` choose a rule set: none of
  *            them turns a rule off.
  */
-function checkDirectives(root, lines) {
+function checkDirectives(root) {
     const ignored = new Map();
     const levels = new Map();
     let all = false;
@@ -7371,11 +7406,8 @@ function checkDirectives(root, lines) {
             ignored.set(line, scoped[2] === undefined ? null
                 : scoped[2].split(',').map(rule => rule.trim()).filter(Boolean));
         }
-        const value = text.slice(1).trim();
-        const ownLine = String(lines[line - 1] === undefined ? '' : lines[line - 1]).trim().startsWith('#');
-        if (!ownLine || !value.startsWith('pyright:')) continue;
-        const operands = value.slice('pyright:'.length);
-        if (operands.trim().startsWith('ignore')) continue;
+        const operands = checkSettingOperands(text);
+        if (operands === null) continue;
         const list = operands.split(',').map(operand => operand.trim()).filter(Boolean);
         if (list.some(operand => CHECK_MODES.has(operand))) levels.clear();
         for (const operand of list) {
@@ -7482,10 +7514,10 @@ function reportedRanges(root, site) {
  *   problem, module, memo }
  */
 function checkSuppressedAt(site) {
-    const { lines, root, memo } = site;
+    const { root, memo } = site;
     if (!root) return false;
-    if (memo && !memo.has('directives')) memo.set('directives', checkDirectives(root, lines));
-    const directives = memo ? memo.get('directives') : checkDirectives(root, lines);
+    if (memo && !memo.has('directives')) memo.set('directives', checkDirectives(root));
+    const directives = memo ? memo.get('directives') : checkDirectives(root);
     if (directives.all) return true;
     const rule = RULE_OF[site.kind] || null;
     const level = rule ? directives.levels.get(rule) : undefined;
@@ -7516,6 +7548,8 @@ function checkedImportAt(root, line, module) {
 }
 
 module.exports = {
+    checkDirectiveComment,
+    checkFileDirectiveComment,
     checkSuppressedAt,
     checkedImportAt,
     annotatedReceiverType,
