@@ -51,8 +51,9 @@ jobs:
     name: Eval (${{ matrix.id }})
     needs: plan
     runs-on: ubuntu-latest
-    # The test-unit matrix starts a test runner about two thousand times.
-    timeout-minutes: ${{ matrix.kind == 'matrices' && 120 || 45 }}
+    # The test-unit matrix starts a test runner about two thousand times; the
+    # release row runs the matrices after the release board.
+    timeout-minutes: ${{ matrix.kind == 'release' && 150 || matrix.kind == 'matrices' && 120 || 45 }}
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -113,9 +114,10 @@ jobs:
           mkdir -p "$HOME/jdtls" && tar -xzf /tmp/jdtls.tar.gz -C "$HOME/jdtls"
           echo "UCN_EVAL_JDTLS=$HOME/jdtls/bin/jdtls" >> "$GITHUB_ENV"
 
-      # pytest, jest, vitest, mocha and the C++ compiler, for the matrices.
+      # pytest, jest, vitest, mocha and the C++ compiler, for the matrices: on
+      # their own runner and on the release row, whose gate runs them too.
       - name: Matrix toolchains
-        if: ${{ matrix.kind == 'matrices' }}
+        if: ${{ matrix.kind == 'matrices' || matrix.kind == 'release' }}
         uses: ./.github/actions/matrix-toolchains
 
       - run: npm ci
@@ -154,20 +156,17 @@ jobs:
       # the repos whose outcome findings drove fixes #293-#298; pinned commit +
       # fixed seed → deterministic tasks). Thresholds: judge/proposal errors 0,
       # contract delete falseSafe 0, contract rename <= grep baseline. Runs on
-      # every trigger; deliberately NOT in npm run trust:gate until this step
-      # has a green run on this runner (the #292b rule: a new gate must run on
-      # the enforcing environment before any tag push relies on it).
+      # every trigger, and inside npm run trust:gate, which the publish job and
+      # the pre-tag dry run execute.
       - name: "Outcome gate (pinned tuned set, toolchain-judged)"
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'checks' }}
         run: node eval/run-outcome-eval.js --gate
 
       # Toolchain-judged matrices, on every trigger, on their own runner. A
       # toolchain that is not installed fails its matrix: a case that was not
-      # judged is never a pass. Like the outcome gate above they are NOT in
-      # npm run trust:gate, so a tag push does not run them: until they are, a
-      # release relies on a green dispatch of this workflow from the commit to
-      # be tagged. They join trust:gate, and the publish job gets the same
-      # toolchain action, only after a green run on this runner.
+      # judged is never a pass. Like the outcome gate above they also run
+      # inside npm run trust:gate, in the publish job and the pre-tag dry run,
+      # with the same toolchain action.
       - name: "Deletion matrix (gate: false-safe = 0)"
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'matrices' }}
         run: node eval/run-deletion-matrix.js

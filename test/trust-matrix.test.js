@@ -20,7 +20,7 @@ const ROOT = path.join(__dirname, '..');
 const { REPOS, RELEASE_REPO_NAMES, RELEASE_REPOS } = require('../eval/lib/repos');
 
 // The gates the Eval workflow qualifies on its own runners on every trigger.
-// The release gate takes all of them or none, each exactly as qualified.
+// The release gate holds all of them, each exactly as qualified.
 const MATRIX_COMMANDS = [
     'node eval/run-deletion-matrix.js',
     'node eval/run-check-matrix.js',
@@ -199,11 +199,17 @@ function assertQualifiedWhole(label, commands) {
         `${label} runs a qualified gate other than as qualified`);
 }
 
-/** The release gate holds every qualified gate or none of them. */
+/** A job beside the release gate holds every qualified gate or none of them. */
 function assertEnrolledTogether(label, commands) {
     const missing = QUALIFIED_COMMANDS.filter(command => !commands.includes(command));
     assert.ok(missing.length === 0 || missing.length === QUALIFIED_COMMANDS.length,
         `${label} holds some of the qualified gates and not: ${missing.join(', ')}`);
+}
+
+/** The release gate holds every qualified gate. */
+function assertEnrolled(label, commands) {
+    assert.deepStrictEqual(QUALIFIED_COMMANDS.filter(command => !commands.includes(command)), [],
+        `${label} does not run every qualified gate`);
 }
 
 describe('command trust matrix: fail-closed proof coverage', () => {
@@ -512,16 +518,18 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         const dependenciesAt = evalJob.steps.findIndex(step => step.id === 'dependencies');
         assert.ok(toolsAt >= 0 && dependenciesAt >= 0 && toolsAt < dependenciesAt);
 
-        // The release gate: the script, and each publish job as it runs it.
-        // It holds every qualified gate, each as qualified, or none.
+        // The release gate: the script, and the publish test job as it runs
+        // it. Both hold every qualified gate, each as qualified. Another
+        // publish job holds all of them or none.
         const gate = leafCommands(['npm run trust:gate'], pkg.scripts);
         assertQualifiedWhole('trust:gate', gate);
-        assertEnrolledTogether('trust:gate', gate);
+        assertEnrolled('trust:gate', gate);
         for (const [name, job] of publishJobs) {
             const commands = job.steps.flatMap(step => leafCommands(step.commands, pkg.scripts));
             assertMatricesProvided(`publish.yml ${name}`, job, pkg.scripts, [{}]);
             assertQualifiedWhole(`publish.yml ${name}`, commands);
-            assertEnrolledTogether(`publish.yml ${name}`, commands);
+            if (name === 'test') assertEnrolled(`publish.yml ${name}`, commands);
+            else assertEnrolledTogether(`publish.yml ${name}`, commands);
         }
         // Publishing waits for the job that runs the release gate, and that
         // step can neither be skipped nor fail without failing the job.

@@ -59,10 +59,14 @@ jobs:
           mkdir -p "$HOME/jdtls" && tar -xzf /tmp/jdtls.tar.gz -C "$HOME/jdtls"
           echo "UCN_EVAL_JDTLS=$HOME/jdtls/bin/jdtls" >> "$GITHUB_ENV"
 
+      # pytest, jest, vitest, mocha and the C++ compiler for the matrices of
+      # the release gate: the action the Eval workflow qualifies them with.
+      - uses: ./.github/actions/matrix-toolchains
+
       - run: npm ci
       - run: npm run lint
       - run: npm test
-      - name: Release trust gate (ten repos across seven external oracles)
+      - name: Release trust gate (ten repos across seven external oracles, the toolchain matrices, the outcome gate)
         run: npm run trust:gate
 
   publish-npm:

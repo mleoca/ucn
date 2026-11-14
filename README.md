@@ -169,7 +169,7 @@ The [Publish workflow](https://github.com/mleoca/ucn/actions/workflows/publish.y
 gates releases, and the [Eval workflow](https://github.com/mleoca/ucn/actions/workflows/eval.yml)
 runs the checks on schedule and on demand. Their run pages provide CI results
 and evaluation artifacts. Reproduce the checks locally with the oracle
-dependencies installed:
+dependencies and the matrices' test runners installed:
 
 ```bash
 npm run verify
