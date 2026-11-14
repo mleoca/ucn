@@ -159,8 +159,10 @@ evaluation, each judged by the language's own compiler or test runner. In the
 same run, across 68 deletions, `plan --delete` reported `no-static-dependents`
 for none that a compiler rejects. Across 369 single changes, `check` called
 none ready that a compiler rejects and blocked none that it accepts. Of 338
-test projects, the 333 run under their own test runner showed no listed test
-that never ran and no printed command that ran other tests.
+test projects, 333 were judged by their own test runners, with zero failures
+in the matrix's test-discovery and command-selection checks. These checks
+account for skipped and conditional tests and each runner's selection scope;
+five projects were not runner-judged.
 
 The samples are deterministic and stratified by reference activity. Confirmed
 precision applies to scored claims; recall counts in-scope oracle edges found
