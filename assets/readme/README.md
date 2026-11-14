@@ -41,5 +41,11 @@ The imported illustration was checked against the live local CLI on
 displayed owner definitions matched. This is UCN evidence, not an independent
 compiler/oracle certification of this individual answer.
 
+The animation is that capture. Since 5.5.2 the engine attributes the call at
+`crates/globset/src/lib.rs:635` to globset's own `file_name`, so the live
+partition is 4 confirmed calls, 0 unverified candidates, 17 non-call lines,
+8 other-target lines, and 0 unaccounted (checked against the local CLI on
+2026-11-14). The README states the live partition and dates the capture.
+
 This directory is excluded from npm packages. Keep it with the README in
 the repository when promoting the proposal.

@@ -82,7 +82,9 @@ visible, and the tree's accounting reports where exploration stopped.
 `impact` connects a symbol or Git diff to its callers. `tests` follows indexed
 call and reference paths to identify statically linked tests, including links
 several hops away. `plan` previews a rename or signature change with source
-locations and review items; it does not edit files. Together these commands
+locations and review items; it does not edit files. `plan --delete` assesses a
+deletion from static evidence: `no-static-dependents`, `has-static-dependents`
+with the first use, or `review` with the reason. Together these commands
 support code exploration, refactoring, and change review from a terminal or
 an AI agent.
 Each linked test is named by its file, suites and name, and where the test
@@ -98,13 +100,16 @@ A matching method name alone does not establish which implementation runs;
 receiver and ownership evidence determine how the candidate is classified.
 
 In ripgrep at [`82313cf9`](https://github.com/BurntSushi/ripgrep/commit/82313cf95849bfe425109ad9506a52154879b1b1),
-the selected `file_name` helper has four confirmed call sites and one unverified
-candidate. This animation accounts for all 29 matching lines, alongside import
-relationships and same-name definitions drawn from UCN's output.
+the selected `file_name` helper has four confirmed call sites among the 29 lines
+that mention the name. The other 25 are accounted for as well: 17 are not calls
+and 8 are attributed to other targets with the same name. This animation is a
+capture from September 2026, when one of those eight was still an unverified
+candidate. It shows the same 29 lines alongside import relationships and
+same-name definitions drawn from UCN's output.
 
 <a href="assets/readme/ucn-evidence-graph.gif"><img src="assets/readme/ucn-evidence-graph.gif" width="736" alt="Captured ripgrep findings for file_name: 29 matching lines in six files, partitioned into 4 confirmed calls, 1 unverified candidate, 17 non-call lines, 7 other-target lines, and 0 unaccounted. The graph shows selected import relationships and the distinct definitions; motion is illustrative."></a>
 
-Captured findings · [Still image](assets/readme/ucn-evidence-graph.png) · [Data](assets/readme/ucn-evidence-graph.json)
+Captured findings, September 6, 2026 · [Still image](assets/readme/ucn-evidence-graph.png) · [Data](assets/readme/ucn-evidence-graph.json)
 
 The ACCOUNT line reconciles the observed name occurrences: confirmed calls,
 unverified candidates, non-call occurrences, and matches attributed to another
@@ -123,9 +128,9 @@ needs the compiler and tests.
 ## Accuracy and validation
 
 Release gates compare UCN's answers with independent compilers and language
-servers on a ten-repository board of pinned production codebases. The local
-November 6, 2026 evaluation, using clangd 18.1.8 for C/C++ and .NET 10.0.403
-for Roslyn, recorded these sampled caller results:
+servers on a ten-repository board of pinned production codebases. The
+November 14, 2026 release dry run on GitHub Actions, using clangd 18.1.3 for
+C/C++ and .NET 11.0.100 for Roslyn, recorded these sampled caller results:
 
 | Repository | Pinned commit | Oracle | Symbols sampled | Confirmed precision | In-scope recall |
 |---|---|---|---:|---:|---:|
@@ -133,21 +138,29 @@ for Roslyn, recorded these sampled caller results:
 | httpx | `b5addb64` | Pyright | 50 | 100% | 100% |
 | cobra | `ad460ea8` | gopls | 50 | 100% | 100% |
 | viper | `528f7416` | gopls | 50 | 100% | 100% |
-| ripgrep | `82313cf9` | rust-analyzer | 41 | 100% | 100% |
+| ripgrep | `82313cf9` | rust-analyzer | 42 | 100% | 100% |
 | clap | `d3e59a9a` | rust-analyzer | 50 | 100% | 100% |
 | javapoet | `b9017a95` | JDT LS | 50 | 100% | 100% |
 | newtonsoft-json | `4f73e743` | Roslyn | 50 | 100% | 100% |
 | cjson | `c859b25d` | clangd | 50 | 100% | 100% |
 | fmt | `e424e3f2` | clangd | 50 | 100% | 100% |
 
-That evaluation scored 9,677 confirmed caller edges, all correct;
-41 further edges were unscored. It reported zero missing in-scope
+That evaluation scored 9,616 confirmed caller edges, all correct;
+23 further edges were unscored. It reported zero missing in-scope
 oracle edges in both caller and callee answers. The separate value-reference
-sample scored 1,241 confirmed sites, all correct, with 4 unscored and zero
+sample scored 1,307 confirmed sites, all correct, with 4 unscored and zero
 missing in-scope sites.
-All 8,000 cross-command comparisons agreed.
+All 8,400 cross-command comparisons agreed.
 The default dead-code audit found zero false-dead results among 7 scored
 claims; 4 additional claims could not be pinned by the oracle and were unscored.
+
+The release gate also runs three matrices of small projects written by the
+evaluation, each judged by the language's own compiler or test runner. In the
+same run, across 68 deletions, `plan --delete` reported `no-static-dependents`
+for none that a compiler rejects. Across 369 single changes, `check` called
+none ready that a compiler rejects and blocked none that it accepts. Of 338
+test projects, the 333 run under their own test runner showed no listed test
+that never ran and no printed command that ran other tests.
 
 The samples are deterministic and stratified by reference activity. Confirmed
 precision applies to scored claims; recall counts in-scope oracle edges found
@@ -190,7 +203,7 @@ npm run trust:gate
 | Symbol or Git-diff impact | `impact [symbol] [--staged]` |
 | Direct or transitively linked tests | `tests <symbol> [--depth=N]` |
 | Signature or pre-commit validation | `check [symbol] [--staged]` |
-| Refactor preview | `plan <symbol> --rename-to=...` |
+| Refactor preview and deletion assessment | `plan <symbol> --rename-to=...` or `--delete` |
 | Imports, importers, and cycles | `deps [file] [--direction=...] [--cycles]` |
 | Project or file public API | `api [file]` |
 | Runtime and framework roots | `entrypoints` |
