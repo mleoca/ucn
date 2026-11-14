@@ -101,11 +101,8 @@ receiver and ownership evidence determine how the candidate is classified.
 
 In ripgrep at [`82313cf9`](https://github.com/BurntSushi/ripgrep/commit/82313cf95849bfe425109ad9506a52154879b1b1),
 the selected `file_name` helper has four confirmed call sites among the 29 lines
-that mention the name. The other 25 are accounted for as well: 17 are not calls
-and 8 are attributed to other targets with the same name. This animation is a
-capture from September 2026, when one of those eight was still an unverified
-candidate. It shows the same 29 lines alongside import relationships and
-same-name definitions drawn from UCN's output.
+that mention the name. This animation accounts for all 29 lines, alongside
+import relationships and same-name definitions drawn from UCN's output.
 
 <a href="assets/readme/ucn-evidence-graph.gif"><img src="assets/readme/ucn-evidence-graph.gif" width="736" alt="Captured ripgrep findings for file_name: 29 matching lines in six files, partitioned into 4 confirmed calls, 1 unverified candidate, 17 non-call lines, 7 other-target lines, and 0 unaccounted. The graph shows selected import relationships and the distinct definitions; motion is illustrative."></a>
 
