@@ -1893,5 +1893,6 @@ const CASES = [
 CASES.push(...require('./check-outgoing-cases').filter(testCase => !['c', 'js'].includes(testCase.lang)));
 CASES.push(...require('./check-call-settlement-cases'));
 CASES.push(...require('./check-path-end-cases'));
+CASES.push(...require('./check-call-shape-cases'));
 
 module.exports = { CASES };

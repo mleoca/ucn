@@ -102,6 +102,25 @@ const JAVA_LANG_NOT_SERIALIZABLE = ['Object', 'Runnable', 'AutoCloseable', 'Comp
     'CharSequence', 'Cloneable', 'Appendable', 'Readable', 'Thread', 'ThreadGroup', 'ClassLoader',
     'ThreadLocal', 'InheritableThreadLocal', 'ClassValue', 'SecurityManager', 'Process', 'Record'];
 
+// TypeScript: the syntax of a binding that holds a callable under a written
+// type (trait `bindingCallInterface`).
+const TS_BINDING_CALL_INTERFACE = Object.freeze({
+    holders: ['variable_declarator', 'public_field_definition'],
+    callables: ['arrow_function', 'function_expression', 'function'],
+    annotation: 'type_annotation',
+    functionTypes: ['function_type'],
+    callSignatures: ['call_signature'],
+    objectTypes: ['object_type', 'interface_body'],
+    typeNames: ['type_identifier'],
+    genericTypes: ['generic_type'],
+    wrappers: ['parenthesized_type'],
+    extendsClauses: ['extends_type_clause'],
+    // Declaration node -> the field holding what it declares, and the
+    // symbol kinds those declarations are indexed as.
+    declarations: { interface_declaration: 'body', type_alias_declaration: 'value' },
+    declarationKinds: ['interface', 'type'],
+});
+
 const STRUCTURAL_TRAITS = {
     typeSystem: 'structural',
     // How a callable's return contract can come from its body instead of its
@@ -423,6 +442,26 @@ const STRUCTURAL_TRAITS = {
     //   neverModules        the modules a never type that is a name (not a
     //                       keyword) is imported from.
     pathEnds: null,
+    // What a call-shaped expression is when its callee names a declaration
+    // that has no parameter list of its own, or null when the language
+    // gives such a name no call form (core/verify.js `calledDeclarationShape`):
+    //   positionalFields   { list, field }: the node holding a declaration's
+    //                      positional fields and the field name of each; the
+    //                      expression constructs the declaration with one
+    //                      value per field (Rust tuple structs and variants);
+    //   conversions        symbol kind -> [fewest, most] values: a type
+    //                      of that kind applied to a value converts it
+    //                      (Go `T(x)`, a C++ functional cast to an enum).
+    calledDeclarations: null,
+    // A callable held by a binding whose written type is its call interface
+    // (`const run: Runner = async (a, b, c) => ..`): its call sites are
+    // checked against that type, read where the project declares it, never
+    // against the list the callable writes (core/verify.js
+    // `bindingCallInterface`). The node types of the language's syntax:
+    // the bindings (`holders`) and callable values, the annotation, inline
+    // function types, call signatures and the declarations that hold them.
+    // null: a binding's type is no call interface.
+    bindingCallInterface: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -783,6 +822,8 @@ const NOMINAL_TRAITS = {
     neverReturnTypes: null,
     // See STRUCTURAL_TRAITS.
     pathEnds: null,
+    calledDeclarations: null,
+    bindingCallInterface: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -1073,6 +1114,7 @@ const LANGUAGES = {
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
             neverReturnTypes: ['never'],
             pathEnds: { calls: 'declared', unitTypes: ['void'], neverAliases: true },
+            bindingCallInterface: TS_BINDING_CALL_INTERFACE,
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -1115,6 +1157,7 @@ const LANGUAGES = {
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
             neverReturnTypes: ['never'],
             pathEnds: { calls: 'declared', unitTypes: ['void'], neverAliases: true },
+            bindingCallInterface: TS_BINDING_CALL_INTERFACE,
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -1282,6 +1325,8 @@ const LANGUAGES = {
             // the end of a function with a result is still a missing
             // return), and `go vet` rejects unreachable code.
             pathEnds: { calls: 'named', neverCallables: ['panic'], unitTypes: [], unitWhenUnwritten: true, unreachableRejected: true },
+            // `T(x)` converts a value to a named type, an alias included.
+            calledDeclarations: { conversions: { type: [1, 1], struct: [1, 1], interface: [1, 1] } },
             checkLiteralArguments: { smallInteger: ['int', 'int8', 'int16', 'int32', 'int64', 'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr', 'float32', 'float64'], string: ['string'], boolean: ['bool'] },
             testUnits: (fileEntry, helpers) => require('./go').testUnits(fileEntry, helpers),
             testGate: (fileEntry, helpers) => require('./go').testGate(fileEntry, helpers),
@@ -1336,6 +1381,8 @@ const LANGUAGES = {
                 neverMacros: ['panic', 'unreachable', 'todo', 'unimplemented'],
                 returningMacros: ['println', 'eprintln', 'print', 'eprint', 'dbg', 'assert', 'assert_eq', 'assert_ne',
                     'debug_assert', 'debug_assert_eq', 'debug_assert_ne', 'write', 'writeln', 'format', 'vec'] },
+            // A tuple struct's or tuple variant's name is its constructor.
+            calledDeclarations: { positionalFields: { list: 'ordered_field_declaration_list', field: 'type' } },
             // `async fn` returns an anonymous future whose auto traits
             // (Send, Sync) come from what the body holds across an await.
             asyncReturnIsOpaque: true,
@@ -1582,6 +1629,8 @@ const LANGUAGES = {
                 ownerScope: node => require('./c-family').implicitOwnerScope(node),
                 baseKinds: ['class', 'struct'], separator: '::' },
             functionalTypeConstruction: true,
+            // `Color(1)` is a functional cast: one value, or none (`Color()`).
+            calledDeclarations: { conversions: { enum: [0, 1] } },
             outOfClassMemberDefinitions: true,
             constructorArgumentNodes: { direct: { nodeType: 'init_declarator', argsField: 'value' },
                 delegation: { nodeType: 'field_initializer', argsNodeType: 'argument_list' } },

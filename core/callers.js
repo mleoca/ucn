@@ -18889,8 +18889,19 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
     // #398F) reaches its definitions in that configuration only.
     let configuration = false;
     let frontier = [[startAbs, exposedName, false]];
+    // A name a module exposes is one of its own top-level bindings: a
+    // member of a type declared in the module is reached through that
+    // type, never by the module's name for it (`from m import isatty`
+    // beside `class Wrapper: def isatty(self)`).
+    const memberOfDeclaredType = d => {
+        const owner = String(d.className || d.receiver || '').replace(/^\*/, '');
+        return !!owner && !d.memberAssigned && (index.symbols.get(owner) || []).some(type =>
+            type.file === d.file && IDENTITY_TYPE_KINDS.has(type.type) &&
+            type.startLine <= d.startLine && (type.endLine ?? type.startLine) >= d.startLine);
+    };
     const shapeMatches = d =>
         (language !== 'rust' || !(d.className || d.receiver)) &&
+        !memberOfDeclaredType(d) &&
         (!NON_CALLABLE_TYPES.has(d.type) ||
             (call.isConstructor && d.type === 'class') ||
             (langTraits(language)?.classesCallableWithoutNew && d.type === 'class')) &&

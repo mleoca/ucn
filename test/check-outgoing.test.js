@@ -313,3 +313,182 @@ it('fix #502: compile-time argument domains are not runtime literal proofs', () 
         assert.strictEqual(check(dir, { staged: true }).trust.status, 'REVIEW_REQUIRED');
     } finally { rm(dir); }
 });
+
+describe('fix #506c: what a call-shaped expression is counted against', () => {
+    const shapes = require('../eval/check-call-shape-cases');
+    const answers = new Map();
+    // The changed symbol's item for one judged case, with its rows as text.
+    function answerOf(id) {
+        if (answers.has(id)) return answers.get(id);
+        const fixture = shapes.find(testCase => testCase.id === `callshape-${id}`);
+        assert.ok(fixture, id);
+        const dir = tmp(fixture.base);
+        try {
+            git(dir, 'init', '-q'); git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'base');
+            write(dir, fixture.after);
+            const result = check(dir);
+            const item = result.changed.find(row => row.name === fixture.name);
+            assert.ok(item, JSON.stringify(result.changed));
+            const answer = { fixture, item, status: result.trust.status,
+                mismatches: (item.mismatches || []).map(row => `${row.target}: expected ${row.expected}, got ${row.actual}`),
+                rows: (item.outgoingReview || []).map(row => `${row.name}: ${row.reason}`) };
+            answers.set(id, answer);
+            return answer;
+        } finally { rm(dir); }
+    }
+    const clean = id => {
+        const { item, mismatches } = answerOf(id);
+        assert.notStrictEqual(item.verdict, 'blocked', id);
+        assert.deepStrictEqual(mismatches, [], id);
+    };
+    const broken = (id, expected) => {
+        const { item, mismatches } = answerOf(id);
+        assert.strictEqual(item.verdict, 'blocked', id);
+        assert.deepStrictEqual(mismatches, expected, id);
+    };
+
+    it('each call of a chain is counted with its own arguments', () => {
+        for (const lang of ['go', 'ts', 'py', 'java', 'cs', 'cpp']) clean(`${lang}-chain-receiver-call`);
+        clean('rs-builder-chain');
+        clean('rs-function-path-argument-in-chain');
+        // Every call of the chain is a row of its own.
+        assert.deepStrictEqual(answerOf('go-chain-receiver-call').rows.filter(row => /^(Root|Traverse):/.test(row)),
+            ['Root: call-interface-unverified', 'Root: call-interface-unverified', 'Traverse: call-interface-unverified']);
+        broken('go-chain-receiver-call-wrong-count', ['Traverse: expected 1 arg(s), got 0']);
+        broken('go-chain-inner-wrong-count', ['Root: expected 0 arg(s), got 1']);
+        broken('rs-builder-chain-wrong-count', ['require_git: expected 1 arg(s), got 0']);
+        broken('rs-chain-method-wrong-count', ['map: expected 1 arg(s), got 2']);
+        broken('ts-chain-receiver-call-wrong-count', ['walk: expected 1 arg(s), got 0']);
+        broken('py-chain-receiver-call-wrong-count', ['walk: expected 1 arg(s), got 0']);
+        broken('cpp-chain-receiver-call-wrong-count', ['walk: expected 1 arg(s), got 0']);
+    });
+
+    it('two calls of one name on a line, or in one chain, are two sites', () => {
+        for (const lang of ['go', 'rs', 'ts']) {
+            clean(`${lang}-two-calls-of-a-name-on-a-line`);
+            broken(`${lang}-two-calls-on-a-line-second-wrong-count`, ['add: expected 2 arg(s), got 1']);
+        }
+        clean('go-same-name-twice-in-a-chain');
+        clean('ts-same-name-twice-in-a-chain');
+        clean('rs-self-tuple-constructor-chain');
+        broken('go-same-name-twice-in-a-chain-second-wrong-count', ['With: expected 1 arg(s), got 0']);
+        broken('ts-same-name-twice-in-a-chain-second-wrong-count', ['with: expected 1 arg(s), got 0']);
+    });
+
+    it('a constructor written on a declaration header is one of its constructors', () => {
+        clean('cs-record-construction');
+        clean('java-record-construction');
+        broken('cs-record-construction-wrong-count', ['Point: expected 2 arg(s), got 1']);
+        broken('java-record-construction-wrong-count', ['Point: expected 2 arg(s), got 1']);
+    });
+
+    it('a tuple struct or tuple variant takes one value per field', () => {
+        for (const id of ['rs-tuple-variant-construction', 'rs-tuple-variant-pair', 'rs-tuple-struct-construction']) clean(id);
+        broken('rs-tuple-variant-two-values', ['Literal: expected 1 arg(s), got 2']);
+        broken('rs-tuple-variant-pair-one-value', ['Pair: expected 2 arg(s), got 1']);
+        broken('rs-tuple-struct-two-values', ['Meters: expected 1 arg(s), got 2']);
+    });
+
+    it('a type name applied to a value converts it', () => {
+        for (const id of ['go-conversion-to-named-type', 'go-conversion-to-alias', 'cpp-functional-cast-to-enum']) clean(id);
+        broken('go-conversion-two-values', ['byName: expected 1 arg(s), got 2']);
+        broken('go-function-beside-alias-wrong-count', ['Join: expected 2 arg(s), got 1']);
+        broken('cpp-functional-cast-to-enum-two-values', ['Color: expected 0-1 arg(s), got 2']);
+    });
+
+    it('a declaration with no parameter list is never counted against an empty one', () => {
+        for (const id of ['cpp-functional-cast-to-alias', 'cs-delegate-construction', 'java-anonymous-interface',
+            'go-function-typed-field', 'ts-function-typed-field', 'py-newtype', 'py-alias-of-class']) clean(id);
+        assert.deepStrictEqual(answerOf('cpp-functional-cast-to-alias').rows, ['Meters: call-interface-unverified']);
+    });
+
+    it('a callee the enclosing function binds is not the project function of that name', () => {
+        for (const id of ['go-local-callee-of-method-result', 'go-local-callee-from-call', 'go-local-callee-declared',
+            'go-parameter-callee', 'rs-local-callee-from-call', 'py-local-callee-from-call', 'ts-local-callee-from-call',
+            'cs-local-callee-from-call', 'cpp-local-callee-from-call']) {
+            clean(id);
+            const { fixture, rows } = answerOf(id);
+            const callee = id.startsWith('go-') ? 'fn' : id.startsWith('cs-') ? 'run' : 'run';
+            assert.ok(!rows.some(row => row.startsWith(`${callee}:`)), `${fixture.id} ${rows.join(' | ')}`);
+        }
+        broken('go-package-function-wrong-count', ['fn: expected 0 arg(s), got 2']);
+    });
+
+    it('a name a module exposes is its own function, never a member of a type it declares', () => {
+        for (const lang of ['py', 'ts']) {
+            clean(`${lang}-module-function-beside-namesake-methods`);
+            assert.deepStrictEqual(answerOf(`${lang}-module-function-wrong-count`).mismatches.map(row => row.replace(/^isatty: /, '')),
+                ['expected 1 arg(s), got 2']);
+        }
+        clean('rs-function-beside-namesake-methods');
+        clean('go-function-beside-namesake-methods');
+        broken('rs-function-beside-namesake-methods-wrong-count', ['isatty: expected 1 arg(s), got 2']);
+        broken('go-function-beside-namesake-methods-wrong-count', ['isatty: expected 1 arg(s), got 2']);
+    });
+
+    it('a callable held by a typed binding is called as the type says', () => {
+        for (const id of ['ts-variable-typed-callable-optional-parameter', 'ts-variable-typed-callable-call-added',
+            'ts-variable-typed-callable-fewer-parameters']) clean(id);
+        broken('ts-variable-typed-callable-call-wrong-count', ['toSite: expected 2-3 arg(s), got 1']);
+        // The declaration no longer fits its type: the toolchain rejects the
+        // changed line, and no call site is blamed for it.
+        const added = answerOf('ts-variable-typed-callable-parameter-added');
+        assert.strictEqual(added.item.verdict, 'review');
+        assert.deepStrictEqual(added.item.reasons, ['header']);
+    });
+
+    it('the binding type is read where the project declares it, and is unknown anywhere else', () => {
+        const use = "export function run(): unknown {\n    return held('a');\n}\n";
+        const project = declaration => ({ 'lib.ts': `${declaration}\n${use}` });
+        const verifyOf = declaration => {
+            const dir = tmp(project(declaration));
+            try {
+                const result = execute(idx(dir), 'verify', { name: 'held' });
+                assert.ok(result.ok, JSON.stringify(result));
+                return [result.result.valid, result.result.mismatches, result.result.uncertain];
+            } finally { rm(dir); }
+        };
+        // [valid, mismatches, uncertain] for the one call `held('a')`.
+        const expected = [
+            ['type Fn = (a: string, b?: string) => string;\nexport const held: Fn = (a, b) => a + (b ?? "");', [1, 0, 0]],
+            ['type Fn = (a: string, b: string) => string;\nexport const held: Fn = (a) => a;', [0, 1, 0]],
+            ['interface Fn { (a: string): string; (a: string, b: string): string }\nexport const held: Fn = (a: string, b?: string) => a + (b ?? "");', [1, 0, 0]],
+            ['type Inner = (a: string, ...rest: string[]) => string;\ntype Fn = Inner;\nexport const held: Fn = (a, ...rest) => a + rest.join("");', [1, 0, 0]],
+            ['type Fn<T> = (a: T, b?: T) => T;\nexport const held: Fn<string> = (a, b) => a + (b ?? "");', [1, 0, 0]],
+            // A supertype, a composition or a type from outside the project: not read.
+            ['interface Base { (a: string, b?: string): string }\ninterface Fn extends Base { tag?: string }\nexport const held: Fn = (a, b) => a + (b ?? "");', [0, 0, 1]],
+            ['type Fn = ((a: string) => string) & { tag?: string };\nexport const held: Fn = (a: string) => a;', [0, 0, 1]],
+            ['export const held: Parameters<typeof String>[0] extends never ? never : (a: string, b?: string) => string = (a, b) => a + (b ?? "");', [0, 0, 1]],
+        ];
+        for (const [declaration, counts] of expected) assert.deepStrictEqual(verifyOf(declaration), counts, declaration);
+    });
+
+    it('every reason of an unverified call is a code', () => {
+        for (const fixture of shapes) {
+            const { rows } = answerOf(fixture.id.replace(/^callshape-/, ''));
+            for (const row of rows) assert.match(row, /^[^:]+: [a-z][a-z-]*$/, `${fixture.id} ${row}`);
+        }
+        // A call written in a macro's tokens, and a construction by literal.
+        const rust = { 'lib.rs': 'pub fn helper(a: i32) -> i32 {\n    a\n}\n\npub fn run() -> i32 {\n    1\n}\n' };
+        const dir = tmp(rust);
+        try {
+            git(dir, 'init', '-q'); git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'base');
+            write(dir, { 'lib.rs': `${rust['lib.rs']}\npub fn more() -> i32 {\n    assert_eq!(helper(1), 1);\n    1\n}\n` });
+            const item = check(dir).changed.find(row => row.name === 'more');
+            assert.deepStrictEqual((item.outgoingReview || []).map(row => `${row.name}: ${row.reason}`), ['helper: call-arguments-unread']);
+            assert.deepStrictEqual(item.outgoingCalls.reasons, [{ reason: 'call-arguments-unread', calls: 1 }]);
+        } finally { rm(dir); }
+    });
+
+    it('verify keeps the sentence and adds the code beside it', () => {
+        const dir = tmp({ 'lib.rs': 'pub fn helper(a: i32) -> i32 {\n    a\n}\n\npub fn run() -> i32 {\n    assert_eq!(helper(1), 1);\n    1\n}\n' });
+        try {
+            const result = execute(idx(dir), 'verify', { name: 'helper' });
+            assert.ok(result.ok, JSON.stringify(result));
+            const [row] = result.result.uncertainDetails;
+            assert.strictEqual(row.reason, 'Could not parse call arguments');
+            assert.strictEqual(row.code, 'call-arguments-unread');
+            assert.ok(!Object.keys(row).includes('code'), 'the code is not part of what verify prints');
+        } finally { rm(dir); }
+    });
+});

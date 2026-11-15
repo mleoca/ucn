@@ -19678,3 +19678,45 @@ describe('constructed receivers: a constructed receiver has the class its name d
         } finally { rm(project.dir); }
     });
 });
+
+describe('fix #506c: the callee a bare name denotes', () => {
+    const calleesOf = (index, name) => {
+        const definition = (index.symbols.get(name) || []).find(symbol => !symbol.className);
+        return index.findCallees(definition, { collectAccount: true, includeMethods: true })
+            .map(callee => `${callee.className ? `${callee.className}.` : ''}${callee.name}`).sort();
+    };
+
+    it('a Go local holding a function value shadows the package function of its name', () => {
+        const dir = tmp({
+            'go.mod': 'module example.invalid/probe\n\ngo 1.20\n',
+            'main.go': 'package probe\n\nfunc render() func(a int, b int) int {\n    return func(a int, b int) int {\n        return a + b\n    }\n}\n\n' +
+                'func fn() int {\n    return 1\n}\n\nfunc Show() int {\n    fn := render()\n    return fn(1, 2)\n}\n\nfunc Plain() int {\n    return fn()\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const records = index.getCachedCalls(path.join(dir, 'main.go')).filter(call => call.name === 'fn');
+            assert.deepStrictEqual(records.map(call => [call.line, call.localShadow === true]), [[15, true], [19, false]]);
+            assert.deepStrictEqual(calleesOf(index, 'Show'), ['render']);
+            assert.deepStrictEqual(calleesOf(index, 'Plain'), ['fn']);
+            const callers = index.findCallers('fn', { includeMethods: true, collectAccount: true });
+            assert.deepStrictEqual(callers.filter(caller => caller.tier !== 'unverified').map(caller => caller.line), [19]);
+        } finally { rm(dir); }
+    });
+
+    it('an imported name is the module function, never a member of a type the module declares', () => {
+        const projects = [
+            { 'compat.py': 'class Wrapper:\n    def isatty(self) -> bool:\n        return True\n\n\nclass Other:\n    def isatty(self) -> bool:\n        return False\n\n\n' +
+                'def isatty(stream: object) -> bool:\n    return stream is not None\n',
+            'lib.py': 'from compat import isatty\n\n\ndef pager() -> bool:\n    return isatty(1)\n' },
+            { 'compat.ts': 'export class Wrapper {\n    isatty(): boolean {\n        return true;\n    }\n}\nexport class Other {\n    isatty(): boolean {\n        return false;\n    }\n}\n' +
+                'export function isatty(stream: object): boolean {\n    return stream !== null;\n}\n',
+            'lib.ts': "import { isatty } from './compat';\nexport function pager(): boolean {\n    return isatty({});\n}\n" },
+        ];
+        for (const files of projects) {
+            const dir = tmp(files);
+            try {
+                assert.deepStrictEqual(calleesOf(idx(dir), 'pager'), ['isatty'], Object.keys(files).join(','));
+            } finally { rm(dir); }
+        }
+    });
+});

@@ -8,6 +8,18 @@ const { unsettledReason, plainOwner, calleeIdentifierAt } = require('./call-fit'
 
 const order = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
+/**
+ * Which call a site is: where it starts AND where it ends. The calls of a
+ * chain (`a.b().c(x)`) all start at the chain's first token, so a start
+ * alone names the innermost one for all of them, and each would be counted
+ * with another call's arguments.
+ */
+const siteKey = site => (Number.isInteger(site?.start) ? `${site.start}:${site.end ?? ''}` : null);
+const recordSite = call => ({
+    start: call.callStart ?? call.callSite?.start,
+    end: call.callEnd ?? call.callSite?.end,
+});
+
 /** One reader and result cache for a check, including all changed symbols. */
 function outgoingChecker(index, judge, addedLinesByFile) {
     const files = new Map();
@@ -27,7 +39,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
      * change of the member is checked against. Asked per member name and
      * file, for the declarations of that name only.
      */
-    const reachedThroughReceiver = (file, name, start) => {
+    const reachedThroughReceiver = (file, name, site) => {
         const key = `${file}\0${name}`;
         if (!receivers.has(key)) {
             const bySite = new Map();
@@ -42,7 +54,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
                     }) || [];
                 } catch (_) { callers = []; }
                 for (const caller of callers) {
-                    const at = caller.provenance?.facts?.site?.start;
+                    const at = siteKey(caller.provenance?.facts?.site);
                     if (caller.tier === 'unverified' || at == null || caller.file !== file) continue;
                     if (!bySite.has(at)) bySite.set(at, []);
                     bySite.get(at).push({ callee: member, provenance: caller.provenance });
@@ -50,7 +62,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
             }
             receivers.set(key, bySite);
         }
-        return receivers.get(key).get(start) || [];
+        return receivers.get(key).get(siteKey(site)) || [];
     };
     return (definition, change, added) => {
         const mismatches = [];
@@ -66,9 +78,10 @@ function outgoingChecker(index, judge, addedLinesByFile) {
                 range.end >= (call.callEnd ?? call.callSite?.end ?? call.callStart ?? call.callSite?.start))
                 : added || lines.has(call.line)));
         if (records.length === 0) return { mismatches, unsettled };
-        const byStart = new Map(records.map(call => [call.callStart ?? call.callSite?.start, call]));
+        const bySite = new Map(records.map(call => [siteKey(recordSite(call)), call]));
         const callees = index.findCallees(definition, {
-            collectAccount: true, includeMethods: true, siteStarts: new Set(byStart.keys()),
+            collectAccount: true, includeMethods: true,
+            siteStarts: new Set(records.map(call => recordSite(call).start)),
         });
         const relative = definition.relativePath;
         const language = index.files.get(definition.file)?.language;
@@ -79,7 +92,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
             // The class's public constructor overloads are the call
             // interface; an initializer edge also projects their body.
             const owner = callee.initializerOf || (callee.type === 'class' ? callee.name : null);
-            return JSON.stringify([site.start, callee.file, owner || callee.name,
+            return JSON.stringify([siteKey(site), callee.file, owner || callee.name,
                 owner ? null : callee.className, callee.namespace, callee.enclosingType]);
         };
         const uncertain = (site, name, reason) => unsettled.push({ file: relative, line: site.line, column: site.column, name, reason });
@@ -89,9 +102,9 @@ function outgoingChecker(index, judge, addedLinesByFile) {
         for (const callee of callees) {
             if (callee.functionReference) continue;
             for (const site of callee.siteProvenance || []) {
-                const record = byStart.get(site.start);
+                const record = bySite.get(siteKey(site));
                 if (!record) continue;
-                answered.add(site.start);
+                answered.add(siteKey(site));
                 reached.push({ callee, site, record, provenance: site.provenance });
             }
         }
@@ -100,10 +113,10 @@ function outgoingChecker(index, judge, addedLinesByFile) {
             // project declaration, however, cannot silently become READY.
             if (!(entry.ownerCount > 0 || entry.initializerOf || index.symbols.has(entry.name))) continue;
             for (const site of entry.siteProvenance || []) {
-                const record = byStart.get(site.start);
+                const record = bySite.get(siteKey(site));
                 if (!record) continue;
-                answered.add(site.start);
-                const members = entry.initializerOf ? [] : reachedThroughReceiver(definition.file, entry.name, site.start);
+                answered.add(siteKey(site));
+                const members = entry.initializerOf ? [] : reachedThroughReceiver(definition.file, entry.name, site);
                 // One owner: members of several types at one site are not
                 // an overload set, and none of them is established.
                 const owners = new Set(members.map(member => `${member.callee.file}\0${member.callee.className}`));
@@ -116,7 +129,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
         }
         for (const { callee, site, record, provenance, receiverProven } of reached) {
             const family = familyOf(callee, site);
-            const key = JSON.stringify([definition.file, site.start, callee.file, callee.startLine,
+            const key = JSON.stringify([definition.file, siteKey(site), callee.file, callee.startLine,
                 callee.sourceSpan?.start, callee.sourceSpan?.end, callee.name, callee.className,
                 callee.type, callee.paramsStructured]);
             let result = checked.get(key);
@@ -161,8 +174,10 @@ function outgoingChecker(index, judge, addedLinesByFile) {
             // What verify could not count, by the shape of the call.
             const shape = result.callShapes?.[0];
             for (const row of result.uncertainDetails || []) {
+                // The reason is a code here, as every other row's: the
+                // sentence stays with verify, which prints sentences.
                 issues.push({ family, site, callee, reason: shape?.hasSpread ? 'argument-count-not-static'
-                    : shape?.indirectKind ? 'indirect-call-arguments' : row.reason });
+                    : shape?.indirectKind ? 'indirect-call-arguments' : row.code || 'call-arguments-unread' });
             }
             if (result.valid > 0) {
                 const stableInvocation = !!changedRanges?.some(range => range.stableInvocation &&
@@ -185,8 +200,8 @@ function outgoingChecker(index, judge, addedLinesByFile) {
         // binding is one the toolchain cannot resolve either.
         const unbound = langTraits(language)?.unboundCallee;
         if (typeof unbound === 'function') {
-            for (const [start, record] of byStart) {
-                if (answered.has(start) || record.isMethod || record.isConstructor) continue;
+            for (const [key, record] of bySite) {
+                if (answered.has(key) || record.isMethod || record.isConstructor) continue;
                 const identifier = calleeIdentifierAt(index, definition.file, record.callSite);
                 let missing;
                 try { missing = !!identifier && identifier.text === record.name && unbound(identifier, index) === true; } catch (_) { missing = false; }

@@ -576,6 +576,14 @@ function classifyCallContext(callNode, language) {
     return result;
 }
 
+// A receiver that is a name: a variable, a type, a path to one. Any other
+// receiver expression is a value the member is read from.
+const RECEIVER_NAME_NODES = new Set(['identifier', 'type_identifier', 'scoped_identifier',
+    'scoped_type_identifier', 'qualified_identifier', 'qualified_type', 'package_identifier',
+    'generic_type', 'generic_name', 'namespace_identifier', 'self', 'this', 'super', 'crate',
+    'member_expression', 'attribute', 'selector_expression', 'field_expression',
+    'member_access_expression', 'field_access', 'template_type', 'predefined_type', 'primitive_type']);
+
 /**
  * Find a call expression node at the target line matching funcName
  */
@@ -591,6 +599,16 @@ function findCallNode(node, callTypes, targetRow, funcName, occurrence = 0, site
         // The resolver already identified the callee token. Preserve that
         // identity through argument extraction, including aliases and several
         // calls on one line (some of which may target another declaration).
+        // A site recorded as the whole call (`callStart`/`callEnd`) is that
+        // node: of two same-name calls on a line, or of a chain's calls that
+        // share a first token (`b.with(1).with()`), only one has both ends.
+        // Asked first: the callee of the chain's outer call contains the
+        // whole inner call.
+        if (Number.isInteger(site.end)) {
+            const whole = matches.filter(candidate =>
+                candidate.startIndex === site.start && candidate.endIndex === site.end);
+            if (whole.length === 1) return whole[0];
+        }
         const exact = matches.filter(candidate => {
             const callee = candidate.childForFieldName('function') ||
                 candidate.childForFieldName('name') ||
@@ -989,6 +1007,110 @@ function extractArrowTypesFromVarDecl(index, def) {
 }
 
 /**
+ * The call interface a binding's written type gives the callable it holds
+ * (trait `bindingCallInterface`): `const run: Runner = async (a, b, c) => ..`
+ * is called as `Runner` says, with the parameters `Runner` makes optional,
+ * whatever list the arrow itself writes. The type is read where the project
+ * declares it: an interface's call signatures, an alias of a function type
+ * or of another such type. An inline function type is read by
+ * `extractArrowTypesFromVarDecl`.
+ *
+ * @returns {{lists: object[][]}|{unknown: string}|null} null when the
+ *   binding writes no type of that kind; `unknown` names a written type
+ *   whose call signatures were not read (declared outside the project,
+ *   inherited, composed)
+ */
+function bindingCallInterface(index, def) {
+    const language = def?.file ? index.languageOf(def.file) : null;
+    const rules = langTraits(language)?.bindingCallInterface;
+    if (!rules || !def.startLine) return null;
+    const { parseStructuredParams } = require('../languages/utils');
+    const trees = new Map();
+    const treeOf = file => {
+        if (!trees.has(file)) {
+            const parsed = () => {
+                try {
+                    const fileLanguage = index.languageOf(file);
+                    const content = index._readFile(file);
+                    return index._treeCache?.get(file) || sharedParsedTree(index, file, content, fileLanguage) ||
+                        safeParse(getParser(fileLanguage), content);
+                } catch (_) { return null; }
+            };
+            trees.set(file, parsed());
+        }
+        return trees.get(file);
+    };
+    // The node of one of `types` named `name` that covers `row`.
+    const declarationAt = (tree, row, name, types) => {
+        let found = null;
+        (function walk(node) {
+            if (found || node.startPosition.row > row || node.endPosition.row < row) return;
+            if (types.includes(node.type) && node.childForFieldName('name')?.text === name) { found = node; return; }
+            for (let i = 0; i < node.namedChildCount; i++) walk(node.namedChild(i));
+        })(tree.rootNode);
+        return found;
+    };
+    const tree = treeOf(def.file);
+    if (!tree) return null;
+    const holder = declarationAt(tree, def.startLine - 1, def.name, rules.holders);
+    const value = holder?.childForFieldName('value');
+    if (!holder || !value || !rules.callables.includes(value.type)) return null;
+    const annotation = holder.namedChildren.find(child => child.type === rules.annotation);
+    const written = annotation?.namedChild(0);
+    if (!written || rules.functionTypes.includes(written.type)) return null;
+
+    const unknown = { unknown: written.text };
+    const signatures = (members, file) => {
+        const lists = members.filter(member => rules.callSignatures.includes(member.type))
+            .map(member => parseStructuredParams(member.childForFieldName('parameters'), index.languageOf(file)) || []);
+        return lists.length > 0 ? { lists } : null;
+    };
+    // The project declaration a type name denotes from `file`: one the
+    // file declares, or one a file it imports the name from declares.
+    const declarationOf = (name, file) => {
+        const kinds = Object.keys(rules.declarations);
+        const named = (index.symbols.get(name) || []).filter(symbol => rules.declarationKinds.includes(symbol.type));
+        const own = named.filter(symbol => symbol.file === file);
+        let candidates = own;
+        if (own.length === 0) {
+            const entry = index.files.get(file);
+            const sources = new Set();
+            for (const binding of entry?.importBindings || []) {
+                if ((binding.alias || binding.name) !== name || binding.alias && binding.alias !== name) continue;
+                const relative = entry.moduleResolved && entry.moduleResolved[binding.module];
+                if (relative) sources.add(path.join(index.root, relative));
+            }
+            candidates = named.filter(symbol => sources.has(symbol.file));
+        }
+        if (candidates.length !== 1) return null;
+        const declarationTree = treeOf(candidates[0].file);
+        const node = declarationTree && declarationAt(declarationTree, candidates[0].startLine - 1, name, kinds);
+        return node ? { node, file: candidates[0].file } : null;
+    };
+    const read = (type, file, depth) => {
+        if (!type || depth > 4) return unknown;
+        if (rules.wrappers.includes(type.type)) return read(type.namedChild(0), file, depth);
+        if (rules.functionTypes.includes(type.type)) {
+            return { lists: [parseStructuredParams(type.childForFieldName('parameters'), index.languageOf(file)) || []] };
+        }
+        if (rules.objectTypes.includes(type.type)) return signatures(type.namedChildren, file) || unknown;
+        const nameNode = rules.genericTypes.includes(type.type) ? type.childForFieldName('name') || type.namedChild(0) : type;
+        if (!nameNode || !rules.typeNames.includes(nameNode.type)) return unknown;
+        const declaration = declarationOf(nameNode.text, file);
+        if (!declaration) return unknown;
+        const { node } = declaration;
+        const body = node.childForFieldName(rules.declarations[node.type]);
+        if (rules.objectTypes.includes(body?.type)) {
+            // Signatures a supertype declares are part of the interface too.
+            if (node.namedChildren.some(child => rules.extendsClauses.includes(child.type))) return unknown;
+            return signatures(body.namedChildren, declaration.file) || unknown;
+        }
+        return read(body, declaration.file, depth + 1);
+    };
+    return read(written, def.file, 0);
+}
+
+/**
  * Constructor parameter lists for a CLASS verify/plan target (fix #230): a
  * class def carries no paramsStructured, so `verify Task` used to arg-check
  * `new Task(id, name)` against 0..0 — a false red on every parameterized
@@ -1005,6 +1127,10 @@ function extractArrowTypesFromVarDecl(index, def) {
 function _constructorParamLists(index, def, lang) {
     if (!def || !def.file || !['class', 'struct', 'enum', 'record'].includes(def.type)) return null;
     const lists = [];
+    // The constructor a declaration's header writes (a record's canonical
+    // constructor, a primary constructor: parser `primaryParams`) is one of
+    // its constructors, beside those its body declares.
+    if (Array.isArray(def.primaryParams)) lists.push(def.primaryParams);
     const { isConstructor } = require('./constructor-calls');
     const seen = new Set();
     const append = d => {
@@ -1762,6 +1888,14 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
                 isMethodCall = true;
             }
         }
+        // What the member is read from, when it is not a name: the value of
+        // another call or of any other expression (`T::new().m(x)`,
+        // `a.b().m(x)`). A record may still spell that receiver as the type
+        // the chain starts from; the call is made on the value.
+        const receiverNode = !funcNode || !isMethodCall ? null
+            : funcNode.childForFieldName('value') || funcNode.childForFieldName('operand') ||
+                funcNode.childForFieldName('object') || callNode.childForFieldName('object');
+        const valueReceiver = !!receiverNode && !RECEIVER_NAME_NODES.has(receiverNode.type);
 
         // Feature A/B: classify the call site by structural context.
         // inLoop/inTry/inCallback come from walking up to the fn boundary.
@@ -1859,7 +1993,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             }
         }
 
-        return Object.defineProperty({
+        return Object.defineProperties({
             // Where the call is in the source: the same node, whoever reads
             // the file next (an alias, the second call on a line).
             span: { start: callNode.startIndex, end: callNode.endIndex },
@@ -1872,7 +2006,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             isMethodCall,
             ...(indirectKind && { indirectKind }),
             ...ctx,
-        }, 'argumentFacts', { value: argumentFacts });
+        }, { argumentFacts: { value: argumentFacts }, valueReceiver: { value: valueReceiver } });
     } catch (e) {
         return { args: null, argCount: 0 };
     }
@@ -2148,6 +2282,63 @@ function bindKeywordCall(params, analysis) {
  * @param {object} options - { file }
  * @returns {object} Verification results with mismatches
  */
+// Kinds whose call-shaped use is a construction: their parameter lists are
+// their constructors' (`_constructorParamLists`), none declared is none taken.
+const CONSTRUCTED_KINDS = new Set(['class', 'struct', 'enum', 'record']);
+
+/**
+ * What a call-shaped expression takes when its callee names a declaration
+ * that has no parameter list of its own (trait `calledDeclarations`):
+ *
+ *   - a declaration with positional fields (a Rust tuple struct or tuple
+ *     variant) is constructed with one value per field, counted in its
+ *     syntax;
+ *   - a type name applied to a value converts it (Go `T(x)`, a C++
+ *     functional cast to an enumeration): the values the language takes;
+ *   - anything else (a field or variable holding a callable, a type the
+ *     language gives no call form, a macro) has an interface this reader
+ *     does not know: its sites are undecided, never miscounted against an
+ *     empty list.
+ *
+ * @returns {{lists: object[][]}|{unknown: true}|null} null when the
+ *   declaration's own parameters, or its constructors', are the interface
+ */
+function calledDeclarationShape(index, def, lang) {
+    if (!def || Array.isArray(def.paramsStructured)) return null;
+    const rules = langTraits(lang)?.calledDeclarations || null;
+    const positional = (count, least = count) => ({ lists: [Array.from({ length: count },
+        (_, at) => ({ name: String(at), ...(at >= least && { optional: true }) }))] });
+    if (rules?.positionalFields) {
+        // No positional fields read: nothing here says what the name takes.
+        const count = positionalFieldCount(index, def, rules.positionalFields);
+        return count != null ? positional(count) : { unknown: true };
+    }
+    const conversion = rules?.conversions?.[def.type];
+    if (conversion) return positional(conversion[1], conversion[0]);
+    return CONSTRUCTED_KINDS.has(def.type) ? null : { unknown: true };
+}
+
+/** The positional fields a declaration writes, or null when it writes none that way. */
+function positionalFieldCount(index, def, rule) {
+    const span = def.sourceSpan;
+    if (!Number.isInteger(span?.start) || !Number.isInteger(span?.end)) return null;
+    let tree;
+    try {
+        const language = index.languageOf(def.file);
+        const content = index._readFile(def.file);
+        tree = index._treeCache?.get(def.file) || sharedParsedTree(index, def.file, content, language) ||
+            safeParse(getParser(language), content);
+    } catch (_) { return null; }
+    if (!tree) return null;
+    let node = tree.rootNode.descendantForIndex(span.start);
+    while (node && !(node.startIndex === span.start && node.endIndex === span.end)) node = node.parent;
+    const list = node?.namedChildren.find(child => child.type === rule.list);
+    if (!list) return null;
+    let count = 0;
+    for (let i = 0; i < list.childCount; i++) if (list.fieldNameForChild(i) === rule.field) count++;
+    return count;
+}
+
 function verify(index, name, options = {}, direct = null) {
     index._beginOp();
     try {
@@ -2186,7 +2377,19 @@ function verify(index, name, options = {}, direct = null) {
             .filter(member => Array.isArray(member.paramsStructured))
             .map(member => member.paramsStructured);
     }
-    const rawParamLists = ctorParamLists ||
+    // A declaration with no parameter list of its own: what the language
+    // makes of a call-shaped use of its name.
+    const declaredShape = !ctorParamLists && !callableIdentityParams?.length && !arrowTypes?.paramsStructured
+        ? calledDeclarationShape(index, def, lang) : null;
+    // A callable held by a binding with a written type is called as that
+    // type says.
+    const heldInterface = !ctorParamLists ? bindingCallInterface(index, def) : null;
+    const interfaceUnknown = heldInterface?.unknown
+        ? `${def.name} is held by a binding typed ${heldInterface.unknown}; that type is the call interface and its signatures were not read`
+        : declaredShape?.unknown === true
+            ? `${def.name} declares no parameter list (${def.type}); what a call of it takes is not read from the declaration`
+            : null;
+    const rawParamLists = heldInterface?.lists || declaredShape?.lists || ctorParamLists ||
         (callableIdentityParams?.length ? callableIdentityParams : null) ||
         [(arrowTypes?.paramsStructured) || def.paramsStructured || []];
     if (direct) direct.parameterLists = rawParamLists.map(stripSelf);
@@ -2302,6 +2505,10 @@ function verify(index, name, options = {}, direct = null) {
         }
         return record;
     };
+    // Why a site's count was not decided, as a code beside the sentence
+    // (not part of what is printed): a reader that lists reasons among
+    // other codes reads this one.
+    const coded = (record, code) => Object.defineProperty(record, 'code', { value: code, enumerable: false });
     const verifyLineSeen = new Map(); // 'file:line' -> per-line ordinal (fix #231)
     for (const call of calls) {
         const siteKey = `${call.file}:${call.line}:${call.calledAs || name}`;
@@ -2321,7 +2528,7 @@ function verify(index, name, options = {}, direct = null) {
             // Couldn't parse arguments, or the call exists only in the
             // expansion of a macro invocation on this line (fix #362): its
             // arguments are the macro's, not text on the line.
-            uncertain.push({
+            uncertain.push(coded({
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
@@ -2330,13 +2537,26 @@ function verify(index, name, options = {}, direct = null) {
                     : analysis.uncertainReason || 'Could not parse call arguments',
                 patterns: patternFlagsFrom(analysis),
                 ...carry,
-            });
+            }, call.macroExpansion ? 'macro-expanded-call'
+                : analysis.indirectKind ? 'indirect-call-arguments' : 'call-arguments-unread'));
+            continue;
+        }
+
+        if (interfaceUnknown) {
+            uncertain.push(coded({
+                file: call.relativePath,
+                line: call.line,
+                expression: call.content.trim(),
+                reason: interfaceUnknown,
+                patterns: patternFlagsFrom(analysis),
+                ...carry,
+            }, 'call-interface-unverified'));
             continue;
         }
 
         if (analysis.hasSpread) {
             // Spread args - can't verify count
-            uncertain.push({
+            uncertain.push(coded({
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
@@ -2345,7 +2565,7 @@ function verify(index, name, options = {}, direct = null) {
                     : 'Uses spread operator',
                 patterns: patternFlagsFrom(analysis),
                 ...carry,
-            });
+            }, 'argument-count-not-static'));
             continue;
         }
 
@@ -2358,8 +2578,12 @@ function verify(index, name, options = {}, direct = null) {
         // the FIRST argument — the same +1 shift the #205 arity discipline
         // already applies when confirming these sites. Without it the
         // arg-check false-flagged every confirmed method-expression call.
+        // Only a receiver that is the type's NAME passes the value as an
+        // argument: a member read from a value (`T::new().m(x)`, whose
+        // record spells the receiver as the type the chain starts from)
+        // is an ordinary method call and passes what is written.
         const targetTypeName = def.className || (def.receiver || '').replace(/^\*/, '');
-        if (targetTypeName && call.receiver === targetTypeName && argCount > 0) {
+        if (targetTypeName && call.receiver === targetTypeName && argCount > 0 && !analysis.valueReceiver) {
             const qualStyle = langTraits(lang)?.typeQualifiedCallStyle;
             if ((qualStyle === 'method-expr' && def.receiver &&
                 !call.receiverType) ||
@@ -2419,7 +2643,7 @@ function verify(index, name, options = {}, direct = null) {
         const bindingProblems = keywordBindable ? bindKeywordCall(params, analysis) : [];
         if (bindingProblems.length > 0) {
             if (decoratorReshapes) {
-                uncertain.push({
+                uncertain.push(coded({
                     file: call.relativePath,
                     line: call.line,
                     expression: call.content.trim(),
@@ -2427,7 +2651,7 @@ function verify(index, name, options = {}, direct = null) {
                         'The definition is decorated, and the decorator may reshape the call interface.',
                     patterns: patternFlagsFrom(analysis),
                     ...carry,
-                });
+                }, 'decorated-call-interface'));
             } else {
                 mismatches.push(located({
                     file: call.relativePath,

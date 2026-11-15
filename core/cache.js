@@ -1021,7 +1021,9 @@ function clearAllCaches() {
 // patches by name: pytest's `monkeypatch` and pytest-mock's `mocker`
 // fixtures, a patch target with a runtime part (`runtimeTarget` is then a
 // glob, `*.name`), a patch call on a receiver with no proven identity.
-const CACHE_FORMAT_VERSION = 337;
+// v338 (fix #506c): a Go call whose callee is a local of the enclosing
+// function carries `localShadow`, as the other languages' records do.
+const CACHE_FORMAT_VERSION = 338;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

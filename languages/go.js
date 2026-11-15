@@ -2969,6 +2969,10 @@ function findCallsInCode(code, parser, options = {}) {
                     callStart: node.startIndex,
                     callEnd: node.endIndex,
                     isMethod: false,
+                    // A local of the name (`fn := c.render(); fn(w, c)`)
+                    // is what the call invokes: the value it holds, never
+                    // a package-level function spelled the same.
+                    ...(isShadowedByLocal(funcNode, callName) && { localShadow: true }),
                     argCount,
                     ...(argSpread && { argSpread: true }),
                     ...(assigned && { assignedTo: assigned.assignedTo }),
