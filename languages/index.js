@@ -462,6 +462,13 @@ const STRUCTURAL_TRAITS = {
     // function types, call signatures and the declarations that hold them.
     // null: a binding's type is no call interface.
     bindingCallInterface: null,
+    // The names a file binds to its own module object, read from its
+    // syntax tree (CommonJS `exports`, `module.exports` and the locals
+    // written into one assignment with them): a member assigned to one is
+    // what importers of the module get under that name. null: the
+    // language has no module object to assign members to (core/callers.js
+    // `_moduleExposesName`).
+    moduleObjectNames: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -824,6 +831,7 @@ const NOMINAL_TRAITS = {
     pathEnds: null,
     calledDeclarations: null,
     bindingCallInterface: null,
+    moduleObjectNames: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -1059,6 +1067,7 @@ const LANGUAGES = {
             checkDirectiveTarget: 'next-line',
             checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
+            moduleObjectNames: tree => require('./javascript').moduleObjectNames(tree),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',
@@ -1096,6 +1105,7 @@ const LANGUAGES = {
             checkDirectiveTarget: 'next-line',
             checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
+            moduleObjectNames: tree => require('./javascript').moduleObjectNames(tree),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',
@@ -1139,6 +1149,7 @@ const LANGUAGES = {
             checkDirectiveTarget: 'next-line',
             checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
+            moduleObjectNames: tree => require('./javascript').moduleObjectNames(tree),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',

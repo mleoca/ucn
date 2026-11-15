@@ -8,6 +8,9 @@
  * name converting one value, a callee the enclosing function binds
  * locally, a module function beside members of the same name, a callable
  * whose call interface is the written type of the binding that holds it.
+ * And what a namespace-qualified call reaches (fix #506d): the module's
+ * own exported binding of the name, never a function the module assigns
+ * to a member of some other value.
  * `expect` is the toolchain's verdict (eval/run-check-matrix.js);
  * `answer` and `detail` are the check's.
  */
@@ -1184,5 +1187,43 @@ module.exports = [
         "expect": "break",
         "answer": "BLOCKED",
         "detail": "origin:modified=blocked(outgoing-signature-mismatch)"
+    },
+    {
+        "id": "callshape-ts-member-assigned-beside-namespace-export",
+        "lang": "ts",
+        "base": {
+            "core/parse.ts": "function makeParse() {\n  return (schema: unknown, data: unknown, params?: unknown, options?: unknown) => data;\n}\n\nexport const parse = makeParse();\n",
+            "core/schemas.ts": "export interface Internals {\n  parse: (payload: unknown, ctx: unknown) => unknown;\n}\n\nexport function init(inst: { _zod: Internals }): void {\n  inst._zod.parse = (payload, _ctx) => {\n    return payload;\n  };\n}\n\nexport function runOne(inst: { _zod: Internals }): unknown {\n  return inst._zod.parse(1, {});\n}\n",
+            "core/index.ts": "export * from \"./parse\";\nexport * from \"./schemas\";\n",
+            "mini/parse.ts": "export { parse } from \"../core/index\";\n",
+            "mini/schemas.ts": "import * as parse from \"./parse\";\n\nexport function run(data: unknown): unknown {\n  return parse.parse(null, data, undefined, { callee: run });\n}\n",
+            "app.ts": "import * as z from \"./core/index\";\n\nexport const value = z.parse(1, 2);\n"
+        },
+        "after": {
+            "core/schemas.ts": "export interface Internals {\n  parse: (payload: unknown, ctx: unknown) => unknown;\n}\n\nexport function init(inst: { _zod: Internals }): void {\n  inst._zod.parse = (payload) => {\n    return payload;\n  };\n}\n\nexport function runOne(inst: { _zod: Internals }): unknown {\n  return inst._zod.parse(1, {});\n}\n"
+        },
+        "name": "parse",
+        "expect": "clean",
+        "answer": "REVIEW_REQUIRED",
+        "detail": "parse:modified=review(header)"
+    },
+    {
+        "id": "callshape-ts-member-assigned-own-receiver-wrong-count",
+        "lang": "ts",
+        "base": {
+            "core/parse.ts": "function makeParse() {\n  return (schema: unknown, data: unknown, params?: unknown, options?: unknown) => data;\n}\n\nexport const parse = makeParse();\n",
+            "core/schemas.ts": "export interface Internals {\n  parse: (payload: unknown, ctx: unknown) => unknown;\n}\n\nexport function init(inst: { _zod: Internals }): void {\n  inst._zod.parse = (payload, _ctx) => {\n    return payload;\n  };\n}\n\nexport function runOne(inst: { _zod: Internals }): unknown {\n  return inst._zod.parse(1, {});\n}\n",
+            "core/index.ts": "export * from \"./parse\";\nexport * from \"./schemas\";\n",
+            "mini/parse.ts": "export { parse } from \"../core/index\";\n",
+            "mini/schemas.ts": "import * as parse from \"./parse\";\n\nexport function run(data: unknown): unknown {\n  return parse.parse(null, data, undefined, { callee: run });\n}\n",
+            "app.ts": "import * as z from \"./core/index\";\n\nexport const value = z.parse(1, 2);\n"
+        },
+        "after": {
+            "core/schemas.ts": "export interface Internals {\n  parse: (payload: unknown, ctx: unknown, extra: unknown) => unknown;\n}\n\nexport function init(inst: { _zod: Internals }): void {\n  inst._zod.parse = (payload, _ctx, _extra) => {\n    return payload;\n  };\n}\n\nexport function runOne(inst: { _zod: Internals }): unknown {\n  return inst._zod.parse(1, {});\n}\n"
+        },
+        "name": "parse",
+        "expect": "break",
+        "answer": "REVIEW_REQUIRED",
+        "detail": "parse:modified=review(header) Internals:modified=review(declaration-change) parse:modified=review(value-change)"
     }
 ];

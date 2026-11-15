@@ -5328,6 +5328,14 @@ function findCallers(index, name, options = {}) {
                                 routeUnverified(filePath, fileEntry, call, 'import-unresolved', calledAs);
                                 continue;
                             }
+                            // That file is evidence only for a name it can
+                            // expose (fix #506d): a callable it assigns to
+                            // a member of some other value is not what the
+                            // import binds.
+                            if (![...tFiles].some(file => _moduleExposesName(index, file, name))) {
+                                routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
+                                continue;
+                            }
                             nameImportFiles = ownResolved;
                         }
                     }
@@ -5676,9 +5684,14 @@ function findCallers(index, name, options = {}) {
                                 undetermined = true;
                                 continue;
                             }
+                            // File-level reach stands in for the name only
+                            // at a file that can expose it (fix #506d):
+                            // `lib.render()` is no call of a `render` the
+                            // module assigns to some other object.
                             if (verdict === 'yes' ||
                                 (verdict === 'unknown' && !ambiguousCjsMember &&
-                                 _importReaches(index, resolvedAbs, tFiles))) {
+                                 _importReaches(index, resolvedAbs, new Set([...tFiles].filter(
+                                     file => _moduleExposesName(index, file, name)))))) {
                                 reaches = true; break;
                             }
                             if (verdict === 'no') definitiveOtherBindings++;
@@ -15059,6 +15072,68 @@ function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
  * cannot fool a 'no' (a rename changes the exposed attribute name; re-renames
  * back to the original route through records this chase follows or flags).
  */
+/**
+ * Can `file` expose a definition of its own under `name` (fix #506d)? What
+ * a module exposes by name is one of its own top-level bindings. A callable
+ * assigned to a member of the module object is one (`exports.parse = ..`,
+ * `module.exports.parse = ..`, a member of the literal `module.exports` is
+ * assigned, `app.init = ..` where `app` is the module object); a callable
+ * assigned to a member of any other value is not (`inst._zod.parse = ..`,
+ * `obj.handler = ..`, `this.cb = ..`): no export chain and no namespace
+ * receiver of the module reaches it, whatever the file is.
+ *
+ * Only a file whose definitions of the name are ALL such member assignments
+ * is refused: any other definition of the name keeps the chase's file-level
+ * answer (it cannot tell two definitions of one file apart).
+ */
+function _moduleExposesName(index, file, name) {
+    // Asked per site of a name: one answer per file and name for the life
+    // of the index.
+    const cache = index._nameBindingReachCache;
+    const key = `exposes\x00${file}\x00${name}`;
+    if (cache?.has(key)) return cache.get(key);
+    const answer = _moduleExposesOwnName(index, file, name);
+    if (cache) cache.set(key, answer);
+    return answer;
+}
+
+function _moduleExposesOwnName(index, file, name) {
+    const fileEntry = index.files.get(file);
+    const own = (index.symbols.get(name) || []).filter(definition => definition.file === file);
+    const members = own.filter(definition => definition.memberAssigned && !definition.className);
+    if (members.length === 0) return true;
+    // A member of a declared type is reached through that type, like the
+    // member assignments: neither is a name of the module.
+    const named = own.filter(definition => !definition.memberAssigned && !definition.className && !definition.receiver);
+    if (named.length > 0) return true;
+    const records = (fileEntry?.exportDetails || []).filter(record => !record.source &&
+        (record.type === 'exports' || record.type === 'module.exports'));
+    let moduleNames = null;
+    const moduleObjectNames = () => {
+        if (moduleNames) return moduleNames;
+        moduleNames = new Set();
+        const read = langTraits(fileEntry?.language)?.moduleObjectNames;
+        if (typeof read !== 'function') return moduleNames;
+        try {
+            const content = index._readFile(file);
+            const tree = index._getParsedTree?.(file, content, fileEntry.language);
+            if (tree) moduleNames = read(tree);
+        } catch (_) { moduleNames = new Set(); }
+        return moduleNames;
+    };
+    const exposed = members.some(definition => {
+        // The export record of the assignment itself, or of the literal
+        // the member is written in.
+        const lines = [definition.startLine, definition.objectLiteralLine].filter(Number.isInteger);
+        if (records.some(record => (record.localName || record.name) === name && lines.includes(record.line))) return true;
+        // A member of a name the file binds to its module object.
+        return !!definition.assignedReceiver && (
+            records.some(record => record.defaultLike && record.localName === definition.assignedReceiver) ||
+            moduleObjectNames().has(definition.assignedReceiver));
+    });
+    return exposed;
+}
+
 function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, options = {}) {
     // The same export path is asked once per competing definition and again
     // by caller/callee projections in a composed command. The graph and file
@@ -15104,7 +15179,11 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
     for (let d = 0; d <= maxDepth && frontier.length > 0; d++) {
         const next = [];
         for (const [abs, attr, viaAlternative] of frontier) {
-            if (targetFiles.has(abs) && (!targetName || attr === targetName)) {
+            // A target file is reached under a name the file itself
+            // exposes. One whose only definitions of the name are members
+            // assigned to some other value is walked like any other file.
+            if (targetFiles.has(abs) && (!targetName || attr === targetName) &&
+                _moduleExposesName(index, abs, attr)) {
                 if (!viaAlternative || !options.configurationVerdict) return finish('yes');
                 alternativeReach = true;
                 continue;

@@ -492,3 +492,36 @@ describe('fix #506c: what a call-shaped expression is counted against', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #506d: a changed member-assigned function is not checked against calls of a module export', () => {
+    const shapes = require('../eval/check-call-shape-cases');
+    const itemsOf = id => {
+        const fixture = shapes.find(testCase => testCase.id === `callshape-${id}`);
+        assert.ok(fixture, id);
+        const dir = tmp(fixture.base);
+        try {
+            git(dir, 'init', '-q'); git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'base');
+            write(dir, fixture.after);
+            const result = check(dir);
+            return { status: result.trust.status, items: result.changed.filter(item => item.name === fixture.name) };
+        } finally { rm(dir); }
+    };
+
+    it('namespace calls of the exported constant are not its call sites', () => {
+        const { status, items } = itemsOf('ts-member-assigned-beside-namespace-export');
+        assert.strictEqual(status, 'REVIEW_REQUIRED');
+        assert.ok(items.length > 0);
+        for (const item of items) {
+            assert.notStrictEqual(item.verdict, 'blocked', JSON.stringify(item.reasons));
+            assert.strictEqual(item.signatureMismatches || 0, 0);
+            assert.deepStrictEqual(item.mismatches || [], []);
+            assert.ok(!(item.reasons || []).includes('signature-mismatch'));
+        }
+    });
+
+    it('a wrong count through the member\'s own receiver is review: its receiver is not established, and no other call is blamed', () => {
+        const { status, items } = itemsOf('ts-member-assigned-own-receiver-wrong-count');
+        assert.strictEqual(status, 'REVIEW_REQUIRED');
+        for (const item of items) assert.deepStrictEqual(item.mismatches || [], []);
+    });
+});

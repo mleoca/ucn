@@ -7370,7 +7370,64 @@ function typedLiteralMembers(root, line) {
     return { names, open };
 }
 
+/**
+ * The names a file binds to its own module object (CommonJS): `exports`,
+ * and every local written into one assignment with `module.exports` or
+ * `exports` at module level (`var app = exports = module.exports = {}`,
+ * `var proto = module.exports = function () {}`, `module.exports = res`,
+ * `const api = module.exports`). A member assigned to one of them is a
+ * member of the module object: what `require()` of the file hands out
+ * under that name. A local of any other value is not.
+ *
+ * @param {object} tree - the file's syntax tree
+ * @returns {Set<string>}
+ */
+function moduleObjectNames(tree) {
+    const names = new Set(['exports']);
+    const isModuleObject = node => !!node && ((node.type === 'identifier' && node.text === 'exports') ||
+        (node.type === 'member_expression' && node.childForFieldName('object')?.text === 'module' &&
+            node.childForFieldName('property')?.text === 'exports'));
+    const unwrap = node => {
+        let current = node;
+        while (current && (current.type === 'parenthesized_expression' || current.type === 'as_expression' ||
+            current.type === 'non_null_expression' || current.type === 'satisfies_expression')) {
+            current = current.namedChild(0);
+        }
+        return current;
+    };
+    // The operands of one assignment: every left side, and the value the
+    // chain ends with.
+    const chain = (first, value) => {
+        const operands = first ? [first] : [];
+        let current = unwrap(value);
+        while (current && current.type === 'assignment_expression') {
+            operands.push(unwrap(current.childForFieldName('left')));
+            current = unwrap(current.childForFieldName('right'));
+        }
+        if (current) operands.push(current);
+        if (!operands.some(isModuleObject)) return;
+        for (const operand of operands) if (operand?.type === 'identifier') names.add(operand.text);
+    };
+    for (const statement of tree.rootNode.namedChildren) {
+        const declaration = statement.type === 'export_statement'
+            ? statement.childForFieldName('declaration') : statement;
+        if (!declaration) continue;
+        if (declaration.type === 'expression_statement') {
+            const expression = unwrap(declaration.namedChild(0));
+            if (expression?.type === 'assignment_expression') chain(null, expression);
+        } else if (declaration.type === 'variable_declaration' || declaration.type === 'lexical_declaration') {
+            for (const declarator of declaration.namedChildren) {
+                if (declarator.type !== 'variable_declarator') continue;
+                const name = declarator.childForFieldName('name');
+                if (name?.type === 'identifier') chain(name, declarator.childForFieldName('value'));
+            }
+        }
+    }
+    return names;
+}
+
 module.exports = {
+    moduleObjectNames,
     classHasNominalMember,
     classMemberRole,
     typedLiteralMembers,

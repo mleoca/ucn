@@ -13218,3 +13218,108 @@ describe('fix #434: JS/TS own-class constructions, non-source imports, wrapped a
         } finally { rm(dir); }
     });
 });
+
+describe('fix #506d: a module exposes its own top-level bindings, never a member of another value', () => {
+    // Confirmed and unverified call sites of one definition, as `file:line` and `file:line reason`.
+    const sitesOf = (index, name, file, line) => {
+        const definition = (index.symbols.get(name) || []).find(symbol =>
+            symbol.relativePath === file && symbol.startLine === line);
+        assert.ok(definition, `${name} @ ${file}:${line}`);
+        const result = execute(index, 'impact', { name: `${file}:${line}:${name}`, all: true });
+        assert.ok(result.ok, JSON.stringify(result));
+        const confirmed = [];
+        for (const group of result.result.byFile || []) for (const site of group.sites) confirmed.push(`${site.file}:${site.line}`);
+        const unverified = (result.result.unverifiedSites || []).map(site => `${site.file}:${site.line} ${site.reason}`);
+        const account = result.result.account;
+        assert.strictEqual(account.conserved, true, JSON.stringify(account));
+        assert.strictEqual(account.unaccounted, 0);
+        return { confirmed: confirmed.sort(), unverified: unverified.sort(), account };
+    };
+    const ESM = {
+        'tsconfig.json': '{"compilerOptions":{"strict":true,"module":"esnext","target":"es2020"}}',
+        'core/parse.ts': 'function makeParse() {\n  return (schema: unknown, data: unknown, params?: unknown, options?: unknown) => data;\n}\n\nexport const parse = makeParse();\n',
+        'core/schemas.ts': 'export interface Internals {\n  parse: (payload: unknown, ctx: unknown) => unknown;\n}\n\n' +
+            'export function init(inst: { _zod: Internals }): void {\n  inst._zod.parse = (payload, _ctx) => {\n    return payload;\n  };\n}\n\n' +
+            'export function runOne(inst: { _zod: Internals }): unknown {\n  return inst._zod.parse(1, {});\n}\n',
+        'core/index.ts': 'export * from "./parse";\nexport * from "./schemas";\n',
+        'mini/parse.ts': 'export { parse } from "../core/index";\n',
+        'mini/schemas.ts': 'import * as parse from "./parse";\n\nexport function run(data: unknown): unknown {\n  return parse.parse(null, data, undefined, { callee: run });\n}\n',
+        'app.ts': 'import * as z from "./core/index";\nimport { parse } from "./core/index";\n\nexport const value = z.parse(1, 2);\nexport const other = parse(3, 4);\n',
+    };
+
+    it('a namespace receiver and an imported name reach the exported constant, not the member-assigned function', () => {
+        const dir = tmp(ESM);
+        try {
+            const index = idx(dir);
+            const member = sitesOf(index, 'parse', 'core/schemas.ts', 6);
+            assert.deepStrictEqual(member.confirmed, []);
+            // The member's own call keeps its tier.
+            assert.deepStrictEqual(member.unverified, ['core/schemas.ts:12 method-ambiguous']);
+            assert.strictEqual(member.account.excluded.byReason['other-definition-import'].count, 3);
+            const constant = sitesOf(index, 'parse', 'core/parse.ts', 5);
+            assert.deepStrictEqual(constant.confirmed, ['app.ts:4', 'app.ts:5', 'mini/schemas.ts:4']);
+        } finally { rm(dir); }
+    });
+
+    it('a member of an exported object literal or of a local object is not a name of the module', () => {
+        const dir = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+            'lib.ts': 'export const api = { parse(a: number) { return a; } };\nconst holder: { go?: (a: number) => number } = {};\nholder.go = (a) => a;\nexport function top(a: number) { return a; }\n',
+            'use.ts': 'import * as ns from "./lib";\nexport const a = (ns as any).parse(1);\nexport const b = (ns as any).go(1);\nexport const c = ns.top(1);\nexport const d = ns.api.parse(1);\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'go', 'lib.ts', 3).confirmed, []);
+            assert.ok(!sitesOf(index, 'parse', 'lib.ts', 1).confirmed.includes('use.ts:2'));
+            assert.deepStrictEqual(sitesOf(index, 'top', 'lib.ts', 4).confirmed, ['use.ts:4']);
+        } finally { rm(dir); }
+    });
+
+    it('CommonJS: members of the module object are exposed, members of any other value are not', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'lib.js': 'exports.parse = function (a, b) { return a; };\nmodule.exports.format = function (a) { return a; };\n' +
+                'const proto = {};\nproto.render = function (a) { return a; };\n' +
+                'function init(inst) {\n    inst._zod.check = (payload, ctx) => payload;\n    inst.handler = function (x) { return x; };\n}\nexports.init = init;\n',
+            'obj.js': 'module.exports = {\n    run(a) { return a; },\n    stop: function (a) { return a; },\n};\n',
+            'application.js': 'var app = exports = module.exports = {};\napp.init = function init() { return 1; };\n',
+            'response.js': 'var res = Object.create(null);\nmodule.exports = res;\nres.status = function status(code) { return this; };\nres.send =\n  function send(body) { return this; };\n',
+            'router.js': 'var proto = module.exports = function (options) { return options; };\nproto.param = function param(name, fn) { return this; };\n',
+            'app.js': "const lib = require('./lib');\nconst obj = require('./obj');\nconst application = require('./application');\nconst res = require('./response');\nconst router = require('./router');\n" +
+                'lib.parse(1, 2);\nlib.format(1);\nlib.render(1);\nlib.check(1, 2);\nlib.handler(1);\nobj.run(1);\nobj.stop(1);\n' +
+                "application.init();\nres.status(200);\nres.send('x');\nrouter.param('a', null);\n" +
+                "const { render, parse } = require('./lib');\nrender(2);\nparse(3, 4);\n",
+        });
+        try {
+            const index = idx(dir);
+            const exposed = [['parse', 'lib.js', 1, ['app.js:19', 'app.js:6']], ['format', 'lib.js', 2, ['app.js:7']],
+                ['run', 'obj.js', 2, ['app.js:11']], ['stop', 'obj.js', 3, ['app.js:12']], ['init', 'application.js', 2, ['app.js:13']],
+                ['status', 'response.js', 3, ['app.js:14']], ['send', 'response.js', 4, ['app.js:15']], ['param', 'router.js', 2, ['app.js:16']]];
+            for (const [name, file, line, sites] of exposed) {
+                assert.deepStrictEqual(sitesOf(index, name, file, line).confirmed, sites, `${name} ${file}`);
+            }
+            // Never confirmed; visible with the reason the route gives.
+            const render = sitesOf(index, 'render', 'lib.js', 4);
+            assert.deepStrictEqual(render.confirmed, []);
+            assert.deepStrictEqual(render.unverified, ['app.js:18 ambiguous-binding', 'app.js:8 no-import-link']);
+            for (const [name, line, site] of [['check', 6, 'app.js:9'], ['handler', 7, 'app.js:10']]) {
+                const answer = sitesOf(index, name, 'lib.js', line);
+                assert.deepStrictEqual(answer.confirmed, [], name);
+                assert.deepStrictEqual(answer.unverified, [`${site} no-import-link`], name);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('the names a file binds to its module object are read from its syntax', () => {
+        const { getParser, langTraits } = require('../languages');
+        const names = source => [...langTraits('javascript').moduleObjectNames(getParser('javascript').parse(source))].sort();
+        assert.deepStrictEqual(names('var app = exports = module.exports = {};\n'), ['app', 'exports']);
+        assert.deepStrictEqual(names('var proto = module.exports = function () {};\nvar res = make();\nmodule.exports = res;\nconst api = module.exports;\n'),
+            ['api', 'exports', 'proto', 'res']);
+        // A local of another value, and a binding inside a function, are not the module object.
+        assert.deepStrictEqual(names('const other = {};\nfunction f() { var inner = module.exports; }\nmodule.exports.x = other;\n'), ['exports']);
+        for (const language of ['python', 'go', 'rust', 'java', 'csharp', 'c', 'cpp']) {
+            assert.strictEqual(langTraits(language).moduleObjectNames, null, language);
+        }
+    });
+});
