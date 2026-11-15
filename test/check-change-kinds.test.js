@@ -1491,6 +1491,208 @@ describe('check: an addition is inert only when nothing that existed can reach i
     }
 });
 
+describe('fix #506b: where the paths of a body end', () => {
+    const lines = (...rows) => rows.join('\n') + '\n';
+    const span = text => [1, text.split('\n').length - 1];
+    // What moved between two bodies of one callable: null, or the words.
+    const moved = (language, before, after, symbol = {}) => {
+        const contract = text => callableContract(parseRevision(text, language), language,
+            { startLine: span(text)[0], endLine: span(text)[1], ...symbol });
+        return classifyChange(contract(before), contract(after), language).pathEndsMoved;
+    };
+    const gone = (...words) => ({ removed: words, added: [] });
+
+    // [label, language, before, after, expected]
+    const CASES = [
+        ['py: a raise replaced by a statement', 'python',
+            lines('def f(k) -> int:', '    if k:', '        return 1', '    raise ValueError(k)'),
+            lines('def f(k) -> int:', '    if k:', '        return 1', '    print(k)'), gone('return or throw')],
+        ['py: what is raised, and what a return returns, move no end', 'python',
+            lines('def f(k) -> int:', '    if k:', '        return 1', '    raise ValueError(k)'),
+            lines('def f(k) -> int:', '    if k:', '        return 2', '    raise KeyError(k)'), null],
+        ['py: a return turned into a raise still ends the path', 'python',
+            lines('def f(k) -> int:', '    if k:', '        return 1', '    return 2'),
+            lines('def f(k) -> int:', '    if k:', '        return 1', '    raise ValueError(k)'), null],
+        ['py: a call of something not read may never return', 'python',
+            lines('def f(k) -> int:', '    if k:', '        stop(k)', '    return 1'),
+            lines('def f(k) -> int:', '    if k:', '        print(k)', '    return 1'), gone('call of stop')],
+        ['py: such a call replaced by a statement that ends the path for certain', 'python',
+            lines('def f(k) -> int:', '    if k:', '        stop(k)', '    return 1'),
+            lines('def f(k) -> int:', '    if k:', '        raise ValueError(k)', '    return 1'), null],
+        ['py: a raise replaced by a call that may return', 'python',
+            lines('def f(k) -> int:', '    if k:', '        raise ValueError(k)', '    return 1'),
+            lines('def f(k) -> int:', '    if k:', '        stop(k)', '    return 1'), gone('return or throw')],
+        ['py: what a bare call is passed moves nothing', 'python',
+            lines('def f(k) -> int:', '    stop(k)', '    return 1'),
+            lines('def f(k) -> int:', '    stop(k, 2)', '    return 1'), null],
+        ['py: a builtin that returns is no end', 'python',
+            lines('def f(k) -> int:', '    print(k)', '    return 1'),
+            lines('def f(k) -> int:', '    return 1'), null],
+        ['py: an added end moves nothing', 'python',
+            lines('def f(k) -> int:', '    return 1'),
+            lines('def f(k) -> int:', '    if k:', '        raise ValueError(k)', '    stop(k)', '    return 1'), null],
+        ['py: the condition an end stands under is not where it stands', 'python',
+            lines('def f(k, j) -> int:', '    if k:', '        return 1', '    return 2'),
+            lines('def f(k, j) -> int:', '    if j:', '        return 1', '    return 2'), null],
+        ['py: an end moved to the other branch', 'python',
+            lines('def f(k) -> int:', '    if k:', '        return 1', '    else:', '        print(k)', '    return 2'),
+            lines('def f(k) -> int:', '    if k:', '        print(k)', '    else:', '        return 1', '    return 2'), gone('return or throw')],
+        ['py: an end wrapped in a handler', 'python',
+            lines('def f(k) -> int:', '    return 1'),
+            lines('def f(k) -> int:', '    try:', '        return 1', '    except ValueError:', '        pass'), gone('return or throw')],
+        ['py: an assertion removed', 'python',
+            lines('def f(k) -> int:', '    assert k is not None', '    return k'),
+            lines('def f(k) -> int:', '    return k'), gone('assert')],
+        ['py: what an assertion tests is not where a path ends', 'python',
+            lines('def f(k, j) -> int:', '    assert k is not None', '    return k'),
+            lines('def f(k, j) -> int:', '    assert j is not None', '    return k'), null],
+        ['py: a break added under an endless loop opens the code after it', 'python',
+            lines('def f(k) -> int:', '    while True:', '        if k:', '            return 1'),
+            lines('def f(k) -> int:', '    while True:', '        if k:', '            return 1', '        break'),
+            { removed: [], added: ['break'] }],
+        ['py: a break added under a loop with a condition', 'python',
+            lines('def f(k) -> int:', '    while k:', '        k -= 1', '    return 1'),
+            lines('def f(k) -> int:', '    while k:', '        k -= 1', '        break', '    return 1'), null],
+        ['py: an endless loop given a condition', 'python',
+            lines('def f(k) -> int:', '    while True:', '        if k:', '            return 1'),
+            lines('def f(k) -> int:', '    while k:', '        if k:', '            return 1'), gone('endless loop')],
+        ['py: a manager replaced around an end', 'python',
+            lines('def f(k) -> int:', '    with open(k) as h:', '        return 1'),
+            lines('def f(k) -> int:', '    with suppress(E):', '        return 1'), gone('return or throw')],
+        ['py: what a manager is called with', 'python',
+            lines('def f(k) -> int:', '    with open(k) as h:', '        return 1'),
+            lines('def f(k) -> int:', '    with open(k, "r") as h:', '        return 1'), null],
+        ['py: an end inside a closure is the closure\'s', 'python',
+            lines('def f(k) -> int:', '    def g():', '        raise ValueError(k)', '    return 1'),
+            lines('def f(k) -> int:', '    def g():', '        print(k)', '    return 1'), null],
+        // The last thing a callable runs, under a result written as the unit type.
+        ['py: the last statement of a callable written to return None', 'python',
+            lines('def f(k) -> None:', '    print(k)', '    stop(k)'),
+            lines('def f(k) -> None:', '    print(k)'), null],
+        ['py: the same end with a statement after it', 'python',
+            lines('def f(k) -> None:', '    if k is None:', '        stop(k)', '    print(k + 1)'),
+            lines('def f(k) -> None:', '    if k is None:', '        print(k)', '    print(k + 1)'), gone('call of stop')],
+        ['py: the same end at the end of a loop body', 'python',
+            lines('def f(k) -> None:', '    for item in k:', '        stop(item)'),
+            lines('def f(k) -> None:', '    for item in k:', '        print(item)'), gone('call of stop')],
+        ['py: the last statement with no result written: the result is read from the body', 'python',
+            lines('def f(k):', '    print(k)', '    stop(k)'),
+            lines('def f(k):', '    print(k)'), gone('call of stop')],
+        ['ts: the last statement of a void function', 'typescript',
+            lines('function f(k: string): void {', '    console.log(k);', '    halt(k);', '}'),
+            lines('function f(k: string): void {', '    console.log(k);', '}'), null],
+        ['ts: the same call with a statement after it', 'typescript',
+            lines('function f(k: string): void {', '    halt(k);', '    console.log(k);', '}'),
+            lines('function f(k: string): void {', '    console.log(k);', '}'), gone('call of halt')],
+        ['ts: a constructor answers for the members it assigns', 'typescript',
+            lines('class Box {', '    constructor(k: string) {', '        halt(k);', '    }', '}'),
+            lines('class Box {', '    constructor(k: string) {', '    }', '}'), gone('call of halt')],
+        ['ts: a throw replaced under a condition', 'typescript',
+            lines('function f(k: string | null): string {', '    if (k === null) {', '        throw new Error();', '    }', '    return k;', '}'),
+            lines('function f(k: string | null): string {', '    if (k === null) {', '        console.log(k);', '    }', '    return k;', '}'),
+            gone('return or throw')],
+        ['ts: a member of a namespace whose members return', 'typescript',
+            lines('function f(k: string): number {', '    console.log(k);', '    return 1;', '}'),
+            lines('function f(k: string): number {', '    return 1;', '}'), null],
+        // Go: `panic` alone ends a path, and vet rejects code after an end.
+        ['go: panic removed', 'go',
+            lines('func f(k string) int {', '\tif k == "a" {', '\t\treturn 1', '\t}', '\tpanic(k)', '}'),
+            lines('func f(k string) int {', '\tif k == "a" {', '\t\treturn 1', '\t}', '}'), gone('return or throw')],
+        ['go: any other call is no end', 'go',
+            lines('func f(k string) int {', '\tos.Exit(1)', '\treturn 1', '}'),
+            lines('func f(k string) int {', '\treturn 1', '}'), null],
+        ['go: an end added before a statement of its block', 'go',
+            lines('func f(k string) int {', '\twarn()', '\treturn 1', '}'),
+            lines('func f(k string) int {', '\tpanic(k)', '\twarn()', '\treturn 1', '}'), { removed: [], added: ['return or throw'] }],
+        ['go: an end added as the last statement of a branch', 'go',
+            lines('func f(k string) int {', '\twarn()', '\treturn 1', '}'),
+            lines('func f(k string) int {', '\tif k == "a" {', '\t\treturn 0', '\t}', '\twarn()', '\treturn 1', '}'), null],
+        ['go: the last statement of a function with no result', 'go',
+            lines('func f(k string) {', '\twarn()', '\tpanic(k)', '}'),
+            lines('func f(k string) {', '\twarn()', '}'), null],
+        // Rust: a macro is not read; a block ends in its last expression.
+        ['rust: a diverging macro replaced', 'rust',
+            lines('fn f(k: &str) -> i32 {', '    if k == "a" {', '        return 1;', '    }', '    panic!("no");', '}'),
+            lines('fn f(k: &str) -> i32 {', '    if k == "a" {', '        return 1;', '    }', '    println!("no");', '}'),
+            gone('return or throw')],
+        ['rust: one diverging macro for another', 'rust',
+            lines('fn f(k: &str) -> i32 {', '    panic!("no");', '}'),
+            lines('fn f(k: &str) -> i32 {', '    unreachable!("no");', '}'), null],
+        ['rust: a macro the language does not define may diverge', 'rust',
+            lines('fn f(k: &str) -> i32 {', '    bail!("no");', '    1', '}'),
+            lines('fn f(k: &str) -> i32 {', '    1', '}'), gone('call of bail!')],
+        ['rust: the value a body ends with', 'rust',
+            lines('fn f(k: &str) -> i32 {', '    warn();', '    1', '}'),
+            lines('fn f(k: &str) -> i32 {', '    warn();', '}'), gone('return or throw')],
+        ['rust: the last statement of a function with no result', 'rust',
+            lines('fn f(k: &str) {', '    warn();', '    panic!("no");', '}'),
+            lines('fn f(k: &str) {', '    warn();', '}'), null],
+        // Java: no call ends a path; a statement after an end is an error.
+        ['java: a throw replaced', 'java',
+            lines('class A { int f(String k) {', '    if (k == null) {', '        return 1;', '    }', '    throw new IllegalStateException();', '} }'),
+            lines('class A { int f(String k) {', '    if (k == null) {', '        return 1;', '    }', '    k = "b";', '} }'),
+            gone('return or throw')],
+        ['java: a call is no end', 'java',
+            lines('class A { int f(String k) {', '    System.exit(1);', '    return 1;', '} }'),
+            lines('class A { int f(String k) {', '    return 1;', '} }'), null],
+        ['java: the other branch', 'java',
+            lines('class A { int f(String k) {', '    if (k == null) {', '        return 1;', '    } else {', '        k = "a";', '    }', '    return 2;', '} }'),
+            lines('class A { int f(String k) {', '    if (k == null) {', '        k = "a";', '    } else {', '        return 1;', '    }', '    return 2;', '} }'),
+            gone('return or throw')],
+        // No toolchain to hold the body to its paths.
+        ['c++: the compiler warns and accepts', 'cpp',
+            lines('int f(int k) {', '    if (k) {', '        return 1;', '    }', '    throw 1;', '}'),
+            lines('int f(int k) {', '    if (k) {', '        return 1;', '    }', '    k = 2;', '}'), null],
+        ['js: no checker', 'javascript',
+            lines('function f(k) {', '    if (k) {', '        return 1;', '    }', '    throw new Error();', '}'),
+            lines('function f(k) {', '    if (k) {', '        return 1;', '    }', '    k = 2;', '}'), null],
+    ];
+    for (const [label, language, before, after, expected] of CASES) {
+        it(label, () => assert.deepStrictEqual(moved(language, before, after), expected));
+    }
+
+    it('says what moved on the item and in its action line, whoever depends on the callable', () => {
+        const base = { 'lib.py': lines('from typing import NoReturn', '', '',
+            'def fail() -> NoReturn:', '    raise ValueError("no")', '', '',
+            'def warn() -> None:', '    print("warn")', '', '',
+            'def pick(key: str) -> int:', '    if key == "a":', '        return 1', '    fail()', '', '',
+            'def show(value):', '    if value is None:', '        fail()', '    print(value + 1)') };
+        const dir = repo(base);
+        try {
+            edit(dir, 'lib.py', '        return 1\n    fail()\n', '        return 1\n    warn()\n');
+            edit(dir, 'lib.py', '    if value is None:\n        fail()\n', '    if value is None:\n        pass\n');
+            const result = checked(dir);
+            // Nothing calls either function: no absence of dependents settles a body.
+            assert.deepStrictEqual(verdicts(result),
+                ['pick:modified=review(path-end-changed)', 'show:modified=review(path-end-changed)']);
+            const pick = result.changed.find(item => item.name === 'pick');
+            assert.strictEqual(pick.change, 'inert');
+            assert.deepStrictEqual(pick.pathEnds, { removed: ['return or throw'], added: [] });
+            assert.strictEqual(pick.outgoingReview, undefined, 'the call that replaced it is a settled call');
+            const messages = result.actions.filter(action => action.kind === 'body_change').map(action => action.message);
+            assert.strictEqual(messages.length, 2);
+            assert.match(messages[0], /^pick: where a path through its body ends changed .*\(removed or replaced: return or throw\)$/);
+            const text = output.formatCheck(result);
+            assert.match(text, /^ {2}pick \(lib\.py:12\) \[MODIFIED, path-end-changed\]/m);
+            assert.match(text, /^ {2}⚠ pick: where a path through its body ends changed/m);
+            assert.doesNotMatch(text, /pick: [^\n]*review its \d+ caller/);
+        } finally { rm(dir); }
+    });
+
+    it('a call written to return a never type is an end for certain, by what the name means in its file', () => {
+        const never = lines('from typing import NoReturn', '', '', 'def fail() -> NoReturn:', '    raise ValueError("no")', '', '',
+            'def pick(key: str) -> int:', '    if key == "a":', '        return 1', '    raise ValueError(key)');
+        const own = never.replace('from typing import NoReturn', 'class NoReturn:\n    pass');
+        for (const [source, expected] of [[never, ['pick:modified=ready']], [own, ['pick:modified=review(path-end-changed)']]]) {
+            const dir = repo({ 'lib.py': source });
+            try {
+                edit(dir, 'lib.py', '    raise ValueError(key)\n', '    fail()\n');
+                assert.deepStrictEqual(verdicts(checked(dir)).filter(row => row.startsWith('pick:')), expected);
+            } finally { rm(dir); }
+        }
+    });
+});
+
 describe('fix #506: what a decorator registers, and which reflection reaches an addition', () => {
     const BASE = { 'app.py': 'def existing(level, label):\n    return level, label\n\n\nclass Old:\n    amount = 1\n',
         'tests/test_app.py': 'from app import existing\n\n\ndef test_existing():\n    assert existing(1, 2)\n' };

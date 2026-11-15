@@ -25,7 +25,7 @@ const symbolKey = (file, line) => entrypoints().symbolKey(file, line);
 const { getLanguageAdapter } = require('../languages');
 const { parseOpenCallShape } = require('../languages/rust-value-flow');
 const { projectComputedDispatch, declarationSnapshots } = require('./ast-analysis');
-const { callableContract, classifyChange, baseCounterpart, parseRevision, moduleChange, declaresPlainReturn } = require('./change-kinds');
+const { callableContract, classifyChange, baseCounterpart, parseRevision, moduleChange, declaresPlainReturn, declaresNever } = require('./change-kinds');
 const { findAccessorReferences } = require('./accessors');
 
 // JS/TS test framework helpers — calls to these bracket a test case.
@@ -2044,7 +2044,10 @@ function about(index, name, options = {}) {
  *   returning   (name, ownerClass) => every declaration the name can mean
  *               is one a call of which returns (`declaresPlainReturn`): a
  *               function the revision declares, or imports by name from a
- *               project module, or the method its own class declares.
+ *               project module, or the method its own class declares;
+ *   never       (name, ownerClass) => every such declaration is written to
+ *               return a never type (`declaresNever`): a call of it ends
+ *               the caller's path for certain.
  *
  * Declarations are read as the project holds them now, for both revisions:
  * a callee whose own declaration changed is a changed symbol of its own.
@@ -2069,40 +2072,66 @@ function calleeFacts(index, entry, filePath, cache) {
             const content = index._readFile(definition.file);
             const root = index._getParsedTree(definition.file, content, owner.language)?.rootNode ||
                 parseRevision(content, owner.language);
-            return declaresPlainReturn(root, definition, never);
+            return declaresPlainReturn(root, definition, never, langTraits(owner.language)?.pathEnds?.neverAliases !== false);
         } catch (_) {
             return false;
         }
     };
-    const allPlain = (name, mine) => {
+    // Written to return a never type and nothing else. A never type that
+    // is a name (not a keyword) means it only where the declaring file
+    // imports it from the module that defines it and the project declares
+    // no such name.
+    const never = definition => {
+        const owner = index.files.get(definition.file);
+        const ownerTraits = owner && langTraits(owner.language);
+        const types = ownerTraits?.neverReturnTypes;
+        if (!Array.isArray(types) || types.length === 0) return false;
+        const modules = ownerTraits.pathEnds?.neverModules || [];
+        const imported = name => (index.symbols.get(name) || []).length === 0 &&
+            (owner.importBindings || []).some(binding => binding.name === name && !binding.alias &&
+                modules.includes(binding.module));
+        try {
+            const content = index._readFile(definition.file);
+            const root = index._getParsedTree(definition.file, content, owner.language)?.rootNode ||
+                parseRevision(content, owner.language);
+            return declaresNever(root, definition, types, imported);
+        } catch (_) {
+            return false;
+        }
+    };
+    const every = (name, mine, test) => {
         const definitions = (index.symbols.get(name) || []).filter(mine);
-        return definitions.length > 0 && definitions.every(plain);
+        return definitions.length > 0 && definitions.every(test);
     };
     const verdicts = new Map();
+    // The declarations a bare name, or a member of the own class, can mean
+    // in this revision, asked one question.
+    const ask = (question, name, ownerClass, test) => {
+        if (!Array.isArray(traits.neverReturnTypes)) return false;
+        const key = `${question}\0${ownerClass || ''}\0${name}`;
+        if (verdicts.has(key)) return verdicts.get(key);
+        let verdict;
+        if (ownerClass) {
+            verdict = (entry.symbols || []).some(symbol => symbol.name === name && symbol.className === ownerClass) &&
+                every(name, definition => definition.className === ownerClass && definition.file === filePath, test);
+        } else {
+            let declared = (entry.symbols || []).some(symbol => symbol.name === name && !symbol.className) ? name : null;
+            if (!declared) {
+                const resolved = (live && live.moduleResolved) || {};
+                const binding = (entry.importBindings || []).find(candidate =>
+                    (candidate.alias || candidate.name) === name && NAMED_IMPORT_KINDS.has(candidate.kind) &&
+                    resolved[candidate.module]);
+                if (binding) declared = binding.name;
+            }
+            verdict = !!declared && every(declared, definition => !definition.className, test);
+        }
+        verdicts.set(key, verdict);
+        return verdict;
+    };
     const facts = {
         fileNames,
-        returning(name, ownerClass) {
-            if (!Array.isArray(traits.neverReturnTypes)) return false;
-            const key = `${ownerClass || ''}\0${name}`;
-            if (verdicts.has(key)) return verdicts.get(key);
-            let verdict;
-            if (ownerClass) {
-                verdict = (entry.symbols || []).some(symbol => symbol.name === name && symbol.className === ownerClass) &&
-                    allPlain(name, definition => definition.className === ownerClass && definition.file === filePath);
-            } else {
-                let declared = (entry.symbols || []).some(symbol => symbol.name === name && !symbol.className) ? name : null;
-                if (!declared) {
-                    const resolved = (live && live.moduleResolved) || {};
-                    const binding = (entry.importBindings || []).find(candidate =>
-                        (candidate.alias || candidate.name) === name && NAMED_IMPORT_KINDS.has(candidate.kind) &&
-                        resolved[candidate.module]);
-                    if (binding) declared = binding.name;
-                }
-                verdict = !!declared && allPlain(declared, definition => !definition.className);
-            }
-            verdicts.set(key, verdict);
-            return verdict;
-        },
+        returning: (name, ownerClass) => ask('returning', name, ownerClass, plain),
+        never: (name, ownerClass) => ask('never', name, ownerClass, never),
     };
     cache.set(entry, facts);
     return facts;

@@ -7,7 +7,10 @@
  *   modified   a change that leaves the callable's contract alone (header,
  *              kind, inferred return: core/change-kinds.js) is inert: no
  *              caller can observe it through the contract. A contract
- *              change is checked against its call sites.
+ *              change is checked against its call sites. A change that
+ *              moves where the body's own paths end is review whatever
+ *              the contract did: the toolchain holds the lines the change
+ *              did not write to those paths.
  *   added      a declaration whose name occurs nowhere outside the lines
  *              the diff added, and that cannot take part in anything that
  *              existed (core/capture.js), is inert.
@@ -62,6 +65,13 @@ const VERDICT_RANK = { ready: 0, review: 1, blocked: 2 };
 // Item reasons that are about the calls an item makes: each has its own
 // action line, which names the calls.
 const OUTGOING_REASONS = new Set(['outgoing-signature-mismatch', 'outgoing-call-unverified']);
+
+// What a change did inside a callable's own body that its callers cannot
+// see and the toolchain can: the item is reviewed whoever depends on it.
+const BODY_TEXT = Object.freeze({
+    'path-end-changed': 'where a path through its body ends changed (a return, a raise or throw, a break, an assertion, a call that may not return): ' +
+        'the code after it, and every path that reaches the end of the body, is held to the types written there',
+});
 
 // What moved in a callable's contract, in words.
 const CHANGE_TEXT = Object.freeze({
@@ -1026,11 +1036,23 @@ function checkTarget(index, options, repoRoot) {
                 signatureMismatches: 0,
                 account: summarizeAccount(fn.account || null),
             };
+            // Where the body's paths end is the callable's own matter: no
+            // caller count and no absence of dependents settles it.
+            const withPathEnds = settled => {
+                if (!change.pathEndsMoved) return settled;
+                if (settled.verdict === 'ready') {
+                    settled.verdict = 'review';
+                    delete settled.noDependents;
+                }
+                settled.reasons = [...settled.reasons, 'path-end-changed'];
+                settled.pathEnds = change.pathEndsMoved;
+                return settled;
+            };
             if (change.kind === 'inert') {
                 // The contract every caller relies on is untouched.
                 item.verdict = 'ready';
                 item.reasons = [];
-                items.push(withOutgoing(item, fn));
+                items.push(withOutgoing(withPathEnds(item), fn));
                 continue;
             }
             // The base revision decides which call sites the changed
@@ -1085,7 +1107,7 @@ function checkTarget(index, options, repoRoot) {
                 }
             }
             item.reviewItems = reviewItemsOf(unverifiedCallers);
-            items.push(withOutgoing(item, fn));
+            items.push(withOutgoing(withPathEnds(item), fn));
             continue;
         }
 
@@ -1250,7 +1272,7 @@ function checkTarget(index, options, repoRoot) {
     // Action items: one per reason an item is not ready, then what else the
     // evidence about a non-ready item says.
     const actions = [];
-    const reasonText = code => CHANGE_TEXT[code] || HAZARD_TEXT[code] || REASON_TEXT[code] || null;
+    const reasonText = code => CHANGE_TEXT[code] || BODY_TEXT[code] || HAZARD_TEXT[code] || REASON_TEXT[code] || null;
     for (const it of items) {
         if (it.kind !== 'module') continue;
         for (const code of it.reasons) {
@@ -1330,6 +1352,21 @@ function checkTarget(index, options, repoRoot) {
             });
         }
         if (it.kind === 'modified' && !it.requiresToolchainValidation) {
+            for (const code of it.reasons.filter(reason => BODY_TEXT[reason])) {
+                // What moved, counted: `removed return or throw, call of fail (2)`.
+                const listed = words => [...new Set(words)].map(word => {
+                    const count = words.filter(other => other === word).length;
+                    return count > 1 ? `${word} (${count})` : word;
+                }).join(', ');
+                const moved = it.pathEnds ? [
+                    it.pathEnds.removed.length ? `removed or replaced: ${listed(it.pathEnds.removed)}` : null,
+                    it.pathEnds.added.length ? `added: ${listed(it.pathEnds.added)}` : null,
+                ].filter(Boolean).join('; ') : '';
+                actions.push({
+                    severity: 'warn', kind: 'body_change',
+                    message: `${it.name}: ${BODY_TEXT[code]}${moved ? ` (${moved})` : ''}`,
+                });
+            }
             const moved = it.reasons.filter(code => CHANGE_TEXT[code]).map(code => CHANGE_TEXT[code]);
             if (moved.length > 0) {
                 actions.push({

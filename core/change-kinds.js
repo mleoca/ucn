@@ -369,6 +369,53 @@ function provablyReturns(callee, facts) {
 }
 
 /**
+ * Is a statement that only calls `callee` one the checker ends the path at:
+ * a function the file declares or imports by name from a project module,
+ * or the own class's method, whose every declaration is written to return
+ * a never type (`facts.context.never`)? A name the callable binds itself,
+ * and anything else, is not shown to be.
+ */
+function provablyNever(callee, facts) {
+    const { context, locals, ownerClass, selfName } = facts;
+    if (!context || !context.never) return false;
+    if (callee.type === 'identifier') return !locals.has(callee.text) && context.never(callee.text, null);
+    const object = callee.childForFieldName('object');
+    const member = callee.childForFieldName('property') || callee.childForFieldName('attribute');
+    if (!object || !member) return false;
+    return (object.type === 'this' || (!!selfName && object.type === 'identifier' && object.text === selfName)) &&
+        !!ownerClass && context.never(member.text, ownerClass);
+}
+
+/**
+ * Is this declaration written to return a never type, and nothing else?
+ * Yes when its return annotation is one never type and that spelling can
+ * only mean it: a keyword of the language, or a name the declaring file
+ * imports from the module that defines it (`imported(name)`). No for
+ * everything that leaves it open: a decorator, a function held by a typed
+ * variable or field, a name the file could have given another meaning.
+ *
+ * @param {string[]} neverTypes - trait `neverReturnTypes`
+ * @param {function(string): boolean} imported - the name is the never type
+ *   of the language's own module in the declaring file
+ */
+function declaresNever(root, symbol, neverTypes, imported) {
+    if (!root || !symbol) return false;
+    const range = rangeOf(symbol);
+    const node = callableNodeOf(root, range);
+    if (!node || node.hasError) return false;
+    for (let up = node; up && !CONTAINER_NODES.has(up.type); up = up.parent) {
+        if (up.type === 'decorated_definition' || up.namedChildren.some(child => child.type === 'decorator')) return false;
+        if (up.previousNamedSibling && LEADING_NODES.has(up.previousNamedSibling.type)) return false;
+        if (!sameNode(up, node) && up.childForFieldName('type')) return false;
+    }
+    const written = node.childForFieldName('return_type');
+    if (!written) return false;
+    const words = tokensOf(written).filter(([, text]) => /\w|!/.test(text));
+    if (words.length !== 1 || !(neverTypes || []).includes(words[0][1])) return false;
+    return !/identifier/.test(words[0][0]) || imported(words[0][1]);
+}
+
+/**
  * Does this declaration say nothing that could make a call of it end the
  * caller's path? Yes for a function or method with a body and either no
  * return annotation or one made of keywords only (`void`, `None`) that is
@@ -379,8 +426,11 @@ function provablyReturns(callee, facts) {
  * (an overload signature).
  *
  * @param {string[]} neverTypes - trait `neverReturnTypes`
+ * @param {boolean} [aliases] - a written type name can stand for a never
+ *   type (trait `pathEnds.neverAliases`; where it cannot, only a never type
+ *   itself says so)
  */
-function declaresPlainReturn(root, symbol, neverTypes) {
+function declaresPlainReturn(root, symbol, neverTypes, aliases = true) {
     if (!root || !symbol) return false;
     const range = rangeOf(symbol);
     const node = callableNodeOf(root, range);
@@ -396,7 +446,7 @@ function declaresPlainReturn(root, symbol, neverTypes) {
     const written = node.childForFieldName('return_type');
     if (!written) return true;
     return !tokensOf(written).some(([type, text]) =>
-        /identifier|string/.test(type) || (neverTypes || []).includes(text));
+        (aliases && /identifier|string/.test(type)) || (neverTypes || []).includes(text));
 }
 
 /**
@@ -531,6 +581,291 @@ function returnDerivation(body, facts = null) {
     }));
 }
 
+// ── Where the paths of a body end ───────────────────────────────────────
+
+// Nodes that only group statements.
+const BLOCK_NODES = new Set(['block', 'statement_block', 'compound_statement', 'switch_block', 'switch_body',
+    'match_block', 'declaration_list']);
+// What a statement can sit under and still be the last thing its callable
+// runs: the branches of a condition, and the wrapper of an expression used
+// as a statement. A loop, a handler, a manager or a case runs something
+// after it.
+const BRANCH_NODES = new Set(['if_statement', 'elif_clause', 'else_clause', 'if_expression', 'expression_statement']);
+const EVERY_LOOP_NODE = new Set(['while_statement', 'do_statement', 'for_statement', 'for_in_statement',
+    'enhanced_for_statement', 'foreach_statement', 'for_each_statement', 'for_range_loop',
+    'while_expression', 'loop_expression', 'for_expression']);
+// Expressions whose value is the value of one of their branches.
+const VALUE_BRANCHES = new Set(['if_expression', 'else_clause', 'match_expression', 'match_block', 'match_arm',
+    'unsafe_block']);
+// What a `break` leaves besides a loop.
+const SWITCH_SCOPES = new Set(['switch_statement', 'switch_expression', 'expression_switch_statement',
+    'type_switch_statement', 'select_statement']);
+const THROW_NODES = new Set(['throw_statement', 'raise_statement']);
+const BREAK_NODES = new Set(['break_statement', 'break_expression']);
+const CONTINUE_NODES = new Set(['continue_statement', 'continue_expression']);
+// A node that is a statement of its own inside a compound statement's
+// header position (a branch written without a block, an initializer).
+const HELD_STATEMENT = /(?:_statement|_declaration|_definition|_item)$/;
+
+// The parts of a compound statement a held statement can stand in.
+const ROLE_FIELDS = ['consequence', 'alternative', 'body', 'handler', 'finalizer'];
+// What a manager is called with decides nothing about whether it swallows
+// what its block raises: its expression, without the arguments, does.
+const ARGUMENT_NODES = new Set(['argument_list', 'arguments']);
+
+/**
+ * The header of a compound statement: its own tokens, without the blocks
+ * and statements it holds. `callsOnly` leaves out what calls are passed.
+ */
+function headerTokens(node, callsOnly = false) {
+    const out = [];
+    const collect = candidate => {
+        if (COMMENT_NODES.has(candidate.type) || BLOCK_NODES.has(candidate.type)) return;
+        if (candidate.isNamed && HELD_STATEMENT.test(candidate.type) && candidate.type !== 'with_item') return;
+        if (callsOnly && ARGUMENT_NODES.has(candidate.type)) return;
+        if (candidate.childCount === 0) { out.push([candidate.type, candidate.text]); return; }
+        for (const child of candidate.children) collect(child);
+    };
+    for (const child of node.children) collect(child);
+    return out;
+}
+
+/** A condition or loop header that names nothing: the checker knows which way it goes. */
+function namesNothing(node) {
+    return !headerTokens(node).some(([type]) => /identifier/.test(type) || type === 'this' || type === 'self');
+}
+
+/** The last statement of a block, comments aside. */
+function lastStatement(block) {
+    for (let at = block.namedChildCount - 1; at >= 0; at--) {
+        const child = block.namedChild(at);
+        if (!COMMENT_NODES.has(child.type)) return child;
+    }
+    return null;
+}
+
+/**
+ * Where a statement stands in its callable's body.
+ *
+ *   holders   every compound statement it sits under, innermost first: its
+ *             kind and the part of it the statement stands in (a branch,
+ *             the other branch, a handler). Not its condition: a changed
+ *             condition moves what is narrowed, not where a path ends. A
+ *             context manager is kept with its expression, which decides
+ *             whether the code after its block is reached;
+ *   tail      nothing in the callable runs after it: it is the last
+ *             statement of its block, under branches of conditions only,
+ *             and so is each of those conditions;
+ *   endless   what a `break` there would leave is a loop whose header names
+ *             nothing;
+ *   followed  another statement follows it in its own block.
+ */
+function placeOf(node, body) {
+    const holders = [];
+    let tail = true;
+    let endless = null;
+    let followed = false;
+    let own = true;
+    for (let child = node, parent = node.parent; parent; child = parent, parent = parent.parent) {
+        const top = sameNode(parent, body);
+        if (BLOCK_NODES.has(parent.type) || top) {
+            const last = lastStatement(parent);
+            if (!last || !sameNode(last, child)) {
+                tail = false;
+                if (own) followed = true;
+            }
+            own = false;
+        } else {
+            const role = ROLE_FIELDS.find(field => sameNode(parent.childForFieldName(field), child)) || null;
+            holders.push(MANAGER_NODES.has(parent.type) ? [parent.type, role, headerTokens(parent, true)] : [parent.type, role]);
+            if (!BRANCH_NODES.has(parent.type)) tail = false;
+            if (parent.type !== 'expression_statement') own = false;
+            if (endless === null && SWITCH_SCOPES.has(parent.type)) endless = false;
+            if (endless === null && EVERY_LOOP_NODE.has(parent.type)) endless = namesNothing(parent);
+        }
+        if (top) break;
+    }
+    return { holders: JSON.stringify(holders), tail, endless: endless === true, followed };
+}
+
+/**
+ * The statements of a body that end a path through it, or decide where one
+ * ends, in source order (trait `pathEnds`):
+ *
+ *   end       a `return`, a `throw` / `raise`, a call the language names as
+ *             never returning, the value the body ends with where a block
+ *             has one;
+ *   maybe     a statement that is only a call of something not shown to
+ *             return (`provablyReturns`): a checker ends the path there
+ *             when the callee is declared never to return, and what an
+ *             outside callee declares is not read;
+ *   break, continue
+ *   assert    it ends the path where what it tests fails;
+ *   static    a condition or loop header that names nothing (`while True`,
+ *             `for {}`, `loop {}`), with its tokens: the checker knows the
+ *             code after an endless loop is not reached.
+ *
+ * Each is kept with where it stands (`placeOf`). What a `return` returns,
+ * what is thrown and what a call is passed are not part of it: those are
+ * read where they are written. Closures are not entered: their ends are
+ * their own.
+ *
+ * @param {object} facts - what `provablyReturns` asks, with `traits`
+ * @returns {object[]} { kind, detail, holders, tail, endless, followed }
+ */
+function pathEndsOf(body, facts) {
+    const rules = facts.traits.pathEnds;
+    const ends = [];
+    const note = (node, kind, detail = null) => ends.push({ at: node.startIndex, kind, detail, ...placeOf(node, body) });
+    const callOf = statement => {
+        if (statement.namedChildCount !== 1) return null;
+        let expression = statement.namedChildren[0];
+        if (AWAIT_NODES.has(expression.type)) expression = expression.namedChildren[0];
+        return expression || null;
+    };
+    // The value a body ends with is what its paths end in (`blockValues`):
+    // its last expression, or the last expression of each branch of a
+    // condition or a match that stands last. A block in statement position
+    // has a value nothing reads.
+    const noteValue = expression => {
+        if (VALUE_BRANCHES.has(expression.type)) {
+            for (const child of expression.namedChildren) {
+                // An arm's value is what follows its pattern.
+                const value = expression.type === 'match_arm' &&
+                    sameNode(expression.namedChild(expression.namedChildCount - 1), child);
+                if (value || BLOCK_NODES.has(child.type) || VALUE_BRANCHES.has(child.type)) noteValue(child);
+            }
+            return;
+        }
+        if (BLOCK_NODES.has(expression.type)) {
+            const last = lastStatement(expression);
+            if (!last) return;
+            if (!HELD_STATEMENT.test(last.type)) noteValue(last);
+            else if (last.type === 'expression_statement' && last.namedChildCount === 1 &&
+                VALUE_BRANCHES.has(last.namedChildren[0].type)) noteValue(last.namedChildren[0]);
+            return;
+        }
+        if (!RESULT_NODES.has(expression.type) && !BREAK_NODES.has(expression.type) &&
+            !CONTINUE_NODES.has(expression.type)) note(expression, 'end');
+    };
+    if (rules.blockValues) noteValue(body);
+    const visit = node => {
+        for (const child of node.namedChildren) {
+            if (COMMENT_NODES.has(child.type) || CALLABLE_NODES.has(child.type)) continue;
+            const type = child.type;
+            if (RESULT_NODES.has(type) || THROW_NODES.has(type)) note(child, 'end');
+            else if (BREAK_NODES.has(type)) note(child, 'break');
+            else if (CONTINUE_NODES.has(type)) note(child, 'continue');
+            else if (ASSERT_NODES.has(type)) note(child, 'assert');
+            else if ((CONDITION_NODES.has(type) || EVERY_LOOP_NODE.has(type)) && namesNothing(child)) {
+                note(child, 'static', JSON.stringify(headerTokens(child)));
+            } else if (type === 'expression_statement') {
+                const expression = callOf(child);
+                if (expression && CALL_NODES.has(expression.type)) {
+                    const callee = expression.childForFieldName('function');
+                    if (rules.calls === 'declared') {
+                        if (callee && provablyNever(callee, facts)) note(child, 'end');
+                        else if (callee && !provablyReturns(callee, facts)) note(child, 'maybe', callee.text);
+                    } else if (rules.calls === 'named' && callee && callee.type === 'identifier' &&
+                        (rules.neverCallables || []).includes(callee.text) && !facts.locals.has(callee.text) &&
+                        !(facts.context && facts.context.fileNames && facts.context.fileNames.has(callee.text))) {
+                        note(child, 'end');
+                    }
+                } else if (expression && expression.type === 'macro_invocation' && rules.calls === 'declared') {
+                    // A macro's expansion is not read: one the language
+                    // defines as diverging ends the path, one it defines
+                    // as an expression that completes does not.
+                    const name = String(expression.childForFieldName('macro')?.text || '').split('::').pop();
+                    if ((rules.neverMacros || []).includes(name)) note(child, 'end');
+                    else if (!(rules.returningMacros || []).includes(name)) note(child, 'maybe', `${name}!`);
+                }
+            }
+            visit(child);
+        }
+    };
+    visit(body);
+    // Source order, whichever walk found an end.
+    return ends.sort((a, b) => a.at - b.at).map(({ at: _at, ...unit }) => unit);
+}
+
+/**
+ * Did a change move where the paths of a body end, in a way the toolchain
+ * holds unchanged lines to? `before` and `after` are contracts of one
+ * callable (`pathEnds`, `unitReturn`).
+ *
+ * Removed or replaced: an end of the base that the changed body no longer
+ * has in the same place, in order (the ends both bodies have are their
+ * longest common run). A call that might not have returned is also
+ * answered by a statement that ends the path for certain. What is
+ * left out: an end nothing runs after, in a callable whose written result
+ * is the unit type (`tail`, `unitReturn`): falling off the end is then
+ * what the type accepts, and no statement is left to read a narrowed name
+ * or an unassigned variable.
+ *
+ * Added: a `break` under an endless loop (the code after the loop is now
+ * reached, and so is the end of the body), and, where the toolchain rejects
+ * code that cannot be reached (`unreachableRejected`), an end that a
+ * statement of its own block follows.
+ *
+ * @returns {{removed: string[], added: string[]}|null} what moved, in
+ *   words; null when nothing did
+ */
+function pathEndsMoved(before, after, traits) {
+    const rules = traits.pathEnds;
+    if (!rules || !before.pathEnds || !after.pathEnds) return null;
+    const base = before.pathEnds;
+    const head = after.pathEnds;
+    const same = (was, is) => was.holders === is.holders && was.kind === is.kind && was.detail === is.detail;
+    // The ends both bodies have, in order: the longest run of like ends.
+    const run = Array.from({ length: base.length + 1 }, () => new Uint16Array(head.length + 1));
+    for (let i = base.length - 1; i >= 0; i--) {
+        for (let j = head.length - 1; j >= 0; j--) {
+            run[i][j] = same(base[i], head[j]) ? run[i + 1][j + 1] + 1 : Math.max(run[i + 1][j], run[i][j + 1]);
+        }
+    }
+    const pairs = new Array(base.length).fill(-1);
+    const taken = new Set();
+    for (let i = 0, j = 0; i < base.length && j < head.length;) {
+        if (same(base[i], head[j]) && run[i][j] === run[i + 1][j + 1] + 1) { pairs[i] = j; taken.add(j); i++; j++; }
+        else if (run[i + 1][j] >= run[i][j + 1]) i++;
+        else j++;
+    }
+    // A call that might not have returned is also answered by a statement
+    // that ends the path for certain, standing where it stood: between the
+    // ends its neighbours kept.
+    for (let i = 0; i < base.length; i++) {
+        if (pairs[i] >= 0 || base[i].kind !== 'maybe') continue;
+        let low = -1;
+        let high = head.length;
+        for (let k = i - 1; k >= 0 && low < 0; k--) if (pairs[k] >= 0) low = pairs[k];
+        for (let k = i + 1; k < base.length && high === head.length; k++) if (pairs[k] >= 0) high = pairs[k];
+        for (let j = low + 1; j < high; j++) {
+            if (!taken.has(j) && head[j].kind === 'end' && head[j].holders === base[i].holders) { pairs[i] = j; taken.add(j); break; }
+        }
+    }
+    const exempt = before.unitReturn === true && after.unitReturn === true;
+    const removed = base.filter((unit, i) => pairs[i] < 0 && !(exempt && unit.tail));
+    // Added: counted by what an end is and where it stands. Which of two
+    // like ends the walk above paired with the base's is not a fact.
+    const opens = unit => (unit.kind === 'break' && unit.endless) ||
+        (rules.unreachableRejected === true && unit.followed && ['end', 'break', 'continue'].includes(unit.kind));
+    const signature = unit => `${unit.kind}\0${unit.holders}\0${unit.endless}\0${unit.followed}`;
+    const had = new Map();
+    for (const unit of base) if (opens(unit)) had.set(signature(unit), (had.get(signature(unit)) || 0) + 1);
+    const added = [];
+    for (const unit of head) {
+        if (!opens(unit)) continue;
+        const left = had.get(signature(unit)) || 0;
+        if (left === 0) added.push(unit);
+        else had.set(signature(unit), left - 1);
+    }
+    if (removed.length === 0 && added.length === 0) return null;
+    // In words, in source order: what a reader looks for in the diff.
+    const word = unit => (unit.kind === 'end' ? 'return or throw' : unit.kind === 'maybe' ? `call of ${unit.detail}`
+        : unit.kind === 'static' ? 'endless loop' : unit.kind);
+    return { removed: removed.map(word), added: added.map(word) };
+}
+
 /**
  * How the declaration states its return contract: 'declared' (a written
  * type that is the contract), 'unannotated', 'placeholder' (a written type
@@ -632,35 +967,59 @@ function callableContract(root, language, symbol, context = null) {
             return true;
         });
     }
+    // What the body's own statements say about the callees they call and
+    // the names they bind: asked by the return derivation and by the path
+    // ends.
+    let facts = null;
+    const bodyFacts = () => {
+        if (facts) return facts;
+        // Names the callable binds itself: its parameters and whatever
+        // its own statements assign.
+        const locals = new Set();
+        const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
+        if (parameters) identifiersOf(parameters, locals);
+        walkOwn(body, candidate => {
+            for (const target of bindingTargets(candidate)) identifiersOf(target, locals);
+            return true;
+        });
+        const leading = parameters ? parameters.namedChildren[0] : null;
+        const first = leading ? [...identifiersOf(leading)][0] : null;
+        const selfName = symbol.className && first && (traits.selfParam || []).includes(first) ? first : null;
+        // The receiver of a class member is an instance of the class.
+        // One whose type is WRITTEN (`this: A | B`, `self: Shape`) is
+        // whatever that says, a union included: a variable like any.
+        const typedReceiver = !!leading && (leading.descendantsOfType('this').length > 0 ||
+            (selfName !== null && leading.type !== 'identifier'));
+        facts = {
+            traits, context, locals, ownerClass: symbol.className || null, selfName,
+            receiverMembers: !!symbol.className && !typedReceiver,
+        };
+        return facts;
+    };
     let derivation = null;
     if (inferred && body) {
         // Expression by expression where the form is "no annotation"; the
         // whole body where the compiler deduces the type from all of it.
-        if (returnForm === 'unannotated') {
-            // Names the callable binds itself: its parameters and whatever
-            // its own statements assign.
-            const locals = new Set();
-            const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
-            if (parameters) identifiersOf(parameters, locals);
-            walkOwn(body, candidate => {
-                for (const target of bindingTargets(candidate)) identifiersOf(target, locals);
-                return true;
-            });
-            const leading = parameters ? parameters.namedChildren[0] : null;
-            const first = leading ? [...identifiersOf(leading)][0] : null;
-            const selfName = symbol.className && first && (traits.selfParam || []).includes(first) ? first : null;
-            // The receiver of a class member is an instance of the class.
-            // One whose type is WRITTEN (`this: A | B`, `self: Shape`) is
-            // whatever that says, a union included: a variable like any.
-            const typedReceiver = !!leading && (leading.descendantsOfType('this').length > 0 ||
-                (selfName !== null && leading.type !== 'identifier'));
-            derivation = returnDerivation(body, {
-                traits, context, locals, ownerClass: symbol.className || null, selfName,
-                receiverMembers: !!symbol.className && !typedReceiver,
-            });
-        } else {
-            derivation = JSON.stringify(tokensOf(body));
-        }
+        derivation = returnForm === 'unannotated' ? returnDerivation(body, bodyFacts()) : JSON.stringify(tokensOf(body));
+    }
+    // Where the body's paths end (trait `pathEnds`), whatever the return
+    // form: a toolchain holds the code after an end, and the paths that
+    // reach the end of the body, to what is written there.
+    let pathEnds = null;
+    let unitReturn = false;
+    if (traits.pathEnds && body) {
+        pathEnds = pathEndsOf(body, bodyFacts());
+        // A result type written as the unit type accepts falling off the
+        // end. A constructor answers for the members it must assign before
+        // it returns, whatever it is written to return.
+        const written = node.childForFieldName('return_type') || node.childForFieldName('result') ||
+            node.childForFieldName('type');
+        const unit = written ? written.text.replace(/^\s*(?::|->)\s*/, '').trim() : null;
+        const constructs = symbol.isConstructor === true || symbol.type === 'constructor' ||
+            /constructor/.test(node.type) || node.childForFieldName('name')?.text === 'constructor';
+        unitReturn = !constructs && (written === null || written === undefined
+            ? traits.pathEnds.unitWhenUnwritten === true
+            : (traits.pathEnds.unitTypes || []).includes(unit));
     }
     // Where a member's type is whatever the class's methods assign to it
     // (trait `memberTypesFromAssignments`), every assignment to a member of
@@ -779,6 +1138,7 @@ function callableContract(root, language, symbol, context = null) {
     const contract = { header: JSON.stringify(header), generator, returnForm, inferred, derivation, memberBindings };
     Object.defineProperties(contract, {
         outgoingCalls: { value: outgoingCalls }, invocationContext: { value: invocationContext },
+        pathEnds: { value: pathEnds }, unitReturn: { value: unitReturn },
     });
     return contract;
 }
@@ -814,6 +1174,9 @@ function classifyChange(before, after, language) {
         return true;
     });
     Object.defineProperty(change, 'changedCalls', { value: changedCalls });
+    // Not a change of what callers rely on: the callable's own body is
+    // what a toolchain holds to where its paths end.
+    Object.defineProperty(change, 'pathEndsMoved', { value: pathEndsMoved(before, after, traits) });
     return change;
 }
 
@@ -1103,6 +1466,6 @@ function parseRevision(content, language) {
 
 module.exports = {
     callableContract, classifyChange, baseCounterpart, parseRevision,
-    declaresPlainReturn, moduleStatements, providedNames, moduleChange,
+    declaresPlainReturn, declaresNever, moduleStatements, providedNames, moduleChange,
     bindingTargets, identifiersOf, callableNodeOf, rangeOf,
 };

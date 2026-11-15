@@ -1017,7 +1017,7 @@ module.exports = [
         "expect": "break",
         "name": "changed",
         "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "detail": "changed:modified=review(path-end-changed,outgoing-call-unverified)"
     },
     {
         "id": "outgoing-review2-rs-unsafe-call-added",

@@ -404,6 +404,25 @@ const STRUCTURAL_TRAITS = {
     // and only at a declared one. []: the language has no such type; null:
     // no return contract is read from a body in this language.
     neverReturnTypes: null,
+    // What the toolchain holds a body to through where its paths end
+    // (core/change-kinds.js `pathEndsOf`): a missing result, a name read
+    // where it is no longer narrowed or assigned. null: it rejects nothing
+    // of the kind (no checker, or a warning only). Otherwise:
+    //   calls               how a call can end a path: 'declared' (the
+    //                       callee is declared never to return, so a callee
+    //                       that is not read may be one), 'named' (only a
+    //                       call of `neverCallables`), null (no call does);
+    //   neverMacros,        macros the language defines as diverging, and
+    //   returningMacros     as expressions that complete (any other macro
+    //                       is not read);
+    //   blockValues         a block's last expression is what it ends in;
+    //   unitTypes,          written result types that accept falling off
+    //   unitWhenUnwritten   the end, and whether no written type is one;
+    //   unreachableRejected the toolchain rejects code that is not reached;
+    //   neverAliases,       a written type name can stand for a never type;
+    //   neverModules        the modules a never type that is a name (not a
+    //                       keyword) is imported from.
+    pathEnds: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -762,6 +781,8 @@ const NOMINAL_TRAITS = {
     // and only at a declared one. []: the language has no such type; null:
     // no return contract is read from a body in this language.
     neverReturnTypes: null,
+    // See STRUCTURAL_TRAITS.
+    pathEnds: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -1051,6 +1072,7 @@ const LANGUAGES = {
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
             neverReturnTypes: ['never'],
+            pathEnds: { calls: 'declared', unitTypes: ['void'], neverAliases: true },
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -1092,6 +1114,7 @@ const LANGUAGES = {
             ambientCallables: JS_AMBIENT_CALLABLES,
             ambientReturningNamespaces: JS_RETURNING_NAMESPACES,
             neverReturnTypes: ['never'],
+            pathEnds: { calls: 'declared', unitTypes: ['void'], neverAliases: true },
             scriptGlobalScope: true,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
@@ -1133,6 +1156,7 @@ const LANGUAGES = {
             ambientCallables: PY_AMBIENT_CALLABLES,
             ambientNeverCallables: new Set(['exit', 'quit']),
             neverReturnTypes: ['NoReturn', 'Never'],
+            pathEnds: { calls: 'declared', unitTypes: ['None'], neverAliases: true, neverModules: ['typing', 'typing_extensions'] },
             namedConditionsDecidable: true,
             checkSuppressedAt: site => require('./python').checkSuppressedAt(site),
             checkedImportAt: (root, line, module) => require('./python').checkedImportAt(root, line, module),
@@ -1254,6 +1278,10 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-go'),
         traits: {
             ...NOMINAL_TRAITS,
+            // The compiler ends a path at `panic` alone (`os.Exit` before
+            // the end of a function with a result is still a missing
+            // return), and `go vet` rejects unreachable code.
+            pathEnds: { calls: 'named', neverCallables: ['panic'], unitTypes: [], unitWhenUnwritten: true, unreachableRejected: true },
             checkLiteralArguments: { smallInteger: ['int', 'int8', 'int16', 'int32', 'int64', 'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr', 'float32', 'float64'], string: ['string'], boolean: ['bool'] },
             testUnits: (fileEntry, helpers) => require('./go').testUnits(fileEntry, helpers),
             testGate: (fileEntry, helpers) => require('./go').testGate(fileEntry, helpers),
@@ -1300,6 +1328,14 @@ const LANGUAGES = {
             testFileNames: [/(^|\/)tests\/[^/]+\.rs$/],
             // `-> impl Trait` hides the type but leaks the value's auto traits.
             inferredReturnForms: ['opaque', 'evaluated'],
+            // `-> !` is the one way a function says it never returns (no
+            // alias of the never type is stable). A block ends in its last
+            // expression; a macro's expansion is not read.
+            neverReturnTypes: ['!'],
+            pathEnds: { calls: 'declared', blockValues: true, unitTypes: ['()'], unitWhenUnwritten: true, neverAliases: false,
+                neverMacros: ['panic', 'unreachable', 'todo', 'unimplemented'],
+                returningMacros: ['println', 'eprintln', 'print', 'eprint', 'dbg', 'assert', 'assert_eq', 'assert_ne',
+                    'debug_assert', 'debug_assert_eq', 'debug_assert_ne', 'write', 'writeln', 'format', 'vec'] },
             // `async fn` returns an anonymous future whose auto traits
             // (Send, Sync) come from what the body holds across an await.
             asyncReturnIsOpaque: true,
@@ -1380,6 +1416,10 @@ const LANGUAGES = {
         parseRecovery: () => require('./java').recoverTypeAnnotatedVarargs,
         traits: {
             ...NOMINAL_TRAITS,
+            // No call ends a path for javac (`System.exit` before the end
+            // of an `int` method is still a missing return); a statement
+            // that cannot be reached is an error.
+            pathEnds: { calls: null, unitTypes: ['void'], unreachableRejected: true },
             testUnits: (fileEntry, helpers) => require('./java').testUnits(fileEntry, helpers),
             testCodeGate: (fileEntry, projectDeclaresType) => require('./java').testCodeGate(fileEntry, projectDeclaresType),
             testRunnerFamily: 'java',
@@ -1599,6 +1639,10 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c-sharp'),
         traits: {
             ...NOMINAL_TRAITS,
+            // No call ends a path for the compiler. No unit type is listed:
+            // an `out` parameter must be assigned on every path that leaves
+            // a `void` method.
+            pathEnds: { calls: null, unitTypes: [] },
             testUnits: (fileEntry, helpers) => require('./csharp').testUnits(fileEntry, helpers),
             testCodeGate: (fileEntry, projectDeclaresType) => require('./csharp').testCodeGate(fileEntry, projectDeclaresType),
             testRunnerFamily: 'dotnet',
