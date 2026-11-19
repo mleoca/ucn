@@ -22,6 +22,8 @@ const { projectKind, downstreamExposureBlocks } = require('./deletion');
 const { pythonIdentity, registrationUnknown, pythonSourceName, pythonNormalizedNames,
     pythonProjectIdentityAffected } = require('./python-binding-identity');
 const { runtimeEntrypoints, runtimeTargetReaches } = require('./runtime-entrypoints');
+const { stringRegionLookup } = require('./string-regions');
+const { indexedContent } = require('./source-memo');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -891,7 +893,18 @@ function memberAccessAfterMacro(index, { macro, before } = {}) {
 
 function isPythonPackageFile(index, fileEntry) {
     if (fileEntry?.language !== 'python' || !fileEntry.relativePath) return false;
-    let dir = path.dirname(path.join(index.root, fileEntry.relativePath));
+    const start = path.dirname(path.join(index.root, fileEntry.relativePath));
+    // The answer depends on the directory alone: once per directory per
+    // operation (an operation asks it of every file, per declaration).
+    const memo = index._opMemo?.('pythonPackageDirectories', () => new Map());
+    if (memo?.has(start)) return memo.get(start);
+    const answer = pythonPackageDirectory(index, start);
+    memo?.set(start, answer);
+    return answer;
+}
+
+function pythonPackageDirectory(index, start) {
+    let dir = start;
     while (dir === index.root || dir.startsWith(`${index.root}${path.sep}`)) {
         if (fs.existsSync(path.join(dir, '__init__.py'))) return true;
         if (dir === index.root) break;
@@ -1299,6 +1312,27 @@ function deadcode(index, options = {}) {
 
     const usageIndex = new Map();
     if (potentiallyDeadNames.size > 0) {
+        // Whether the identifier regex below can produce a name, decided
+        // once per name.
+        const identifierShaped = new Map();
+        for (const name of potentiallyDeadNames) identifierShaped.set(name, /^[a-zA-Z_]\w*$/.test(name));
+        // A few names (one declaration's assessment) are looked for one by
+        // one instead: the regex produces exactly the maximal \w runs that
+        // do not begin with a digit, so it produces such a name exactly
+        // when the name occurs between word boundaries. Many names (the
+        // audit) share one identifier set per file.
+        const fewNames = potentiallyDeadNames.size <= 32;
+        const wordPattern = new Map();
+        if (fewNames) {
+            for (const name of potentiallyDeadNames) {
+                if (identifierShaped.get(name)) wordPattern.set(name, new RegExp(`\\b${name}\\b`));
+            }
+        }
+        // A file's lines depend on its content alone: an operation that
+        // assesses many declarations splits each file once (one audit over
+        // every name splits each file once anyway, and keeps none).
+        const maskedLines = fewNames ? index._opMemo?.('deadcodeMaskedLines', () => new Map()) : null;
+        const stringRegionLookups = index._opMemo?.('stringRegionLookups', () => new Map());
         for (const [filePath, fileEntry] of index.files) {
             try {
                 const content = index._readFile(filePath);
@@ -1309,12 +1343,12 @@ function deadcode(index, options = {}) {
                 // check, or they would scan as zero-usage and be falsely claimed dead
                 // (fix #211: `this["~validate"](data)` is a real usage; the quotes in
                 // the symbol name make the substring search self-delimiting).
-                const fileIdentifiers = new Set(content.match(/\b[a-zA-Z_]\w*\b/g));
+                const fileIdentifiers = fewNames ? null : new Set(content.match(/\b[a-zA-Z_]\w*\b/g));
                 const namesInFile = [];
                 for (const name of potentiallyDeadNames) {
-                    const present = /^[a-zA-Z_]\w*$/.test(name)
-                        ? fileIdentifiers.has(name)
-                        : content.includes(name);
+                    const present = !identifierShaped.get(name) ? content.includes(name)
+                        : fewNames ? content.includes(name) && wordPattern.get(name).test(content)
+                            : fileIdentifiers.has(name);
                     if (present) namesInFile.push(name);
                 }
                 if (namesInFile.length === 0) continue;
@@ -1322,11 +1356,35 @@ function deadcode(index, options = {}) {
                 // per-line skip below only handles // and # comments, so a
                 // name inside /* ... */ counted as usage — commented-out code
                 // silently kept its symbols "alive" and hid true dead claims.
-                const lines = maskBlockComments(content, fileEntry.language).split('\n');
+                let lines = maskedLines?.get(filePath);
+                if (!lines) {
+                    lines = maskBlockComments(content, fileEntry.language).split('\n');
+                    maskedLines?.set(filePath, lines);
+                }
                 let stringTree;
+                let inStringAt;
+                let lineStarts;
                 const multilinePython = fileEntry.language === 'python' && (content.includes('"""') || content.includes("'''"));
                 const inMultilineString = (line, column) => {
                     if (!multilinePython) return false;
+                    // The parser recorded where the file's strings are: the
+                    // answer the tree below gives, without parsing again,
+                    // for the text the file was indexed from.
+                    if (inStringAt || (typeof fileEntry.stringRegions === 'string' &&
+                        indexedContent(index, filePath, fileEntry, content))) {
+                        if (!inStringAt) {
+                            inStringAt = stringRegionLookups?.get(fileEntry);
+                            if (!inStringAt) {
+                                inStringAt = stringRegionLookup(fileEntry.stringRegions);
+                                stringRegionLookups?.set(fileEntry, inStringAt);
+                            }
+                            lineStarts = [0];
+                            for (let row = 0; row + 1 < lines.length; row++) {
+                                lineStarts.push(lineStarts[row] + lines[row].length + 1);
+                            }
+                        }
+                        return inStringAt(lineStarts[line] + column);
+                    }
                     stringTree ||= index._getParsedTree(filePath, content, fileEntry.language);
                     let node = stringTree.rootNode.descendantForPosition({ row: line, column });
                     for (; node; node = node.parent) {

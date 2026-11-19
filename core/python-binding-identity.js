@@ -4,6 +4,7 @@
 // conditional bindings and unknown expressions have no proven identity.
 const { referenceScopeNode, pythonScopeBindingTable } = require('../languages/lexical-scope');
 const { sameNode } = require('../languages/utils');
+const { indexedContent } = require('./source-memo');
 const BUILTINS = new Set(['object', 'property', 'classmethod', 'staticmethod',
     'getattr', 'setattr', 'hasattr', 'delattr', 'eval', 'exec', 'globals', 'locals', 'vars', '__import__']);
 const UNBOUND_BUILTINS = new Set(['object', 'property', 'classmethod', 'staticmethod']);
@@ -19,6 +20,7 @@ const NAMESPACE_ATTRIBUTES = new Set(['__dict__', '__self__', '__globals__', '__
 const STANDARD_NAMESPACES = new Set(['builtins', 'typing']);
 const NAMESPACE_READS = new Set(['get', 'keys', 'values', 'items', 'copy', '__getitem__', '__contains__', '__iter__', '__len__']);
 const UNKNOWN_ORIGIN = '<unresolved-origin>';
+const NON_ASCII = /[\u0080-\uffff]/;
 
 // Test doubles install, replace or remove an attribute by its runtime name.
 // The attribute must exist unless the call says it may not, so the call is a
@@ -111,59 +113,113 @@ function pythonNormalizedNames(index) {
     const { langTraits } = require('../languages');
     for (const [file, entry] of index.files) {
         if (!langTraits(entry.language)?.reflectionApi?.pythonBindingIdentity) continue;
-        let source, tree;
-        try {
-            source = index._readFile(file);
-            // This is only a parse precheck. Runtime strings are never added.
-            if (source.normalize('NFKC') === source) continue;
-            tree = index._getParsedTree(file, source, entry.language);
-        } catch { continue; }
-        if (!tree) continue;
-        for (const identifier of tree.rootNode.descendantsOfType('identifier')) {
-            const normalized = pythonSourceName(identifier.text);
-            if (normalized !== identifier.text) names.add(normalized);
+        // Recorded when the file was indexed, from the same tree; it answers
+        // for the text the file was indexed from.
+        let recorded = null;
+        if (Array.isArray(entry.normalizedIdentifiers)) {
+            try {
+                if (indexedContent(index, file, entry, index._readFile(file))) recorded = entry.normalizedIdentifiers;
+            } catch { /* unreadable: read below, as for any file */ }
         }
+        for (const name of recorded || fileNormalizedNames(() => index._readFile(file),
+            source => index._getParsedTree(file, source, entry.language))) names.add(name);
     }
     if (operation) OP_NORMALIZED_NAMES.set(operation, names);
     return names;
+}
+
+/**
+ * One file's part of the inventory above, sorted: the NFKC form of each
+ * identifier written otherwise. `readSource` and `treeOf` supply the file;
+ * one that cannot be read or parsed has no part.
+ */
+function fileNormalizedNames(readSource, treeOf) {
+    let source, tree;
+    try {
+        source = readSource();
+        // This is only a parse precheck. Runtime strings are never added.
+        // ASCII text is its own NFKC form.
+        if (!NON_ASCII.test(source) || source.normalize('NFKC') === source) return [];
+        tree = treeOf(source);
+    } catch { return []; }
+    if (!tree) return [];
+    const names = new Set();
+    for (const identifier of tree.rootNode.descendantsOfType('identifier')) {
+        const normalized = pythonSourceName(identifier.text);
+        if (normalized !== identifier.text) names.add(normalized);
+    }
+    return [...names].sort();
 }
 
 /** Explicit project source can mutate otherwise-known standard identities. */
 function projectNamespaceEffects(index) {
     const operation = index._opTreeCache;
     if (operation && OP_NAMESPACE_EFFECTS.has(operation)) return OP_NAMESPACE_EFFECTS.get(operation);
-    const affected = new Set();
     const { langTraits } = require('../languages');
-    for (const [file, entry] of index.files) {
-        // The sole consumer treats '*' as affecting every identity. Later
-        // files cannot change that answer; this inventory is operation-local.
-        if (affected.has('*')) break;
-        if (!langTraits(entry.language)?.reflectionApi?.pythonBindingIdentity) continue;
-        let source, tree;
-        try {
-            source = index._readFile(file);
-            // A text precheck only. Identities/effects come from the AST.
-            if (!/\b(?:builtins|typing|__builtins__|__dict__|__self__|__globals__|__import__|import_module|getattr|vars|globals)\b/.test(source.normalize('NFKC'))) continue;
-            tree = index._getParsedTree(file, source, entry.language);
-        } catch { affected.add('*'); continue; }
-        if (!tree) { affected.add('*'); continue; }
-        const node = tree.rootNode;
-        const effects = effectsOf(node);
-        const memo = new Map();
-        for (const effect of namespaceEffects(node, memo)) {
-            if (effect.owner === UNKNOWN_NAMESPACE) affected.add('*');
-            else if (STANDARD_NAMESPACES.has(effect.owner)) affected.add(`${effect.owner}.${effect.key ?? '*'}`);
-        }
-        for (const write of effects.writes) {
-            if (write.type !== 'attribute') continue;
-            for (const origin of resolveIdentity(write, memo, 0, true).origins) {
-                if (origin.startsWith(UNKNOWN_ORIGIN)) affected.add('*');
-                else if ([...STANDARD_NAMESPACES].some(namespace => origin.startsWith(`${namespace}.`))) affected.add(origin);
-            }
-        }
+    const python = [...index.files].filter(([, entry]) => langTraits(entry.language)?.reflectionApi?.pythonBindingIdentity);
+    const partOf = ([file, entry]) => fileNamespaceEffects(() => index._readFile(file),
+        source => index._getParsedTree(file, source, entry.language));
+    // The sole consumer treats '*' as affecting every identity: once one
+    // file gives it, no other file can change an answer, whichever file it
+    // is. So the smaller files, cheaper to walk, are read first; without a
+    // '*' every file is read and the order does not matter.
+    const bySize = [...python].sort(([fileA, a], [fileB, b]) =>
+        (a.size || 0) - (b.size || 0) || (fileA < fileB ? -1 : fileA > fileB ? 1 : 0));
+    let affected;
+    try {
+        affected = collectNamespaceEffects(bySize, partOf);
+    } catch {
+        // A walk that fails sends the inventory back to the files in index
+        // order, which fails where that order reaches the failing file
+        // before a '*'. A failing file the smaller-first order never reaches
+        // (a '*' came first) fails nothing.
+        affected = collectNamespaceEffects(python, partOf);
     }
     if (operation) OP_NAMESPACE_EFFECTS.set(operation, affected);
     return affected;
+}
+
+/** The parts of `files` in order, until one gives '*'. */
+function collectNamespaceEffects(files, partOf) {
+    const affected = new Set();
+    for (const file of files) {
+        if (affected.has('*')) break;
+        for (const effect of partOf(file)) affected.add(effect);
+    }
+    return affected;
+}
+
+/**
+ * One file's part of the inventory above, sorted: `*` (any identity) or
+ * the standard identities its source can change. A file that cannot be
+ * read or parsed can change any.
+ */
+function fileNamespaceEffects(readSource, treeOf) {
+    let source, tree;
+    try {
+        source = readSource();
+        // A text precheck only. Identities/effects come from the AST.
+        // ASCII text is its own NFKC form.
+        if (!/\b(?:builtins|typing|__builtins__|__dict__|__self__|__globals__|__import__|import_module|getattr|vars|globals)\b/.test(NON_ASCII.test(source) ? source.normalize('NFKC') : source)) return [];
+        tree = treeOf(source);
+    } catch { return ['*']; }
+    if (!tree) return ['*'];
+    const affected = new Set();
+    const node = tree.rootNode;
+    const effects = effectsOf(node);
+    const memo = new Map();
+    for (const effect of namespaceEffects(node, memo)) {
+        if (effect.owner === UNKNOWN_NAMESPACE) affected.add('*');
+        else if (STANDARD_NAMESPACES.has(effect.owner)) affected.add(`${effect.owner}.${effect.key ?? '*'}`);
+    }
+    for (const write of effects.writes) {
+        if (write.type !== 'attribute') continue;
+        for (const origin of resolveIdentity(write, memo, 0, true).origins) {
+            if (origin.startsWith(UNKNOWN_ORIGIN)) affected.add('*');
+            else if ([...STANDARD_NAMESPACES].some(namespace => origin.startsWith(`${namespace}.`))) affected.add(origin);
+        }
+    }
+    return [...affected].sort();
 }
 
 function pythonProjectIdentityAffected(index, identity) {
@@ -1003,4 +1059,4 @@ function pythonNameUnbound(identifier, index = null, ambientCallables = null) {
 module.exports = { pythonIdentity, pythonPossibleIdentities, pythonRuntimeOwners, pythonBoundValue, pythonNameUnbound,
     pythonDecoratorsRegisterNothing,
     pythonSourceName, pythonNormalizedNames, pythonProjectIdentityAffected, registrationUnknown,
-    pythonPatchApi, pythonPatchSpelling, pythonPossibleValues };
+    pythonPatchApi, pythonPatchSpelling, pythonPossibleValues, fileNormalizedNames, fileNamespaceEffects };

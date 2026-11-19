@@ -4518,3 +4518,284 @@ describe('fix #476: ambiguous template initializer records survive workers and c
         } finally { rm(dir); }
     });
 });
+
+describe('fix #508: dead-code facts read once per file, answers unchanged', () => {
+    const countParses = (run) => {
+        const Parser = require('tree-sitter');
+        const original = Parser.prototype.parse;
+        let parses = 0;
+        Parser.prototype.parse = function (...args) { parses++; return original.apply(this, args); };
+        try { run(); } finally { Parser.prototype.parse = original; }
+        return parses;
+    };
+    // What the dead-code scan asked the tree: is the innermost string or
+    // interpolation node at this position a string?
+    const treeSaysString = (tree, row, column) => {
+        for (let node = tree.rootNode.descendantForPosition({ row, column }); node; node = node.parent) {
+            if (node.type === 'interpolation') return false;
+            if (node.type === 'string') return true;
+        }
+        return false;
+    };
+    const PY_SOURCES = [
+        '"""Module doc naming helper, and it\'s here."""\nimport os\n\n' +
+            'def helper(x):\n    \'\'\'Doc with "quotes" and don\'t\'\'\'\n' +
+            '    s = f"{x[\'k\']} name {helper(x)!r:>{10}}"\n' +
+            '    t = rf\'\\d+{x}\' "plain" b\'bytes\'\n' +
+            '    u = f"""multi\n    {x + 1} line {"inner"}\n    """\n' +
+            '    v = "emoji \u{1F600} helper \\" still"\n    return s + t + u + v\n\n' +
+            'class Box:\n    """Box doc\n    with lines"""\n    def run(self):\n        return "it\'s" + \'say "hi"\'\n',
+        'x = 1\r\ndef a():\r\n    """doc\r\n    a"""\r\n    return "a"\r\n',
+        'x = "abc\ndef helper():\n    return \'\'\'oops\n',
+        'v = f"{x["k"]} {f\'{y}\'}"\nw = f"{{literal}} {z:{w}}"\n',
+        '',
+        'def plain():\n    return 1\n',
+        '\ufb01le_name = "\uff46ull"\nvalue = \ufb01le_name\n',
+    ];
+
+    it('python: the recorded string regions answer what the tree answers at every position', () => {
+        const { getParser, getLanguageAdapter, safeParse } = require('../languages');
+        const { stringRegionLookup } = require('../core/string-regions');
+        const parser = getParser('python');
+        const adapter = getLanguageAdapter('python');
+        let inString = 0;
+        for (const code of PY_SOURCES) {
+            const ir = adapter.analyze(code, parser, 'probe.py');
+            assert.strictEqual(typeof ir.stringRegions, 'string');
+            const lookup = stringRegionLookup(ir.stringRegions);
+            const tree = safeParse(parser, code);
+            const lines = code.split('\n');
+            let offset = 0;
+            for (let row = 0; row < lines.length; row++) {
+                for (let column = 0; column <= lines[row].length; column++) {
+                    const expected = treeSaysString(tree, row, column);
+                    if (expected) inString++;
+                    assert.strictEqual(lookup(offset + column), expected,
+                        `${JSON.stringify(code.slice(0, 20))} row ${row} column ${column}`);
+                }
+                offset += lines[row].length + 1;
+            }
+        }
+        assert.ok(inString > 100, `positions in strings (${inString})`);
+    });
+
+    it('python: recorded facts are the same from workers, the sequential build, the cache and an incremental rebuild', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { indexSnapshot } = require('./helpers');
+        const files = {};
+        PY_SOURCES.forEach((code, i) => { files[`m${i}.py`] = code; });
+        const dir = tmp(files);
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            assert.ok([...sequential.files.values()].some(entry => entry.stringRegions.length > 0));
+            assert.ok([...sequential.files.values()].some(entry => entry.normalizedIdentifiers.length > 0));
+            parallel.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.strictEqual(indexSnapshot(loaded), indexSnapshot(sequential));
+            // An incremental rebuild of a changed file equals a fresh build.
+            fs.writeFileSync(path.join(dir, 'm0.py'), PY_SOURCES[0] + '\ndef added():\n    """It\'s new."""\n    return f"{added}"\n');
+            loaded.build(null, { quiet: true, forceRebuild: true });
+            const fresh = new ProjectIndex(dir);
+            fresh.build(null, { quiet: true, workers: 0 });
+            assert.strictEqual(indexSnapshot(loaded), indexSnapshot(fresh));
+            assert.notStrictEqual(fresh.files.get(path.join(dir, 'm0.py')).stringRegions,
+                sequential.files.get(path.join(dir, 'm0.py')).stringRegions);
+        } finally { rm(dir); }
+    });
+
+    it('python: dead code reads the recorded regions and parses no file for them', () => {
+        const { ProjectIndex } = require('../core/project');
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/lib.py': '"""Library.\n\nUse _unused_helper or _quoted_helper.\n"""\n\n' +
+                'def _unused_helper():\n    """It\'s _quoted_helper\'s sibling."""\n    return 1\n\n' +
+                'def _quoted_helper():\n    return "_unused_helper"\n\n' +
+                'def _used_helper():\n    return 2\n\nVALUE = _used_helper()\n',
+            'pkg/app.py': 'from .lib import VALUE\n\n\ndef _main():\n    """Calls _unused_helper? No:\n    _unused_helper is only named here."""\n' +
+                '    return VALUE\n',
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true, workers: 0 });
+            let recorded;
+            assert.strictEqual(countParses(() => { recorded = JSON.stringify(index.deadcode({ includeExported: true })); }), 0);
+            for (const entry of index.files.values()) delete entry.stringRegions;
+            let fromTrees;
+            assert.ok(countParses(() => { fromTrees = JSON.stringify(index.deadcode({ includeExported: true })); }) > 0);
+            assert.strictEqual(recorded, fromTrees);
+            assert.match(recorded, /_unused_helper/);
+        } finally { rm(dir); }
+    });
+
+    it('a few names looked up by substring find what the identifier set finds', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { deadcode } = require('../core/deadcode');
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function get() { return 1; }\nfunction getter() { return get; }\nfunction $helper() {}\n' +
+                'const o = { "~validate": 1 };\nfunction unusedOne() {}\nfunction usedTwo() {}\n' +
+                '/* unusedOne in a comment */\n// usedTwo in a comment\nconst s = "unusedOne";\n' +
+                'module.exports = { getter };\n',
+            'b.js': 'const { getter } = require("./a");\ngetter();\nconst h = $helper;\nusedTwo;\n',
+            'c.py': 'def py_unused():\n    """py_unused names itself."""\n\n\ndef py_used():\n    return 1\n\n\nX = [py_used]\n',
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true, workers: 0 });
+            const all = new Set([...index.symbols.keys()]);
+            for (let i = 0; all.size <= 40; i++) all.add(`absentName${i}`);
+            const outcomes = (names) => {
+                const rows = [];
+                const result = deadcode(index, { names, includeExported: true, includeTests: true,
+                    explain: (symbol, reason) => rows.push(`${symbol.name}:${symbol.startLine}:${reason}`) });
+                return { rows: rows.sort(), claims: result.map(row => `${row.name}:${row.startLine}`).sort() };
+            };
+            const wide = outcomes(all);
+            for (const name of index.symbols.keys()) {
+                const narrow = outcomes(new Set([name]));
+                assert.deepStrictEqual(narrow.rows, wide.rows.filter(row => row.startsWith(`${name}:`)), name);
+                assert.deepStrictEqual(narrow.claims, wide.claims.filter(row => row.startsWith(`${name}:`)), name);
+            }
+            assert.ok(wide.claims.some(row => row.startsWith('unusedOne:')));
+            assert.ok(!wide.claims.some(row => row.startsWith('usedTwo:')));
+        } finally { rm(dir); }
+    });
+
+    it('python: recorded normalized identifiers equal the names read from each file', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { pythonNormalizedNames } = require('../core/python-binding-identity');
+        const dir = tmp({
+            'a.py': '\ufb01le_name = 1\nvalue = \ufb01le_name\n',
+            'b.py': 's = "\uff46\uff55\uff4c\uff4c width only in a string"\n',
+            'c.py': 'plain = 1\n',
+        });
+        try {
+            for (const workers of [0, 2]) {
+                const index = new ProjectIndex(dir);
+                index.build(null, { quiet: true, workers });
+                const names = () => {
+                    index._beginOp();
+                    try { return [...pythonNormalizedNames(index)].sort(); } finally { index._endOp(); }
+                };
+                let recorded;
+                assert.strictEqual(countParses(() => { recorded = names(); }), 0);
+                for (const entry of index.files.values()) {
+                    assert.ok(Array.isArray(entry.normalizedIdentifiers), entry.relativePath);
+                    delete entry.normalizedIdentifiers;
+                }
+                assert.deepStrictEqual(recorded, ['file_name']);
+                assert.deepStrictEqual(names(), recorded);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('python: the namespace inventory read smallest file first answers what the walk in index order answers', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { pythonProjectIdentityAffected, fileNamespaceEffects } = require('../core/python-binding-identity');
+        const { getParser, safeParse } = require('../languages');
+        const big = 'from typing import List\n' + Array.from({ length: 300 }, (_, i) => `def f${i}(x: List[int]) -> int:\n    return len(x) + ${i}\n`).join('');
+        const identities = ['builtins.*', 'builtins.open', 'builtins.object', 'typing.Generic', 'typing.List', 'zz.unnamed'];
+        // The walk in index order, stopping at the first '*', and the consumer's rule.
+        const reference = (index) => {
+            const affected = new Set();
+            for (const [file] of index.files) {
+                if (affected.has('*')) break;
+                for (const effect of fileNamespaceEffects(() => fs.readFileSync(file, 'utf-8'),
+                    source => safeParse(getParser('python'), source))) affected.add(effect);
+            }
+            return identities.map(identity => {
+                if (affected.has('*')) return true;
+                const namespace = identity.split('.')[0];
+                if (affected.has(`${namespace}.*`)) return true;
+                if (identity.endsWith('.*')) return [...affected].some(effect => effect.startsWith(identity.slice(0, -1)));
+                return affected.has(identity) || [...affected].some(effect => effect.startsWith(`${identity}.`));
+            });
+        };
+        const layouts = [
+            // a '*' file small and last in index order, a large file first
+            { 'a_big.py': big, 'b.py': 'import builtins\nbuiltins.open = None\n', 'z.py': 'def f(x, name):\n    return getattr(x, name)\n' },
+            // no '*' anywhere: every file is read in both orders
+            { 'a_big.py': big, 'b.py': 'import builtins\nbuiltins.open = None\n', 'c.py': 'plain = 1\n' },
+            // the '*' file is the large one
+            { 'a.py': 'import builtins\nbuiltins.open = None\n', 'z_big.py': big + 'def g(x, name):\n    return getattr(x, name)\n' },
+        ];
+        for (const files of layouts) {
+            const dir = tmp(files);
+            try {
+                const index = new ProjectIndex(dir);
+                index.build(null, { quiet: true, workers: 0 });
+                index._beginOp();
+                let answers;
+                let parses;
+                try {
+                    parses = countParses(() => { answers = identities.map(identity => pythonProjectIdentityAffected(index, identity)); });
+                } finally { index._endOp(); }
+                assert.deepStrictEqual(answers, reference(index), Object.keys(files).join(','));
+                if (files['z.py']) assert.strictEqual(parses, 2, 'the large file is not read');
+            } finally { rm(dir); }
+        }
+    });
+
+    it('python: a namespace walk that fails reads the files again in index order', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { pythonProjectIdentityAffected } = require('../core/python-binding-identity');
+        const star = 'from typing import List\n' + 'x: List[int] = []\n'.repeat(40) + 'def f(x, name):\n    return getattr(x, name)\n';
+        const failing = 'import typing\n';
+        const ask = (files, failingName) => {
+            const dir = tmp(files);
+            try {
+                const index = new ProjectIndex(dir);
+                index.build(null, { quiet: true, workers: 0 });
+                const own = index._getParsedTree.bind(index);
+                // A walk that fails part way: the tree it reads cannot be walked.
+                index._getParsedTree = (file, content, language) => (path.basename(file) === failingName
+                    ? { rootNode: {} } : own(file, content, language));
+                index._beginOp();
+                try { return pythonProjectIdentityAffected(index, 'builtins.object'); } finally { index._endOp(); }
+            } finally { rm(dir); }
+        };
+        // Index order reaches the '*' file first: the smaller failing file,
+        // read first by size, does not end the inventory.
+        assert.strictEqual(ask({ 'a_star.py': star, 'b_fail.py': failing }, 'b_fail.py'), true);
+        // Index order reaches the failing file first: it fails, as it did.
+        assert.throws(() => ask({ 'a_fail.py': failing, 'b_star.py': star }, 'a_fail.py'));
+    });
+
+    it('python: one walk of a scope answers every name as a walk per name does', () => {
+        const { getParser, safeParse } = require('../languages');
+        const { pyScopeBindings, pyScopeNameBindings, referenceScopeNode } = require('../languages/lexical-scope');
+        const code = 'from os import *\nimport sys as system\nCOUNT = 0\n\n' +
+            'def outer(a, b=1, *args, c, **kw):\n    global COUNT\n    x = [y := i for i in range(3)]\n' +
+            '    def inner():\n        nonlocal x\n        x = 2\n        return x\n' +
+            '    class Local:\n        z = a\n        def m(self):\n            return z\n' +
+            '    for k, (v, w) in kw.items():\n        pass\n    with open(a) as fh:\n        del fh\n' +
+            '    import json\n    from typing import List as L\n    match a:\n        case [first, *rest]:\n            pass\n' +
+            '    COUNT += 1\n    return inner, Local, system, L, first, rest, v, w\n\n' +
+            'class Top:\n    attr = COUNT\n    def outer(self):\n        return attr\n';
+        const tree = safeParse(getParser('python'), code);
+        const names = [...new Set(tree.rootNode.descendantsOfType('identifier').map(node => node.text))];
+        const scopes = tree.rootNode.descendantsOfType(['function_definition', 'class_definition']);
+        assert.ok(scopes.length >= 5 && names.length >= 30);
+        for (const scope of scopes) {
+            const isFunction = scope.type === 'function_definition';
+            const body = scope.childForFieldName('body');
+            for (const name of names) {
+                assert.deepStrictEqual(pyScopeNameBindings(scope, body, name, isFunction),
+                    pyScopeBindings(scope, body, name, isFunction), `${scope.type}:${scope.startPosition.row}:${name}`);
+            }
+        }
+        // Shared and fresh memos give every reference the same scope.
+        const shared = new Map();
+        for (const node of tree.rootNode.descendantsOfType('identifier')) {
+            const a = referenceScopeNode(node, node.text, shared);
+            const b = referenceScopeNode(node, node.text);
+            assert.strictEqual(a ? `${a.type}:${a.startIndex}` : null, b ? `${b.type}:${b.startIndex}` : null, node.text);
+        }
+    });
+});

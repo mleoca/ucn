@@ -7,6 +7,7 @@
 
 const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
 const { referenceScope, scopeFields } = require('./lexical-scope');
+const { encodeStringRegions } = require('../core/string-regions');
 
 
 const {
@@ -1350,9 +1351,10 @@ function findStateObjects(code, parser) {
 }
 
 /**
- * Parse a Python file completely
+ * Parse a Python file completely. `options.stringRegions` (file analysis)
+ * also records where the file's string literals are.
  */
-function parse(code, parser) {
+function parse(code, parser, options = {}) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const functions = [];
@@ -1366,6 +1368,9 @@ function parse(code, parser) {
     // one traversal feed the configuration-item gate (fix #398F).
     const bindingNodes = [];
     const reboundNodes = [];
+    // String literals and f-string interpolations, in preorder: where the
+    // file's strings are (core/string-regions.js).
+    const stringNodes = options?.stringRegions ? [] : null;
     traverseTreeCached(tree.rootNode, (node) => {
         _processFunction(node, functions, processedFn, lines, code);
         _processClass(node, classes, processedCls, lines) ||
@@ -1376,6 +1381,9 @@ function parse(code, parser) {
         if (type === 'function_definition' || type === 'class_definition' ||
             type === 'import_statement' || type === 'import_from_statement') bindingNodes.push(node);
         else if (type === 'global_statement' || type === 'nonlocal_statement') reboundNodes.push(node);
+        else if (stringNodes && (type === 'string' || type === 'interpolation')) {
+            stringNodes.push({ string: type === 'string', start: node.startIndex, end: node.endIndex });
+        }
         return true;
     });
 
@@ -1396,6 +1404,7 @@ function parse(code, parser) {
         ...(configurationItems.length > 0 && { configurationItems }),
         ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
         ...(moduleAssigned.size > 0 && { moduleAssignedNames: [...moduleAssigned].sort() }),
+        ...(stringNodes && { stringRegions: encodeStringRegions(stringNodes) }),
         imports: [],
         exports: []
     };

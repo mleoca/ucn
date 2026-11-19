@@ -249,10 +249,16 @@ function pyScopeBindings(scopeNode, body, name, isFunction, includeClasses = fal
             case 'future_import_statement':
                 return false;
             case 'global_statement':
-                for (const part of namedChildrenOf(node)) if (part.text === name) info.global = true;
+                for (const part of namedChildrenOf(node)) {
+                    if (part.text === name) info.global = true;
+                    else if (name === null) (info.globalNames ||= new Set()).add(part.text);
+                }
                 return false;
             case 'nonlocal_statement':
-                for (const part of namedChildrenOf(node)) if (part.text === name) info.nonlocal = true;
+                for (const part of namedChildrenOf(node)) {
+                    if (part.text === name) info.nonlocal = true;
+                    else if (name === null) (info.nonlocalNames ||= new Set()).add(part.text);
+                }
                 return false;
             case 'case_clause': {
                 for (const part of namedChildrenOf(node)) {
@@ -1306,6 +1312,46 @@ function scopeFields(verdict) {
 }
 
 /**
+ * What pyScopeBindings(scopeNode, body, name, isFunction) answers, read from
+ * one walk of the body that records every name: a body holding many
+ * references is walked once, not once per name. Kept per tree.
+ */
+const SCOPE_NAME_TABLES = new WeakMap();
+function pyScopeNameBindings(scopeNode, body, name, isFunction) {
+    let tables = SCOPE_NAME_TABLES.get(scopeNode.tree);
+    if (!tables) { tables = new Map(); SCOPE_NAME_TABLES.set(scopeNode.tree, tables); }
+    const key = `${scopeNode.startIndex}:${scopeNode.endIndex}:${scopeNode.type}:${isFunction}`;
+    let table = tables.get(key);
+    if (table === undefined) {
+        const sites = new Map();
+        try {
+            const all = pyScopeBindings(scopeNode, body, null, isFunction, false, (site, kind) => {
+                const entry = { kind, row: kind === 'def' ? site.startPosition.row : -1 };
+                const list = sites.get(site.text);
+                if (list) list.push(entry); else sites.set(site.text, [entry]);
+            });
+            table = { sites, starImport: all.starImport,
+                globalNames: all.globalNames || null, nonlocalNames: all.nonlocalNames || null };
+        } catch (error) {
+            // The walk does not depend on the name: it fails for every name.
+            table = { error };
+        }
+        tables.set(key, table);
+    }
+    if (table.error) throw table.error;
+    const info = { bound: false, defRows: [], other: false, import: false,
+        global: !!table.globalNames?.has(name), nonlocal: !!table.nonlocalNames?.has(name),
+        starImport: table.starImport };
+    for (const { kind, row } of table.sites.get(name) || []) {
+        info.bound = true;
+        if (kind === 'def') info.defRows.push(row);
+        else if (kind === 'import') info.import = true;
+        else info.other = true;
+    }
+    return info;
+}
+
+/**
  * The Python scope node whose binding a reference to `name` resolves to
  * (fix #402): the function, lambda or comprehension that binds it, or the
  * module; null when that is not decidable (star imports, `global`/`nonlocal`
@@ -1325,7 +1371,7 @@ function referenceScopeNode(node, name, memo = new Map()) {
                 case 'function_definition': {
                     const body = scope.childForFieldName('body');
                     if (!sameNode(body, child)) continue;
-                    const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, true));
+                    const info = memoGet(memo, scope, name, () => pyScopeNameBindings(scope, body, name, true));
                     if (info.starImport || info.global || info.nonlocal) return null;
                     if (info.bound) return scope;
                     crossedFunction = true;
@@ -1342,7 +1388,7 @@ function referenceScopeNode(node, name, memo = new Map()) {
                 case 'class_definition': {
                     const body = scope.childForFieldName('body');
                     if (!sameNode(body, child) || crossedFunction) continue;
-                    const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, false));
+                    const info = memoGet(memo, scope, name, () => pyScopeNameBindings(scope, body, name, false));
                     if (info.bound || info.starImport) return null;
                     continue;
                 }
@@ -1531,4 +1577,5 @@ function localImportStatement(node, language, name = node?.text) {
 
 module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding,
     localImportStatement,
-    pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds, pythonScopeBindingTable, goExpressionTypeArgument, jsPatternTarget };
+    pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds, pythonScopeBindingTable, goExpressionTypeArgument, jsPatternTarget,
+    pyScopeBindings, pyScopeNameBindings };

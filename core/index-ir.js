@@ -148,6 +148,8 @@ function createFileEntryFromIR({
         }),
         ...(ir.reflectionUses > 0 && { reflectionUses: ir.reflectionUses }),
         ...(ir.evalUses > 0 && { evalUses: ir.evalUses }),
+        ...(typeof ir.stringRegions === 'string' && { stringRegions: ir.stringRegions }),
+        ...(Array.isArray(ir.normalizedIdentifiers) && { normalizedIdentifiers: ir.normalizedIdentifiers }),
         ...(Array.isArray(ir.computedDispatchSites) && {
             computedDispatchSites: ir.computedDispatchSites,
         }),

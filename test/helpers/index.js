@@ -299,6 +299,10 @@ function indexSnapshot(index) {
             // The use counts `repo` discloses are counted in the worker too.
             reflectionUses: fe.reflectionUses || 0,
             evalUses: fe.evalUses || 0,
+            // Python string regions and normalized identifiers (fix #508) come
+            // from the worker parse too.
+            stringRegions: fe.stringRegions ?? null,
+            normalizedIdentifiers: fe.normalizedIdentifiers || null,
             // C# compiler-feature facts (fix #380) come from the worker parse too.
             languageFeatures: [...(fe.languageFeatures || [])],
             conditionalViews: fe.conditionalViews || null,

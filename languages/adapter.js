@@ -121,6 +121,9 @@ function createLanguageAdapter(config) {
             require('./index').captureLiteralParse(parser, code);
             const parsed = languageModule.parse(code, parser, {
                 releaseAnalysisTree: true,
+                // Where the file's string literals are (core/string-regions.js),
+                // recorded by a parser that reads them.
+                stringRegions: true,
                 // Macro definitions the file's include closure supplies
                 // (C/C++ recovery, fix #396).
                 ...(analyzeOptions.externalMacros && { externalMacros: analyzeOptions.externalMacros }),
@@ -159,6 +162,18 @@ function createLanguageAdapter(config) {
                 // read from the index instead of from every file's text.
                 if (facts.reflectionUses > 0) parsed.reflectionUses = facts.reflectionUses;
                 if (facts.evalUses > 0) parsed.evalUses = facts.evalUses;
+            }
+            // The file's part of the normalized-identifier inventory
+            // (core/python-binding-identity.js), from the same parse: the
+            // dead-code audit reads it from the index instead of reading and
+            // normalizing every file again. Left out when it cannot be
+            // computed here; it is then read from the file when asked.
+            if (config.traits?.reflectionApi?.pythonBindingIdentity) {
+                const { safeParse } = require('./index');
+                const { fileNormalizedNames } = require('../core/python-binding-identity');
+                try {
+                    parsed.normalizedIdentifiers = fileNormalizedNames(() => code, () => safeParse(parser, code));
+                } catch { /* read when asked */ }
             }
             // Computed dispatch sites (`handlers[name]()`) of the literal
             // parse the doctor's blind-spot inventory reads (fix #436): a

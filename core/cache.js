@@ -1023,7 +1023,12 @@ function clearAllCaches() {
 // glob, `*.name`), a patch call on a receiver with no proven identity.
 // v338 (fix #506c): a Go call whose callee is a local of the enclosing
 // function carries `localShadow`, as the other languages' records do.
-const CACHE_FORMAT_VERSION = 338;
+// v339 (fix #508): Python file entries carry `stringRegions`, where the
+// file's string literals are (core/string-regions.js), and
+// `normalizedIdentifiers`, the NFKC forms of identifiers written otherwise
+// (core/python-binding-identity.js): the dead-code audit reads both instead
+// of parsing and normalizing the files on each query.
+const CACHE_FORMAT_VERSION = 339;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

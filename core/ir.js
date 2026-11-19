@@ -265,6 +265,15 @@ function createFileIR({
         // the tree (core/reflection.js).
         ...(parsed.reflectionUses > 0 && { reflectionUses: parsed.reflectionUses }),
         ...(parsed.evalUses > 0 && { evalUses: parsed.evalUses }),
+        // Where the file's string literals are (core/string-regions.js);
+        // an empty string when it has none.
+        ...(typeof parsed.stringRegions === 'string' && { stringRegions: parsed.stringRegions }),
+        // The file's identifiers Python reads under another spelling (NFKC,
+        // core/python-binding-identity.js), when analysis read them; an
+        // empty list when it has none.
+        ...(Array.isArray(parsed.normalizedIdentifiers) && {
+            normalizedIdentifiers: [...parsed.normalizedIdentifiers],
+        }),
         ...(Array.isArray(parsed.computedDispatchSites) && {
             computedDispatchSites: parsed.computedDispatchSites.map(item => ({ ...item })),
         }),
