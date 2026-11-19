@@ -986,8 +986,8 @@ async function main() {
         `${describeHostCalibration()}. Host class ${HOST_CLASS}` +
             `${HOST_CLASS === HOST_REFERENCE.hostClass
                 ? ' (the reference class: absolute floors gate here)'
-                : ' (not the reference class: absolute floors are advisory wherever a ' +
-                  'class baseline gates)'}. ` +
+                : ' (not the reference class: absolute floors are advisory; a class ' +
+                  'baseline gates throughput where one is pinned)'}. ` +
             `Throughput budgets are stated on reference hardware (${HOST_REFERENCE.host}); ` +
             'the "norm" columns are the measured value scaled by the host factor, and the ' +
             '"vs base" column compares them with the pinned healthy baseline for this host ' +

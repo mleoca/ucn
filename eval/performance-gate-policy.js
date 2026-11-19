@@ -12,7 +12,8 @@
  * would have produced on reference hardware. Budget VALUES never move; only
  * their units become "LOC/s on reference hardware". That reconstruction is
  * only valid WITHIN the reference host class (see `hostClass` below); other
- * classes pin their own per-repo baselines and gate on ratios against those.
+ * classes pin their own per-repo baselines and gate on ratios against those,
+ * and a repository with no pin for the running class is reported, not gated.
  *
  * RE-PIN PROTOCOL. Run `node eval/lib/host-calibration.js --pin` on a quiet
  * reference machine and paste the result here when, and only when:
@@ -254,28 +255,32 @@ function evaluatePerformanceBudgets(metrics, budgets = DEFAULT_BUDGETS) {
 
     // The absolute floors are a claim about the REFERENCE host class (fix
     // #279): the probe factor bridges SKU variation within a class, never
-    // across classes. Off the reference class they demote to warnings EXACTLY
-    // when a class-matched per-repo baseline gates the repository instead;
-    // with no class baseline they stay hard, which can only false-alarm,
-    // never false-pass.
+    // across classes (a runner's probe reads 1.08-1.15 while its cold build
+    // measures 2.0-2.7x slower than the reference). Off the reference class
+    // they are advisory: a class-matched per-repo baseline gates the
+    // repository where one is pinned, and where none is, its throughput is
+    // reported. A floor judged through a factor that cannot see the class
+    // passes or fails by the runner drawn, not by the engine.
     const offReferenceClass = metrics.hostClass != null &&
         metrics.hostClass !== HOST_REFERENCE.hostClass;
     const classBaselineGates = offReferenceClass &&
         metrics.baselineHostClass === metrics.hostClass &&
         Number.isFinite(metrics.baselineLocPerCpuSec) && metrics.baselineLocPerCpuSec > 0;
     const advisoryFloorSuffix = `; the absolute floors are a reference-hardware claim -- on ` +
-        `${metrics.hostClass} the pinned ${metrics.repo} baseline gates throughput`;
+        `${metrics.hostClass} ` + (classBaselineGates
+        ? `the pinned ${metrics.repo} baseline gates throughput`
+        : `no ${metrics.repo} baseline is pinned, so its throughput is reported, not gated`);
 
     if (substantialProject && normalizedColdLocPerCpuSec < budgets.minColdLocPerCpuSec) {
         const message = `cold CPU throughput ${normalizedColdLocPerCpuSec} LOC/CPU-s${note} < ` +
             budgets.minColdLocPerCpuSec;
-        if (classBaselineGates) warnings.push(`${message}${advisoryFloorSuffix}`);
+        if (offReferenceClass) warnings.push(`${message}${advisoryFloorSuffix}`);
         else failures.push(message);
     }
     if (substantialProject && normalizedColdLocPerSec < budgets.minColdLocPerSec) {
         const message = `cold wall throughput ${normalizedColdLocPerSec} LOC/s${wallNote} < ` +
             `${budgets.minColdLocPerSec}`;
-        if (classBaselineGates) {
+        if (offReferenceClass) {
             warnings.push(`${message}${advisoryFloorSuffix}`);
         } else if (budgets.requireColdWallThroughput) {
             failures.push(message);
@@ -331,8 +336,9 @@ function evaluatePerformanceBudgets(metrics, budgets = DEFAULT_BUDGETS) {
     if (substantialProject && budgets.requireThroughputBaselines &&
         !(Number.isFinite(baselineCpu) && baselineCpu > 0)) {
         warnings.push(`no pinned throughput baseline for ${metrics.repo}` +
-            (offReferenceClass ? ` on ${metrics.hostClass}` : '') +
-            '; only the absolute floors gate this repository');
+            (offReferenceClass
+                ? ` on ${metrics.hostClass}; its throughput is reported, not gated, on this host class`
+                : '; only the absolute floors gate this repository'));
     }
 
     if (metrics.expectedFiles != null && metrics.files !== metrics.expectedFiles) {

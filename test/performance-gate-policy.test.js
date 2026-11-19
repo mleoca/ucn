@@ -194,18 +194,29 @@ describe('performance gate host normalization', () => {
         assert.equal(verdict.hostFactor, 1);
     });
 
-    it('keeps the floors hard off-class when no class baseline gates the repository', () => {
-        // Fail-strict: an unpinned host class is judged at the reference
-        // floors, which can only false-alarm, never false-pass.
-        const verdict = evaluatePerformanceBudgets(linuxBoard('fmt', {
+    it('reports the floors off-class when no class baseline is pinned for the repository', () => {
+        // The probe factor cannot bridge host classes, so a reference floor
+        // judged through it on another class passes or fails by the runner
+        // drawn. With no class baseline the throughput is reported.
+        const unpinned = {
             coldLocPerSec: 8333.936, coldLocPerCpuSec: 2610.549, hostFactor: 1.0757,
             baselineLocPerSec: undefined, baselineLocPerCpuSec: undefined,
             baselineHostClass: null,
-        }), GATING_BUDGETS);
-        assert.ok(verdict.failures.some(f => /cold CPU throughput/.test(f)));
-        assert.ok(verdict.failures.some(f => /cold wall throughput/.test(f)));
+        };
+        const verdict = evaluatePerformanceBudgets(linuxBoard('fmt', unpinned), GATING_BUDGETS);
+        assert.ok(!verdict.failures.some(f => /throughput/.test(f)), verdict.failures.join(' | '));
         assert.ok(verdict.warnings.some(w =>
-            /no pinned throughput baseline for fmt on linux-x64/.test(w)));
+            /cold CPU throughput .* no fmt baseline is pinned, so its throughput is reported, not gated/.test(w)));
+        assert.ok(verdict.warnings.some(w =>
+            /cold wall throughput .* reported, not gated/.test(w)));
+        assert.ok(verdict.warnings.some(w =>
+            /no pinned throughput baseline for fmt on linux-x64; its throughput is reported, not gated/.test(w)));
+        // The same numbers on the reference class fail the floors.
+        const reference = evaluatePerformanceBudgets(linuxBoard('fmt', {
+            ...unpinned, hostClass: 'darwin-arm64',
+        }), GATING_BUDGETS);
+        assert.ok(reference.failures.some(f => /cold CPU throughput/.test(f)));
+        assert.ok(reference.failures.some(f => /cold wall throughput/.test(f)));
     });
 
     it('keeps the R2-003 wall regression release-blocking on every host', () => {
