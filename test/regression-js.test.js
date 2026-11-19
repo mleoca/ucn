@@ -13323,3 +13323,347 @@ describe('fix #506d: a module exposes its own top-level bindings, never a member
         }
     });
 });
+
+describe('fix #513: a module exposes a name per definition, not per file', () => {
+    // Confirmed and unverified call sites of one definition, and its exclusions by reason.
+    const sitesOf = (index, name, file, line) => {
+        const result = execute(index, 'impact', { name: `${file}:${line}:${name}`, all: true });
+        assert.ok(result.ok, JSON.stringify(result));
+        const confirmed = [];
+        for (const group of result.result.byFile || []) for (const site of group.sites) confirmed.push(`${site.file}:${site.line}`);
+        const unverified = (result.result.unverifiedSites || []).map(site => `${site.file}:${site.line} ${site.reason}`);
+        const account = result.result.account;
+        assert.strictEqual(account.conserved, true, JSON.stringify(account));
+        assert.strictEqual(account.unaccounted, 0);
+        const excluded = Object.fromEntries(Object.entries(account.excluded.byReason || {}).map(([reason, entry]) => [reason, entry.count]));
+        return { confirmed: confirmed.sort(), unverified: unverified.sort(), excluded };
+    };
+    // The callees one function's body resolves, as `file:line`.
+    const calleesOf = (index, name, file, line) => {
+        const definition = (index.symbols.get(name) || []).find(symbol => symbol.relativePath === file && symbol.startLine === line);
+        assert.ok(definition, `${name} @ ${file}:${line}`);
+        index._beginOp();
+        try {
+            return index.findCallees(definition, { includeMethods: true, collectAccount: true })
+                .filter(callee => callee.tier !== 'unverified')
+                .map(callee => `${callee.relativePath}:${callee.startLine}`).sort();
+        } finally { index._endOp(); }
+    };
+
+    it('CommonJS: the exported member is confirmed, the other object\'s member of the name is excluded', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'lib.js': 'var app = exports = module.exports = {};\n\napp.init = function init(a) {\n  return a;\n};\n\n' +
+                'exports.render = function render(view, options) {\n  return view;\n};\n\n' +
+                'var other = {};\nother.render = function (x) {\n  return x;\n};\n',
+            'use.js': "var lib = require('./lib');\n\nlib.init(1);\nlib.render('a', {});\n",
+            'use2.js': "const { render } = require('./lib');\n\nfunction go() {\n  return render('b', {});\n}\n\nmodule.exports = { go };\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'render', 'lib.js', 7).confirmed, ['use.js:4', 'use2.js:4']);
+            const other = sitesOf(index, 'render', 'lib.js', 12);
+            assert.deepStrictEqual(other.confirmed, []);
+            assert.deepStrictEqual(other.unverified, []);
+            assert.strictEqual(other.excluded['other-definition-import'], 2);
+            assert.deepStrictEqual(calleesOf(index, 'go', 'use2.js', 3), ['lib.js:7']);
+        } finally { rm(dir); }
+    });
+
+    it('CommonJS: a default export and an exported literal member beside another object\'s member', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'fn.js': 'module.exports = function render(view, options) {\n  return view;\n};\n\nvar other = {};\nother.render = function (x) {\n  return x;\n};\n',
+            'lit.js': 'var other = {\n  draw: function (x) {\n    return x;\n  },\n};\n\nmodule.exports = {\n  draw(view, options) {\n    return other.draw(view);\n  },\n};\n',
+            'use.js': "const render = require('./fn');\nconst lit = require('./lit');\n\nfunction go() {\n  render('a', {});\n  return lit.draw('b', {});\n}\n\nmodule.exports = { go };\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'render', 'fn.js', 1).confirmed, ['use.js:5']);
+            assert.deepStrictEqual(sitesOf(index, 'render', 'fn.js', 6).confirmed, []);
+            assert.deepStrictEqual(sitesOf(index, 'draw', 'lit.js', 8).confirmed, ['use.js:6']);
+            const member = sitesOf(index, 'draw', 'lit.js', 2);
+            assert.deepStrictEqual(member.confirmed, []);
+            // The literal's own receiver call keeps its tier.
+            assert.deepStrictEqual(member.unverified, ['lit.js:9 method-ambiguous']);
+            assert.strictEqual(member.excluded['other-definition-import'], 1);
+            assert.deepStrictEqual(calleesOf(index, 'go', 'use.js', 4), ['fn.js:1', 'lit.js:8']);
+        } finally { rm(dir); }
+    });
+
+    it('TypeScript: a named export beside a member and a literal member of the same name', () => {
+        const dir = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true,"module":"esnext","target":"es2020"}}',
+            'lib.ts': 'export const render = (view: string, options: object): string => view;\n\n' +
+                'const other: { render?: (x: number) => number } = {};\nother.render = function (x: number): number {\n  return x;\n};\n\n' +
+                'const table = {\n  render(x: number): number {\n    return x;\n  },\n};\n\n' +
+                'export function useOther(): number {\n  return (other.render ? other.render(1) : 0) + table.render(2);\n}\n',
+            'use.ts': "import * as lib from './lib';\nimport { render } from './lib';\n\nexport function go(): string {\n  lib.render('a', {});\n  return render('b', {});\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'render', 'lib.ts', 1).confirmed, ['use.ts:5', 'use.ts:6']);
+            for (const line of [4, 9]) {
+                const member = sitesOf(index, 'render', 'lib.ts', line);
+                assert.deepStrictEqual(member.confirmed, [], `lib.ts:${line}`);
+                assert.strictEqual(member.excluded['other-definition-import'], 2, `lib.ts:${line}`);
+            }
+            assert.deepStrictEqual(calleesOf(index, 'go', 'use.ts', 4), ['lib.ts:1']);
+        } finally { rm(dir); }
+    });
+
+    it('ESM JavaScript: a named export beside another object\'s member of the same name', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}',
+            'lib.js': 'export function render(view, options) {\n  return view;\n}\n\nconst other = {};\nother.render = function (x) {\n  return x;\n};\n',
+            'use.js': "import * as lib from './lib.js';\nimport { render } from './lib.js';\n\nexport function go() {\n  lib.render('a', {});\n  return render('b', {});\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'render', 'lib.js', 1).confirmed, ['use.js:5', 'use.js:6']);
+            const member = sitesOf(index, 'render', 'lib.js', 6);
+            assert.deepStrictEqual(member.confirmed, []);
+            assert.strictEqual(member.excluded['other-definition-import'], 2);
+            assert.deepStrictEqual(calleesOf(index, 'go', 'use.js', 4), ['lib.js:1']);
+        } finally { rm(dir); }
+    });
+
+    it('an imported name passed as a value and a member of an exported namespace object take the same answer', () => {
+        const dir = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true,"module":"esnext","target":"es2020"}}',
+            'lib.ts': 'export function render(view: string, options: object): string {\n  return view;\n}\n\n' +
+                'const other: { render?: (x: number) => number } = {};\nother.render = function (x: number): number {\n  return x;\n};\n',
+            'barrel.ts': "import * as z from './lib';\nexport { z };\n",
+            'use.ts': "import { z } from './barrel';\nimport { render } from './lib';\n\nfunction apply(fn: (v: string, o: object) => string): string {\n  return fn('x', {});\n}\n\n" +
+                "export function go(): string {\n  apply(render);\n  return z.render('a', {});\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'render', 'lib.ts', 1).confirmed, ['use.ts:10', 'use.ts:9']);
+            const member = sitesOf(index, 'render', 'lib.ts', 6);
+            assert.deepStrictEqual(member.confirmed, []);
+            assert.deepStrictEqual(member.unverified, []);
+            assert.strictEqual(member.excluded['other-definition-import'], 2);
+        } finally { rm(dir); }
+    });
+
+    it('a default import binds the module\'s default export, never a namesake the module defines', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}',
+            'plugin/index.js': 'export default (o, c, d) => {\n  const proto = c.prototype;\n  const localeData = function () {\n    return 1;\n  };\n' +
+                '  proto.localeData = function () {\n    return localeData.bind(this)();\n  };\n};\n',
+            'plugin2/index.js': 'function weekday() {\n  return 1;\n}\n\nexport default (o, c) => {\n  c.prototype.weekday = weekday;\n};\n',
+            'plugin3/index.js': 'export default function isoWeek(o, c) {\n  return c;\n}\n',
+            'core.js': 'export function extend(plugin) {\n  return plugin;\n}\n',
+            'use.js': "import { extend } from './core.js';\nimport localeData from './plugin/index.js';\nimport weekday from './plugin2/index.js';\nimport isoWeek from './plugin3/index.js';\n\n" +
+                'extend(localeData);\nextend(weekday);\nweekday(1, 2);\nextend(isoWeek);\nisoWeek(1, 2);\n',
+        });
+        try {
+            const index = idx(dir);
+            const nested = sitesOf(index, 'localeData', 'plugin/index.js', 3);
+            assert.deepStrictEqual(nested.confirmed, ['plugin/index.js:7']);
+            assert.strictEqual(nested.excluded['other-definition-import'], 1);
+            assert.deepStrictEqual(sitesOf(index, 'localeData', 'plugin/index.js', 6).confirmed, []);
+            const local = sitesOf(index, 'weekday', 'plugin2/index.js', 1);
+            assert.deepStrictEqual(local.confirmed, ['plugin2/index.js:6']);
+            assert.strictEqual(local.excluded['other-definition-import'], 2);
+            // A named default export is what its default import binds.
+            assert.deepStrictEqual(sitesOf(index, 'isoWeek', 'plugin3/index.js', 1).confirmed, ['use.js:10', 'use.js:9']);
+        } finally { rm(dir); }
+    });
+
+    it('a default export that is not a function or class literal keeps the name chase', () => {
+        const dir = tmp({
+            'package.json': '{"type":"module"}',
+            'util.js': 'function memo(f) { return f; }\nexport function apply(f) { return f(1); }\nexport { memo };\n',
+            'a.js': "import { memo } from './util.js';\n\nfunction Button(x) {\n  return x;\n}\n\nexport default memo(Button);\n",
+            'use.js': "import { apply } from './util.js';\nimport Button from './a.js';\n\nexport function go() {\n  Button(1);\n  return apply(Button);\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            // `memo(Button)` may hand back Button itself: never excluded.
+            const button = sitesOf(index, 'Button', 'a.js', 3);
+            assert.strictEqual(button.excluded['other-definition-import'], undefined);
+            assert.deepStrictEqual(button.confirmed, ['a.js:7', 'use.js:5', 'use.js:6']);
+        } finally { rm(dir); }
+    });
+
+    it('a module object filled by a call keeps the file-level answer: never excluded on an unread surface', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'lib.js': 'exports.render = function render(view, options) {\n  return view;\n};\n\nvar other = {};\nother.render = function (x) {\n  return x;\n};\nObject.assign(module.exports, other);\n',
+            'use.js': "const lib = require('./lib');\n\nfunction go() {\n  return lib.render(1);\n}\n\nmodule.exports = { go };\n",
+        });
+        try {
+            const index = idx(dir);
+            const member = sitesOf(index, 'render', 'lib.js', 6);
+            assert.strictEqual(member.excluded['other-definition-import'], undefined);
+            assert.deepStrictEqual(member.confirmed, ['use.js:4']);
+            const { getParser, langTraits } = require('../languages');
+            const filled = source => langTraits('javascript').moduleObjectNames(getParser('javascript').parse(source)).filledByCall;
+            assert.strictEqual(filled('Object.assign(module.exports, other);\n'), true);
+            assert.strictEqual(filled('var app = exports = module.exports = {};\nmixin(app, proto);\n'), true);
+            assert.strictEqual(filled('exports[name] = fn;\n'), true);
+            assert.strictEqual(filled('exports.render = render;\nmodule.exports.x = 1;\nconsole.log(other);\n'), false);
+        } finally { rm(dir); }
+    });
+
+    it('a member the module exports by a value the file does not own is unverified, never confirmed', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'lib.js': 'var other = {};\nother.render = function (x) {\n  return x;\n};\nfunction make() {\n  return function (y) { return y; };\n}\nexports.render = make();\n',
+            'use.js': "const lib = require('./lib');\nconst { render } = require('./lib');\n\nfunction go() {\n  lib.render(1);\n  return render(2);\n}\n\nmodule.exports = { go };\n",
+        });
+        try {
+            const index = idx(dir);
+            const member = sitesOf(index, 'render', 'lib.js', 2);
+            assert.deepStrictEqual(member.confirmed, []);
+            assert.deepStrictEqual(member.unverified, ['use.js:5 no-import-link', 'use.js:6 ambiguous-binding']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #513: a JavaScript or TypeScript module loaded by path is the module at that path', () => {
+    // Every caller row of one `main`, as `file:line tier[:reason]`.
+    const rowsOf = (index, file) => {
+        const target = index.find('main', { exact: true, file })[0];
+        assert.ok(target, file);
+        index._beginOp();
+        try {
+            const callers = index.findCallers('main', { targetDefinitions: [target], collectAccount: true, includeMethods: true });
+            const rows = callers.filter(c => c.tier !== 'unverified').map(c => `${c.relativePath}:${c.line} confirmed`);
+            for (const u of callers.unverifiedEntries || []) rows.push(`${u.relativePath}:${u.line} ${u.reason}`);
+            for (const e of callers.accountRaw.excludedEntries) rows.push(`${path.relative(index.root, e.file)}:${e.line} excluded:${e.reason}`);
+            return rows.sort();
+        } finally { index._endOp(); }
+    };
+    const SCRIPT = name => `function main() {\n  return "${name}";\n}\nmodule.exports = { main };\n`;
+
+    it('a path constant, an awaited import and a template path with a runtime part', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe","scripts":{"test":"jest"},"devDependencies":{"jest":"^29.0.0"}}',
+            'app.js': SCRIPT('app'),
+            'scripts/alpha.js': SCRIPT('alpha'),
+            'scripts/delta.js': SCRIPT('delta'),
+            'scripts/gamma.ts': 'export function main(): string {\n  return "gamma";\n}\n',
+            'tests/resolve.test.js': "const path = require('path');\nconst SCRIPT = path.resolve(__dirname, '../scripts/delta.js');\n\n" +
+                "test('delta', () => {\n  const d = require(SCRIPT);\n  expect(d.main()).toBe('delta');\n});\n",
+            'tests/gamma.test.js': "test('gamma', async () => {\n  const g = await import('../scripts/gamma.js');\n  expect(g.main()).toBe('gamma');\n});\n",
+            'tests/dynamic.test.js': "test.each(['alpha', 'delta'])('any %s', (name) => {\n  const m = require(`../scripts/${name}.js`);\n  expect(typeof m.main()).toBe('string');\n});\n",
+            'tests/typed.ts': "import * as path from 'path';\n\nexport function viaRequire(): string {\n" +
+                "  const a = require(path.resolve(__dirname, '../scripts/alpha.js'));\n  return a.main();\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(rowsOf(index, 'scripts/delta.js'), ['tests/dynamic.test.js:3 module-path-runtime',
+                'tests/gamma.test.js:3 excluded:other-module-path', 'tests/resolve.test.js:6 confirmed',
+                'tests/typed.ts:5 excluded:other-module-path']);
+            // A written `.js` names its TypeScript source too, as the import resolver reads it.
+            assert.deepStrictEqual(rowsOf(index, 'scripts/gamma.ts'), ['tests/dynamic.test.js:3 module-path-runtime',
+                'tests/gamma.test.js:3 confirmed', 'tests/resolve.test.js:6 excluded:other-module-path',
+                'tests/typed.ts:5 excluded:other-module-path']);
+            assert.deepStrictEqual(rowsOf(index, 'scripts/alpha.js'), ['tests/dynamic.test.js:3 module-path-runtime',
+                'tests/gamma.test.js:3 excluded:other-module-path', 'tests/resolve.test.js:6 excluded:other-module-path',
+                'tests/typed.ts:5 confirmed']);
+            // A file the runtime path cannot name is excluded for every load.
+            assert.ok(rowsOf(index, 'app.js').every(row => row.includes('excluded:other-module-path')));
+            // The callee side takes the same answer.
+            const via = index.find('viaRequire', { exact: true })[0];
+            index._beginOp();
+            try {
+                const callees = index.findCallees(via, { collectAccount: true, includeMethods: true });
+                assert.deepStrictEqual(callees.filter(c => c.tier !== 'unverified' && c.name === 'main').map(c => c.relativePath), ['scripts/alpha.js']);
+            } finally { index._endOp(); }
+            // `tests` links the loading test file, with its command.
+            const tests = execute(index, 'tests', { name: 'scripts/delta.js:1:main' });
+            assert.ok(tests.ok, tests.error);
+            const linked = tests.result.filter(entry => entry.run).map(entry => entry.file);
+            assert.deepStrictEqual(linked, ['tests/resolve.test.js']);
+            const apart = tests.result.find(entry => entry.file === 'tests/dynamic.test.js');
+            assert.ok(!apart.run && apart.matches.every(match => match.reason === 'module-path-runtime'), JSON.stringify(apart));
+        } finally { rm(dir); }
+    });
+
+    it('refuses what the Python reader refuses: rebinding, member writes, conditional and shadowed loaders', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'scripts/alpha.js': SCRIPT('alpha'),
+            'other.js': SCRIPT('other'),
+            'loads.js': [
+                "const path = require('path');",
+                "const ALPHA = path.resolve(__dirname, 'scripts/alpha.js');",
+                "const NAME = 'left-pad';",
+                '',
+                'function reassigned() {',
+                '  let r = require(ALPHA);',
+                '  r = { main: () => 0 };',
+                '  return r.main();',
+                '}',
+                '',
+                'function memberWritten() {',
+                '  const w = require(ALPHA);',
+                '  w.main = () => 0;',
+                '  return w.main();',
+                '}',
+                '',
+                'function conditional(flag) {',
+                '  if (flag) {',
+                '    const k = require(ALPHA);',
+                '    return k.main();',
+                '  }',
+                '  return 0;',
+                '}',
+                '',
+                'function shadowed(require) {',
+                '  const s = require(ALPHA);',
+                '  return s.main();',
+                '}',
+                '',
+                'function computed(name) {',
+                '  const u = require(name);',
+                '  return u.main();',
+                '}',
+                '',
+                'function outside() {',
+                '  const o = require(NAME);',
+                '  return o.main();',
+                '}',
+                '',
+                'module.exports = { reassigned, memberWritten, conditional, shadowed, computed, outside };',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const rows = rowsOf(index, 'scripts/alpha.js');
+            for (const line of [8, 14, 20, 27]) {
+                assert.ok(rows.includes(`loads.js:${line} no-import-link`), `${line}: ${rows}`);
+            }
+            assert.ok(rows.includes('loads.js:32 module-path-unread'), String(rows));
+            assert.ok(rows.includes('loads.js:37 excluded:external-package'), String(rows));
+            assert.ok(!rows.some(row => row.endsWith(' confirmed')), String(rows));
+        } finally { rm(dir); }
+    });
+
+    it('a module loaded by path exposes a name per definition (the two-definition module of fix #513)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'lib.js': 'exports.render = function render(view, options) {\n  return view;\n};\n\nvar other = {};\nother.render = function (x) {\n  return x;\n};\n',
+            'use.js': "const path = require('path');\nconst LIB = path.join(__dirname, 'lib.js');\n\nfunction go() {\n  const lib = require(LIB);\n  return lib.render('a', {});\n}\n\nmodule.exports = { go };\n",
+        });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                const [exported, member] = ['lib.js', 'lib.js'].map((file, at) => index.find('render', { exact: true, file })
+                    .find(d => d.startLine === (at === 0 ? 1 : 6)));
+                const exportedCallers = index.findCallers('render', { targetDefinitions: [exported], collectAccount: true, includeMethods: true });
+                assert.deepStrictEqual(exportedCallers.map(c => `${c.relativePath}:${c.line}`), ['use.js:6']);
+                const memberCallers = index.findCallers('render', { targetDefinitions: [member], collectAccount: true, includeMethods: true });
+                assert.deepStrictEqual(memberCallers.filter(c => c.tier !== 'unverified'), []);
+                assert.deepStrictEqual(memberCallers.accountRaw.excludedEntries.map(e => `${path.relative(dir, e.file)}:${e.line} ${e.reason}`),
+                    ['use.js:6 other-module-path']);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+});

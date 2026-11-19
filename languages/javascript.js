@@ -7379,10 +7379,51 @@ function typedLiteralMembers(root, line) {
  * member of the module object: what `require()` of the file hands out
  * under that name. A local of any other value is not.
  *
+ * The set's `filledByCall` is true when the file also hands its module
+ * object to a call (`Object.assign(module.exports, other)`, `mixin(exports,
+ * proto)`) or writes a computed member of it (`exports[name] = fn`): then
+ * the module's names are not all read from its assignments (fix #513).
+ *
  * @param {object} tree - the file's syntax tree
  * @returns {Set<string>}
  */
 function moduleObjectNames(tree) {
+    const names = moduleObjectBindings(tree);
+    names.filledByCall = moduleObjectFilledByCall(tree, names);
+    return names;
+}
+
+/** Is a module-object expression (`module.exports` or one of `names`)
+ * passed to a call, or written through a computed member, anywhere in the
+ * file? */
+function moduleObjectFilledByCall(tree, names) {
+    const isModuleObject = node => {
+        let current = node;
+        while (current && (current.type === 'parenthesized_expression' || current.type === 'as_expression' ||
+            current.type === 'non_null_expression' || current.type === 'satisfies_expression')) {
+            current = current.namedChild(0);
+        }
+        if (!current) return false;
+        if (current.type === 'identifier') return names.has(current.text);
+        return current.type === 'member_expression' && current.childForFieldName('object')?.text === 'module' &&
+            current.childForFieldName('property')?.text === 'exports';
+    };
+    const stack = [tree.rootNode];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (node.type === 'call_expression') {
+            const args = node.childForFieldName('arguments');
+            if (args && args.namedChildren.some(isModuleObject)) return true;
+        } else if (node.type === 'assignment_expression') {
+            const left = node.childForFieldName('left');
+            if (left?.type === 'subscript_expression' && isModuleObject(left.childForFieldName('object'))) return true;
+        }
+        for (const child of node.namedChildren) stack.push(child);
+    }
+    return false;
+}
+
+function moduleObjectBindings(tree) {
     const names = new Set(['exports']);
     const isModuleObject = node => !!node && ((node.type === 'identifier' && node.text === 'exports') ||
         (node.type === 'member_expression' && node.childForFieldName('object')?.text === 'module' &&

@@ -59,13 +59,16 @@ const WILD = null;
 
 /** The module a call's receiver holds, or null (see the header). */
 function loadedModuleOfReceiver(index, filePath, call) {
-    if (!call || !call.isMethod || !call.receiver || call.receiverField || call.receiverIsModule ||
-        call.receiverModuleSpecifier) return null;
+    if (!call || !call.isMethod || !call.receiver || call.receiverField || call.receiverModuleSpecifier) return null;
     const entry = index.files.get(filePath);
+    // A module receiver the import graph placed is an import, not a load:
+    // only one whose every import of the name is a load the graph could
+    // not read (`const m = require(P)`) is read here (fix #513).
+    if (call.receiverIsModule && !unplacedLoadBinding(entry, call.receiver)) return null;
     const reader = entry && langTraits(entry.language)?.loadedModule;
     if (!reader) return null;
     const memo = index._opMemo?.('loadedModuleOfReceiver') || null;
-    const key = `${filePath}\0${call.callSite?.start ?? ''}\0${call.line}\0${call.receiver}`;
+    const key = `${filePath}\0${call.callSite?.start ?? call.callStart ?? ''}\0${call.line}\0${call.receiver}`;
     if (memo?.has(key)) return memo.get(key);
     let answer;
     try {
@@ -75,6 +78,13 @@ function loadedModuleOfReceiver(index, filePath, call) {
     }
     memo?.set(key, answer);
     return answer;
+}
+
+/** Are the file's imports of `name` all loads the import graph did not place? */
+function unplacedLoadBinding(entry, name) {
+    const bindings = (entry?.importBindings || []).filter(binding => (binding.alias || binding.name) === name);
+    return bindings.length > 0 && bindings.every(binding => binding.dynamic === true &&
+        !entry.moduleResolved?.[binding.module]);
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +681,7 @@ function place(loaded, ctx) {
  * be. The written prefix is normalized; a `.` or `..` segment after a
  * runtime part cannot be, and leaves the path unread.
  */
-function pathPattern(parts) {
+function pathPattern(parts, tail = null) {
     const first = parts.findIndex(part => part === WILD);
     const prefix = first > 0 ? parts.slice(0, first).join('') : '';
     let normalized = prefix ? path.posix.normalize(prefix) : '';
@@ -679,16 +689,542 @@ function pathPattern(parts) {
     const rest = parts.slice(first);
     const after = rest.filter(part => part !== WILD).join('/');
     if (after.split('/').some(segment => segment === '.' || segment === '..')) return null;
-    const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const body = rest.map(part => (part === WILD ? '.*' : escape(part))).join('');
+    const body = rest.map(part => (part === WILD ? '.*' : escapeRegExp(part))).join('');
     try {
-        return new RegExp(`^${escape(normalized)}${body}$`);
+        return new RegExp(`^${escapeRegExp(normalized)}${tail ? tail(body, rest) : body}$`);
     } catch {
         return null;
     }
 }
 
+const escapeRegExp = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const toPosix = text => String(text).split(path.sep).join('/');
 const fromPosix = text => (path.sep === '/' ? text : text.split('/').join(path.sep));
 
-module.exports = { loadedModuleOfReceiver, pythonLoadedModule };
+// ---------------------------------------------------------------------------
+// JavaScript and TypeScript (fix #513)
+// ---------------------------------------------------------------------------
+//
+//     const SCRIPT = path.resolve(__dirname, '../scripts/delta.js');
+//     const d = require(SCRIPT);            d.main()
+//     const g = await import('../scripts/gamma.js');   g.main()
+//     const m = require(`../scripts/${name}.js`);      m.main()
+//
+// `require(..)` and `await import(..)` load the module at a path: a relative
+// specifier is read from the loading file's directory, a bare one names a
+// package, an absolute one is that file; `path.resolve` of a relative path
+// is read from the directory the program runs in (the test runner's, else
+// the project root) and from the file's own directory, like the Python
+// reader's relative paths. The answers and refusals are the Python reader's:
+// one unconditional binding, the name never written, no member written.
+
+// One table of a scope's binding sites per name, per syntax tree.
+const JS_SCOPE_SITES = new WeakMap();
+// Node's path module, by the specifiers that name it.
+const JS_PATH_MODULES = new Set(['path', 'node:path', 'path/posix', 'node:path/posix']);
+const JS_PATH_FUNCTIONS = new Set(['join', 'resolve', 'dirname', 'normalize']);
+// Source extensions a load of an extensionless path or a runtime tail may
+// reach, and the sources a compiled extension names (TypeScript ESM).
+const JS_EXTENSIONS = ['js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'mts', 'cts'];
+const JS_EXTENSION_SOURCES = { js: ['js', 'ts', 'tsx'], jsx: ['jsx', 'tsx'], mjs: ['mjs', 'mts'], cjs: ['cjs', 'cts'] };
+const JS_FUNCTION_NODES = new Set(['function_declaration', 'generator_function_declaration', 'function_expression',
+    'function', 'generator_function', 'arrow_function', 'method_definition']);
+const JS_WRAPPERS = new Set(['parenthesized_expression', 'as_expression', 'non_null_expression',
+    'satisfies_expression', 'type_assertion']);
+
+/** The module the receiver of a JavaScript or TypeScript call record holds (trait `loadedModule`). */
+function javascriptLoadedModule(index, filePath, call) {
+    let content;
+    try { content = index._readFile(filePath); } catch { return null; }
+    const entry = index.files.get(filePath);
+    // A load is written in the file: a `require` the import graph recorded
+    // as dynamic under the receiver's name, or an `import(..)` call. Asked
+    // once per file.
+    const named = index._opMemo?.('loadedModuleWordsJs') || null;
+    let loads = named?.get(filePath);
+    if (loads === undefined) {
+        loads = {
+            names: new Set((entry?.importBindings || []).filter(binding => binding.dynamic === true)
+                .map(binding => binding.alias || binding.name)),
+            importCall: /\bimport\s*\(/.test(content),
+        };
+        named?.set(filePath, loads);
+    }
+    if (!loads.importCall && !loads.names.has(call.receiver)) return null;
+    return withTree(index, filePath, content, entry.language, tree => {
+        const receiver = jsReceiverNode(tree, call);
+        if (!receiver) return null;
+        let sites = JS_SCOPE_SITES.get(tree);
+        if (!sites) { sites = new Map(); JS_SCOPE_SITES.set(tree, sites); }
+        const ctx = { index, filePath, entry, tree, sites };
+        const value = jsBoundValue(receiver, ctx);
+        if (!value) return null;
+        const loaded = jsModuleOf(value, ctx, 0);
+        return loaded ? jsPlace(loaded, ctx) : null;
+    });
+}
+
+function jsUnwrap(node) {
+    while (node && JS_WRAPPERS.has(node.type)) node = node.namedChild(0);
+    return node;
+}
+
+/** The identifier `m` of `m.name(..)` at the record's call. */
+function jsReceiverNode(tree, call) {
+    const start = call.callStart;
+    const end = call.callEnd;
+    if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+    // The call whose span the record holds (a chain's calls share its start).
+    let node = tree.rootNode.descendantForIndex(start);
+    while (node && !(node.type === 'call_expression' && node.startIndex === start && node.endIndex === end)) {
+        if (node.startIndex < start || node.endIndex > end) return null;
+        node = node.parent;
+    }
+    const callee = jsUnwrap(node?.childForFieldName('function'));
+    if (callee?.type !== 'member_expression' || callee.childForFieldName('property')?.text !== call.name) return null;
+    const object = callee.childForFieldName('object');
+    return object?.type === 'identifier' && object.text === call.receiver ? object : null;
+}
+
+/** The function or program whose own declarations a read of a name at `node` sees first. */
+function jsEnclosingScope(node) {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type === 'program' || JS_FUNCTION_NODES.has(parent.type)) return parent;
+    }
+    return null;
+}
+
+/**
+ * Every site in the scope's own code (nested functions and classes left
+ * out, their names kept) that binds `name`: { kind, node } with kind
+ * 'declarator' (the plain name of a variable declarator), 'param',
+ * 'import' or 'other' (patterns, functions, classes, catch and loop
+ * bindings).
+ */
+function jsScopeSites(scope, name, ctx) {
+    const key = `${scope.startIndex}:${scope.endIndex}\0${name}`;
+    if (ctx.sites.has(key)) return ctx.sites.get(key);
+    const sites = [];
+    const patternNames = (pattern, out) => {
+        if (!pattern) return;
+        if (pattern.type === 'identifier' || pattern.type === 'shorthand_property_identifier_pattern') { out.push(pattern); return; }
+        if (pattern.type === 'assignment_pattern') return patternNames(pattern.childForFieldName('left'), out);
+        if (pattern.type === 'pair_pattern') return patternNames(pattern.childForFieldName('value'), out);
+        if (['required_parameter', 'optional_parameter'].includes(pattern.type)) return patternNames(pattern.childForFieldName('pattern'), out);
+        for (const child of pattern.namedChildren) patternNames(child, out);
+    };
+    if (scope.type !== 'program') {
+        const params = scope.childForFieldName('parameters') || scope.childForFieldName('parameter');
+        const names = [];
+        patternNames(params, names);
+        for (const node of names) if (node.text === name) sites.push({ kind: 'param', node });
+        const own = scope.childForFieldName('name');
+        if (own?.text === name && scope.type !== 'function_declaration' && scope.type !== 'generator_function_declaration') {
+            sites.push({ kind: 'other', node: own });
+        }
+    }
+    const body = scope.type === 'program' ? scope : scope.childForFieldName('body');
+    const stack = body ? [body] : [];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (!sameNode(node, body) && (JS_FUNCTION_NODES.has(node.type) || node.type === 'class_declaration' ||
+            node.type === 'class' || node.type === 'abstract_class_declaration')) {
+            // A declaration's name binds here; an expression's or a
+            // method's does not.
+            const own = node.childForFieldName('name');
+            if (own?.text === name && ['function_declaration', 'generator_function_declaration',
+                'class_declaration', 'abstract_class_declaration'].includes(node.type)) sites.push({ kind: 'other', node: own });
+            continue;
+        }
+        if (node.type === 'variable_declarator') {
+            const target = node.childForFieldName('name');
+            if (target?.type === 'identifier') {
+                if (target.text === name) sites.push({ kind: 'declarator', node: target });
+            } else {
+                const names = [];
+                patternNames(target, names);
+                for (const found of names) if (found.text === name) sites.push({ kind: 'other', node: found });
+            }
+        } else if (node.type === 'import_statement') {
+            for (const found of node.descendantsOfType(['identifier'])) {
+                if (found.text === name && found.parent?.type !== 'string') sites.push({ kind: 'import', node: found });
+            }
+            continue;
+        } else if (node.type === 'catch_clause') {
+            const names = [];
+            patternNames(node.childForFieldName('parameter'), names);
+            for (const found of names) if (found.text === name) sites.push({ kind: 'other', node: found });
+        } else if (node.type === 'for_in_statement') {
+            const names = [];
+            patternNames(node.childForFieldName('left'), names);
+            for (const found of names) if (found.text === name) sites.push({ kind: 'other', node: found });
+        }
+        for (const child of node.namedChildren) stack.push(child);
+    }
+    ctx.sites.set(key, sites);
+    return sites;
+}
+
+const JS_WRITTEN = new WeakMap();
+/** The names any assignment, update or destructuring write in the file writes. */
+function jsWrittenNames(tree) {
+    let names = JS_WRITTEN.get(tree);
+    if (names) return names;
+    names = new Set();
+    const collect = target => {
+        const node = jsUnwrap(target);
+        if (!node) return;
+        if (node.type === 'identifier') { names.add(node.text); return; }
+        if (['object_pattern', 'array_pattern', 'rest_pattern', 'pair_pattern', 'assignment_pattern',
+            'shorthand_property_identifier_pattern'].includes(node.type)) {
+            if (node.type === 'shorthand_property_identifier_pattern') { names.add(node.text); return; }
+            if (node.type === 'pair_pattern') return collect(node.childForFieldName('value'));
+            if (node.type === 'assignment_pattern') return collect(node.childForFieldName('left'));
+            for (const child of node.namedChildren) collect(child);
+        }
+    };
+    for (const node of tree.rootNode.descendantsOfType(['assignment_expression', 'augmented_assignment_expression', 'update_expression'])) {
+        collect(node.childForFieldName(node.type === 'update_expression' ? 'argument' : 'left'));
+    }
+    for (const node of tree.rootNode.descendantsOfType('for_in_statement')) {
+        if (!node.childForFieldName('kind')) collect(node.childForFieldName('left'));
+    }
+    JS_WRITTEN.set(tree, names);
+    return names;
+}
+
+/**
+ * Members of the name written in the scope (`m.main = ..`, `m[k] = ..`,
+ * `delete m.main`, `Object.assign(m, ..)`, `Object.defineProperty(m, ..)`)?
+ */
+function jsMembersWritten(scope, name) {
+    const rootOf = node => {
+        let current = jsUnwrap(node);
+        while (current && (current.type === 'member_expression' || current.type === 'subscript_expression')) {
+            current = jsUnwrap(current.childForFieldName('object'));
+        }
+        return current;
+    };
+    const isName = node => node?.type === 'identifier' && node.text === name;
+    for (const node of scope.descendantsOfType(['assignment_expression', 'augmented_assignment_expression',
+        'update_expression', 'unary_expression', 'call_expression'])) {
+        if (node.type === 'call_expression') {
+            const callee = jsUnwrap(node.childForFieldName('function'));
+            const first = node.childForFieldName('arguments')?.namedChildren?.[0];
+            if (callee?.type === 'member_expression' && callee.childForFieldName('object')?.text === 'Object' &&
+                ['assign', 'defineProperty', 'defineProperties', 'setPrototypeOf'].includes(callee.childForFieldName('property')?.text) &&
+                isName(jsUnwrap(first))) return true;
+            continue;
+        }
+        if (node.type === 'unary_expression') {
+            if (node.child(0)?.type === 'delete') {
+                const target = jsUnwrap(node.childForFieldName('argument'));
+                if (target && target.type !== 'identifier' && isName(rootOf(target))) return true;
+            }
+            continue;
+        }
+        const target = jsUnwrap(node.childForFieldName(node.type === 'update_expression' ? 'argument' : 'left'));
+        if (target && (target.type === 'member_expression' || target.type === 'subscript_expression') && isName(rootOf(target))) return true;
+    }
+    return false;
+}
+
+/** Does a function stand between the node and the scope? */
+function jsCrossesFunction(node, scope) {
+    for (let parent = node.parent; parent && !sameNode(parent, scope); parent = parent.parent) {
+        if (JS_FUNCTION_NODES.has(parent.type)) return true;
+    }
+    return false;
+}
+
+/**
+ * The value a name holds where it is read: its one binding, a `const` /
+ * `let` / `var` declarator of the plain name that is a statement of the
+ * function or program the read resolves to, declared before the read (or
+ * read from a function nested in that scope). Null when the name is bound
+ * by anything else or more than once there, written anywhere in the file,
+ * or its members are written.
+ */
+function jsBoundValue(identifier, ctx) {
+    if (identifier?.type !== 'identifier') return null;
+    const name = identifier.text;
+    if (jsWrittenNames(ctx.tree).has(name)) return null;
+    for (let scope = jsEnclosingScope(identifier); scope; scope = jsEnclosingScope(scope)) {
+        const sites = jsScopeSites(scope, name, ctx);
+        if (sites.length === 0) continue;
+        if (sites.length !== 1 || sites[0].kind !== 'declarator') return null;
+        const declarator = sites[0].node.parent;
+        const value = declarator.childForFieldName('value');
+        if (!value) return null;
+        let statement = declarator.parent;
+        if (!['lexical_declaration', 'variable_declaration'].includes(statement?.type)) return null;
+        if (statement.parent?.type === 'export_statement') statement = statement.parent;
+        const body = scope.type === 'program' ? scope : scope.childForFieldName('body');
+        if (!sameNode(statement.parent, body)) return null;
+        if (!jsCrossesFunction(identifier, scope) && declarator.endIndex > identifier.startIndex) return null;
+        if (jsMembersWritten(scope, name)) return null;
+        return value;
+    }
+    return null;
+}
+
+/** Is the name bound nowhere in the file (a global such as `require` or `__dirname`)? */
+function jsUnbound(identifier, ctx) {
+    const name = identifier.text;
+    if (jsWrittenNames(ctx.tree).has(name)) return false;
+    for (let scope = jsEnclosingScope(identifier); scope; scope = jsEnclosingScope(scope)) {
+        if (jsScopeSites(scope, name, ctx).length > 0) return false;
+    }
+    return true;
+}
+
+/** The import record that binds a name the program binds only by that import. */
+function jsImportBinding(identifier, ctx) {
+    const program = ctx.tree.rootNode;
+    if (jsWrittenNames(ctx.tree).has(identifier.text)) return null;
+    for (let scope = jsEnclosingScope(identifier); scope && !sameNode(scope, program); scope = jsEnclosingScope(scope)) {
+        if (jsScopeSites(scope, identifier.text, ctx).length > 0) return null;
+    }
+    const sites = jsScopeSites(program, identifier.text, ctx);
+    if (sites.length !== 1 || sites[0].kind !== 'import') return null;
+    const bindings = (ctx.entry?.importBindings || []).filter(binding => (binding.alias || binding.name) === identifier.text);
+    return bindings.length === 1 ? bindings[0] : null;
+}
+
+/**
+ * The path-module function a callee names: `path.join` with `path` bound to
+ * Node's path module (`require('path')`, `import path from 'path'`, `import
+ * * as path from 'node:path'`), or `join` imported by name from it
+ * (`import { join } from 'path'`; a destructured `require` is not read).
+ */
+function jsPathFunction(callee, ctx) {
+    const node = jsUnwrap(callee);
+    if (node?.type === 'member_expression') {
+        const method = node.childForFieldName('property')?.text;
+        const object = jsUnwrap(node.childForFieldName('object'));
+        if (!JS_PATH_FUNCTIONS.has(method) || object?.type !== 'identifier') return null;
+        const binding = jsImportBinding(object, ctx);
+        if (binding) {
+            return JS_PATH_MODULES.has(binding.module) && ['default', 'namespace'].includes(binding.kind) ? method : null;
+        }
+        const value = jsUnwrap(jsBoundValue(object, ctx));
+        return value && jsRequiredSpecifier(value, ctx) && JS_PATH_MODULES.has(jsRequiredSpecifier(value, ctx)) ? method : null;
+    }
+    if (node?.type === 'identifier') {
+        const binding = jsImportBinding(node, ctx);
+        if (binding && JS_PATH_MODULES.has(binding.module) && binding.kind === 'named' &&
+            JS_PATH_FUNCTIONS.has(binding.name)) return binding.name;
+    }
+    return null;
+}
+
+/** The literal specifier of `require('x')` with the global `require`, or null. */
+function jsRequiredSpecifier(node, ctx) {
+    if (node?.type !== 'call_expression') return null;
+    const callee = jsUnwrap(node.childForFieldName('function'));
+    if (callee?.type !== 'identifier' || callee.text !== 'require' || !jsUnbound(callee, ctx)) return null;
+    const args = node.childForFieldName('arguments')?.namedChildren || [];
+    if (args.length !== 1) return null;
+    const value = jsPathOf(args[0], ctx, 0);
+    return isExact(value) ? value.parts[0] : null;
+}
+
+/**
+ * The module an expression evaluates to: `require(p)` with the global
+ * `require`, `await import(p)`, or a name bound to one. Answers
+ * { kind: 'path', path, base } or { kind: 'module', module } or
+ * { kind: 'unread' }, each with `via`; null when no load is shown.
+ */
+function jsModuleOf(expression, ctx, depth) {
+    const node = jsUnwrap(expression);
+    if (!node || depth > MAX_DEPTH) return null;
+    if (node.type === 'identifier') {
+        const value = jsBoundValue(node, ctx);
+        return value ? jsModuleOf(value, ctx, depth + 1) : null;
+    }
+    let call = node;
+    let via = 'require()';
+    if (node.type === 'await_expression') {
+        call = jsUnwrap(node.namedChild(0));
+        if (call?.type !== 'call_expression' || call.childForFieldName('function')?.type !== 'import') return null;
+        via = 'import()';
+    } else {
+        if (node.type !== 'call_expression') return null;
+        const callee = jsUnwrap(node.childForFieldName('function'));
+        if (callee?.type !== 'identifier' || callee.text !== 'require' || !jsUnbound(callee, ctx)) return null;
+    }
+    const args = call.childForFieldName('arguments')?.namedChildren || [];
+    // `import(p, options)` takes import attributes; a spread is not read.
+    if (args.length === 0 || args.some(arg => arg.type === 'spread_element') ||
+        (via === 'require()' && args.length !== 1)) return { kind: 'unread', via };
+    const value = jsPathOf(args[0], ctx, 0);
+    if (!value || value.unknown || value.parts.every(part => part === WILD)) return { kind: 'unread', via };
+    const first = value.parts[0];
+    if (typeof first !== 'string') return { kind: 'unread', via };
+    if (value.base === 'cwd') return { kind: 'path', path: value, base: 'cwd', via };
+    if (first.startsWith('/')) return { kind: 'path', path: value, base: 'absolute', via };
+    if (/^\.\.?(\/|$)/.test(first)) return { kind: 'path', path: value, base: 'file', via };
+    // A bare specifier names a package; with a runtime part it is not read.
+    return isExact(value) ? { kind: 'module', module: first, via } : { kind: 'unread', via };
+}
+
+/**
+ * The path an expression is: { parts, base? } with runtime parts WILD and
+ * `base: 'cwd'` for a relative `path.resolve(..)`; UNKNOWN for a parameter;
+ * null when not read.
+ */
+function jsPathOf(expression, ctx, depth) {
+    const node = jsUnwrap(expression);
+    if (!node || depth > MAX_DEPTH) return null;
+    switch (node.type) {
+        case 'string': {
+            if (node.namedChildren.some(child => child.type === 'escape_sequence')) return null;
+            return exact(node.namedChildren.map(child => child.text).join(''));
+        }
+        case 'template_string': {
+            const parts = [];
+            for (const child of node.namedChildren) {
+                if (child.type === 'string_fragment') { parts.push(child.text); continue; }
+                if (child.type !== 'template_substitution') return null;
+                const inner = jsPathOf(child.namedChild(0), ctx, depth + 1);
+                if (inner && !inner.unknown && inner.base !== 'cwd') parts.push(...inner.parts);
+                else parts.push(WILD);
+            }
+            return concat({ parts });
+        }
+        case 'identifier': {
+            if ((node.text === '__dirname' || node.text === '__filename') && jsUnbound(node, ctx)) {
+                return exact(node.text === '__dirname' ? toPosix(path.dirname(ctx.filePath)) : toPosix(ctx.filePath));
+            }
+            const value = jsBoundValue(node, ctx);
+            if (value) return jsPathOf(value, ctx, depth + 1);
+            return jsIsParameter(node, ctx) ? UNKNOWN : null;
+        }
+        case 'binary_expression': {
+            if (node.childForFieldName('operator')?.text !== '+') return null;
+            const left = jsPathOf(node.childForFieldName('left'), ctx, depth + 1);
+            const right = jsPathOf(node.childForFieldName('right'), ctx, depth + 1);
+            if (!left || !right || left.base === 'cwd' || right.base === 'cwd') return null;
+            return concat(left, right);
+        }
+        case 'call_expression': {
+            const fn = jsPathFunction(node.childForFieldName('function'), ctx);
+            if (!fn) return null;
+            const args = node.childForFieldName('arguments')?.namedChildren || [];
+            if (args.some(arg => arg.type === 'spread_element')) return null;
+            const values = args.map(arg => jsPathOf(arg, ctx, depth + 1));
+            if (values.some(value => !value || value.unknown || value.base === 'cwd')) return null;
+            if (fn === 'join') return values.length === 0 ? null : jsJoin(values);
+            if (fn === 'resolve') return jsResolve(values);
+            if (values.length !== 1) return null;
+            if (fn === 'dirname') return dirname(values[0]);
+            return isExact(values[0]) ? exact(path.posix.normalize(values[0].parts[0])) : values[0];
+        }
+        default: return null;
+    }
+}
+
+/** Node's `path.join`: every part joined with `/`, an absolute part never restarting it. */
+function jsJoin(values) {
+    let joined = null;
+    for (const value of values) {
+        if (!joined) { joined = value; continue; }
+        const last = joined.parts[joined.parts.length - 1];
+        joined = last === WILD || String(last).endsWith('/') ? concat(joined, value) : concat(joined, exact('/'), value);
+    }
+    return joined && isExact(joined) ? exact(path.posix.normalize(joined.parts[0])) : joined;
+}
+
+/** Node's `path.resolve`: the last absolute part and what follows it; with none, a path read from the working directory. */
+function jsResolve(values) {
+    let from = -1;
+    values.forEach((value, at) => {
+        if (typeof value.parts[0] === 'string' && value.parts[0].startsWith('/')) from = at;
+    });
+    // A runtime part at the start of a later argument may be absolute.
+    if (values.slice(from + 1).some(value => value.parts[0] === WILD)) return null;
+    const joined = values.length === 0 ? exact('.') : jsJoin(from >= 0 ? values.slice(from) : values);
+    return from >= 0 ? joined : { ...joined, base: 'cwd' };
+}
+
+/** Is the name a parameter of the function it is read in? */
+function jsIsParameter(identifier, ctx) {
+    const scope = jsEnclosingScope(identifier);
+    if (!scope || scope.type === 'program') return false;
+    const sites = jsScopeSites(scope, identifier.text, ctx);
+    return sites.length > 0 && sites.every(site => site.kind === 'param');
+}
+
+/** The files a JavaScript load names (see `place`). */
+function jsPlace(loaded, ctx) {
+    const { index, filePath, entry } = ctx;
+    const posixRoot = toPosix(index.root);
+    const shown = text => (text.startsWith(`${posixRoot}/`) ? text.slice(posixRoot.length + 1) : text);
+    const { resolveImport } = require('./imports');
+    const resolve = specifier => {
+        try {
+            const resolved = resolveImport(specifier, filePath, {
+                aliases: index.config?.aliases, language: entry.language, root: index.root,
+            });
+            return resolved && index.files.has(resolved) ? resolved : null;
+        } catch {
+            return null;
+        }
+    };
+    if (loaded.kind === 'unread') return { kind: 'unread', via: loaded.via };
+    if (loaded.kind === 'module') {
+        const via = `${loaded.via}: "${loaded.module}"`;
+        const file = entry.moduleResolved?.[loaded.module]
+            ? path.join(index.root, entry.moduleResolved[loaded.module]) : resolve(loaded.module);
+        return file ? { kind: 'file', file, via } : { kind: 'module', module: loaded.module, via };
+    }
+    const value = loaded.path;
+    const fileDir = toPosix(path.dirname(filePath));
+    const bases = loaded.base === 'absolute' ? ['']
+        : loaded.base === 'file' ? [fileDir]
+        : [...new Set([toPosix(baseDir(index, filePath)), fileDir])];
+    const at = base => (base ? `${base}/` : '');
+    if (isExact(value)) {
+        const candidates = bases.map(base => path.posix.normalize(`${at(base)}${value.parts[0]}`));
+        const via = `${loaded.via}: ${shown(candidates[0])}`;
+        const files = [...new Set(candidates.map(candidate => resolve(fromPosix(candidate))).filter(Boolean))];
+        if (files.length > 1) return { kind: 'ambiguous', files: files.sort(), via };
+        if (files.length === 1 && resolve(fromPosix(candidates[0]))) return { kind: 'file', file: files[0], via };
+        if (files.length === 1) return { kind: 'ambiguous', files, via };
+        return { kind: 'unresolved', via };
+    }
+    const patterns = [];
+    for (const base of bases) {
+        const pattern = pathPattern(concat(exact(at(base)), value).parts, jsPatternTail);
+        if (!pattern) return { kind: 'unread', via: loaded.via };
+        patterns.push(pattern);
+    }
+    const files = [];
+    for (const file of index.files.keys()) {
+        const posix = toPosix(file);
+        if (patterns.some(pattern => pattern.test(posix))) files.push(file);
+    }
+    files.sort();
+    const text = value.parts.map(part => (part === WILD ? '*' : part)).join('');
+    const via = `${loaded.via}: ${shown(text)}`;
+    return files.length > 0 ? { kind: 'files', files, via } : { kind: 'unresolved', via };
+}
+
+/**
+ * What a load's path can end with: a runtime tail or an extensionless path
+ * reaches a source file or a directory's index; a written `.js` names its
+ * TypeScript source too.
+ */
+function jsPatternTail(body, rest) {
+    const extensions = `\\.(?:${JS_EXTENSIONS.join('|')})`;
+    const last = rest[rest.length - 1];
+    if (last === WILD) return `${body}${extensions}`;
+    const written = /\.([A-Za-z]+)$/.exec(last)?.[1];
+    if (written && JS_EXTENSIONS.includes(written)) {
+        const sources = JS_EXTENSION_SOURCES[written] || [written];
+        return `${body.slice(0, body.length - escapeRegExp(`.${written}`).length)}\\.(?:${sources.join('|')})`;
+    }
+    return `${body}(?:${extensions}|/index${extensions})`;
+}
+
+module.exports = { loadedModuleOfReceiver, pythonLoadedModule, javascriptLoadedModule };

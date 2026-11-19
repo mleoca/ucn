@@ -1905,10 +1905,17 @@ function about(index, name, options = {}) {
         className: options.className || primary.className,
         exclude: options.exclude,
     });
+    // Counted as `tests` counts (fix #513): a file whose every row is
+    // unverified links no test, and an unverified row is no match; those
+    // rows are counted apart.
+    const { linkedTestFiles, isUnverifiedTestRow } = require('./search');
+    const linkedTests = linkedTestFiles(tests);
+    const unverifiedTestRows = tests.reduce((sum, t) => sum + t.matches.filter(isUnverifiedTestRow).length, 0);
     const testSummary = {
-        fileCount: tests.length,
-        totalMatches: tests.reduce((sum, t) => sum + t.matches.length, 0),
-        files: (options.all ? tests : tests.slice(0, 3)).map(t => t.file)
+        fileCount: linkedTests.length,
+        totalMatches: linkedTests.reduce((sum, t) => sum + t.matches.filter(match => !isUnverifiedTestRow(match)).length, 0),
+        files: (options.all ? linkedTests : linkedTests.slice(0, 3)).map(t => t.file),
+        ...(unverifiedTestRows > 0 && { unverifiedMatches: unverifiedTestRows }),
     };
 
     // Extract code if requested (default: true)

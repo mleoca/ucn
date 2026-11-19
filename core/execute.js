@@ -1592,7 +1592,9 @@ const HANDLERS = {
             });
         }
         const testNotes = [];
-        if (result.length === 0) testNotes.push(NO_STATIC_TEST_LINK_NOTE);
+        // No linked test file, whatever unverified rows the answer lists
+        // apart (fix #513): the note says so, as the text does.
+        if (require('./search').linkedTestFiles(result).length === 0) testNotes.push(NO_STATIC_TEST_LINK_NOTE);
         // Mixed-language honesty: test files in unsupported languages (RSpec
         // for a .rb service, etc.) are invisible to the static scan — say so
         // whenever the target name occurs in unsupported files at all.

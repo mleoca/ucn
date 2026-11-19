@@ -3648,3 +3648,50 @@ describe('fix #507: a module object loaded by path is the module at that path', 
         }
     });
 });
+
+describe('fix #513: every surface counts the test files tests links', () => {
+    it('a tests answer of unverified rows only carries the no-link note, and about counts no linked file', () => {
+        const dir = projectOf({
+            'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+            'scripts/alpha.py': 'def main():\n    return 0\n',
+            'scripts/beta.py': 'def main():\n    return 1\n',
+            'tests/test_runtime.py': [
+                'import importlib.util',
+                '',
+                '',
+                'def test_runtime(name="beta"):',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_r", f"scripts/{name}.py"))',
+                '    assert mod.main() in (0, 1)',
+                '',
+            ].join('\n'),
+            'tests/test_alpha.py': [
+                'import importlib.util',
+                '',
+                '',
+                'def test_alpha():',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_a", "scripts/alpha.py"))',
+                '    assert mod.main() == 0',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const noteOf = response => response.note || '';
+            // beta: one file, every row unverified.
+            const beta = execute(index, 'tests', { name: 'main', file: 'scripts/beta.py' });
+            assert.ok(beta.ok, beta.error);
+            assert.strictEqual(beta.result.length, 1);
+            assert.match(noteOf(beta), /No static test link found/);
+            const betaAbout = execute(index, 'about', { name: 'main', file: 'scripts/beta.py' });
+            assert.ok(betaAbout.ok, betaAbout.error);
+            assert.deepStrictEqual(betaAbout.result.tests, { fileCount: 0, totalMatches: 0, files: [], unverifiedMatches: 1 });
+            // alpha: a linked file beside the unverified one.
+            const alpha = execute(index, 'tests', { name: 'main', file: 'scripts/alpha.py' });
+            assert.doesNotMatch(noteOf(alpha), /No static test link found/);
+            const alphaAbout = execute(index, 'about', { name: 'main', file: 'scripts/alpha.py' });
+            assert.deepStrictEqual(alphaAbout.result.tests, { fileCount: 1, totalMatches: 2, files: ['tests/test_alpha.py'], unverifiedMatches: 1 });
+        } finally {
+            rm(dir);
+        }
+    });
+});

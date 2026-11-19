@@ -897,3 +897,69 @@ describe('fix #507: calls through a module loaded by path stay in the partition'
         } finally { rm(dir); }
     });
 });
+
+describe('fix #513: one site, two definitions of a name in one module, one confirmation', () => {
+    it('the export\'s site is confirmed for the exported member and excluded for the other one, both conserved', () => {
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'lib.js': 'var app = exports = module.exports = {};\n\napp.init = function init(a) {\n  return a;\n};\n\n' +
+                'exports.render = function render(view, options) {\n  return view;\n};\n\n' +
+                'var other = {};\nother.render = function (x) {\n  return x;\n};\n',
+            'use.js': "var lib = require('./lib');\n\nlib.init(1);\nlib.render('a', {});\n",
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const tiers = {};
+            for (const line of [7, 12]) {
+                const result = execute(index, 'impact', { name: `lib.js:${line}:render`, all: true });
+                assert.ok(result.ok, JSON.stringify(result));
+                const account = result.result.account;
+                const sum = account.confirmed + account.unverified + account.nonCall.total + account.excluded.total +
+                    account.unparsed.lines + (account.unsupported ? account.unsupported.lines : 0) + account.unaccounted;
+                assert.strictEqual(sum, account.groundTotal, JSON.stringify(account));
+                assert.strictEqual(account.unaccounted, 0);
+                assert.strictEqual(account.conserved, true);
+                tiers[line] = { confirmed: account.confirmed, unverified: account.unverified, excluded: account.excluded.total };
+            }
+            assert.deepStrictEqual(tiers, {
+                7: { confirmed: 1, unverified: 0, excluded: 0 },
+                12: { confirmed: 0, unverified: 0, excluded: 1 },
+            });
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #513: calls through a JavaScript module loaded by path stay in the partition', () => {
+    it('confirmed for the loaded file, excluded for namesakes, unverified for runtime paths', () => {
+        const script = name => `function main() {\n  return "${name}";\n}\nmodule.exports = { main };\n`;
+        const dir = tmp({
+            'package.json': '{"name":"probe"}',
+            'app.js': script('app'),
+            'scripts/alpha.js': script('alpha'),
+            'scripts/beta.js': script('beta'),
+            'tests/loads.js': "const path = require('path');\nconst ALPHA = path.resolve(__dirname, '../scripts/alpha.js');\n\n" +
+                "function one() {\n  const a = require(ALPHA);\n  return a.main();\n}\n\n" +
+                "function any(name) {\n  const m = require(`../scripts/${name}.js`);\n  return m.main();\n}\n\nmodule.exports = { one, any };\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(accountForSymbol(index, 'main').conserved, true);
+            const { execute } = require('../core/execute');
+            const tiers = {};
+            for (const file of ['app.js', 'scripts/alpha.js', 'scripts/beta.js']) {
+                const result = execute(index, 'impact', { name: `${file}:1:main`, all: true });
+                assert.ok(result.ok, JSON.stringify(result));
+                const account = result.result.account;
+                assert.strictEqual(account.unaccounted, 0);
+                assert.strictEqual(account.conserved, true);
+                tiers[file] = { confirmed: account.confirmed, unverified: account.unverified, excluded: account.excluded.total };
+            }
+            assert.deepStrictEqual(tiers, {
+                'app.js': { confirmed: 0, unverified: 0, excluded: 2 },
+                'scripts/alpha.js': { confirmed: 1, unverified: 1, excluded: 0 },
+                'scripts/beta.js': { confirmed: 0, unverified: 1, excluded: 1 },
+            });
+        } finally { rm(dir); }
+    });
+});

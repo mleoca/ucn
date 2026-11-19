@@ -505,16 +505,19 @@ const STRUCTURAL_TRAITS = {
     // The names a file binds to its own module object, read from its
     // syntax tree (CommonJS `exports`, `module.exports` and the locals
     // written into one assignment with them): a member assigned to one is
-    // what importers of the module get under that name. null: the
+    // what importers of the module get under that name. The set's
+    // `filledByCall` says the file also fills the module object by a call
+    // or a computed member write, so not every name is read. null: the
     // language has no module object to assign members to (core/callers.js
-    // `_moduleExposesName`).
+    // `_moduleExposesName`, `_moduleExposesTarget`).
     moduleObjectNames: null,
     // `(index, filePath, call) => answer | null`: the module object a
     // call's receiver holds when the program loads it by path or by a
     // literal name (Python `importlib.util.module_from_spec` of a spec from
     // `spec_from_file_location`, `SourceFileLoader(..).load_module()`,
-    // `importlib.import_module("m")`), read from the syntax tree
-    // (core/loaded-modules.js, fix #507). null: not read.
+    // `importlib.import_module("m")`; JavaScript `require(p)` and `await
+    // import(p)` of a path the import graph does not read), read from the
+    // syntax tree (core/loaded-modules.js, fixes #507, #513). null: not read.
     loadedModule: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
@@ -1124,6 +1127,7 @@ const LANGUAGES = {
             checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             moduleObjectNames: tree => require('./javascript').moduleObjectNames(tree),
+            loadedModule: (index, filePath, call) => require('../core/loaded-modules').javascriptLoadedModule(index, filePath, call),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',
@@ -1162,6 +1166,7 @@ const LANGUAGES = {
             checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             moduleObjectNames: tree => require('./javascript').moduleObjectNames(tree),
+            loadedModule: (index, filePath, call) => require('../core/loaded-modules').javascriptLoadedModule(index, filePath, call),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',
@@ -1206,6 +1211,7 @@ const LANGUAGES = {
             checkDirectiveBarrier: text => text.startsWith('/*'),
             testUnits: (fileEntry, helpers) => require('./javascript').testUnits(fileEntry, helpers),
             moduleObjectNames: tree => require('./javascript').moduleObjectNames(tree),
+            loadedModule: (index, filePath, call) => require('../core/loaded-modules').javascriptLoadedModule(index, filePath, call),
             testRunnerModules: () => require('./javascript').TEST_RUNNER_MODULES,
             testExport: (fileEntry, helpers, name) => require('./javascript').testExport(fileEntry, helpers, name),
             testRunnerFamily: 'javascript',

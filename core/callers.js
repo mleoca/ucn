@@ -835,6 +835,21 @@ function findCallers(index, name, options = {}) {
         typeQueryTargets.every(target => IDENTITY_TYPE_KINDS.has(target.type));
     const targetDefinitionFiles = new Set(
         typeQueryTargets.map(definition => definition.file).filter(Boolean));
+    // The target files whose module binds the name to a target definition
+    // (fix #513): what a module-name chase (an import of the name, a module
+    // receiver's member, a loaded module's member) may reach. A target
+    // assigned to a member of some other value is reached through that value
+    // only, so its file stands in for it only when another target there is
+    // the module's name; otherwise the file is walked like any other.
+    let _moduleNameTargetFiles = null;
+    const moduleNameTargetFiles = () => {
+        if (_moduleNameTargetFiles) return _moduleNameTargetFiles;
+        const kept = [...targetDefinitionFiles].filter(file =>
+            _moduleExposesTarget(index, file, name, typeQueryTargets));
+        _moduleNameTargetFiles = kept.length === targetDefinitionFiles.size
+            ? targetDefinitionFiles : new Set(kept);
+        return _moduleNameTargetFiles;
+    };
     // Go build-configuration alternatives of a target (fix #425).
     const goConfigurationsExclude = typeQueryTargets.some(target =>
         langTraits(index.files.get(target.file)?.language)?.conditionalDefinitions === 'build-constraint' &&
@@ -3231,9 +3246,15 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                             const resolvedAbs = path.join(index.root, rel);
+                            // The import binds the module's name, which a
+                            // member of another value is not, and a default
+                            // import binds the module's default export,
+                            // whatever its local spelling (fix #513).
                             const verdict = binding.defaultLike
-                                ? _defaultBindingReaches(index, resolvedAbs, cbTargetFiles)
-                                : _nameBindingReaches(index, resolvedAbs, binding.name, cbTargetFiles,
+                                ? _defaultBindingReaches(index, resolvedAbs, moduleNameTargetFiles())
+                                : binding.kind === 'default' && _esmDefaultImportIsAnonymous(index, resolvedAbs, name)
+                                ? 'no'
+                                : _nameBindingReaches(index, resolvedAbs, binding.name, moduleNameTargetFiles(),
                                     4, { targetName: name });
                             if (verdict === 'yes') {
                                 cbBindingReaches = true;
@@ -4535,7 +4556,7 @@ function findCallers(index, name, options = {}) {
                     (call.receiver || call.receiverRoot) &&
                     structuralLanguage)
                     ? _importedNamespaceMemberOwnership(
-                        index, fileEntry, call, targetDefinitionFiles)
+                        index, fileEntry, call, moduleNameTargetFiles())
                     : null;
 
                 // Go package-owned value receiver (`io.Discard.Write`). The
@@ -5128,8 +5149,10 @@ function findCallers(index, name, options = {}) {
                 let importChainReachesTarget = false;
                 // The project files the name's own import bindings resolve to
                 // when their chains could not be modeled (fix #423): the only
-                // import edges that are evidence about this name.
+                // import edges that are evidence about this name, and the
+                // target files they may stand in for (fix #513).
                 let nameImportFiles = null;
+                let nameImportTargets = null;
                 if (!bindingId && !call.isMethod &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     (fileEntry.importBindings || []).length > 0) {
@@ -5265,9 +5288,15 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                             const resolvedAbs = path.join(index.root, rel);
+                            // The import binds the module's name, which a
+                            // member of another value is not, and a default
+                            // import binds the module's default export,
+                            // whatever its local spelling (fix #513).
                             const verdict = b.defaultLike
-                                ? _defaultBindingReaches(index, resolvedAbs, tFiles)
-                                : _nameBindingReaches(index, resolvedAbs, b.name, tFiles,
+                                ? _defaultBindingReaches(index, resolvedAbs, moduleNameTargetFiles())
+                                : b.kind === 'default' && _esmDefaultImportIsAnonymous(index, resolvedAbs, name)
+                                ? 'no'
+                                : _nameBindingReaches(index, resolvedAbs, b.name, moduleNameTargetFiles(),
                                     4, { targetName: name, valueVerdict: true, configurationVerdict: true });
                             if (verdict === 'yes') { reaches = true; break; }
                             if (verdict === 'unknown') undetermined = true;
@@ -5333,11 +5362,13 @@ function findCallers(index, name, options = {}) {
                             // That file is evidence only for a name it can
                             // expose (fix #506d): a callable it assigns to
                             // a member of some other value is not what the
-                            // import binds.
-                            if (![...tFiles].some(file => _moduleExposesName(index, file, name))) {
+                            // import binds, whatever else the file binds
+                            // under the name (fix #513).
+                            if (moduleNameTargetFiles().size === 0) {
                                 routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
                                 continue;
                             }
+                            nameImportTargets = moduleNameTargetFiles();
                             nameImportFiles = ownResolved;
                         }
                     }
@@ -5607,11 +5638,10 @@ function findCallers(index, name, options = {}) {
                 // path stays visible with its reason.
                 if (recvLoaded) {
                     const reachesFile = file => {
-                        const verdict = _nameBindingReaches(index, file, call.name, targetDefinitionFiles, 4,
+                        const verdict = _nameBindingReaches(index, file, call.name, moduleNameTargetFiles(), 4,
                             { targetName: name, valueVerdict: true, configurationVerdict: true });
                         if (verdict === 'yes' || verdict === 'no') return verdict;
-                        if (verdict === 'unknown' && _importReaches(index, file, new Set([...targetDefinitionFiles]
-                            .filter(target => _moduleExposesName(index, target, name))))) return 'yes';
+                        if (verdict === 'unknown' && _importReaches(index, file, moduleNameTargetFiles())) return 'yes';
                         return 'unknown';
                     };
                     const loadedVia = { dispatchVia: recvLoaded.via };
@@ -5670,12 +5700,16 @@ function findCallers(index, name, options = {}) {
                 // definition; an unknown chain stays visible (deep barrels and
                 // dynamic CJS surfaces can exceed the modeled ownership);
                 // unresolved-but-project-looking → visible (resolver gap).
-                if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod &&
+                // A load the reader placed (`const m = require(P)`, fix
+                // #513) was decided above: its import record names no module.
+                if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod && !recvLoaded &&
                     (call.receiverIsModule || call.receiverModuleSpecifier ||
                         recvSubmoduleRel || recvExportedNamespace ||
                         call.receiverModuleComposition) &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
-                    const tFiles = targetDefinitionFiles;
+                    // A module's member is a name of that module, which a
+                    // member of another value is not (fix #513).
+                    const tFiles = moduleNameTargetFiles();
                     const compositeOwnership = call.receiverModuleComposition
                         ? _structuralCompositeModuleOwnership(
                             index, fileEntry, call, tFiles)
@@ -5756,13 +5790,13 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                             // File-level reach stands in for the name only
-                            // at a file that can expose it (fix #506d):
-                            // `lib.render()` is no call of a `render` the
-                            // module assigns to some other object.
+                            // at a file that can expose it (fix #506d)
+                            // through a target (fix #513): `lib.render()`
+                            // is no call of a `render` the module assigns
+                            // to some other object.
                             if (verdict === 'yes' ||
                                 (verdict === 'unknown' && !ambiguousCjsMember &&
-                                 _importReaches(index, resolvedAbs, new Set([...tFiles].filter(
-                                     file => _moduleExposesName(index, file, name)))))) {
+                                 _importReaches(index, resolvedAbs, tFiles))) {
                                 reaches = true; break;
                             }
                             if (verdict === 'no') definitiveOtherBindings++;
@@ -6772,9 +6806,10 @@ function findCallers(index, name, options = {}) {
                 // The name's own import binding chased to a target through
                 // any number of re-exports (fix #397) is import evidence; the
                 // file-level edge check looks one re-export hop deep.
+                const nameTargets = nameImportTargets || targetFiles2;
                 let importEdgeLink = importChainReachesTarget || (nameImportFiles
-                    ? setSome(nameImportFiles, f => f !== filePath && (targetFiles2.has(f) ||
-                        setSome(index.importGraph.get(f) || new Set(), ti => ti !== filePath && targetFiles2.has(ti))))
+                    ? setSome(nameImportFiles, f => f !== filePath && (nameTargets.has(f) ||
+                        setSome(index.importGraph.get(f) || new Set(), ti => ti !== filePath && nameTargets.has(ti))))
                     : fileImportEdgeLink(filePath, callerImports, targetFiles2));
                 // Same-file membership is module-scope evidence for plain calls,
                 // but says nothing about a method receiver: `foo.map()` sharing a
@@ -9493,8 +9528,10 @@ function findCallees(index, definition, options = {}) {
             // A module object the program loads by path or by a literal name
             // (fix #507, the caller side's rule): its member is the name the
             // loaded file binds; a path with a runtime part or one that is
-            // not read keeps the site visible with its reason.
-            if (call.isMethod && call.receiver && !call.receiverField && !call.receiverIsModule &&
+            // not read keeps the site visible with its reason. A module
+            // receiver is read only when its import is such a load (fix
+            // #513, `loadedModuleOfReceiver`).
+            if (call.isMethod && call.receiver && !call.receiverField &&
                 langTraits(language)?.loadedModule) {
                 const loaded = lazyLoadedModules().loadedModuleOfReceiver(index, def.file, call);
                 if (loaded) {
@@ -15219,7 +15256,6 @@ function _moduleExposesName(index, file, name) {
 }
 
 function _moduleExposesOwnName(index, file, name) {
-    const fileEntry = index.files.get(file);
     const own = (index.symbols.get(name) || []).filter(definition => definition.file === file);
     const members = own.filter(definition => definition.memberAssigned && !definition.className);
     if (members.length === 0) return true;
@@ -15227,33 +15263,103 @@ function _moduleExposesOwnName(index, file, name) {
     // member assignments: neither is a name of the module.
     const named = own.filter(definition => !definition.memberAssigned && !definition.className && !definition.receiver);
     if (named.length > 0) return true;
+    return members.some(definition => _memberOfModuleObject(index, file, definition, name));
+}
+
+/**
+ * Is a callable assigned to a member (`definition.memberAssigned`) a member
+ * of its file's module object (fix #506d)? The export record of the
+ * assignment itself or of the literal the member is written in
+ * (`exports.parse = ..`, `module.exports.parse = ..`, `module.exports = {
+ * parse() {} }`), or a member of a name the file binds to its module object
+ * (`module.exports = res` then `res.send = ..`, trait `moduleObjectNames`).
+ */
+function _memberOfModuleObject(index, file, definition, name) {
+    const fileEntry = index.files.get(file);
     const records = (fileEntry?.exportDetails || []).filter(record => !record.source &&
         (record.type === 'exports' || record.type === 'module.exports'));
-    let moduleNames = null;
-    const moduleObjectNames = () => {
-        if (moduleNames) return moduleNames;
-        moduleNames = new Set();
-        const read = langTraits(fileEntry?.language)?.moduleObjectNames;
-        if (typeof read !== 'function') return moduleNames;
+    const lines = [definition.startLine, definition.objectLiteralLine].filter(Number.isInteger);
+    if (records.some(record => (record.localName || record.name) === name && lines.includes(record.line))) return true;
+    return !!definition.assignedReceiver && (
+        records.some(record => record.defaultLike && record.localName === definition.assignedReceiver) ||
+        _moduleObjectNamesOf(index, file).has(definition.assignedReceiver));
+}
+
+/** The names `file` binds to its module object (trait `moduleObjectNames`),
+ * read once per file for the life of the index. */
+function _moduleObjectNamesOf(index, file) {
+    const cache = index._nameBindingReachCache;
+    const key = `module-objects\x00${file}`;
+    if (cache?.has(key)) return cache.get(key);
+    const fileEntry = index.files.get(file);
+    let names = new Set();
+    const read = langTraits(fileEntry?.language)?.moduleObjectNames;
+    if (typeof read === 'function') {
         try {
             const content = index._readFile(file);
             const tree = index._getParsedTree?.(file, content, fileEntry.language);
-            if (tree) moduleNames = read(tree);
-        } catch (_) { moduleNames = new Set(); }
-        return moduleNames;
-    };
-    const exposed = members.some(definition => {
-        // The export record of the assignment itself, or of the literal
-        // the member is written in.
-        const lines = [definition.startLine, definition.objectLiteralLine].filter(Number.isInteger);
-        if (records.some(record => (record.localName || record.name) === name && lines.includes(record.line))) return true;
-        // A member of a name the file binds to its module object.
-        return !!definition.assignedReceiver && (
-            records.some(record => record.defaultLike && record.localName === definition.assignedReceiver) ||
-            moduleObjectNames().has(definition.assignedReceiver));
-    });
-    return exposed;
+            if (tree) names = read(tree);
+        } catch (_) { names = new Set(); }
+    }
+    if (cache) cache.set(key, names);
+    return names;
 }
+
+/**
+ * Does `file` expose `name` through one of `targets` (fix #513)? The module
+ * binds a name per definition, not per file: in a file holding both
+ * `exports.render = function render(..)` and `other.render = function (x)`,
+ * `require('./lib').render` is the first and never the second. A target
+ * assigned to a member of some other value is no name of its module even
+ * when another definition of the file is, unless the file fills its module
+ * object by a call (`Object.assign(module.exports, other)`): what that
+ * exposes is not read, and the file-level answer stands. Any other target
+ * keeps the file-level answer (`_moduleExposesName`).
+ */
+function _moduleExposesTarget(index, file, name, targets) {
+    const own = (targets || []).filter(definition => definition.file === file && definition.name === name);
+    if (own.length === 0) return _moduleExposesName(index, file, name);
+    return own.some(definition => {
+        if (!definition.memberAssigned || definition.className) return _moduleExposesName(index, file, name);
+        if (_memberOfModuleObject(index, file, definition, name)) return true;
+        return _moduleObjectNamesOf(index, file).filledByCall === true && _moduleExposesName(index, file, name);
+    });
+}
+
+/**
+ * Does an ES module default import of `file` bind an anonymous function or
+ * class (fix #513)? `import localeData from './plugin'` binds the module's
+ * `default` export, never a binding the module names `localeData`; when that
+ * export is written as a function or class literal with no name of its own
+ * (`export default (o, c) => {..}`, `export default class {}`), no
+ * definition named `name` is what the import binds. Any other value
+ * (`export default memo(Button)`, `flag ? A : B`) may carry a definition and
+ * keeps the name chase. Only a module whose surface is read: no CommonJS
+ * assignment, one local default record, no definition of `name` declared on
+ * the record's line.
+ */
+function _esmDefaultImportIsAnonymous(index, file, name) {
+    if (!name || name === 'default') return false;
+    const fileEntry = index.files.get(file);
+    const details = fileEntry?.exportDetails || [];
+    if (details.some(record => record.type === 'exports' || record.type === 'module.exports')) return false;
+    if (details.some(record => record.source && (record.alias || record.name) === 'default')) return false;
+    const defaults = details.filter(record => !record.source && (record.type === 'default' || record.alias === 'default'));
+    if (defaults.length !== 1 || defaults[0].type !== 'default' || defaults[0].name !== 'default') return false;
+    if (definitionsInFile(index, name, file).some(definition => definition.startLine === defaults[0].line)) return false;
+    let tree;
+    try {
+        tree = index._getParsedTree?.(file, index._readFile(file), fileEntry.language) || null;
+    } catch (_) { tree = null; }
+    if (!tree) return false;
+    const statement = tree.rootNode.namedChildren.find(node => node.type === 'export_statement' &&
+        node.startPosition.row + 1 === defaults[0].line && !node.childForFieldName('declaration'));
+    let value = statement?.childForFieldName('value');
+    while (value?.type === 'parenthesized_expression') value = value.namedChild(0);
+    return !!value && _ANONYMOUS_DEFAULT_VALUES.has(value.type) && !value.childForFieldName('name');
+}
+const _ANONYMOUS_DEFAULT_VALUES = new Set(['arrow_function', 'function_expression', 'function',
+    'generator_function', 'class']);
 
 function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, options = {}) {
     // The same export path is asked once per competing definition and again
@@ -19099,9 +19205,14 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
             type.file === d.file && IDENTITY_TYPE_KINDS.has(type.type) &&
             type.startLine <= d.startLine && (type.endLine ?? type.startLine) >= d.startLine);
     };
+    // Nor is a callable assigned to a member of some other value
+    // (`other.render = function (x)` beside `exports.render = ..`, fix
+    // #513): that value reaches it, never the module's name.
+    const memberOfOtherValue = d => !!d.memberAssigned && !d.className && !!d.file &&
+        !_memberOfModuleObject(index, d.file, d, d.name);
     const shapeMatches = d =>
         (language !== 'rust' || !(d.className || d.receiver)) &&
-        !memberOfDeclaredType(d) &&
+        !memberOfDeclaredType(d) && !memberOfOtherValue(d) &&
         (!NON_CALLABLE_TYPES.has(d.type) ||
             (call.isConstructor && d.type === 'class') ||
             (langTraits(language)?.classesCallableWithoutNew && d.type === 'class')) &&
@@ -24274,8 +24385,16 @@ function _callArityCompatible(call, targetDefs, language) {
                 .replace(/&|mut\s*/g, '').trim()));
         const boundExtension = !!(def.isExtensionMethod && call.isMethod &&
             call.receiver !== def.className);
+        const receiverPassed = hasExplicitSelf
+            ? _receiverPassedImplicitly(call, def, traits) : 'implicit';
+        // A receiver the call may or may not pass: either list fits.
+        if (receiverPassed === 'either' && !boundExtension) {
+            sawComparable = true;
+            if (_paramListFits(call, ps.slice(1), traits) || _paramListFits(call, ps, traits)) return true;
+            continue;
+        }
         const params = ps.filter((p, i) =>
-            !(i === 0 && p && (hasExplicitSelf || boundExtension)));
+            !(i === 0 && p && ((hasExplicitSelf && receiverPassed === 'implicit') || boundExtension)));
         const isMethodDef = !!(def.className || def.receiver);
         // The receiver-as-first-arg shift applies only to call shapes that
         // can actually be unbound: Rust UFCS (Type::method(&x)) and Go
@@ -24307,6 +24426,48 @@ function _callArityCompatible(call, targetDefs, language) {
         }
     }
     return sawComparable ? false : true;
+}
+
+/**
+ * Does a call pass the leading receiver-named parameter of `def` implicitly
+ * (fix #513)? A language's receiver syntax (Rust `self`, TypeScript `this`)
+ * always is. Where the receiver is an ordinary first parameter named by
+ * convention (trait `receiverParameterByConvention`: Python `self`, `cls`),
+ * only a member of a type called through a receiver gets it implicitly:
+ *   'explicit' - a function that is not a member, called by name or through
+ *                a module (`helper(a, b)` for `def helper(self, x)`); a
+ *                static member, called through its class or an instance;
+ *                and a member called through its own class's name, which
+ *                is the unbound function (`Box.run(box, 1)`);
+ *   'either'   - a function that is not a member, called through another
+ *                receiver (a class attribute holding it binds the receiver,
+ *                an instance attribute does not), and a member called
+ *                through a local spelled like its class;
+ *   'implicit' - every other member call (`box.run(1)`, `Box.make(1)` for a
+ *                classmethod).
+ */
+function _receiverPassedImplicitly(call, def, traits) {
+    if (traits?.receiverParameterByConvention !== true) return 'implicit';
+    if (!def.className && !def.receiver) {
+        return call.isMethod && !call.receiverIsModule ? 'either' : 'explicit';
+    }
+    if (def.memberType === 'static' || def.type === 'static') return 'explicit';
+    if (def.memberType === 'classmethod' || def.type === 'classmethod') return 'implicit';
+    if (call.isMethod && call.receiver && call.receiver === def.className && !call.receiverType) {
+        return call.receiverLocalBinding ? 'either' : 'explicit';
+    }
+    return 'implicit';
+}
+
+/** Does the call's argument count fit one parameter list (no receiver
+ * shift, no unbound form)? */
+function _paramListFits(call, params, traits) {
+    if (params.some(p => p && p.rest)) {
+        return call.argCount >= params.filter(p => p && !p.rest && !p.optional && p.default === undefined).length;
+    }
+    const min = params.filter(p => p && !p.rest && !p.optional && p.default === undefined).length;
+    if (traits?.packageScope === 'directory') return call.argCount <= params.length;
+    return call.argCount >= min && call.argCount <= params.length;
 }
 
 const JAVA_PRIMITIVES = new Set(['int', 'long', 'short', 'byte', 'char', 'float', 'double', 'boolean']);
@@ -32785,6 +32946,6 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { argumentProvablyConverts: _argProvablyConverts, cppArgumentProvablyConverts: _cppArgProvablyConverts, rustPathQualifierVerdict: _pathQualifierVerdict, rustTraitDeclPathProbe: _rustTraitDeclPathProbe, _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _nonSourceModuleFile, _moduleValueAliasType, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
+module.exports = { argumentProvablyConverts: _argProvablyConverts, cppArgumentProvablyConverts: _cppArgProvablyConverts, rustPathQualifierVerdict: _pathQualifierVerdict, rustTraitDeclPathProbe: _rustTraitDeclPathProbe, _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _nonSourceModuleFile, _moduleValueAliasType, _importReaches, _moduleExposesTarget, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
     _goFileConstraint, _typeQueryRecords };

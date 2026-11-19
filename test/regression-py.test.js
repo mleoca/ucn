@@ -66,10 +66,12 @@ describe('fix #467: instance wrappers preserve possible method calls', () => {
                     { collectAccount: true, includeMethods: true });
                 assert.ok(callees.some(callee => callee.name === 'm' && callee.className === 'A'), name);
             }
+            // `A.m(b)` calls the class's own function, never the instance
+            // field: its receiver is its argument, so it fits (fix #513).
             const qualified = index.findCallees(index.find('qualified', { exact: true })[0],
                 { collectAccount: true, includeMethods: true });
-            assert.ok(qualified.unverifiedCallees.some(callee => callee.name === 'm' &&
-                callee.reason === 'uncertain-receiver'));
+            assert.ok(qualified.some(callee => callee.name === 'm' && callee.className === 'A'));
+            assert.ok(!qualified.unverifiedCallees.some(callee => callee.name === 'm'));
             const show = execute(index, 'show', { name: 'a.py:4:m', sections: 'callers' });
             assert.ok(show.ok, show.error);
             assert.strictEqual(show.result.context.meta.account.conserved, true);
@@ -11147,6 +11149,115 @@ describe('fix #507: module objects loaded by path, caller and callee sides', () 
             assert.ok(alpha.unverified.every(site => !site.includes('module-path')), JSON.stringify(alpha));
             // Not the loaded module: no exclusion for the other namesakes either.
             assert.strictEqual(callersOf(index, 'app.py').unverified.length, 3);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #513: a receiver name is not a receiver', () => {
+    const { _callArityCompatible, getCachedCalls } = require('../core/callers');
+    // Every call record of `file` whose name has one callable definition, as
+    // `L<line> <name>: fits|no-fit` under the engine's argument-count model.
+    const arityOf = (index, file) => {
+        const rows = [];
+        for (const call of getCachedCalls(index, path.join(index.root, file)) || []) {
+            const defs = (index.symbols.get(call.name) || []).filter(d =>
+                ['function', 'method', 'static', 'classmethod'].includes(d.type));
+            if (defs.length !== 1) continue;
+            rows.push(`L${call.line} ${call.name}: ${_callArityCompatible(call, defs, 'python') ? 'fits' : 'no-fit'}`);
+        }
+        return rows;
+    };
+    const LIB = [
+        'def helper(self, x):',
+        '    return x',
+        '',
+        '',
+        'class Box:',
+        '    @staticmethod',
+        '    def build(self, x):',
+        '        return x',
+        '',
+        '    @classmethod',
+        '    def make(cls, x):',
+        '        return cls()',
+        '',
+        '    def run(self, x):',
+        '        return x',
+        '',
+        '    attached = helper',
+        '',
+    ].join('\n');
+
+    // Each count is pyright's verdict on the same file (basic mode): the
+    // clean twin has no error, every call of the break twin has one.
+    it('the leading self or cls is an argument of a function and of a static member', () => {
+        const dir = tmp({
+            'helpers.py': LIB,
+            'clean.py': [
+                'import helpers',
+                'from helpers import helper, Box',
+                '',
+                '',
+                'def main():',
+                '    helper(1, 2)',
+                '    helpers.helper(1, 2)',
+                '    Box.build(1, 2)',
+                '    Box.make(1)',
+                '    box = Box()',
+                '    box.run(1)',
+                '    Box.run(box, 1)',
+                '    box.attached(1)',
+                '    return box.build(3, 4)',
+                '',
+            ].join('\n'),
+            'broken.py': [
+                'import helpers',
+                'from helpers import helper, Box',
+                '',
+                '',
+                'def main():',
+                '    helper(1)',
+                '    helpers.helper(1)',
+                '    Box.build(1)',
+                '    Box.make(1, 2)',
+                '    box = Box()',
+                '    box.run(1, 2)',
+                '    Box.run(box)',
+                '    return box.build(3)',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(arityOf(index, 'clean.py'), ['L6 helper: fits', 'L7 helper: fits', 'L8 build: fits',
+                'L9 make: fits', 'L11 run: fits', 'L12 run: fits', 'L14 build: fits']);
+            assert.deepStrictEqual(arityOf(index, 'broken.py'), ['L6 helper: no-fit', 'L7 helper: no-fit', 'L8 build: no-fit',
+                'L9 make: no-fit', 'L11 run: no-fit', 'L12 run: no-fit', 'L13 build: no-fit']);
+            // A function held by a class attribute binds the receiver through an
+            // instance: a method-shaped call takes either count.
+            const attached = getCachedCalls(index, path.join(dir, 'clean.py')).find(call => call.name === 'attached');
+            const helperDef = index.symbols.get('helper')[0];
+            assert.strictEqual(_callArityCompatible({ ...attached, name: 'helper' }, [helperDef], 'python'), true);
+            // The callees of the clean twin are all confirmed.
+            const main = index.symbols.get('main').find(d => d.relativePath === 'clean.py');
+            index._beginOp();
+            try {
+                const callees = index.findCallees(main, { includeMethods: true, collectAccount: true });
+                const confirmed = callees.filter(c => c.tier !== 'unverified').map(c => `${c.name}x${c.callCount}`).sort();
+                assert.deepStrictEqual(confirmed, ['Boxx1', 'buildx2', 'helperx2', 'makex1', 'runx2']);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
+    it('a receiver syntax of another language keeps its implicit receiver', () => {
+        const dir = tmp({
+            'lib.rs': 'pub struct S;\nimpl S {\n    pub fn get(&self, x: i32) -> i32 { x }\n}\npub fn use_it(s: &S) -> i32 { s.get(1) }\n',
+        });
+        try {
+            const index = idx(dir);
+            const call = getCachedCalls(index, path.join(dir, 'lib.rs')).find(c => c.name === 'get');
+            assert.strictEqual(_callArityCompatible(call, index.symbols.get('get'), 'rust'), true);
+            assert.strictEqual(_callArityCompatible({ ...call, argCount: 2 }, index.symbols.get('get'), 'rust'), false);
         } finally { rm(dir); }
     });
 });

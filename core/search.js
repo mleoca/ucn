@@ -23,6 +23,16 @@ const { createTestModel, addTestCaseRows, linkFiles, testSite, testSiteKey, unit
 /** A row the engine could not attribute to the target: it links no test. */
 const isUnverifiedTestRow = match => match.matchType === 'unverified-call' || match.matchType === 'unverified-reference';
 
+/**
+ * The files of a `tests` answer that link a test: a file whose every row is
+ * unverified links none (fix #507). Every surface that counts linked test
+ * files reads this one rule (fix #513: `tests` text, its note, `about`).
+ */
+function linkedTestFiles(files) {
+    return (Array.isArray(files) ? files : []).filter(file =>
+        !(file.matches.length > 0 && file.matches.every(isUnverifiedTestRow)));
+}
+
 // Keep the established search-input contract for the canonical catastrophic
 // nested-single-atom family even though the RE2-compatible engine could run it
 // safely. Rejecting these patterns avoids silently changing behavior if an
@@ -2306,4 +2316,4 @@ function _deduplicateMatches(matches) {
     return [...byLine.values()].sort((a, b) => a.line - b.line);
 }
 
-module.exports = { find, _applyFindFilters, usages, search, structuralSearch, example, typedef, tests };
+module.exports = { find, _applyFindFilters, usages, search, structuralSearch, example, typedef, tests, isUnverifiedTestRow, linkedTestFiles };

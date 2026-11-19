@@ -412,9 +412,9 @@ function formatTests(tests, name) {
     // are listed after the linked tests, with the test that holds each and
     // why it is unverified, and no command (fix #507).
     const files = Array.isArray(tests) ? tests : [];
-    const unverifiedRow = match => match.matchType === 'unverified-call' || match.matchType === 'unverified-reference';
+    const { isUnverifiedTestRow: unverifiedRow, linkedTestFiles } = require('../search');
     // A file whose every row is unverified is no linked test file.
-    const linked = files.filter(testFile => !(testFile.matches.length > 0 && testFile.matches.every(unverifiedRow)));
+    const linked = linkedTestFiles(files);
     const unverified = files.filter(testFile => testFile.matches.some(unverifiedRow));
 
     if (linked.length === 0) {
