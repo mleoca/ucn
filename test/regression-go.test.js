@@ -9085,3 +9085,63 @@ describe('fix #434: Go keyed composite-literal fields and literal-typed locals i
         } finally { rm(dir); }
     });
 });
+
+describe('fix #515: a local spelled like a type is that local, never the type', () => {
+    const callerRows = (index, name, file, line) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        const rows = new Map();
+        for (const c of r) rows.set(`${c.relativePath}:${c.line}`, c.tier === 'unverified' ? 'unverified' : 'confirmed');
+        for (const u of r.unverifiedEntries || []) {
+            const key = `${u.relativePath || path.relative(index.root, u.file)}:${u.line}`;
+            if (!rows.has(key)) rows.set(key, 'unverified');
+        }
+        for (const e of r.accountRaw.excludedEntries) {
+            const key = `${path.relative(index.root, e.file)}:${e.line}`;
+            if (!rows.has(key)) rows.set(key, `excluded ${e.reason}`);
+        }
+        return rows;
+    };
+
+    it('never confirms the type method through a local of its spelling', () => {
+        // `go test` on this package passes with `RunVia(makeOther, "a") == "a!"`:
+        // the local `parser` holds an Other.
+        const dir = tmp({
+            'go.mod': 'module example.com/fx\n\ngo 1.21\n',
+            'app/parser.go': [
+                'package app',
+                '',
+                'type parser struct{ n int }',
+                '',
+                'func (p *parser) Parse(s string) string { return s }',
+                '',
+                'type Other struct{}',
+                '',
+                'func (o Other) Parse(s string) string { return s + "!" }',
+                '',
+                'type Parsing interface{ Parse(s string) string }',
+                '',
+                'func makeOther() Parsing { return Other{} }',
+                '',
+                'func RunVia(get func() Parsing, s string) string {',
+                '\tparser := get()',
+                '\treturn parser.Parse(s)',
+                '}',
+                '',
+                'func RunTyped(s string) string {',
+                '\tp := &parser{}',
+                '\treturn p.Parse(s)',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const call = index.getCachedCalls(path.join(dir, 'app/parser.go')).find(c => c.name === 'Parse' && c.line === 17);
+            assert.strictEqual(call.receiverLocalBinding, true);
+            const typeMethod = callerRows(index, 'Parse', 'app/parser.go', 5);
+            assert.strictEqual(typeMethod.get('app/parser.go:17'), 'unverified');
+            assert.strictEqual(typeMethod.get('app/parser.go:22'), 'confirmed');
+        } finally { rm(dir); }
+    });
+});

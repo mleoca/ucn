@@ -10081,3 +10081,48 @@ describe('fix #503 correction: Rust attributes belong to AST items', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #515: a Rust path names what the item scopes bind, a module beside a type of its name', () => {
+    it('a module of the name is the module, the type path is the type', () => {
+        // `cargo run`: via_module returns "a!", via_type returns "a".
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fx"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/model.rs': 'pub struct Parser;\n\nimpl Parser {\n    pub fn parse(s: &str) -> String {\n        s.to_string()\n    }\n}\n',
+            'src/main.rs': [
+                'mod model;',
+                '',
+                '#[allow(non_snake_case)]',
+                'mod Parser {',
+                '    pub fn parse(s: &str) -> String {',
+                '        format!("{}!", s)',
+                '    }',
+                '}',
+                '',
+                'fn via_module(s: &str) -> String {',
+                '    Parser::parse(s)',
+                '}',
+                '',
+                'fn via_type(s: &str) -> String {',
+                '    model::Parser::parse(s)',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calleesOf = name => {
+                const def = index.symbols.get(name)[0];
+                index._beginOp();
+                try {
+                    return index.findCallees(def, { collectAccount: true, includeMethods: true })
+                        .filter(c => c.tier !== 'unverified').map(c => `${c.name} ${c.relativePath}:${c.startLine}`);
+                } finally { index._endOp(); }
+            };
+            assert.deepStrictEqual(calleesOf('via_module'), ['parse src/main.rs:5']);
+            assert.deepStrictEqual(calleesOf('via_type'), ['parse src/model.rs:4']);
+            const typeMethod = index.symbols.get('parse').find(d => d.relativePath === 'src/model.rs');
+            const callers = index.findCallers('parse', { includeMethods: true, targetDefinitions: [typeMethod], collectAccount: true });
+            assert.deepStrictEqual(callers.filter(c => c.tier !== 'unverified').map(c => c.line), [15]);
+        } finally { rm(dir); }
+    });
+});

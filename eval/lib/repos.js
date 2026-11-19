@@ -564,6 +564,17 @@ const REPOS = [
         targetCandidates: ['.'],
     },
     {
+        // A fresh finding in receiver denotation: `parser = None` beside a
+        // lazy `from dateutil import parser` under `global parser` binds the
+        // package, never the class `parser` of another module. Pinned at the
+        // commit of the failed weekly draw.
+        name: 'python-dateutil',
+        url: 'https://github.com/dateutil/dateutil',
+        commit: 'a78cbd81d5d03b5f126eb36edb92bca78972c804',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
+    {
         // An APPLICATION, not a library: a Django site whose static assets
         // vendor two bundled `*.min.js` files beside its Python and
         // JavaScript sources. The board had no repository where unindexed
@@ -631,13 +642,14 @@ const RELEASE_REPOS = Object.freeze(RELEASE_REPO_NAMES.map(name => {
 // screening. A failed fresh draw remains a failure until investigated; do
 // not rotate it away or weaken the gate. Tuning it triggers graduation.
 // Packaging replaces the repaired cachetools draw using source/build
-// eligibility only; it has not been screened for passing answers.
+// eligibility only; it has not been screened for passing answers. So does
+// sqlparse for the repaired python-dateutil draw.
 const FRESH_POOL = [
     { name: 'jinja', url: 'https://github.com/pallets/jinja', language: 'python', targetCandidates: ['.'] },
     { name: 'papaparse', url: 'https://github.com/mholt/PapaParse', language: 'javascript', targetCandidates: ['.'] },
     { name: 'superstruct', url: 'https://github.com/ianstormtaylor/superstruct', language: 'typescript', targetCandidates: ['.'] },
     { name: 'packaging', url: 'https://github.com/pypa/packaging', language: 'python', targetCandidates: ['.'] },
-    { name: 'python-dateutil', url: 'https://github.com/dateutil/dateutil', language: 'python', targetCandidates: ['.'] },
+    { name: 'sqlparse', url: 'https://github.com/andialbrecht/sqlparse', language: 'python', targetCandidates: ['.'] },
     { name: 'toml', url: 'https://github.com/BurntSushi/toml', language: 'go', targetCandidates: ['.'] },
     { name: 'resty', url: 'https://github.com/go-resty/resty', language: 'go', targetCandidates: ['.'] },
     { name: 'semver', url: 'https://github.com/dtolnay/semver', language: 'rust', targetCandidates: ['.'] },

@@ -8707,3 +8707,80 @@ describe('fix #476: template calls inside ambiguous direct initializers', () => 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #515: a C# local or lambda parameter spelled like a class is that variable, never the class', () => {
+    const callerRows = (index, name, file, line) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        const rows = new Map();
+        for (const c of r) rows.set(`${c.relativePath}:${c.line}`, c.tier === 'unverified' ? 'unverified' : 'confirmed');
+        for (const u of r.unverifiedEntries || []) {
+            const key = `${u.relativePath || path.relative(index.root, u.file)}:${u.line}`;
+            if (!rows.has(key)) rows.set(key, 'unverified');
+        }
+        for (const e of r.accountRaw.excludedEntries) {
+            const key = `${path.relative(index.root, e.file)}:${e.line}`;
+            if (!rows.has(key)) rows.set(key, `excluded ${e.reason}`);
+        }
+        return rows;
+    };
+
+    it('never confirms the static method through a local or lambda parameter of its spelling', () => {
+        // `dotnet run` on these files: both `Parser.Parse(s)` through the
+        // variable return "a!" (C# simple-name lookup finds the local first).
+        const dir = tmp({
+            'Parser.cs': [
+                'namespace App',
+                '{',
+                '    public class Parser',
+                '    {',
+                '        public static string Parse(string s) { return s; }',
+                '    }',
+                '',
+                '    public class Other',
+                '    {',
+                '        public string Parse(string s) { return s + "!"; }',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+            'Use.cs': [
+                'using System;',
+                '',
+                'namespace App',
+                '{',
+                '    public class Use',
+                '    {',
+                '        public static string ViaLocal(Func<Other> get, string s)',
+                '        {',
+                '            var Parser = get();',
+                '            return Parser.Parse(s);',
+                '        }',
+                '',
+                '        public static string ViaLambda(string s)',
+                '        {',
+                '            Func<Other, string> f = Parser => Parser.Parse(s);',
+                '            return f(new Other());',
+                '        }',
+                '',
+                '        public static string Direct(string s)',
+                '        {',
+                '            return Parser.Parse(s);',
+                '        }',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'Use.cs')).filter(c => c.name === 'Parse');
+            assert.deepStrictEqual(calls.map(c => [c.line, !!c.receiverLocalBinding, !!c.receiverIsTypeQualified]),
+                [[10, true, false], [15, true, false], [21, false, true]]);
+            const staticMethod = callerRows(index, 'Parse', 'Parser.cs', 5);
+            assert.notStrictEqual(staticMethod.get('Use.cs:10'), 'confirmed');
+            assert.notStrictEqual(staticMethod.get('Use.cs:15'), 'confirmed');
+            assert.strictEqual(staticMethod.get('Use.cs:21'), 'confirmed');
+        } finally { rm(dir); }
+    });
+});

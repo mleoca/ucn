@@ -11317,3 +11317,177 @@ describe('fix #513: a method called through its class name is counted with the r
         } finally { rm(dir); }
     });
 });
+
+describe('fix #515: a receiver spelled like a class is that class only when the file binds it so', () => {
+    // Each site's tier for one pinned definition: `file:line tier`.
+    const callerRows = (index, name, file, line) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        const rows = new Map();
+        for (const c of r) rows.set(`${c.relativePath}:${c.line}`, c.tier === 'unverified' ? 'unverified' : 'confirmed');
+        for (const u of r.unverifiedEntries || []) {
+            const key = `${u.relativePath || path.relative(index.root, u.file)}:${u.line}`;
+            if (!rows.has(key)) rows.set(key, 'unverified');
+        }
+        for (const e of r.accountRaw.excludedEntries) {
+            const key = `${path.relative(index.root, e.file)}:${e.line}`;
+            if (!rows.has(key)) rows.set(key, `excluded ${e.reason}`);
+        }
+        return rows;
+    };
+    // The confirmed callees of one function as `name file:line`.
+    const confirmedCallees = (index, file, name, options = { includeMethods: true }) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file);
+        index._beginOp();
+        try {
+            return index.findCallees(def, { collectAccount: true, ...options })
+                .filter(c => c.tier !== 'unverified').map(c => `${c.name} ${c.relativePath}:${c.startLine}`).sort();
+        } finally { index._endOp(); }
+    };
+    const PARSER = [
+        'class parser(object):',
+        '    def __init__(self, info=None):',
+        '        self.info = info',
+        '',
+        '    def parse(self, timestr, default=None, ignoretz=False, **kwargs):',
+        '        return timestr',
+        '',
+        '',
+        'DEFAULTPARSER = parser()',
+        '',
+        '',
+        'def parse(timestr, parserinfo=None, **kwargs):',
+        '    if parserinfo:',
+        '        return parser(parserinfo).parse(timestr, **kwargs)',
+        '    return DEFAULTPARSER.parse(timestr, **kwargs)',
+        '',
+    ].join('\n');
+
+    it('a package a lazy import binds under global, beside a None placeholder, owns the member (python-dateutil)', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "fx"\nversion = "0"\n',
+            'pkg/__init__.py': '',
+            'pkg/parser/__init__.py': 'from ._parser import parse, parser\n\n__all__ = ["parse", "parser"]\n',
+            'pkg/parser/_parser.py': PARSER,
+            'pkg/rrule.py': [
+                'parser = None',
+                '',
+                '',
+                'class _rrulestr(object):',
+                '    def _handle_UNTIL(self, rrkwargs, name, value, **kwargs):',
+                '        global parser',
+                '        if not parser:',
+                '            from pkg import parser',
+                '        rrkwargs["until"] = parser.parse(value, ignoretz=kwargs.get("ignoretz"))',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // pyright: `parser.parse` is the function of pkg/parser/_parser.py:12.
+            for (const options of [{ includeMethods: true }, {}]) {
+                assert.deepStrictEqual(confirmedCallees(index, 'pkg/rrule.py', '_handle_UNTIL', options),
+                    ['parse pkg/parser/_parser.py:12']);
+            }
+            assert.strictEqual(callerRows(index, 'parse', 'pkg/parser/_parser.py', 12).get('pkg/rrule.py:9'), 'confirmed');
+            assert.notStrictEqual(callerRows(index, 'parse', 'pkg/parser/_parser.py', 5).get('pkg/rrule.py:9'), 'confirmed');
+        } finally { rm(dir); }
+    });
+
+    it('a module value, a parameter or a placeholder-free lazy import spelled like a class is not that class', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "fx"\nversion = "0"\n',
+            'pkg/__init__.py': '',
+            'pkg/models.py': 'class parser(object):\n    def parse(self, s):\n        return s\n',
+            'pkg/other.py': 'class Other(object):\n    def parse(self, s):\n        return [s]\n\n\nREGISTRY = {"default": Other}\n',
+            'pkg/sub/__init__.py': '',
+            'pkg/sub/parser.py': 'def parse(s):\n    return (s,)\n',
+            'pkg/use_value.py': 'from pkg.other import REGISTRY\n\nparser = REGISTRY["default"]()\n\n\ndef run(s):\n    return parser.parse(s)\n',
+            'pkg/use_param.py': 'def run(parser, s):\n    return parser.parse(parser, s)\n',
+            'pkg/use_class.py': 'from pkg.models import parser\n\n\ndef run(s):\n    return parser.parse(parser(), s)\n',
+            'pkg/use_star.py': 'from pkg.models import *\n\n\ndef run(s):\n    return parser.parse(parser(), s)\n',
+            'pkg/use_lazyclass.py': [
+                'parser = None', '', '', 'def run(s):', '    global parser', '    if parser is None:',
+                '        from pkg.models import parser', '    return parser.parse(parser(), s)', '',
+            ].join('\n'),
+            'pkg/use_lazyvalue.py': [
+                'from pkg.other import REGISTRY', '', 'parser = REGISTRY["default"]()', '', '', 'def run(s):',
+                '    global parser', '    if s is None:', '        from pkg.sub import parser', '    return parser.parse(s)', '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const method = callerRows(index, 'parse', 'pkg/models.py', 2);
+            for (const site of ['pkg/use_class.py:5', 'pkg/use_star.py:5', 'pkg/use_lazyclass.py:8']) {
+                assert.strictEqual(method.get(site), 'confirmed', site);
+            }
+            for (const site of ['pkg/use_value.py:7', 'pkg/use_param.py:2', 'pkg/use_lazyvalue.py:10']) {
+                assert.strictEqual(method.get(site), 'unverified', site);
+            }
+            // The other module's value may hold an Other: never excluded by spelling.
+            assert.strictEqual(callerRows(index, 'parse', 'pkg/other.py', 2).get('pkg/use_value.py:7'), 'unverified');
+            assert.strictEqual(callerRows(index, 'parse', 'pkg/sub/parser.py', 1).get('pkg/use_lazyvalue.py:10'), 'unverified');
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/use_value.py', 'run'), []);
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/use_class.py', 'run'),
+                ['parse pkg/models.py:2', 'parser pkg/models.py:1']);
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/use_star.py', 'run'),
+                ['parse pkg/models.py:2', 'parser pkg/models.py:1']);
+        } finally { rm(dir); }
+    });
+
+    it('a from-import submodule owns its members on the callee side too, and a parameter of its name is not it', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "fx"\nversion = "0"\n',
+            'pkg/__init__.py': '',
+            'pkg/cli.py': [
+                'class AppGroup(object):', '    def __init__(self, name):', '        self.name = name', '', '',
+                'def run(x):', '    return x', '',
+            ].join('\n'),
+            'pkg/app.py': [
+                'from . import cli', '', '', 'def make():', '    return cli.AppGroup("a")', '', '',
+                'def go():', '    return cli.run(1)', '', '', 'def missing():', '    return cli.absent(3)', '', '',
+                'def shadowed(cli):', '    return cli.run(2)', '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/app.py', 'make'), ['AppGroup pkg/cli.py:1']);
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/app.py', 'go'), ['run pkg/cli.py:6']);
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/app.py', 'missing'), []);
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/app.py', 'shadowed'), []);
+            const run = callerRows(index, 'run', 'pkg/cli.py', 6);
+            assert.strictEqual(run.get('pkg/app.py:9'), 'confirmed');
+            assert.notStrictEqual(run.get('pkg/app.py:17'), 'confirmed');
+        } finally { rm(dir); }
+    });
+
+    it('among classes of one spelling, the one the file binds owns the call, through an alias too', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "fx"\nversion = "0"\n',
+            'pkg/__init__.py': '',
+            'pkg/a.py': [
+                'class Base(object):', '    @classmethod', '    def load(cls, x):', '        return x', '', '',
+                'class Config(Base):', '    pass', '', '',
+                'class Store(object):', '    @classmethod', '    def save(cls, x):', '        return x', '',
+            ].join('\n'),
+            'pkg/b.py': [
+                'class Config(object):', '    @classmethod', '    def load(cls, x):', '        return [x]', '', '',
+                'class Store(object):', '    @classmethod', '    def save(cls, x):', '        return [x]', '',
+            ].join('\n'),
+            'pkg/c.py': 'from pkg.a import Config, Store\n\n\ndef run(x):\n    Store.save(x)\n    return Config.load(x)\n',
+            'pkg/d.py': 'from pkg import b\n\nStore = b.Store\n\n\ndef keep(x):\n    return Store.save(x)\n',
+        });
+        try {
+            const index = idx(dir);
+            // pyright: c.py calls a.Store.save and a.Base.load (inherited by
+            // a.Config); d.py calls b.Store.save through the module alias.
+            // Definitions start at their decorator line.
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/c.py', 'run'), ['save pkg/a.py:12']);
+            assert.deepStrictEqual(confirmedCallees(index, 'pkg/d.py', 'keep'), ['save pkg/b.py:8']);
+            assert.strictEqual(callerRows(index, 'save', 'pkg/b.py', 8).get('pkg/d.py:7'), 'confirmed');
+            assert.strictEqual(callerRows(index, 'save', 'pkg/a.py', 12).get('pkg/d.py:7'), 'excluded path-type-mismatch');
+            assert.strictEqual(callerRows(index, 'load', 'pkg/a.py', 2).get('pkg/c.py:6'), 'confirmed');
+            assert.notStrictEqual(callerRows(index, 'load', 'pkg/b.py', 2).get('pkg/c.py:6'), 'confirmed');
+        } finally { rm(dir); }
+    });
+});

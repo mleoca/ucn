@@ -1033,7 +1033,11 @@ function clearAllCaches() {
 // callers' values complete) or `open` (a member no value closes, its
 // `runtimeTarget` a glob such as `pkg.mod.*` or `*`); parametrize marks,
 // `str.join`, literal container lookups and more than eight values are read.
-const CACHE_FORMAT_VERSION = 340;
+// v341 (fix #515): Go, Java and C# method calls whose receiver is a
+// parameter or local of the enclosing function carry `receiverLocalBinding`,
+// as the Python and JavaScript records do; a C# receiver so bound is not
+// `receiverIsTypeQualified`.
+const CACHE_FORMAT_VERSION = 341;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

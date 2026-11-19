@@ -2428,7 +2428,7 @@ function findCallers(index, name, options = {}) {
                 if (call.isMethod && call.receiver && !call.receiverType &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const importedType = _structuralImportedReceiverType(
-                        index, fileEntry, call.receiver);
+                        index, fileEntry, call);
                     if (importedType) {
                         call = { ...call, receiverType: importedType.type,
                             receiverTypeSource: 'flow',
@@ -5592,9 +5592,11 @@ function findCallers(index, name, options = {}) {
                 // branch keeps its parser-marked receiverIsModule condition
                 // (a rare package attribute/submodule name collision must not
                 // become exclusion evidence).
+                // A parameter or local of the enclosing function is not the
+                // module (fix #515, the callee side's rule).
                 const recvSubmoduleRel = (!call.receiverIsModule && call.isMethod && call.receiver &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural')
-                    ? _submoduleReceiverModule(index, fileEntry, call.receiver) : null;
+                    ? _submoduleReceiverAt(index, fileEntry, call) : null;
                 // A module object the program loads by path or by a literal
                 // name (fix #507, core/loaded-modules.js): `mod =
                 // importlib.util.module_from_spec(spec)` with the spec read
@@ -7089,7 +7091,11 @@ function findCallers(index, name, options = {}) {
                     // An interface-typed member hop (fieldDispatchType) is a
                     // member hop too (fix #391: `Logger.Write(..)` on Log's
                     // `ILogger Logger` property is not the class Logger).
+                    // A parameter or local of the enclosing function is that
+                    // variable (fix #515: Go `parser := get()` beside `type
+                    // parser`, Java/C# `var Parser = ..`).
                     let typeQualifiedReceiver = !!(receiverName && tTypes.has(receiverName)) &&
+                        !call.receiverLocalBinding &&
                         !((fieldHopType || fieldDispatchType) && call.receiverField && !call.receiverIsTypeQualified &&
                             langTraits(fileEntry.language)?.bareCallReachesMethods);
                     if (typeQualifiedReceiver) {
@@ -7909,12 +7915,38 @@ function findCallers(index, name, options = {}) {
                         !recvSubmoduleRel && !call.moduleOwnedPath) {
                         const tTypes = dispatchTargetTypes(targetDefs2, filePath, call);
                         let typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        // The name is the class only where the file binds it
+                        // so (fix #515): a module, a parameter or a module
+                        // assignment spelled like the class is that binding,
+                        // and a name nothing here binds proves no class.
+                        const spelledTypes = typeQualifiedReceiver ? (index.symbols.get(call.receiver) || [])
+                            .filter(d => d.file && IDENTITY_TYPE_KINDS.has(d.type)) : [];
+                        // Among several classes of the spelling, the one the
+                        // file binds owns the call: true or false when that
+                        // decides it, null otherwise.
+                        let denotedOwnsTarget = null;
+                        if (spelledTypes.length > 0) {
+                            const denotation = _receiverNameDenotation(index, fileEntry, filePath, call,
+                                call.receiver, spelledTypes);
+                            if (denotation.kind !== 'type') {
+                                typeQualifiedReceiver = false;
+                            } else {
+                                const named = classDefsNamed(index, call.receiver);
+                                const keys = named.unique ? null : new Set(named.entries
+                                    .filter(entry => denotation.defs.includes(entry.def)).map(entry => entry.key));
+                                const direct = targetDefs2.filter(target => target.className === call.receiver);
+                                if (keys?.size > 0 && direct.length > 0) {
+                                    denotedOwnsTarget = direct.some(target => keys.has(ownerRefOf(index, target)?.key));
+                                }
+                            }
+                        }
                         // The qualifying name denotes the type the calling
                         // module binds it to (fix #384): another module's
                         // same-name type is not the target's.
                         if (typeQualifiedReceiver && langTraits(fileEntry.language)?.moduleTypeIdentity &&
-                            _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs2,
-                                call.line) === 'other') {
+                            denotedOwnsTarget !== true && (denotedOwnsTarget === false ||
+                                _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs2,
+                                    call.line) === 'other')) {
                             // Another class of the name still runs the member
                             // it inherits (fix #424: `tqdm.get_lock()` with
                             // tqdm.auto's subclass): an undecided ancestry
@@ -9570,6 +9602,49 @@ function findCallees(index, definition, options = {}) {
                                 : loaded.kind === 'ambiguous' ? 'module-path-ambiguous'
                                     : loaded.kind === 'module' ? 'no-import-link'
                                         : loaded.kind === 'unread' ? 'module-path-unread' : 'module-path-unresolved', meta);
+                        continue;
+                    }
+                }
+            }
+
+            // A from-import the resolver proved a submodule (fix #224) is a
+            // module receiver: its member is the name that module binds, the
+            // caller side's `recvSubmoduleRel` answer (fix #515). The chase
+            // starts at the submodule file (fix #294b).
+            if (call.isMethod && call.receiver && !call.receiverIsModule && !call.receiverField &&
+                !call.receiverType && structuralCallee && !(localTypes && localTypes.has(call.receiver))) {
+                const submoduleRel = _submoduleReceiverAt(index, fileEntry, call);
+                if (submoduleRel) {
+                    const routed = _calleeExportDefinitions(index, path.join(index.root, submoduleRel),
+                        call.name, language, call, {});
+                    if (routed.matches.length > 0 && !routed.configuration) {
+                        const record = siteEvidence.get(siteId);
+                        record.call = { ...call, moduleOwnedPath: true };
+                        record.evidence.moduleOwnedPath = true;
+                        record.evidence.hasImportEvidence = true;
+                        for (const match of routed.matches) {
+                            const key = match.bindingId || `${match.file}:${match.startLine}:${call.name}`;
+                            const existing = callees.get(key);
+                            if (existing) {
+                                existing.count += 1;
+                                existing.sites.push(call.line); existing.siteIds.push(siteId);
+                            } else {
+                                callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
+                                    sites: [call.line], siteIds: [siteId] });
+                            }
+                        }
+                        continue;
+                    }
+                    // A name with no project definition is no project call
+                    // (fix #261). Otherwise the module binds no such name the
+                    // index reads: visible on the contract surface, never
+                    // another owner's member.
+                    if (!routed.configuration && _calleeZeroCandidateName(index, call)) {
+                        noteSite(siteId, 'external', null, call);
+                        continue;
+                    }
+                    if (collectAccount) {
+                        noteUnverified(siteId, call, routed.configuration ? 'configuration-alternative' : 'no-import-link');
                         continue;
                     }
                 }
@@ -16108,22 +16183,56 @@ function _submoduleReceiverModule(index, fileEntry, receiverName) {
     for (const b of (fileEntry.importBindings || [])) {
         // The receiver is the binding's LOCAL name: `from pkg import v1 as
         // x` binds the submodule v1 as x (fix #424), and binds no `v1`.
-        if (!b || (b.alias || b.name) !== receiverName || b.module == null) continue;
-        const mod = String(b.module);
-        const spec = mod.endsWith('.') ? mod + b.name : mod + '.' + b.name;
-        const rel = fileEntry.moduleResolved[spec];
-        if (!rel) continue;
-        // An attribute the package itself binds under that name is what the
-        // from-import reads (`class model` in pkg/__init__.py beside
-        // pkg/model.py): not the submodule.
-        const parentRel = fileEntry.moduleResolved[mod];
-        const parentAbs = parentRel && (path.isAbsolute(parentRel) ? parentRel : path.join(index.root, parentRel));
-        const parentEntry = parentAbs && index.files.get(parentAbs);
-        if (parentEntry && ((parentEntry.moduleAssignedNames || []).includes(b.name) ||
-            definitionsInFile(index, b.name, parentAbs).some(d => !d.className))) continue;
-        return rel;
+        if (!b || (b.alias || b.name) !== receiverName) continue;
+        const rel = _submoduleOfImportBinding(index, fileEntry, b);
+        if (rel) return rel;
     }
     return null;
+}
+
+/**
+ * The project submodule one from-import binding names (fix #224), or null:
+ * the composed `pkg.name` specifier resolved to a file, and the package does
+ * not bind that name itself.
+ */
+function _submoduleOfImportBinding(index, fileEntry, b) {
+    if (!b || b.module == null || !fileEntry?.moduleResolved ||
+        !langTraits(fileEntry.language)?.submoduleImports) return null;
+    const mod = String(b.module);
+    const spec = mod.endsWith('.') ? mod + b.name : mod + '.' + b.name;
+    const rel = fileEntry.moduleResolved[spec];
+    if (!rel) return null;
+    // An attribute the package itself binds under that name is what the
+    // from-import reads (`class model` in pkg/__init__.py beside
+    // pkg/model.py): not the submodule.
+    const parentRel = fileEntry.moduleResolved[mod];
+    const parentAbs = parentRel && (path.isAbsolute(parentRel) ? parentRel : path.join(index.root, parentRel));
+    const parentEntry = parentAbs && index.files.get(parentAbs);
+    if (parentEntry && ((parentEntry.moduleAssignedNames || []).includes(b.name) ||
+        definitionsInFile(index, b.name, parentAbs).some(d => !d.className))) return null;
+    return rel;
+}
+
+/**
+ * The submodule a from-import receiver denotes where the call stands (fix
+ * #515): the file's #224 answer, unless the enclosing function binds the
+ * name itself. Then only that function's own import of the submodule is
+ * the module; a parameter or local assignment is not.
+ */
+function _submoduleReceiverAt(index, fileEntry, call) {
+    const rel = _submoduleReceiverModule(index, fileEntry, call?.receiver);
+    if (!rel) return null;
+    const named = (fileEntry.importBindings || []).filter(b => (b.alias || b.name) === call.receiver);
+    // A module-level value of the name beside the import may be what the
+    // name holds; a placeholder the import replaces is not (fix #515).
+    if (!call.receiverLocalBinding) {
+        return _moduleValueBindings(index, fileEntry, fileEntry.path, call.receiver, new Set(), true).length > 0
+            ? null : rel;
+    }
+    const local = _scopeImportBindings(fileEntry, named, call.line).filter(b => b.deferred);
+    if (local.length === 0) return null;
+    const rels = local.map(b => _submoduleOfImportBinding(index, fileEntry, b));
+    return rels.every(r => r && r === rels[0]) ? rels[0] : null;
 }
 
 /**
@@ -18992,26 +19101,227 @@ function _pythonFixtureReceiverType(index, file, call) {
     });
 }
 
-function _structuralImportedReceiverType(index, fileEntry, receiver) {
-    const bindings = (fileEntry.importBindings || []).filter(binding =>
-        binding.name === receiver || binding.alias === receiver);
-    const matches = new Map();
-    for (const binding of bindings) {
-        const rel = fileEntry.moduleResolved?.[binding.module];
-        if (!rel) continue;
-        const start = path.isAbsolute(rel) ? rel : path.join(index.root, rel);
-        for (const definition of (index.symbols.get(receiver) || [])) {
-            if (!definition.file || !IDENTITY_TYPE_KINDS.has(definition.type)) continue;
-            if (definition.file === start ||
-                _nameBindingReaches(
-                    index, start, receiver, new Set([definition.file])) === 'yes') {
-                matches.set(`${definition.file}:${definition.startLine}`, definition);
-            }
-        }
+/**
+ * A receiver the file binds to a project class by an import: the class it
+ * denotes there (fix #515). A namespace, module or submodule import, an
+ * import of another name, another module's default value or any other
+ * binding of the name in the file is not that class.
+ */
+function _structuralImportedReceiverType(index, fileEntry, call) {
+    const receiver = call?.receiver;
+    const typeDefs = (index.symbols.get(receiver) || []).filter(definition =>
+        definition.file && IDENTITY_TYPE_KINDS.has(definition.type));
+    if (typeDefs.length === 0 ||
+        !(fileEntry.importBindings || []).some(b => (b.alias || b.name) === receiver)) return null;
+    const denotation = _receiverNameDenotation(index, fileEntry, fileEntry.path, call, receiver, typeDefs);
+    if (denotation.kind !== 'type' || !denotation.imported) return null;
+    const files = new Set(denotation.defs.map(definition => definition.file));
+    if (files.size !== 1) return null;
+    return { type: receiver, fromFile: [...files][0] };
+}
+
+/**
+ * The local names a module's default value is written with (fix #515): an
+ * ES `export default Name`, `export { Name as default }`, a CommonJS
+ * `module.exports = Name`. `reexported` when the default comes from another
+ * module's record.
+ */
+function _defaultExportLocalNames(index, abs) {
+    const names = new Set();
+    let reexported = false;
+    for (const record of index.files.get(abs)?.exportDetails || []) {
+        const isDefault = record.type === 'default' || record.alias === 'default' ||
+            (record.type === 'module.exports' && record.defaultLike);
+        if (!isDefault) continue;
+        if (record.source) { reexported = true; continue; }
+        names.add(record.localName || record.name);
     }
-    if (matches.size !== 1) return null;
-    const definition = [...matches.values()][0];
-    return { type: receiver, fromFile: definition.file };
+    return { names, reexported };
+}
+
+/**
+ * What a receiver NAME written at a call site denotes in its file, asked of
+ * the project types spelled like it (fix #515, python-dateutil: `parser =
+ * None` beside a lazy `from dateutil import parser` makes `parser.parse(..)`
+ * the package's function, never the method of `class parser` in another
+ * module). A name spelled like a class is that class only when the file
+ * binds it so: the class is declared in the file (a function-local one in
+ * scope), or an import binds the name to it. Structural languages; reads
+ * recorded facts only.
+ *   { kind: 'type', defs, imported }  one of these definitions
+ *   { kind: 'module' }   a module object: a namespace or module import, a
+ *                        from-import the resolver proved a submodule
+ *   { kind: 'value' }    another value: a parameter or local, a module
+ *                        assignment or function, an import of another name,
+ *                        another module's default value, an outside
+ *                        module's member
+ *   { kind: 'unknown' }  nothing the file writes binds it here (globals,
+ *                        unread star imports), or an import chain the
+ *                        resolver cannot finish
+ */
+function _receiverNameDenotation(index, fileEntry, filePath, call, name, typeDefs) {
+    if (!fileEntry || !name || !filePath) return { kind: 'unknown' };
+    if (call?.receiverIsModule || call?.receiverModuleSpecifier) return { kind: 'module' };
+    const line = call?.line ?? null;
+    const memo = index._opMemo?.('receiverNameDenotation', () => new Map());
+    const memoKey = memo && `${filePath}\x00${name}\x00${line}\x00${call?.receiverLocalBinding ? 1 : 0}\x00` +
+        typeDefs.map(d => `${d.file}:${d.startLine}`).join('\x01');
+    if (memo?.has(memoKey)) return memo.get(memoKey);
+    const finish = result => { memo?.set(memoKey, result); return result; };
+    // A class declared in the function scope that holds the call.
+    if (line != null) {
+        const local = _functionLocalTypeInScope(index, filePath, name, line);
+        if (local) return finish(typeDefs.includes(local) ? { kind: 'type', defs: [local] } : { kind: 'value' });
+    }
+    const named = (fileEntry.importBindings || []).filter(b => (b.alias || b.name) === name);
+    if (call?.receiverLocalBinding) {
+        // The enclosing function binds the name itself: only its own
+        // import can make it a class; a parameter or local is a value.
+        const typeOnly = b => (fileEntry.importDetails || []).some(detail =>
+            detail.deferredReason === 'type-only' && detail.module === b.module && detail.line === b.line);
+        const local = _scopeImportBindings(fileEntry, named, line).filter(b => b.deferred && !typeOnly(b));
+        return finish(local.length > 0 ? _importBindingsDenotation(index, fileEntry, local, name, typeDefs) : { kind: 'value' });
+    }
+    const own = typeDefs.filter(d => d.file === filePath && !_isFunctionLocalType(d));
+    if (own.length > 0) return finish({ kind: 'type', defs: own });
+    const ownLines = new Set(typeDefs.filter(d => d.file === filePath).map(d => d.startLine));
+    const valueBound = _moduleValueBindings(index, fileEntry, filePath, name, ownLines, named.length > 0).length > 0;
+    // A module-level alias of the class (`Kit = mod.Kit`, fix #389) is it.
+    if (valueBound && named.length === 0) {
+        const alias = _moduleValueAliasType(index, filePath, name);
+        const aliased = alias?.type === name
+            ? typeDefs.filter(d => d.file === alias.fromFile && !_isFunctionLocalType(d)) : [];
+        if (aliased.length > 0) return finish({ kind: 'type', defs: aliased });
+    }
+    let imported = named.length > 0 ? _importBindingsDenotation(index, fileEntry, named, name, typeDefs) : null;
+    // `from m import *` binds the names m exposes (Python star imports).
+    if (!imported && !valueBound && langTraits(fileEntry.language)?.submoduleImports) {
+        const stars = (fileEntry.importDetails || []).filter(detail =>
+            detail.type === 'from' && (detail.names || []).includes('*'));
+        if (stars.length > 0) imported = _importBindingsDenotation(index, fileEntry,
+            stars.map(detail => ({ name, module: detail.module, kind: 'from', star: true })), name, typeDefs);
+    }
+    if (!imported) return finish({ kind: valueBound ? 'value' : 'unknown' });
+    // A module-level value beside an import of the class (a placeholder the
+    // import replaces, or a reassignment): either may hold the name.
+    if (valueBound && imported.kind === 'type') return finish({ kind: 'unknown' });
+    if (valueBound && imported.kind === 'module') return finish({ kind: 'value' });
+    return finish(imported);
+}
+
+const _PLACEHOLDER_VALUE_NODES = new Set(['none', 'null', 'undefined']);
+
+/**
+ * The module-level bindings of `name` in a file other than the type
+ * declarations at `skipLines`. Beside an import of the name, a placeholder
+ * the import replaces is not one.
+ */
+function _moduleValueBindings(index, fileEntry, filePath, name, skipLines, imported) {
+    return (fileEntry.bindings || []).filter(b => b.name === name && !skipLines.has(b.startLine) &&
+        _bindingIsModuleLevel(index, fileEntry, filePath, b) &&
+        !(imported && _moduleValueIsPlaceholder(index, filePath, fileEntry.language, name, b.startLine)));
+}
+
+/**
+ * Is a file binding one of the module's own names? A class member (a
+ * method, a field such as the `cli` of `self.cli = cli.AppGroup()`) or a
+ * declaration inside a callable is not. A binding with no indexed
+ * declaration counts as the module's.
+ */
+function _bindingIsModuleLevel(index, fileEntry, filePath, b) {
+    const def = (index.symbols.get(b.name) || []).find(d => d.file === filePath &&
+        (d.bindingId === b.id || d.startLine === b.startLine));
+    if (!def) return true;
+    if (def.className || def.receiver || def.memberAssigned || def.lexicalScopeStartLine != null) return false;
+    return !(fileEntry.symbols || []).some(s => s !== def && CALLABLE_SYMBOL_KINDS.has(s.type) &&
+        s.startLine < def.startLine && (s.endLine ?? s.startLine) >= def.startLine);
+}
+
+/**
+ * Is the module-level binding of `name` at `line` a placeholder an import
+ * replaces before any use (fix #515: `parser = None` beside a lazy `from
+ * dateutil import parser` under `global parser`)? Read from the syntax: a
+ * plain assignment or declaration of the name to the language's null
+ * literal. A placeholder has no members, so a member call on the name can
+ * only reach what the import binds.
+ */
+function _moduleValueIsPlaceholder(index, filePath, language, name, line) {
+    const memo = index._opMemo?.('moduleValuePlaceholder', () => new Map());
+    const key = `${filePath}\x00${name}\x00${line}`;
+    if (memo?.has(key)) return memo.get(key);
+    let placeholder;
+    try {
+        const tree = index._getParsedTree?.(filePath, index._readFile(filePath), language);
+        const statement = tree?.rootNode.namedChildren.find(node => node.startPosition.row + 1 === line);
+        let pairs = [];
+        if (statement?.type === 'expression_statement' && statement.namedChild(0)?.type === 'assignment') {
+            const assignment = statement.namedChild(0);
+            pairs = [[assignment.childForFieldName('left'), assignment.childForFieldName('right')]];
+        } else if (statement && ['lexical_declaration', 'variable_declaration'].includes(statement.type)) {
+            pairs = statement.namedChildren.filter(child => child.type === 'variable_declarator')
+                .map(child => [child.childForFieldName('name'), child.childForFieldName('value')]);
+        }
+        placeholder = pairs.some(([left, right]) => left?.type === 'identifier' && left.text === name &&
+            !!right && _PLACEHOLDER_VALUE_NODES.has(right.type));
+    } catch (_) { placeholder = false; }
+    memo?.set(key, placeholder);
+    return placeholder;
+}
+
+/** The combined denotation of the import bindings of one local name. */
+function _importBindingsDenotation(index, fileEntry, bindings, name, typeDefs) {
+    const defs = new Map();
+    const kinds = new Set();
+    const moduleKinds = new Set(['namespace', 'import']);
+    for (const b of bindings) {
+        if (moduleKinds.has(b.kind) || (!b.star && _submoduleOfImportBinding(index, fileEntry, b))) {
+            kinds.add('module');
+            continue;
+        }
+        const rel = fileEntry.moduleResolved?.[b.module];
+        if (!rel) {
+            // An outside module's member is not a project class; whether an
+            // outside star import binds the name at all is not read.
+            kinds.add(b.star || _unresolvedModuleIsGap(index, b.module, b) ? 'unknown' : 'value');
+            continue;
+        }
+        const start = path.isAbsolute(rel) ? rel : path.join(index.root, rel);
+        let exported = b.name;
+        if (b.defaultLike || b.kind === 'default') {
+            // The module's default value, whatever the local spelling.
+            const { names, reexported } = _defaultExportLocalNames(index, start);
+            if (reexported || names.size !== 1) { kinds.add('unknown'); continue; }
+            exported = [...names][0];
+            if (exported === 'default') { kinds.add('unknown'); continue; }
+        } else if (b.kind === 'dynamic') {
+            kinds.add('unknown');
+            continue;
+        }
+        // An import of another name binds that name's value, never a class
+        // spelled like the local name.
+        if (exported !== name) { kinds.add('value'); continue; }
+        const candidates = typeDefs.filter(d => !_isFunctionLocalType(d));
+        // The name chase reads re-exports under another name too: `export
+        // { default as Foo }` reaches the class.
+        const reached = candidates.filter(d => _nameBindingReaches(index, start, name,
+            new Set([d.file])) === 'yes');
+        if (reached.length > 0) {
+            kinds.add('type');
+            for (const d of reached) defs.set(`${d.file}:${d.startLine}`, d);
+            continue;
+        }
+        const files = new Set(candidates.map(d => d.file));
+        const verdict = files.size > 0
+            ? _nameBindingReaches(index, start, name, files) : 'no';
+        // A star import that does not bind the name says nothing of it.
+        if (verdict === 'no' && b.star) continue;
+        kinds.add(verdict === 'no' ? 'value' : 'unknown');
+    }
+    if (kinds.size === 0) return { kind: 'unknown' };
+    if (kinds.size === 1 && kinds.has('type')) return { kind: 'type', defs: [...defs.values()], imported: true };
+    if (kinds.has('unknown') || kinds.has('type')) return { kind: 'unknown' };
+    if (kinds.size === 1 && kinds.has('module')) return { kind: 'module' };
+    return { kind: 'value' };
 }
 
 function _pythonBuiltinCallReturnType(index, fileEntry, call, evidence = null) {
@@ -22797,6 +23107,11 @@ function _sameImplBlock(index, a, b) {
 function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     let receiver = call.receiver;
     if (!receiver || call.receiverIsChainRoot) return null;
+    // A parameter or local of the enclosing function is that variable, never
+    // a type of its spelling (fix #515: Go `parser := get()` beside `type
+    // parser`, Java/C# `var Parser = ..`). Structural receivers ask the
+    // file's bindings below, where a function's own import can still be one.
+    if (call.receiverLocalBinding && langTraits(language)?.typeSystem !== 'structural') return null;
     // A member path rooted at a value (`SourceType.GenericTypeArguments`
     // the parser rooted at `this`) or an element access (`Members[^1]`)
     // names no type (fix #401, AutoMapper: C# properties are PascalCase).
@@ -22824,17 +23139,15 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
 
     const typeKindsOf = (name) => (index.symbols.get(name) || [])
         .filter(d => IDENTITY_TYPE_KINDS.has(d.type) || (d.type === 'type' && d.aliasOf));
+    // A structural receiver spelled like a class is that class only when the
+    // file binds the name to it (fix #515): declared here, or imported as
+    // it. A module, a parameter, a module assignment (python-dateutil's
+    // `parser = None` beside a lazy package import) is that binding.
+    let denoted = null;
     const structuralTypeInScope = (name, defs) => {
-        if (defs.some(d => d.file === def.file)) return true;
-        if ((fileEntry?.bindings || []).some(b => b.name === name)) return true;
-        for (const im of (fileEntry?.importBindings || [])) {
-            if (im.name !== name) continue;
-            const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[String(im.module || '')];
-            if (!rel) continue;
-            const abs = path.join(index.root, rel);
-            if (defs.some(d => d.file === abs)) return true;
-        }
-        return false;
+        const denotation = _receiverNameDenotation(index, fileEntry, def.file, call, name, defs);
+        denoted = denotation.kind === 'type' ? denotation.defs : null;
+        return !!denoted;
     };
 
     // Multi-segment path receivers (std::sync::Arc::new): the LAST segment
@@ -23004,10 +23317,17 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     // `Outcome.Create()` never selects `Outcome<T>.Create`.
     const siteArity = traits?.genericArityIsIdentity && call.receiverIsTypeQualified
         ? (call.receiverTypeArgs || 0) : null;
+    // Several project classes share the spelling: the one the file binds
+    // owns the call (fix #515), never another one's member of the name.
+    const namedClasses = denoted ? classDefsNamed(index, receiver) : null;
+    const denotedKeys = namedClasses && !namedClasses.unique
+        ? new Set(namedClasses.entries.filter(entry => denoted.includes(entry.def)).map(entry => entry.key)) : null;
+    if (denotedKeys && denotedKeys.size === new Set(namedClasses.entries.map(entry => entry.key)).size) denotedKeys.clear();
     const symbols = (ownerFiles
         ? allSymbols.filter(s => !candidateTypes.includes(s.className) || ownerFiles.has(s.file))
         : allSymbols).filter(s => siteArity == null || !candidateTypes.includes(s.className) ||
-            (s.ownerTypeArity || 0) === siteArity);
+            (s.ownerTypeArity || 0) === siteArity).filter(s => !denotedKeys?.size ||
+            !candidateTypes.includes(s.className) || denotedKeys.has(ownerRefOf(index, s)?.key));
     if (language !== 'java' && language !== 'csharp' && classDefsNamed(index, receiver).hasScoped) {
         const selected = _calleeSelectReceiverMethod(
             index, call, symbols, receiver, language, def.file, isCallable, { typeQualified: true });

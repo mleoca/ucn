@@ -2580,7 +2580,14 @@ function findCallsInTree(code, parser, tree, reaches = null) {
                 /^[A-Z]/.test(unwrappedReceiverNode.namedChild(0)?.text || '')
                 ? unwrappedReceiverNode : null;
             if (genericTypeReceiver) identity.receiver = genericTypeReceiver.namedChild(0).text;
-            const receiverIsTypeQualified = !!(identity.isMethod &&
+            // A local, parameter or lambda parameter in scope: that variable,
+            // never a type or a member of its spelling (fix #515, C# simple
+            // name lookup finds the local first).
+            const receiverLocalBinding = !!(identity.isMethod && !genericTypeReceiver &&
+                unwrappedReceiverNode?.type === 'identifier' && identity.receiver &&
+                csharpLocalBindingNames(tree).has(identity.receiver) &&
+                csharpBareNameShadowedByLocal(node, identity.receiver));
+            const receiverIsTypeQualified = !!(identity.isMethod && !receiverLocalBinding &&
                 (genericTypeReceiver || (unwrappedReceiverNode?.type === 'identifier' &&
                 /^[A-Z]/.test(identity.receiver || '') &&
                 !variableTypes.has(identity.receiver) &&
@@ -2632,6 +2639,7 @@ function findCallsInTree(code, parser, tree, reaches = null) {
                     { localShadow: true }),
                 ...(identity.receiver && { receiver: identity.receiver }),
                 ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
+                ...(receiverLocalBinding && { receiverLocalBinding: true }),
                 ...(receiverTypeArgs > 0 && { receiverTypeArgs }),
                 ...(receiverType && receiverTypeInfo.typeArgs && { receiverTypeArgs: receiverTypeInfo.typeArgs }),
                 ...(receiverType && { receiverType, ...(unwrappedReceiverNode?.type === 'cast_expression' ? {

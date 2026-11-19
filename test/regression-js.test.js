@@ -13708,3 +13708,73 @@ describe('fix #513: a rename plan edits the imports that bind the pinned definit
         } finally { rm(dir); }
     });
 });
+
+describe('fix #515: a receiver spelled like a class is that class only when the file binds it so', () => {
+    const callerRows = (index, name, file, line) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        const rows = new Map();
+        for (const c of r) rows.set(`${c.relativePath}:${c.line}`, c.tier === 'unverified' ? 'unverified' : 'confirmed');
+        for (const u of r.unverifiedEntries || []) {
+            const key = `${u.relativePath || path.relative(index.root, u.file)}:${u.line}`;
+            if (!rows.has(key)) rows.set(key, 'unverified');
+        }
+        for (const e of r.accountRaw.excludedEntries) {
+            const key = `${path.relative(index.root, e.file)}:${e.line}`;
+            if (!rows.has(key)) rows.set(key, `excluded ${e.reason}`);
+        }
+        return rows;
+    };
+    const confirmedCallees = (index, file, name) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file);
+        index._beginOp();
+        try {
+            return index.findCallees(def, { collectAccount: true, includeMethods: true })
+                .filter(c => c.tier !== 'unverified').map(c => `${c.name} ${c.relativePath}:${c.startLine}`).sort();
+        } finally { index._endOp(); }
+    };
+
+    it('a namespace import is its module and a const value is that value, beside a class of the name', () => {
+        const dir = tmp({
+            'package.json': '{ "name": "fx", "version": "0.0.0", "type": "module" }',
+            'src/parser.js': 'export class parser {\n    parse(s) { return s; }\n}\nexport function parse(s) { return [s]; }\n',
+            'src/other.js': 'export class Other {\n    parse(s) { return [s, s]; }\n}\nexport const registry = { make: () => new Other() };\n',
+            'src/use_ns.js': "import * as parser from './parser.js';\n\nexport function runNs(s) {\n    return parser.parse(s);\n}\n",
+            'src/use_value.js': "import { registry } from './other.js';\n\nconst parser = registry.make();\n\nexport function runValue(s) {\n    return parser.parse(s);\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            // tsc: `parser.parse` in use_ns.js is the function of parser.js:4;
+            // in use_value.js it is Other#parse.
+            assert.strictEqual(callerRows(index, 'parse', 'src/parser.js', 4).get('src/use_ns.js:4'), 'confirmed');
+            assert.notStrictEqual(callerRows(index, 'parse', 'src/parser.js', 2).get('src/use_ns.js:4'), 'confirmed');
+            assert.strictEqual(callerRows(index, 'parse', 'src/parser.js', 2).get('src/use_value.js:6'), 'unverified');
+            assert.deepStrictEqual(confirmedCallees(index, 'src/use_ns.js', 'runNs'), ['parse src/parser.js:4']);
+            assert.deepStrictEqual(confirmedCallees(index, 'src/use_value.js', 'runValue'), []);
+        } finally { rm(dir); }
+    });
+
+    it('a default import is the module default value, through re-exports too', () => {
+        const dir = tmp({
+            'package.json': '{ "name": "fx", "version": "0.0.0", "type": "module" }',
+            'src/a.js': 'export default class Foo { static make() { return 1; } }\n',
+            'src/b.js': 'class Foo { static make() { return 2; } }\nclass Bar { static make() { return 3; } }\nexport default Bar;\nexport { Foo };\n',
+            'src/reexp.js': "export { default as Foo } from './a.js';\n",
+            'src/use_a.js': "import Foo from './a.js';\nexport function goA() { return Foo.make(); }\n",
+            'src/use_b.js': "import Foo from './b.js';\nexport function goB() { return Foo.make(); }\n",
+            'src/use_reexp.js': "import { Foo } from './reexp.js';\nexport function goR() { return Foo.make(); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const aMake = callerRows(index, 'make', 'src/a.js', 1);
+            assert.strictEqual(aMake.get('src/use_a.js:2'), 'confirmed');
+            assert.strictEqual(aMake.get('src/use_reexp.js:2'), 'confirmed');
+            // use_b.js binds b.js's default value, the class Bar.
+            assert.notStrictEqual(callerRows(index, 'make', 'src/b.js', 1).get('src/use_b.js:2'), 'confirmed');
+            assert.ok(!String(callerRows(index, 'make', 'src/b.js', 2).get('src/use_b.js:2')).startsWith('excluded'));
+            assert.deepStrictEqual(confirmedCallees(index, 'src/use_a.js', 'goA'), ['make src/a.js:1']);
+            assert.deepStrictEqual(confirmedCallees(index, 'src/use_reexp.js', 'goR'), ['make src/a.js:1']);
+            assert.deepStrictEqual(confirmedCallees(index, 'src/use_b.js', 'goB'), []);
+        } finally { rm(dir); }
+    });
+});

@@ -2180,6 +2180,13 @@ function findCallsInCode(code, parser) {
                             { receiverTypeSource: 'unknown' })) }),
                     ...(receiverTypeQualifier && { receiverTypeQualifier }),
                     ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
+                    // A local, parameter, loop or lambda variable of the
+                    // enclosing method: that variable, never a type of its
+                    // spelling (fix #515, JLS 6.5.2). The local names are
+                    // collected per method, so this can only over-claim.
+                    ...(receiverNode?.type === 'identifier' && receiver &&
+                        (isDeclaredLocal(receiver) || getReceiverType(receiver) !== undefined) &&
+                        { receiverLocalBinding: true }),
                     ...(receiver === 'super' && anonymousSuperType(node) && { receiverSuperType: anonymousSuperType(node) }),
                     // A bare call in an anonymous class or enum-constant
                     // body: its implicit `this` is that body's class (fix

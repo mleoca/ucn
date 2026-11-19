@@ -3165,6 +3165,10 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                         ...(receiverRootIsModule && { receiverRootIsModule: true }),
                         ...(receiverPackageScope && { receiverPackageScope: true }),
+                        // A parameter or local of the enclosing function: that
+                        // variable, never a type of its spelling (fix #515).
+                        ...(!isPkgCall && operandNode?.type === 'identifier' &&
+                            isShadowedByLocal(operandNode, operandNode.text) && { receiverLocalBinding: true }),
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
                         ...(receiverFieldName && receiverRootTypeQualifier && { receiverRootTypeQualifier }),
                         ...(receiverFieldName && receiverRootType && receiverRootTypeGuessed && { receiverRootTypeGuessed: true }),

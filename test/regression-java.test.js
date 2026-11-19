@@ -7200,3 +7200,54 @@ describe('fix #430: Java nested member types named like other classes\' member t
         } finally { rm(dir); }
     });
 });
+
+describe('fix #515: a local spelled like a class is that local, never the class', () => {
+    const callerRows = (index, name, file, line) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        const rows = new Map();
+        for (const c of r) rows.set(`${c.relativePath}:${c.line}`, c.tier === 'unverified' ? 'unverified' : 'confirmed');
+        for (const u of r.unverifiedEntries || []) {
+            const key = `${u.relativePath || path.relative(index.root, u.file)}:${u.line}`;
+            if (!rows.has(key)) rows.set(key, 'unverified');
+        }
+        for (const e of r.accountRaw.excludedEntries) {
+            const key = `${path.relative(index.root, e.file)}:${e.line}`;
+            if (!rows.has(key)) rows.set(key, `excluded ${e.reason}`);
+        }
+        return rows;
+    };
+
+    it('never confirms the static method through a local of its spelling (JLS 6.5.2)', () => {
+        // javac/java on these files: `viaLocal(Other::new, "a")` returns "a!".
+        const dir = tmp({
+            'src/app/Parser.java': 'package app;\n\npublic class Parser {\n    public static String parse(String s) { return s; }\n}\n',
+            'src/app/Other.java': 'package app;\n\npublic class Other {\n    public String parse(String s) { return s + "!"; }\n}\n',
+            'src/app/Use.java': [
+                'package app;',
+                '',
+                'import java.util.function.Supplier;',
+                '',
+                'public class Use {',
+                '    public static String viaLocal(Supplier<Other> get, String s) {',
+                '        var Parser = get.get();',
+                '        return Parser.parse(s);',
+                '    }',
+                '',
+                '    public static String direct(String s) {',
+                '        return Parser.parse(s);',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const call = index.getCachedCalls(path.join(dir, 'src/app/Use.java')).find(c => c.name === 'parse' && c.line === 8);
+            assert.strictEqual(call.receiverLocalBinding, true);
+            const staticMethod = callerRows(index, 'parse', 'src/app/Parser.java', 4);
+            assert.strictEqual(staticMethod.get('src/app/Use.java:8'), 'unverified');
+            assert.strictEqual(staticMethod.get('src/app/Use.java:12'), 'confirmed');
+        } finally { rm(dir); }
+    });
+});
