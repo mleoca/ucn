@@ -1167,16 +1167,51 @@ function callableContract(root, language, symbol, context = null) {
     // the call that produces it.
     const dependencyNames = candidate => [...identifiersOf(candidate)]
         .filter(name => !(traits.discardIdentifierNames || []).includes(name));
-    const contextFacts = contextStatements.map(statement => ({
-        names: dependencyNames(statement), tokens: tokensOf(statement),
-    }));
-    const statementsByName = new Map();
-    contextFacts.forEach((fact, position) => {
-        for (const name of fact.names) {
-            if (!statementsByName.has(name)) statementsByName.set(name, []);
-            statementsByName.get(name).push(position);
+    // The statements a call depends on are those connected to one of its
+    // names through shared names, transitively: the components of the
+    // body's statements joined by the names they share. They are read once
+    // per body. A call holds the positions of its components, shared with
+    // every call that reaches the same ones, and a statement is serialized
+    // once, when a comparison first reads it. A compound statement holds
+    // every name of the statements under it, so in a large body nearly
+    // every call reaches nearly every statement, and a copy of their tokens
+    // per call would grow with calls times statements times nesting.
+    const contextTexts = [];
+    const contextText = position => {
+        if (contextTexts[position] === undefined) contextTexts[position] = JSON.stringify(tokensOf(contextStatements[position]));
+        return contextTexts[position];
+    };
+    const component = new Map();
+    const rootOf = name => {
+        let root = name;
+        while (component.get(root) !== root) root = component.get(root);
+        for (let next = name; next !== root;) {
+            const up = component.get(next);
+            component.set(next, root);
+            next = up;
         }
+        return root;
+    };
+    const statementNames = contextStatements.map(statement => {
+        const names = dependencyNames(statement);
+        for (const name of names) if (!component.has(name)) component.set(name, name);
+        for (let at = 1; at < names.length; at++) {
+            const first = rootOf(names[0]);
+            const other = rootOf(names[at]);
+            if (first !== other) component.set(other, first);
+        }
+        return names;
     });
+    // Statement positions of each component, in source order.
+    const componentStatements = new Map();
+    statementNames.forEach((names, position) => {
+        if (names.length === 0) return;
+        const root = rootOf(names[0]);
+        if (!componentStatements.has(root)) componentStatements.set(root, []);
+        componentStatements.get(root).push(position);
+    });
+    const parameterNames = (parameters?.namedChildren || []).map(parameter => ({ parameter, names: dependencyNames(parameter) }));
+    const selections = new Map();
     // Checker comment position is measured against code tokens, so blank
     // lines and ordinary comments do not change the call's applicability.
     const sourceTokens = [];
@@ -1209,34 +1244,37 @@ function callableContract(root, language, symbol, context = null) {
         // written bindings of its callee, receiver and arguments (including
         // aliases), and retain the checker comments around it.
         const names = dependencyNames(call.node);
-        const seenNames = new Set(names);
-        const selected = new Set();
-        for (let at = 0; at < names.length; at++) {
-            for (const position of statementsByName.get(names[at]) || []) {
-                if (selected.has(position)) continue;
-                selected.add(position);
-                for (const name of contextFacts[position].names) {
-                    if (!seenNames.has(name)) { seenNames.add(name); names.push(name); }
-                }
-            }
+        const own = new Set(names);
+        const roots = [...new Set(names.filter(name => component.has(name)).map(rootOf))].sort();
+        const reached = new Set(roots);
+        const joined = roots.join('\0');
+        let selection = selections.get(joined);
+        if (!selection) {
+            selection = roots.length === 1 ? componentStatements.get(roots[0])
+                : roots.flatMap(root => componentStatements.get(root)).sort((a, b) => a - b);
+            selections.set(joined, selection);
         }
         const nesting = [];
         for (let parent = call.node.parent; parent && !sameNode(parent, body); parent = parent.parent) {
             nesting.push(parent.type);
         }
         call.invocationKey = JSON.stringify(invocationTokens(call.node));
-        const relevantParameters = (parameters?.namedChildren || []).filter(parameter =>
-            dependencyNames(parameter).some(name => seenNames.has(name)));
+        // A parameter is relevant when a name it binds is the call's own or
+        // one of the statements the call depends on.
+        const relevantParameters = parameterNames.filter(entry => entry.names.some(name =>
+            own.has(name) || (component.has(name) && reached.has(rootOf(name))))).map(entry => entry.parameter);
         const returnsValue = sameNode(call.node, body) || nesting.some(type => RESULT_NODES.has(type));
+        // The statements are compared by `classifyChange` (`selection`).
         call.key = JSON.stringify([tokensOf(call.node), relevantParameters.map(parameter => tokensOf(parameter)),
             returnsValue ? symbol.returnType || null : null, nesting,
-            [...selected].sort((a, b) => a - b).map(position => contextFacts[position].tokens),
             commentFacts.map(([text, at, prior, next]) => [text, at - tokenPosition(call.node.startIndex), prior, next])]);
+        call.selection = selection;
         delete call.node;
     }
     const contract = { header: JSON.stringify(header), generator, returnForm, inferred, derivation, memberBindings };
     Object.defineProperties(contract, {
         outgoingCalls: { value: outgoingCalls }, invocationContext: { value: invocationContext },
+        contextText: { value: contextText },
         pathEnds: { value: pathEnds }, unitReturn: { value: unitReturn }, boundReturn: { value: boundReturn },
     });
     return contract;
@@ -1267,13 +1305,45 @@ function classifyChange(before, after, language) {
     const change = { kind: reasons.length > 0 ? 'contract' : 'inert', reasons };
     // Moving or formatting a call does not make it a new call. Repeated
     // calls are counted, so an extra occurrence is still checked.
+    // A call is its own key and the statements it depends on (`selection`),
+    // compared by content: in this comparison only (a contract can be
+    // compared again), a statement's tokens are one number and a selection
+    // the sequence of its statements' numbers.
+    const statementIds = new Map();
+    const selectionIds = new Map();
+    const positionIds = new Map();
+    const selectionIdOf = new Map();
+    const keyOf = (contract, call) => {
+        let id = selectionIdOf.get(call.selection);
+        if (id === undefined) {
+            let ids = positionIds.get(contract);
+            if (!ids) positionIds.set(contract, ids = []);
+            const sequence = call.selection.map(position => {
+                if (ids[position] === undefined) {
+                    const text = contract.contextText(position);
+                    if (!statementIds.has(text)) statementIds.set(text, statementIds.size);
+                    ids[position] = statementIds.get(text);
+                }
+                return ids[position];
+            }).join(',');
+            if (!selectionIds.has(sequence)) selectionIds.set(sequence, selectionIds.size);
+            id = selectionIds.get(sequence);
+            selectionIdOf.set(call.selection, id);
+        }
+        return `${call.key}\0${id}`;
+    };
     const prior = new Map();
-    for (const call of before.outgoingCalls || []) prior.set(call.key, (prior.get(call.key) || 0) + 1);
+    for (const call of before.outgoingCalls || []) {
+        const key = keyOf(before, call);
+        prior.set(key, (prior.get(key) || 0) + 1);
+    }
     const preserved = new Set((before.outgoingCalls || []).map(call => call.invocationKey));
+    const sameContext = before.invocationContext === after.invocationContext;
     const changedCalls = (after.outgoingCalls || []).filter(call => {
-        const left = prior.get(call.key) || 0;
-        if (left) { prior.set(call.key, left - 1); return false; }
-        call.stableInvocation = before.invocationContext === after.invocationContext && preserved.has(call.invocationKey);
+        const key = keyOf(after, call);
+        const left = prior.get(key) || 0;
+        if (left) { prior.set(key, left - 1); return false; }
+        call.stableInvocation = sameContext && preserved.has(call.invocationKey);
         return true;
     });
     Object.defineProperty(change, 'changedCalls', { value: changedCalls });

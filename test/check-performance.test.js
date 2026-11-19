@@ -5,7 +5,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const { tmp, rm, idx } = require('./helpers');
 const { execute } = require('../core/execute');
 const { createTestModel } = require('../core/test-units');
@@ -180,5 +180,84 @@ describe('fix #501: stop namespace inventory after an all-identities effect', ()
             assert.deepStrictEqual(answers(loaded), [false, false, false]);
             assert.deepStrictEqual(answers(loaded), answers(idx(dir)), 'no wildcard survives its source repair');
         } finally { rm(dir); }
+    });
+});
+
+// A function of several thousand statements and calls that all share names
+// (`total`, `seen`, `index`, `item`), nested two levels deep: every call
+// depends on nearly every statement of the body.
+function largeFunctionSource(blocks) {
+    const lines = [
+        'function step(item, index, seen) { return item ? index.weight + seen.size : 0; }',
+        'function note(total, item) { return total + (item ? 1 : 0); }',
+        'function large(index, options) {',
+        '  const seen = new Set();',
+        '  let total = 0;',
+    ];
+    for (let i = 0; i < blocks; i++) {
+        lines.push(
+            `  if (options.flag${i % 7}) {`,
+            `    for (const item of index.items${i % 11}) {`,
+            '      total += step(item, index, seen);',
+            '      if (seen.has(item)) { total = note(total, item); continue; }',
+            '      seen.add(item);',
+            '    }',
+            '  }');
+    }
+    lines.push('  return total;', '}', 'module.exports = { large, step, note };', '');
+    return lines.join('\n');
+}
+
+// One statement of the middle block changed.
+function changeOneLine(source) {
+    const lines = source.split('\n');
+    const at = lines.findIndex((line, i) => i > lines.length / 2 && line.includes('total += step(item, index, seen);'));
+    lines[at] = lines[at].replace('step(item, index, seen);', 'step(item, index, seen) + 1;');
+    return lines.join('\n');
+}
+
+describe('fix #514: a change inside a very large function is compared in bounded memory', () => {
+    const CLI = path.join(__dirname, '..', 'cli', 'index.js');
+
+    it('check and impact --base answer for one changed line under a 256 MB heap', () => {
+        const source = largeFunctionSource(600);
+        const dir = repository({ 'package.json': '{"name":"generated","version":"1.0.0"}\n', 'large.js': source });
+        try {
+            fs.writeFileSync(path.join(dir, 'large.js'), changeOneLine(source));
+            for (const command of ['check', 'impact']) {
+                const run = spawnSync(process.execPath, ['--max-old-space-size=256', CLI, dir, command,
+                    '--base=HEAD', '--json', '--no-cache'], { encoding: 'utf8', timeout: 120000, maxBuffer: 1 << 26 });
+                assert.ok(!run.error, `${command}: ${run.error && run.error.message}`);
+                assert.doesNotMatch(run.stderr, /heap limit|out of memory/i, `${command} ran out of memory`);
+                const data = JSON.parse(run.stdout).data;
+                if (command === 'check') {
+                    const item = data.changed.find(entry => entry.name === 'large');
+                    assert.strictEqual(item && item.kind, 'modified');
+                } else {
+                    assert.deepStrictEqual(data.functions.map(fn => fn.name), ['large']);
+                }
+            }
+        } finally { rm(dir); }
+    });
+
+    it('one changed statement changes every call that depends on it, and the call keys stay the size of the calls', () => {
+        const { callableContract, classifyChange, parseRevision } = require('../core/change-kinds');
+        const source = largeFunctionSource(40);
+        const range = text => {
+            const lines = text.split('\n');
+            return { startLine: lines.indexOf('function large(index, options) {') + 1, endLine: lines.lastIndexOf('}') + 1 };
+        };
+        const contract = text => callableContract(parseRevision(text, 'javascript'), 'javascript', range(text));
+        const before = contract(source);
+        const calls = before.outgoingCalls.length;
+        assert.strictEqual(calls, 1 + 40 * 4);
+        // Each call holds its own tokens, not a copy of the statements around it.
+        const keyText = before.outgoingCalls.reduce((sum, call) => sum + call.key.length, 0);
+        assert.ok(keyText < source.length * 20, `call keys hold ${keyText} characters for a ${source.length}-character body`);
+        assert.strictEqual(classifyChange(before, contract(source), 'javascript').changedCalls.length, 0);
+        const changed = classifyChange(before, contract(changeOneLine(source)), 'javascript');
+        assert.strictEqual(changed.changedCalls.length, calls, 'every call reaches the changed statement through a shared name');
+        // A contract compared twice gives the same answer.
+        assert.strictEqual(classifyChange(before, contract(changeOneLine(source)), 'javascript').changedCalls.length, calls);
     });
 });
