@@ -11530,8 +11530,9 @@ describe('fix #515: a receiver spelled like a class is that class only when the 
     });
 });
 
-describe('fix #516: overload stubs and their implementation are one call interface', () => {
-    // pyright (basic mode) on this file: one error, line 19 (no overload takes two arguments).
+describe('fix #516: overload stubs are one call interface', () => {
+    // pyright (basic mode) on this file: errors on lines 19 and 20 (no overload takes two
+    // arguments, none takes the keyword `nope`).
     const LIB = [
         'from typing import Optional, overload',
         '',
@@ -11552,18 +11553,30 @@ describe('fix #516: overload stubs and their implementation are one call interfa
         '    pick()',
         '    pick(1)',
         '    pick(1, 2)',
+        '    pick(nope=1)',
         '',
     ].join('\n');
+    const mismatchLines = (index, line) => {
+        const result = execute(index, 'verify', { name: `lib.py:${line}:pick` });
+        assert.ok(result.ok, JSON.stringify(result));
+        return (result.result.mismatchDetails || []).map(row => row.line).sort((a, b) => a - b);
+    };
 
     it('a call that binds another overload is no mismatch of the pinned stub', () => {
         const dir = tmp({ 'requirements.txt': '', 'lib.py': LIB });
         try {
             const index = idx(dir);
-            for (const line of [5, 9, 12]) {
-                const result = execute(index, 'verify', { name: `lib.py:${line}:pick` });
-                assert.ok(result.ok, JSON.stringify(result));
-                assert.deepStrictEqual((result.result.mismatchDetails || []).map(row => row.line), [19], `pick at line ${line}`);
-            }
+            // A stub is counted with its family: only the call no member takes by count.
+            assert.deepStrictEqual(mismatchLines(index, 5), [19]);
+            assert.deepStrictEqual(mismatchLines(index, 9), [19]);
+        } finally { rm(dir); }
+    });
+
+    it('the implementation keeps its own list, keyword names included', () => {
+        // pyright rejects line 20 too: no overload takes the keyword `nope`.
+        const dir = tmp({ 'requirements.txt': '', 'lib.py': LIB });
+        try {
+            assert.deepStrictEqual(mismatchLines(idx(dir), 12), [19, 20]);
         } finally { rm(dir); }
     });
 });

@@ -10,8 +10,8 @@
  * decorator or held as a class attribute. A method called through a
  * class's name, its own or a subclass's, is the unbound function, so that
  * call writes the receiver as its first argument (fix #513). `@overload`
- * stubs and the implementation beside them are one call interface: a call
- * that binds another overload is no mismatch of an edited stub (fix #516).
+ * stubs are one call interface: a call that binds another overload is no
+ * mismatch of an edited stub, and one no stub takes is (fix #516).
  * `expect` is the toolchain's verdict (eval/run-check-matrix.js);
  * `answer` and `detail` are the check's.
  */
@@ -266,7 +266,7 @@ module.exports = [
             "lib.py": "from typing import Optional, overload\n\n\n@overload\ndef pick(x: int, y: int) -> int: ...\n\n\n@overload\ndef pick() -> None: ...\n\n\ndef pick(x: Optional[int] = None, y: Optional[int] = None) -> Optional[int]:\n    return x\n\n\ndef use() -> None:\n    pick()\n    pick(1)\n"
         },
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "pick:modified=review(header) pick:modified=review(header)"
+        "answer": "BLOCKED",
+        "detail": "pick:modified=blocked(signature-mismatch,header) pick:modified=review(header)"
     }
 ];

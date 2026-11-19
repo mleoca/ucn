@@ -309,9 +309,10 @@ const STRUCTURAL_TRAITS = {
     // convention (`self`, `cls`): a function that is not a member takes
     // that parameter as an argument like any other.
     // Decorators that declare an overload of a name (the last segment of
-    // the decorator's dotted name): the declarations so marked and the
-    // implementation beside them are one call interface (core/verify.js).
-    // null: overloads are syntax, or the language has none.
+    // the decorator's dotted name): the declarations so marked are one
+    // call interface, and a call is counted against each of them
+    // (core/verify.js). null: overloads are syntax, or the language has
+    // none.
     overloadDecorators: null,
     receiverParameterByConvention: false,
     // Files that only declare what other files implement (Python stubs,

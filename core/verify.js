@@ -2445,10 +2445,13 @@ function verify(index, name, options = {}, direct = null) {
             ? `${def.name} declares no parameter list (${def.type}); what a call of it takes is not read from the declaration`
             : null;
     // Overloads a language declares by decorator (trait
-    // `overloadDecorators`: Python `@overload` stubs beside their
-    // implementation) are one call interface: a call of the name binds
-    // whichever of them takes it, so a site is counted against the family
-    // and never against the pinned stub alone.
+    // `overloadDecorators`: Python `@overload` stubs) are one call
+    // interface: a call of the name binds whichever stub takes it, so a
+    // site of a pinned stub is counted against each stub of the family
+    // and is a mismatch only when no stub takes its count. The
+    // implementation beside the stubs is not part of that interface (a
+    // checker never binds a call to it); pinned itself, it keeps its own
+    // list, keyword names included.
     let declaredOverloadParams = null;
     const overloadDecorators = langTraits(lang)?.overloadDecorators;
     if (!ctorParamLists && !callableIdentityParams?.length && overloadDecorators && Array.isArray(def.paramsStructured)) {
@@ -2458,9 +2461,9 @@ function verify(index, name, options = {}, direct = null) {
             (member.className || null) === (def.className || null) &&
             (member.lexicalScopeStartLine ?? null) === (def.lexicalScopeStartLine ?? null) &&
             Array.isArray(member.paramsStructured));
-        if (family.length > 1 && family.some(declaresOverload) &&
-            family.some(member => member.startLine === def.startLine)) {
-            declaredOverloadParams = family.map(member => member.paramsStructured);
+        const stubs = family.filter(declaresOverload);
+        if (stubs.length > 1 && stubs.some(member => member.startLine === def.startLine)) {
+            declaredOverloadParams = stubs.map(member => member.paramsStructured);
         }
     }
     const rawParamLists = heldInterface?.lists || declaredShape?.lists || ctorParamLists ||
@@ -2708,7 +2711,7 @@ function verify(index, name, options = {}, direct = null) {
         const receiverWritten = form === 'unbound' ? 1 : 0;
         const siteMin = minArgs + receiverWritten;
         const siteMax = expectedParamCount + receiverWritten;
-        const countFits = shift => (direct && !inheritedCtorOnly
+        const countFits = shift => ((direct || declaredOverloadParams) && !inheritedCtorOnly
             ? arities.some(arity => argCount >= arity.min + shift &&
                 (arity.hasRest || argCount <= arity.max + shift))
             : hasRest ? argCount >= minArgs + shift
