@@ -18,7 +18,10 @@ const isSafeRegex = require('safe-regex2');
 const { RE2JS } = require('re2js');
 const { UcnError } = require('./errors');
 const { paramValues } = require('./registry');
-const { createTestModel, addTestCaseRows, linkFiles, testSite, testSiteKey } = require('./test-units');
+const { createTestModel, addTestCaseRows, linkFiles, testSite, testSiteKey, unitLabel } = require('./test-units');
+
+/** A row the engine could not attribute to the target: it links no test. */
+const isUnverifiedTestRow = match => match.matchType === 'unverified-call' || match.matchType === 'unverified-reference';
 
 // Keep the established search-input contract for the canonical catastrophic
 // nested-single-atom family even though the RE2-compatible engine could run it
@@ -1714,6 +1717,7 @@ function tests(index, nameOrFile, options = {}) {
                     evidenceTier: site._testEvidenceTier,
                     ...(site.resolution && { resolution: site.resolution }),
                     ...(site.reason && { reason: site.reason }),
+                    ...(site._testEvidenceTier !== 'confirmed' && site.dispatchVia && { dispatchVia: site.dispatchVia }),
                 });
             }
 
@@ -1804,6 +1808,7 @@ function tests(index, nameOrFile, options = {}) {
                 evidenceTier: site._testEvidenceTier,
                 ...(site.resolution && { resolution: site.resolution }),
                 ...(site.reason && { reason: site.reason }),
+                ...(site._testEvidenceTier !== 'confirmed' && site.dispatchVia && { dispatchVia: site.dispatchVia }),
             });
         }
 
@@ -1881,19 +1886,28 @@ function tests(index, nameOrFile, options = {}) {
     }
 
     // The tests that hold the matches (core/test-units.js): one row per
-    // test, then what the file is to its runner and how to run it.
+    // test, then what the file is to its runner and how to run it. An
+    // unverified row links no test (fix #507): it names the test that holds
+    // it and is never counted or given a command; a file whose only rows
+    // are unverified has no role, count or command.
     const absolute = new Map(testFiles.map(info => [info.entry.relativePath, info.path]));
     const linesByFile = new Map();
     for (const fileResult of results) {
         const testPath = absolute.get(fileResult.file);
         if (!testPath) continue;
         addTestCaseRows(model, index, testPath, isFilePath ? null : searchTerm, fileResult.matches, {
-            counts: match => match.matchType !== 'import',
+            counts: match => match.matchType !== 'import' && !isUnverifiedTestRow(match),
             titles: titled.has(fileResult.file),
             titleNeedsMatch: !!className,
         });
-        linesByFile.set(testPath,
-            fileResult.matches.filter(match => match.matchType !== 'import'));
+        for (const match of fileResult.matches) {
+            if (!isUnverifiedTestRow(match)) continue;
+            const unit = model.unitAt(testPath, match);
+            if (unit && unit.kind === 'test') match.test = unitLabel(unit);
+        }
+        if (fileResult.matches.length > 0 && fileResult.matches.every(isUnverifiedTestRow)) continue;
+        linesByFile.set(testPath, fileResult.matches.filter(match =>
+            match.matchType !== 'import' && !isUnverifiedTestRow(match)));
     }
     // A test a class inherits runs where the class is: the file of a class
     // that inherits a linked test is a result of its own, with the test.

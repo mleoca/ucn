@@ -2,7 +2,7 @@
  * core/output/search.js - Text search, structural search, example, typedef, tests formatters
  */
 
-const { detectDoubleEscaping, advisoryLine } = require('./shared');
+const { detectDoubleEscaping, advisoryLine, unverifiedReasonLabel } = require('./shared');
 const { selectorText, testCountText } = require('../test-units');
 
 /**
@@ -408,28 +408,32 @@ function formatTests(tests, name) {
     }
     if (tests?.warnings?.length > 0) lines.push('');
 
-    if (!tests || !Array.isArray(tests) || tests.length === 0) {
-        lines.push('  (no statically linked tests found)');
-    } else {
-        const totalMatches = tests.reduce((sum, t) => sum + t.matches.length, 0);
-        lines.push(`Found ${totalMatches} matches in ${tests.length} test file(s):\n`);
-        const unverified = tests.reduce((sum, t) => sum +
-            t.matches.filter(m => ['unverified-call', 'unverified-reference'].includes(m.matchType)).length, 0);
-        if (unverified > 0) {
-            lines.push(`UNVERIFIED: ${unverified} possible test call${unverified === 1 ? '' : 's'} need receiver/binding review.\n`);
-        }
+    // Rows the engine could not attribute to the target link no test: they
+    // are listed after the linked tests, with the test that holds each and
+    // why it is unverified, and no command (fix #507).
+    const files = Array.isArray(tests) ? tests : [];
+    const unverifiedRow = match => match.matchType === 'unverified-call' || match.matchType === 'unverified-reference';
+    // A file whose every row is unverified is no linked test file.
+    const linked = files.filter(testFile => !(testFile.matches.length > 0 && testFile.matches.every(unverifiedRow)));
+    const unverified = files.filter(testFile => testFile.matches.some(unverifiedRow));
 
-        for (const testFile of tests) {
+    if (linked.length === 0) {
+        lines.push('  (no statically linked tests found)');
+        if (unverified.length > 0) lines.push('');
+    } else {
+        const totalMatches = linked.reduce((sum, t) => sum + t.matches.filter(match => !unverifiedRow(match)).length, 0);
+        lines.push(`Found ${totalMatches} matches in ${linked.length} test file(s):\n`);
+
+        for (const testFile of linked) {
             const counted = testCountText(testFile.tests, testFile.moreTests, testFile.conditionalTests);
             const facts = testFile.role === 'support' ? '  [support: declares no test]'
                 : counted ? `  (${counted})` : '';
             lines.push(`${testFile.file}${facts}`);
             for (const match of testFile.matches) {
+                if (unverifiedRow(match)) continue;
                 const typeLabel = match.matchType === 'test-case' ? '[test]' :
                     match.matchType === 'import' ? '[import]' :
                     match.matchType === 'call' ? '[call]' :
-                    match.matchType === 'unverified-call' ? '[unverified-call]' :
-                    match.matchType === 'unverified-reference' ? '[unverified-ref]' :
                     match.matchType === 'inherited-test' ? '[inherited]' :
                     match.matchType === 'string-ref' ? '[string]' : '[ref]';
                 // A test the class inherits: its name, and where its body is.
@@ -440,6 +444,22 @@ function formatTests(tests, name) {
             else if (testFile.role === 'tests' && testFile.runWithheld) lines.push(`  no command: ${testFile.runWithheld}`);
             for (const unit of testFile.units || []) {
                 if (unit.selector) lines.push(`  run test: ${selectorText(unit.selector)}`);
+            }
+            lines.push('');
+        }
+    }
+
+    if (unverified.length > 0) {
+        const count = unverified.reduce((sum, t) => sum + t.matches.filter(unverifiedRow).length, 0);
+        lines.push(`UNVERIFIED: ${count} possible test call${count === 1 ? '' : 's'} in ${unverified.length} file(s), ` +
+            'receiver or binding not proven; not linked, no command given:\n');
+        for (const testFile of unverified) {
+            lines.push(testFile.file);
+            for (const match of testFile.matches) {
+                if (!unverifiedRow(match)) continue;
+                const typeLabel = match.matchType === 'unverified-call' ? '[unverified-call]' : '[unverified-ref]';
+                const why = [match.test, unverifiedReasonLabel(match)].filter(Boolean).join('; ');
+                lines.push(`  ${match.line}: ${typeLabel} ${match.content}${why ? `  (${why})` : ''}`);
             }
             lines.push('');
         }

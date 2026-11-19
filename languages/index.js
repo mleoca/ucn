@@ -509,6 +509,13 @@ const STRUCTURAL_TRAITS = {
     // language has no module object to assign members to (core/callers.js
     // `_moduleExposesName`).
     moduleObjectNames: null,
+    // `(index, filePath, call) => answer | null`: the module object a
+    // call's receiver holds when the program loads it by path or by a
+    // literal name (Python `importlib.util.module_from_spec` of a spec from
+    // `spec_from_file_location`, `SourceFileLoader(..).load_module()`,
+    // `importlib.import_module("m")`), read from the syntax tree
+    // (core/loaded-modules.js, fix #507). null: not read.
+    loadedModule: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -872,6 +879,7 @@ const NOMINAL_TRAITS = {
     calledDeclarations: null,
     bindingCallInterface: null,
     moduleObjectNames: null,
+    loadedModule: null,
     // Can a type checker decide a condition from the names in it (Python:
     // `sys.version_info`, `sys.platform`, `TYPE_CHECKING`, constants its
     // configuration defines)? Then a condition that guards part of what a
@@ -1231,6 +1239,7 @@ const LANGUAGES = {
             untypedParameters: { defaultTypes: { integer: 'int', float: 'float', string: 'str', boolean: 'bool' },
                 openDefaults: ['None'], resultFollowsArguments: true },
             unboundCallee: (identifier, index) => require('../core/python-binding-identity').pythonNameUnbound(identifier, index, PY_AMBIENT_CALLABLES),
+            loadedModule: (index, filePath, call) => require('../core/loaded-modules').pythonLoadedModule(index, filePath, call),
             declarationFilePattern: /\.pyi$/,
             receiverParameterByConvention: true,
             decoratorsRegisterNothing: (index, declaration) => require('../core/python-binding-identity').pythonDecoratorsRegisterNothing(index, declaration),

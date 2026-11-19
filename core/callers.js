@@ -62,6 +62,8 @@ let lazyCallNameCacheModuleCache = null;
 const lazyCallNameCacheModule = () => lazyCallNameCacheModuleCache || (lazyCallNameCacheModuleCache = require('./call-name-cache'));
 let lazyClassIdentityModuleCache = null;
 const lazyClassIdentityModule = () => lazyClassIdentityModuleCache || (lazyClassIdentityModuleCache = require('./class-identity'));
+let lazyLoadedModulesCache = null;
+const lazyLoadedModules = () => lazyLoadedModulesCache || (lazyLoadedModulesCache = require('./loaded-modules'));
 const {
     ownerRefOf, lexicalClassRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
     shareDescendant: shareClassDescendant, parentRefsOf: parentRefsOfClass,
@@ -5562,6 +5564,14 @@ function findCallers(index, name, options = {}) {
                 const recvSubmoduleRel = (!call.receiverIsModule && call.isMethod && call.receiver &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural')
                     ? _submoduleReceiverModule(index, fileEntry, call.receiver) : null;
+                // A module object the program loads by path or by a literal
+                // name (fix #507, core/loaded-modules.js): `mod =
+                // importlib.util.module_from_spec(spec)` with the spec read
+                // from a path. `mod.main()` calls the `main` of the file at
+                // that path and no other.
+                const recvLoaded = ((!bindingId || recvExportedNamespace) && !resolvedBySameClass &&
+                    !recvSubmoduleRel && !recvExportedNamespace)
+                    ? lazyLoadedModules().loadedModuleOfReceiver(index, filePath, call) : null;
                 // A named/default import can itself be an exported namespace
                 // object: `import { z } from './index'; z.string()`, where
                 // index does `import * as z from './api'; export { z }`.
@@ -5573,7 +5583,8 @@ function findCallers(index, name, options = {}) {
                 // only when every target is a class method; standalone-function
                 // and class (constructor) targets keep flowing on import evidence.
                 if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod &&
-                    (call.receiverIsModule || call.receiverModuleSpecifier || recvExportedNamespace) &&
+                    (call.receiverIsModule || call.receiverModuleSpecifier || recvExportedNamespace ||
+                        recvLoaded?.kind === 'file') &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     targetDefs.length > 0 && targetDefs.every(d => d.className)) {
                     isUncertain = true;
@@ -5584,6 +5595,66 @@ function findCallers(index, name, options = {}) {
                     }
                     if (!options.includeUncertain) {
                         if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                        continue;
+                    }
+                }
+
+                // A loaded module's member is the name its file binds, asked
+                // like an imported module's (the name-level chain below): a
+                // file that binds the target's name confirms, one that binds
+                // another definition excludes. A path with a runtime part
+                // reaches only the files it matches; an unread or unplaced
+                // path stays visible with its reason.
+                if (recvLoaded) {
+                    const reachesFile = file => {
+                        const verdict = _nameBindingReaches(index, file, call.name, targetDefinitionFiles, 4,
+                            { targetName: name, valueVerdict: true, configurationVerdict: true });
+                        if (verdict === 'yes' || verdict === 'no') return verdict;
+                        if (verdict === 'unknown' && _importReaches(index, file, new Set([...targetDefinitionFiles]
+                            .filter(target => _moduleExposesName(index, target, name))))) return 'yes';
+                        return 'unknown';
+                    };
+                    const loadedVia = { dispatchVia: recvLoaded.via };
+                    if (recvLoaded.kind === 'file') {
+                        const verdict = reachesFile(recvLoaded.file);
+                        if (verdict === 'no') {
+                            recordExcluded(filePath, call.line, 'other-module-path');
+                            continue;
+                        }
+                        if (verdict === 'yes') {
+                            call = { ...call, moduleOwnedPath: true };
+                        } else if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call, 'no-import-link', calledAs, loadedVia);
+                            continue;
+                        }
+                    } else if (recvLoaded.kind === 'files' || recvLoaded.kind === 'ambiguous') {
+                        const verdicts = recvLoaded.files.map(reachesFile);
+                        if (verdicts.every(verdict => verdict === 'no')) {
+                            recordExcluded(filePath, call.line, 'other-module-path');
+                            continue;
+                        }
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call,
+                                recvLoaded.kind === 'files' ? 'module-path-runtime' : 'module-path-ambiguous',
+                                calledAs, { ...loadedVia, dispatchCandidates: recvLoaded.files.length });
+                            continue;
+                        }
+                    } else if (recvLoaded.kind === 'module') {
+                        // A literal module name the resolver did not place:
+                        // an outside module, unless it looks like the
+                        // project's own (a resolver gap).
+                        if (!_unresolvedModuleIsGap(index, recvLoaded.module)) {
+                            recordExcluded(filePath, call.line, 'external-package');
+                            continue;
+                        }
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call, 'no-import-link', calledAs, loadedVia);
+                            continue;
+                        }
+                    } else if (collectAccount) {
+                        routeUnverified(filePath, fileEntry, call,
+                            recvLoaded.kind === 'unread' ? 'module-path-unread' : 'module-path-unresolved',
+                            calledAs, loadedVia);
                         continue;
                     }
                 }
@@ -9416,6 +9487,54 @@ function findCallees(index, definition, options = {}) {
                 if (!localTarget) {
                     noteSite(siteId, 'excluded', 'local-shadow', call);
                     continue;
+                }
+            }
+
+            // A module object the program loads by path or by a literal name
+            // (fix #507, the caller side's rule): its member is the name the
+            // loaded file binds; a path with a runtime part or one that is
+            // not read keeps the site visible with its reason.
+            if (call.isMethod && call.receiver && !call.receiverField && !call.receiverIsModule &&
+                langTraits(language)?.loadedModule) {
+                const loaded = lazyLoadedModules().loadedModuleOfReceiver(index, def.file, call);
+                if (loaded) {
+                    const meta = { dispatchVia: loaded.via };
+                    if (loaded.kind === 'file') {
+                        const routed = _calleeExportDefinitions(index, loaded.file, call.name, language, call, {});
+                        if (routed.matches.length > 0 && !routed.configuration) {
+                            // The loaded file owns the member, as an imported
+                            // module's export chain does.
+                            siteEvidence.get(siteId).evidence.moduleOwnedPath = true;
+                            for (const match of routed.matches) {
+                                const key = match.bindingId || `${match.file}:${match.startLine}:${call.name}`;
+                                const existing = callees.get(key);
+                                if (existing) {
+                                    existing.count += 1;
+                                    existing.sites.push(call.line); existing.siteIds.push(siteId);
+                                } else {
+                                    callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
+                                        sites: [call.line], siteIds: [siteId] });
+                                }
+                            }
+                            continue;
+                        }
+                        // Not settled: visible on the contract surface; other
+                        // traversals keep their own handling below.
+                        if (collectAccount) {
+                            noteUnverified(siteId, call, routed.configuration ? 'configuration-alternative' : 'no-import-link', meta);
+                            continue;
+                        }
+                    } else if (loaded.kind === 'module' && !_unresolvedModuleIsGap(index, loaded.module)) {
+                        noteSite(siteId, 'external', null, call);
+                        continue;
+                    } else if (collectAccount) {
+                        noteUnverified(siteId, call,
+                            loaded.kind === 'files' ? 'module-path-runtime'
+                                : loaded.kind === 'ambiguous' ? 'module-path-ambiguous'
+                                    : loaded.kind === 'module' ? 'no-import-link'
+                                        : loaded.kind === 'unread' ? 'module-path-unread' : 'module-path-unresolved', meta);
+                        continue;
+                    }
                 }
             }
 
@@ -13300,8 +13419,10 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                     if (!map) map = new Map();
                     const key = `${scope}:${call.assignedTo}`;
                     if (!map.has(key)) map.set(key, []);
+                    // A dotted module (`importlib.util.f()`) has no receiver
+                    // name, only its specifier.
                     map.get(key).push({ line: call.line, start: call.callStart,
-                        externalVia: `${call.receiver}.${call.name}` });
+                        externalVia: `${call.receiver || call.receiverModuleSpecifier}.${call.name}` });
                 }
                 continue;
             }
@@ -32062,7 +32183,7 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         if (binding && !rel) {
             if (!_unresolvedModuleIsGap(index, binding.module, binding)) {
                 return {
-                    externalVia: `${record.receiver}.${name}`,
+                    externalVia: `${record.receiver || record.receiverModuleSpecifier}.${name}`,
                     ...(/^[A-Z]/.test(name) && { externalConcrete: true }),
                 };
             }

@@ -360,6 +360,10 @@ function unverifiedReasonLabel(entry) {
             ? `possible-dispatch via ${entry.dispatchVia} — 1 of ${n} implementations`
             : `possible-dispatch via ${entry.dispatchVia}`;
     }
+    if (/^module-path-/.test(entry.reason) && entry.dispatchVia) {
+        // A module the program loads by path (fix #507): its loader and path.
+        return `${entry.reason} via ${entry.dispatchVia}`;
+    }
     if (entry.reason === 'macro-generated-scope' && entry.dispatchVia) {
         // A macro-wrapped body whose argument names a class (fix #396).
         return `macro-generated-scope via ${entry.dispatchVia}`;

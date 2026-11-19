@@ -846,3 +846,54 @@ describe('mixed-language repos: unsupported files enter the ground set', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #507: calls through a module loaded by path stay in the partition', () => {
+    it('confirmed for the loaded file, excluded for namesakes, unverified for runtime and unread paths', () => {
+        const dir = tmp({
+            'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+            'scripts/alpha.py': 'def main():\n    return 0\n',
+            'scripts/beta.py': 'def main():\n    return 1\n',
+            'tests/test_loads.py': [
+                'import importlib.util',
+                '',
+                '',
+                'def _load(path):',
+                '    spec = importlib.util.spec_from_file_location("_x", path)',
+                '    mod = importlib.util.module_from_spec(spec)',
+                '    spec.loader.exec_module(mod)',
+                '    return mod',
+                '',
+                '',
+                'def test_alpha():',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_a", "scripts/alpha.py"))',
+                '    assert mod.main() == 0',
+                '',
+                '',
+                'def test_runtime(name="beta"):',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_r", f"scripts/{name}.py"))',
+                '    assert mod.main() == 1',
+                '',
+                '',
+                'def test_unread():',
+                '    assert _load("scripts/beta.py").main() == 1',
+                '    mod = _load("scripts/beta.py")',
+                '    assert mod.main() == 1',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // The strict invariant (buckets sum to the ground set, nothing unaccounted).
+            assert.strictEqual(accountForSymbol(index, 'main').conserved, true);
+            for (const file of ['scripts/alpha.py', 'scripts/beta.py']) {
+                const def = index.find('main', { exact: true, file })[0];
+                index._beginOp();
+                try {
+                    const raw = index.findCallers('main', { targetDefinitions: [def], collectAccount: true });
+                    const excluded = raw.accountRaw.excludedEntries.filter(entry => entry.reason === 'other-module-path');
+                    assert.deepStrictEqual(excluded.map(entry => entry.line), file === 'scripts/alpha.py' ? [] : [13]);
+                } finally { index._endOp(); }
+            }
+        } finally { rm(dir); }
+    });
+});

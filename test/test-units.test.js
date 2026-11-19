@@ -2990,8 +2990,19 @@ describe('test units: what a test executes is test code whatever its file is cal
             try {
                 const index = idx(dir);
                 const found = index.tests('cookies', {});
-                assert.deepStrictEqual(found.map(row => `${row.file}:${row.tests}`), [`${file}:1`]);
-                assert.ok(found[0].units[0].selector);
+                assert.deepStrictEqual(found.map(row => row.file), [file]);
+                if (file === 'checks.py') {
+                    // The read's receiver type is not resolved here: the row
+                    // is found and names the test that holds it, but an
+                    // unverified row links no test and gets no command
+                    // (fix #507).
+                    assert.deepStrictEqual(found[0].matches.map(match => `${match.matchType}:${match.test}`),
+                        ['unverified-reference:test_reads']);
+                    assert.strictEqual(found[0].run, undefined);
+                } else {
+                    assert.deepStrictEqual(found.map(row => `${row.file}:${row.tests}`), [`${file}:1`]);
+                    assert.ok(found[0].units[0].selector);
+                }
                 assert.deepStrictEqual(index.tests('cookies', { exclude: file }), []);
                 assert.deepStrictEqual(index.tests('cookies', {}), found);
             } finally {
@@ -3508,5 +3519,132 @@ describe('fix #503 correction: Rust cfg_attr test declarations', () => {
             assert.strictEqual(loaded.loadCache(), true);
             assert.deepStrictEqual(loaded.tests('leaf', { file: 'src/lib.rs' }), expected);
         } finally { rm(dir); }
+    });
+});
+
+describe('fix #507: a module object loaded by path is the module at that path', () => {
+    const LOADED = {
+        'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+        'app.py': 'def main():\n    return 9\n\n\ndef helper():\n    return main()\n',
+        'scripts/alpha.py': 'def main():\n    return 0\n',
+        'scripts/beta.py': 'def main():\n    return 1\n',
+        'scripts/gamma.py': 'def main():\n    return 2\n',
+        // A module constant built from the file's own location, loaded by a
+        // helper that returns the module.
+        'tests/test_alpha.py': [
+            'import importlib.util',
+            'from pathlib import Path',
+            '',
+            'SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "alpha.py"',
+            '',
+            '',
+            'def _load():',
+            '    spec = importlib.util.spec_from_file_location("_alpha", str(SCRIPT_PATH))',
+            '    mod = importlib.util.module_from_spec(spec)',
+            '    spec.loader.exec_module(mod)',
+            '    return mod',
+            '',
+            '',
+            'def test_alpha_main():',
+            '    mod = _load()',
+            '    assert mod.main() == 0',
+            '',
+        ].join('\n'),
+        // A literal path, read from where the runner runs.
+        'tests/test_beta.py': [
+            'import importlib.util',
+            '',
+            '',
+            'def test_beta_main():',
+            '    spec = importlib.util.spec_from_file_location("_beta", "scripts/beta.py")',
+            '    mod = importlib.util.module_from_spec(spec)',
+            '    spec.loader.exec_module(mod)',
+            '    assert mod.main() == 1',
+            '',
+        ].join('\n'),
+        // A path with a runtime part reaches only the files it matches.
+        'tests/test_dynamic.py': [
+            'import importlib.util',
+            'import pytest',
+            '',
+            '',
+            '@pytest.mark.parametrize("name", ["alpha", "beta"])',
+            'def test_any_script(name):',
+            '    spec = importlib.util.spec_from_file_location("_any", f"scripts/{name}.py")',
+            '    mod = importlib.util.module_from_spec(spec)',
+            '    spec.loader.exec_module(mod)',
+            '    assert mod.main() in (0, 1)',
+            '',
+        ].join('\n'),
+        'tests/test_app.py': 'from app import main\n\n\ndef test_app_main():\n    assert main() == 9\n',
+    };
+    const shape = rows => rows.map(row => ({
+        file: row.file,
+        linked: row.matches.filter(match => !match.matchType.startsWith('unverified')).map(match => `${match.line}:${match.matchType}`),
+        unverified: row.matches.filter(match => match.matchType.startsWith('unverified'))
+            .map(match => `${match.line}:${match.test}:${match.reason}`),
+        run: row.run ? selectorText(row.run) : null,
+        units: (row.units || []).map(unit => unit.name),
+    }));
+
+    it('tests links each load to the file at its path, never to a namesake, and gives unverified rows no command', () => {
+        const dir = projectOf(LOADED);
+        try {
+            const index = idx(dir);
+            const dynamic = {
+                file: 'tests/test_dynamic.py', linked: [], unverified: ['10:test_any_script:module-path-runtime'],
+                run: null, units: [],
+            };
+            const answers = Object.fromEntries(['scripts/alpha.py', 'scripts/beta.py', 'scripts/gamma.py', 'app.py']
+                .map(file => [file, shape(execute(index, 'tests', { name: 'main', file }).result)]));
+            assert.deepStrictEqual(answers['scripts/alpha.py'], [
+                { file: 'tests/test_alpha.py', linked: ['14:test-case', '16:call'], unverified: [],
+                    run: 'pytest tests/test_alpha.py', units: ['test_alpha_main'] },
+                dynamic,
+            ]);
+            assert.deepStrictEqual(answers['scripts/beta.py'], [
+                { file: 'tests/test_beta.py', linked: ['4:test-case', '8:call'], unverified: [],
+                    run: 'pytest tests/test_beta.py', units: ['test_beta_main'] },
+                dynamic,
+            ]);
+            assert.deepStrictEqual(answers['scripts/gamma.py'], [dynamic]);
+            assert.deepStrictEqual(answers['app.py'], [
+                { file: 'tests/test_app.py', linked: ['1:import', '4:test-case', '5:call'], unverified: [],
+                    run: 'pytest tests/test_app.py', units: ['test_app_main'] },
+            ]);
+
+            const text = output.formatTests(execute(index, 'tests', { name: 'main', file: 'scripts/alpha.py' }).result, 'main');
+            const [linkedPart, unverifiedPart] = text.split('UNVERIFIED:');
+            assert.match(linkedPart, /tests\/test_alpha\.py {2}\(1 test\)\n[\s\S]*run test: pytest tests\/test_alpha\.py::test_alpha_main/);
+            assert.doesNotMatch(linkedPart, /test_dynamic/);
+            assert.match(unverifiedPart, /tests\/test_dynamic\.py\n {2}10: \[unverified-call\] assert mod\.main\(\) in \(0, 1\) {2}\(test_any_script; module-path-runtime via importlib\.util\.module_from_spec: scripts\/\*\.py\)/);
+            assert.doesNotMatch(unverifiedPart, /\brun( test)?: /);
+            const gamma = output.formatTests(execute(index, 'tests', { name: 'main', file: 'scripts/gamma.py' }).result, 'main');
+            assert.match(gamma, /\(no statically linked tests found\)\n\nUNVERIFIED: 1 possible test call in 1 file/);
+            // A file target asks for the same identity.
+            assert.deepStrictEqual(shape(execute(index, 'tests', { name: 'scripts/alpha.py' }).result).map(row => row.file),
+                ['tests/test_alpha.py']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('check selects the tests the linked section names for the changed declaration', () => {
+        const dir = projectOf(LOADED);
+        try {
+            git(dir, 'init', '-q');
+            git(dir, 'add', '-A');
+            git(dir, 'commit', '-q', '-m', 'base');
+            fs.writeFileSync(path.join(dir, 'scripts/alpha.py'), 'def main():\n    return 10\n');
+            const index = idx(dir);
+            const checked = execute(index, 'check', {});
+            assert.ok(checked.ok, checked.error);
+            assert.deepStrictEqual(checked.result.testFiles.map(row => row.file), ['tests/test_alpha.py']);
+            const linked = execute(index, 'tests', { name: 'main', file: 'scripts/alpha.py' }).result
+                .filter(row => row.run).map(row => row.file);
+            assert.deepStrictEqual(linked, ['tests/test_alpha.py']);
+        } finally {
+            rm(dir);
+        }
     });
 });

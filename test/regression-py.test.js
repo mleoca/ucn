@@ -10867,3 +10867,286 @@ describe('fix #509: a function that is not a member takes every parameter it wri
         } finally { rm(dir); }
     });
 });
+
+describe('fix #507: module objects loaded by path, caller and callee sides', () => {
+    const accountOf = (index, file) => {
+        const result = execute(index, 'impact', { name: 'main', file });
+        assert.ok(result.ok, result.error);
+        const account = result.result.account;
+        assert.strictEqual(account.unaccounted, 0, JSON.stringify(account));
+        assert.ok(account.conserved);
+        return account;
+    };
+    const callersOf = (index, file) => {
+        const def = index.find('main', { exact: true, file })[0];
+        index._beginOp();
+        try {
+            const raw = index.findCallers('main', { targetDefinitions: [def], collectAccount: true });
+            return {
+                confirmed: raw.map(site => `${site.relativePath}:${site.line}`).sort(),
+                unverified: (raw.unverifiedEntries || []).map(site => `${site.relativePath}:${site.line}:${site.reason}`).sort(),
+            };
+        } finally { index._endOp(); }
+    };
+    const calleesOf = (index, name) => {
+        const def = index.find(name, { exact: true })[0];
+        index._beginOp();
+        try {
+            const callees = index.findCallees(def, { collectAccount: true });
+            return {
+                confirmed: callees.map(callee => `${callee.relativePath}:${callee.startLine}:${callee.name}`).sort(),
+                unverified: (callees.unverifiedCallees || []).map(entry => `${entry.name}:${entry.reason}`).sort(),
+            };
+        } finally { index._endOp(); }
+    };
+    const SCRIPTS = {
+        'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+        'app.py': 'def main():\n    return 9\n',
+        'scripts/alpha.py': 'def main():\n    return 0\n',
+        'scripts/beta.py': 'def main():\n    return 1\n',
+    };
+
+    it('confirms the call for the loaded file and excludes it for every namesake, conserved', () => {
+        const dir = tmp({ ...SCRIPTS,
+            'tests/test_loads.py': [
+                'import os',
+                'import importlib',
+                'import importlib.util',
+                'from importlib.machinery import SourceFileLoader',
+                '',
+                'HERE = os.path.dirname(__file__)',
+                'BETA = os.path.join(HERE, os.pardir, "scripts", "beta.py")',
+                '_SPEC = importlib.util.spec_from_file_location("_alpha", os.path.join(HERE, "..", "scripts", "alpha.py"))',
+                'ALPHA = importlib.util.module_from_spec(_SPEC)',
+                '',
+                '',
+                'def test_module_level():',
+                '    assert ALPHA.main() == 0',
+                '',
+                '',
+                'def test_loader():',
+                '    mod = SourceFileLoader("_beta", BETA).load_module()',
+                '    assert mod.main() == 1',
+                '',
+                '',
+                'def test_by_name():',
+                '    mod = importlib.import_module("scripts.alpha")',
+                '    assert mod.main() == 0',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callersOf(index, 'scripts/alpha.py'), {
+                confirmed: ['tests/test_loads.py:13', 'tests/test_loads.py:23'], unverified: [],
+            });
+            assert.deepStrictEqual(callersOf(index, 'scripts/beta.py'), {
+                confirmed: ['tests/test_loads.py:18'], unverified: [],
+            });
+            assert.deepStrictEqual(callersOf(index, 'app.py'), { confirmed: [], unverified: [] });
+            for (const file of ['scripts/alpha.py', 'scripts/beta.py', 'app.py']) accountOf(index, file);
+            assert.strictEqual(accountOf(index, 'app.py').excluded.byReason['other-module-path'].count, 3);
+            assert.deepStrictEqual(calleesOf(index, 'test_loader'), {
+                confirmed: ['scripts/beta.py:1:main'], unverified: [],
+            });
+            assert.deepStrictEqual(calleesOf(index, 'test_module_level'), {
+                confirmed: ['scripts/alpha.py:1:main'], unverified: [],
+            });
+        } finally { rm(dir); }
+    });
+
+    it('keeps unread, runtime and unresolved paths visible with their reason, on both sides', () => {
+        const dir = tmp({ ...SCRIPTS,
+            'tests/test_open.py': [
+                'import importlib.util',
+                '',
+                '',
+                'def _load(path):',
+                '    spec = importlib.util.spec_from_file_location("_x", path)',
+                '    mod = importlib.util.module_from_spec(spec)',
+                '    spec.loader.exec_module(mod)',
+                '    return mod',
+                '',
+                '',
+                'def test_parameter():',
+                '    mod = _load("scripts/alpha.py")',
+                '    assert mod.main() == 0',
+                '',
+                '',
+                'def test_runtime_part(name="alpha"):',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_r", f"scripts/{name}.py"))',
+                '    assert mod.main() == 0',
+                '',
+                '',
+                'def test_missing():',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_m", "scripts/missing.py"))',
+                '    assert mod.main() == 0',
+                '',
+                '',
+                'def test_conditional(flag=False):',
+                '    if flag:',
+                '        mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_a", "scripts/alpha.py"))',
+                '    else:',
+                '        mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_b", "scripts/beta.py"))',
+                '    assert mod.main() in (0, 1)',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callersOf(index, 'scripts/alpha.py'), {
+                confirmed: [],
+                unverified: ['tests/test_open.py:13:module-path-unread', 'tests/test_open.py:18:module-path-runtime',
+                    'tests/test_open.py:23:module-path-unresolved', 'tests/test_open.py:31:possible-dispatch'],
+            });
+            // The runtime part matches scripts/*.py only: no link for app.py.
+            assert.deepStrictEqual(callersOf(index, 'app.py'), {
+                confirmed: [],
+                unverified: ['tests/test_open.py:13:module-path-unread', 'tests/test_open.py:23:module-path-unresolved',
+                    'tests/test_open.py:31:possible-dispatch'],
+            });
+            accountOf(index, 'app.py');
+            // A load bound under a condition is not read; the flow still names
+            // its loader by the dotted module, never an `undefined.` receiver.
+            const def = index.find('main', { exact: true, file: 'app.py' })[0];
+            index._beginOp();
+            try {
+                const raw = index.findCallers('main', { targetDefinitions: [def], collectAccount: true });
+                assert.strictEqual((raw.unverifiedEntries || []).find(site => site.line === 31).dispatchVia,
+                    'importlib.util.module_from_spec');
+            } finally { index._endOp(); }
+            assert.deepStrictEqual(calleesOf(index, 'test_runtime_part'), {
+                confirmed: [], unverified: ['main:module-path-runtime'],
+            });
+        } finally { rm(dir); }
+    });
+
+    it('an outside module name, a class-method target, an ambiguous relative path and the runner directory', () => {
+        const dir = tmp({
+            'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+            'tools.py': 'class Runner:\n    def main(self):\n        return 3\n\n\ndef loads(text):\n    return text\n',
+            'scripts/alpha.py': 'def main():\n    return 0\n',
+            'helpers/h.py': 'def main():\n    return 5\n',
+            'tests/helpers/h.py': 'def main():\n    return 6\n',
+            'tests/test_more.py': [
+                'import json',
+                'import importlib',
+                'import importlib.util',
+                '',
+                '',
+                'def test_external():',
+                '    mod = importlib.import_module("json")',
+                '    assert mod.loads("1") == 1',
+                '    assert json.loads("1") == 1',
+                '',
+                '',
+                'def test_ambiguous():',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_h", "helpers/h.py"))',
+                '    assert mod.main() == 5',
+                '',
+                '',
+                'def test_class_target(path):',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_a", "scripts/alpha.py"))',
+                '    other = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_p", path))',
+                '    assert mod.main() == 0',
+                '    assert other.main() == 0',
+                '',
+            ].join('\n'),
+        });
+        const sitesOf = (index, name, file, className) => {
+            const def = index.find(name, { exact: true, file }).find(d => (d.className || null) === (className || null));
+            index._beginOp();
+            try {
+                const raw = index.findCallers(name, { targetDefinitions: [def], collectAccount: true });
+                return [
+                    ...raw.map(site => `C ${site.line}`),
+                    ...(raw.unverifiedEntries || []).map(site => `U ${site.line} ${site.reason}`),
+                    ...raw.accountRaw.excludedEntries.map(entry => `X ${entry.line} ${entry.reason}`),
+                ].sort();
+            } finally { index._endOp(); }
+        };
+        try {
+            const index = idx(dir);
+            // `import_module("json")` is the outside module, like `import json`.
+            assert.deepStrictEqual(sitesOf(index, 'loads', 'tools.py'), ['X 8 external-package', 'X 9 external-package']);
+            // A module's attribute is no class method; an unread load stays visible.
+            assert.deepStrictEqual(sitesOf(index, 'main', 'tools.py', 'Runner'),
+                ['U 21 module-path-unread', 'X 14 other-module-path', 'X 20 module-receiver']);
+            // Read from the runner directory and from the file's own directory
+            // the relative path names two files: both stay unverified.
+            for (const file of ['helpers/h.py', 'tests/helpers/h.py']) {
+                assert.deepStrictEqual(sitesOf(index, 'main', file),
+                    ['U 14 module-path-ambiguous', 'U 21 module-path-unread', 'X 20 other-module-path']);
+            }
+            assert.deepStrictEqual(sitesOf(index, 'main', 'scripts/alpha.py'),
+                ['C 20', 'U 21 module-path-unread', 'X 14 other-module-path']);
+        } finally { rm(dir); }
+
+        // A relative path is read from the directory the runner runs in.
+        const nested = tmp({
+            'sub/pytest.ini': '[pytest]\n',
+            'sub/scripts/a.py': 'def main():\n    return 1\n',
+            'scripts/a.py': 'def main():\n    return 2\n',
+            'sub/tests/test_sub.py': [
+                'import importlib.util',
+                '',
+                '',
+                'def test_sub():',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_a", "scripts/a.py"))',
+                '    assert mod.main() == 1',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(nested);
+            assert.deepStrictEqual(sitesOf(index, 'main', 'sub/scripts/a.py'), ['C 6']);
+            assert.deepStrictEqual(sitesOf(index, 'main', 'scripts/a.py'), ['X 6 other-module-path']);
+            const linked = execute(index, 'tests', { name: 'main', file: 'sub/scripts/a.py' }).result;
+            assert.deepStrictEqual(linked.map(row => row.run?.command), ['pytest tests/test_sub.py']);
+            assert.strictEqual(linked[0].run.cwd, 'sub');
+        } finally { rm(nested); }
+    });
+
+    it('a project module named importlib, a rebound receiver and a written member are not the loaded module', () => {
+        const dir = tmp({ ...SCRIPTS,
+            'importlib/__init__.py': '',
+            'importlib/util.py': 'def spec_from_file_location(name, location):\n    return location\n\n\n' +
+                'def module_from_spec(spec):\n    return spec\n',
+            'tests/test_not_loaded.py': [
+                'import importlib.util',
+                '',
+                '',
+                'def test_shadowed():',
+                '    mod = importlib.util.module_from_spec(importlib.util.spec_from_file_location("_a", "scripts/alpha.py"))',
+                '    assert mod.main() == 0',
+                '',
+            ].join('\n'),
+            'tests/test_rebound.py': [
+                'import importlib.util as util',
+                '',
+                '',
+                'def test_rebound(other):',
+                '    mod = util.module_from_spec(util.spec_from_file_location("_a", "scripts/alpha.py"))',
+                '    mod = other',
+                '    assert mod.main() == 0',
+                '',
+                '',
+                'def test_member_written():',
+                '    mod = util.module_from_spec(util.spec_from_file_location("_a", "scripts/alpha.py"))',
+                '    mod.main = lambda: 5',
+                '    assert mod.main() == 5',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const alpha = callersOf(index, 'scripts/alpha.py');
+            assert.deepStrictEqual(alpha.confirmed, []);
+            assert.deepStrictEqual(alpha.unverified.map(site => site.split(':').slice(0, 2).join(':')),
+                ['tests/test_not_loaded.py:6', 'tests/test_rebound.py:13', 'tests/test_rebound.py:7']);
+            assert.ok(alpha.unverified.every(site => !site.includes('module-path')), JSON.stringify(alpha));
+            // Not the loaded module: no exclusion for the other namesakes either.
+            assert.strictEqual(callersOf(index, 'app.py').unverified.length, 3);
+        } finally { rm(dir); }
+    });
+});
