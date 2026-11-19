@@ -11316,6 +11316,44 @@ describe('fix #513: a method called through its class name is counted with the r
             assert.strictEqual(build.mismatchDetails[0].expected, '2 arg(s)');
         } finally { rm(dir); }
     });
+
+    it('a subclass name is the unbound form too, and a name the file binds to no class is an instance', () => {
+        // pyright (basic mode) on these files: one error, app.py line 9.
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': [
+                'class Color:',
+                '    def run(self, x: int) -> int:',
+                '        return x',
+                '',
+                '',
+                'class Sub(Color):',
+                '    pass',
+                '',
+                '',
+                'color = Color()',
+                '',
+            ].join('\n'),
+            'app.py': [
+                'from lib import Color, Sub, color',
+                '',
+                '',
+                'def use() -> int:',
+                '    total = Sub.run(Sub(), 1)',
+                '    total += Color.run(Sub(), 1)',
+                '    total += Sub().run(1)',
+                '    total += color.run(1)',
+                '    return total + Sub.run(1)',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const run = idx(dir).verify('run');
+            assert.deepStrictEqual(lines(run.mismatchDetails), [9]);
+            assert.strictEqual(run.mismatchDetails[0].expected, '2 arg(s)');
+            assert.strictEqual(run.mismatchDetails[0].actual, 1);
+        } finally { rm(dir); }
+    });
 });
 
 describe('fix #515: a receiver spelled like a class is that class only when the file binds it so', () => {
@@ -11488,6 +11526,44 @@ describe('fix #515: a receiver spelled like a class is that class only when the 
             assert.strictEqual(callerRows(index, 'save', 'pkg/a.py', 12).get('pkg/d.py:7'), 'excluded path-type-mismatch');
             assert.strictEqual(callerRows(index, 'load', 'pkg/a.py', 2).get('pkg/c.py:6'), 'confirmed');
             assert.notStrictEqual(callerRows(index, 'load', 'pkg/b.py', 2).get('pkg/c.py:6'), 'confirmed');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #516: overload stubs and their implementation are one call interface', () => {
+    // pyright (basic mode) on this file: one error, line 19 (no overload takes two arguments).
+    const LIB = [
+        'from typing import Optional, overload',
+        '',
+        '',
+        '@overload',
+        'def pick(x: int) -> int: ...',
+        '',
+        '',
+        '@overload',
+        'def pick() -> None: ...',
+        '',
+        '',
+        'def pick(x: Optional[int] = None) -> Optional[int]:',
+        '    return x',
+        '',
+        '',
+        'def use() -> None:',
+        '    pick()',
+        '    pick(1)',
+        '    pick(1, 2)',
+        '',
+    ].join('\n');
+
+    it('a call that binds another overload is no mismatch of the pinned stub', () => {
+        const dir = tmp({ 'requirements.txt': '', 'lib.py': LIB });
+        try {
+            const index = idx(dir);
+            for (const line of [5, 9, 12]) {
+                const result = execute(index, 'verify', { name: `lib.py:${line}:pick` });
+                assert.ok(result.ok, JSON.stringify(result));
+                assert.deepStrictEqual((result.result.mismatchDetails || []).map(row => row.line), [19], `pick at line ${line}`);
+            }
         } finally { rm(dir); }
     });
 });

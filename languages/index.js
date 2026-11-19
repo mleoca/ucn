@@ -308,6 +308,11 @@ const STRUCTURAL_TRAITS = {
     // true where the receiver is an ordinary first parameter named by
     // convention (`self`, `cls`): a function that is not a member takes
     // that parameter as an argument like any other.
+    // Decorators that declare an overload of a name (the last segment of
+    // the decorator's dotted name): the declarations so marked and the
+    // implementation beside them are one call interface (core/verify.js).
+    // null: overloads are syntax, or the language has none.
+    overloadDecorators: null,
     receiverParameterByConvention: false,
     // Files that only declare what other files implement (Python stubs,
     // TypeScript ambient declarations): a checker reads a name's interface
@@ -784,6 +789,7 @@ const NOMINAL_TRAITS = {
     callEffects: null,
     decoratorsRegisterNothing: null,
     declarationFilePattern: null,
+    overloadDecorators: null,
     receiverParameterByConvention: false,
     checkDirectiveComment: null,
     checkFileDirectiveComment: null,
@@ -1291,6 +1297,8 @@ const LANGUAGES = {
                 narrowing: { condition: /\b(?:TypeGuard|TypeIs)\s*\[/, statement: null, unannotatedCondition: false } },
             loadedModule: (index, filePath, call) => require('../core/loaded-modules').pythonLoadedModule(index, filePath, call),
             declarationFilePattern: /\.pyi$/,
+            // `@overload` / `@typing.overload` stubs (typing semantics).
+            overloadDecorators: ['overload'],
             receiverParameterByConvention: true,
             decoratorsRegisterNothing: (index, declaration) => require('../core/python-binding-identity').pythonDecoratorsRegisterNothing(index, declaration),
             checkDirectiveComment: text => require('./python').checkDirectiveComment(text),

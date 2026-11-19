@@ -2444,8 +2444,27 @@ function verify(index, name, options = {}, direct = null) {
         : declaredShape?.unknown === true
             ? `${def.name} declares no parameter list (${def.type}); what a call of it takes is not read from the declaration`
             : null;
+    // Overloads a language declares by decorator (trait
+    // `overloadDecorators`: Python `@overload` stubs beside their
+    // implementation) are one call interface: a call of the name binds
+    // whichever of them takes it, so a site is counted against the family
+    // and never against the pinned stub alone.
+    let declaredOverloadParams = null;
+    const overloadDecorators = langTraits(lang)?.overloadDecorators;
+    if (!ctorParamLists && !callableIdentityParams?.length && overloadDecorators && Array.isArray(def.paramsStructured)) {
+        const declaresOverload = member => (member.decorators || []).some(decorator =>
+            overloadDecorators.includes(String(decorator).replace(/^@/, '').split('(')[0].trim().split('.').pop()));
+        const family = (index.symbols.get(name) || []).filter(member => member.file === def.file &&
+            (member.className || null) === (def.className || null) &&
+            (member.lexicalScopeStartLine ?? null) === (def.lexicalScopeStartLine ?? null) &&
+            Array.isArray(member.paramsStructured));
+        if (family.length > 1 && family.some(declaresOverload) &&
+            family.some(member => member.startLine === def.startLine)) {
+            declaredOverloadParams = family.map(member => member.paramsStructured);
+        }
+    }
     const rawParamLists = heldInterface?.lists || declaredShape?.lists || ctorParamLists ||
-        (callableIdentityParams?.length ? callableIdentityParams : null) ||
+        (callableIdentityParams?.length ? callableIdentityParams : null) || declaredOverloadParams ||
         [(arrowTypes?.paramsStructured) || def.paramsStructured || []];
     if (direct) direct.parameterLists = rawParamLists.map(stripSelf);
     const params = stripSelf(rawParamLists[0]);
@@ -2460,24 +2479,41 @@ function verify(index, name, options = {}, direct = null) {
     const expectedParamCount = Math.max(...arities.map(a => a.max));
     const minArgs = inheritedCtorOnly ? 0 : Math.min(...arities.map(a => a.min));
     // Where the receiver is a parameter named by convention (trait
-    // `receiverParameterByConvention`), a member called through its own
-    // class's name is the unbound function: the receiver is the first
-    // argument the call writes, so that call is counted and bound against
-    // the parameter list as written (`Box.run(box, 1)` fits `def run(self,
-    // x)`, `Box.run(1)` does not). The call record says whether the
-    // receiver spells the class or a local of the same name; a site whose
-    // record is not read keeps the member count.
+    // `receiverParameterByConvention`), a member called through a class's
+    // name is the unbound function: the receiver is the first argument the
+    // call writes, so that call is counted and bound against the parameter
+    // list as written (`Box.run(box, 1)` fits `def run(self, x)`, `Box.run(1)`
+    // does not; `Sub.run(sub, 1)` is the same call through a subclass). The
+    // call record gives the receiver's name, and what the name denotes in
+    // the calling file decides: a class the file binds is the unbound form,
+    // any other binding is an instance, and a name the file's bindings do
+    // not settle (a local spelled like a class) is either. A classmethod
+    // receives its class from the call; a site whose record is not read
+    // keeps the member count.
     const conventionReceiver = langTraits(lang)?.receiverParameterByConvention === true && !receiverArgument &&
         !ctorParamLists && !heldInterface?.lists && !declaredShape?.lists && rawParamLists.length === 1 &&
-        params.length !== rawParamLists[0].length;
-    const writesReceiver = call => {
-        if (!conventionReceiver || !call.isMethod || call.invalidOverload || call.rebind) return false;
-        const { getCachedCalls, _receiverPassedImplicitly } = require('./callers');
+        params.length !== rawParamLists[0].length &&
+        def.memberType !== 'classmethod' && def.type !== 'classmethod';
+    const receiverForm = call => {
+        if (!conventionReceiver || !call.isMethod || call.invalidOverload || call.rebind) return 'bound';
+        const { getCachedCalls, _receiverNameDenotation } = require('./callers');
         const start = call.callSite?.start;
         const records = (getCachedCalls(index, call.file) || []).filter(record => record.line === call.line &&
             record.isMethod && (record.name === name || record.name === call.calledAs) &&
             (!Number.isInteger(start) || (record.callStart ?? record.callSite?.start) === start));
-        return records.length === 1 && _receiverPassedImplicitly(records[0], def, langTraits(lang)) === 'explicit';
+        if (records.length !== 1) return 'bound';
+        const record = records[0];
+        // A typed receiver, a member of a value, a call's result or a
+        // module is no bare class name.
+        if (!record.receiver || record.receiverType || record.receiverField || record.receiverCall ||
+            record.receiverIsModule || record.receiverModuleSpecifier) return 'bound';
+        const classes = (index.symbols.get(record.receiver) || []).filter(candidate =>
+            candidate.file && candidate.type === 'class');
+        if (classes.length === 0) return 'bound';
+        if (record.receiverLocalBinding) return 'unknown';
+        const denotation = _receiverNameDenotation(index, index.files.get(call.file), call.file, record,
+            record.receiver, classes);
+        return denotation.kind === 'type' ? 'unbound' : denotation.kind === 'unknown' ? 'unknown' : 'bound';
     };
 
     // v4 tiered contract: the confirmed band is arg-checked below; unverified
@@ -2668,14 +2704,30 @@ function verify(index, name, options = {}, direct = null) {
         }
 
         // Check if arg count is valid
-        const receiverWritten = writesReceiver(call) ? 1 : 0;
+        const form = receiverForm(call);
+        const receiverWritten = form === 'unbound' ? 1 : 0;
         const siteMin = minArgs + receiverWritten;
         const siteMax = expectedParamCount + receiverWritten;
-        const countOk = direct && !inheritedCtorOnly
-            ? arities.some(arity => argCount >= arity.min + receiverWritten &&
-                (arity.hasRest || argCount <= arity.max + receiverWritten))
-            : hasRest ? argCount >= siteMin
-                : (argCount >= siteMin && argCount <= siteMax);
+        const countFits = shift => (direct && !inheritedCtorOnly
+            ? arities.some(arity => argCount >= arity.min + shift &&
+                (arity.hasRest || argCount <= arity.max + shift))
+            : hasRest ? argCount >= minArgs + shift
+                : (argCount >= minArgs + shift && argCount <= expectedParamCount + shift));
+        if (form === 'unknown' && countFits(0) !== countFits(1)) {
+            // The count fits the call as a bound member or as the unbound
+            // function, and the receiver's name does not say which it is.
+            uncertain.push(coded({
+                file: call.relativePath,
+                line: call.line,
+                expression: call.content.trim(),
+                reason: `the receiver may be the class ${def.className} or an instance of it here; ` +
+                    'the argument count fits only one of the two',
+                patterns: patternFlagsFrom(analysis),
+                ...carry,
+            }, 'call-interface-unverified'));
+            continue;
+        }
+        const countOk = countFits(receiverWritten);
         if (call.rebind && call.rebind.kind !== 'no-overload' && (countOk || call.rebind.kind !== 'count')) {
             // Bound the base declaration; the new one may still take it, or
             // another overload may: the compiler decides (fix #394).
