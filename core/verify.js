@@ -1025,6 +1025,33 @@ function bindingCallInterface(index, def) {
     const rules = langTraits(language)?.bindingCallInterface;
     if (!rules || !def.startLine) return null;
     const { parseStructuredParams } = require('../languages/utils');
+    const reader = writtenTypeReader(index, rules);
+    const tree = reader.treeOf(def.file);
+    if (!tree) return null;
+    const holder = reader.declarationAt(tree, def.startLine - 1, def.name, rules.holders);
+    const value = holder?.childForFieldName('value');
+    if (!holder || !value || !rules.callables.includes(value.type)) return null;
+    const annotation = holder.namedChildren.find(child => child.type === rules.annotation);
+    const written = annotation?.namedChild(0);
+    if (!written || rules.functionTypes.includes(written.type)) return null;
+    const read = reader.signaturesOf(written, def.file);
+    if (read.unknown) return read;
+    return { lists: read.signatures.map(signature =>
+        parseStructuredParams(signature.node.childForFieldName('parameters'), index.languageOf(signature.file)) || []) };
+}
+
+/**
+ * What a written type says a value of it is called as: the call signatures
+ * of an inline function or object type, or of the interface or alias the
+ * project declares under its name (trait `bindingCallInterface`). One
+ * reader per question: it keeps the trees it parsed.
+ *
+ * `signaturesOf(type, file)` answers `{signatures: [{node, file}]}` (each a
+ * function type or call signature node) or `{unknown: text}` for a type whose
+ * signatures were not read (declared outside the project, inherited from a
+ * supertype, composed, or denoted by more than one declaration).
+ */
+function writtenTypeReader(index, rules) {
     const trees = new Map();
     const treeOf = file => {
         if (!trees.has(file)) {
@@ -1050,20 +1077,9 @@ function bindingCallInterface(index, def) {
         })(tree.rootNode);
         return found;
     };
-    const tree = treeOf(def.file);
-    if (!tree) return null;
-    const holder = declarationAt(tree, def.startLine - 1, def.name, rules.holders);
-    const value = holder?.childForFieldName('value');
-    if (!holder || !value || !rules.callables.includes(value.type)) return null;
-    const annotation = holder.namedChildren.find(child => child.type === rules.annotation);
-    const written = annotation?.namedChild(0);
-    if (!written || rules.functionTypes.includes(written.type)) return null;
-
-    const unknown = { unknown: written.text };
     const signatures = (members, file) => {
-        const lists = members.filter(member => rules.callSignatures.includes(member.type))
-            .map(member => parseStructuredParams(member.childForFieldName('parameters'), index.languageOf(file)) || []);
-        return lists.length > 0 ? { lists } : null;
+        const found = members.filter(member => rules.callSignatures.includes(member.type)).map(node => ({ node, file }));
+        return found.length > 0 ? { signatures: found } : null;
     };
     // The project declaration a type name denotes from `file`: one the
     // file declares, or one a file it imports the name from declares.
@@ -1087,27 +1103,64 @@ function bindingCallInterface(index, def) {
         const node = declarationTree && declarationAt(declarationTree, candidates[0].startLine - 1, name, kinds);
         return node ? { node, file: candidates[0].file } : null;
     };
-    const read = (type, file, depth) => {
-        if (!type || depth > 4) return unknown;
-        if (rules.wrappers.includes(type.type)) return read(type.namedChild(0), file, depth);
-        if (rules.functionTypes.includes(type.type)) {
-            return { lists: [parseStructuredParams(type.childForFieldName('parameters'), index.languageOf(file)) || []] };
-        }
-        if (rules.objectTypes.includes(type.type)) return signatures(type.namedChildren, file) || unknown;
-        const nameNode = rules.genericTypes.includes(type.type) ? type.childForFieldName('name') || type.namedChild(0) : type;
-        if (!nameNode || !rules.typeNames.includes(nameNode.type)) return unknown;
-        const declaration = declarationOf(nameNode.text, file);
-        if (!declaration) return unknown;
-        const { node } = declaration;
-        const body = node.childForFieldName(rules.declarations[node.type]);
-        if (rules.objectTypes.includes(body?.type)) {
-            // Signatures a supertype declares are part of the interface too.
-            if (node.namedChildren.some(child => rules.extendsClauses.includes(child.type))) return unknown;
-            return signatures(body.namedChildren, declaration.file) || unknown;
-        }
-        return read(body, declaration.file, depth + 1);
+    const signaturesOf = (written, startFile) => {
+        const unknown = { unknown: written.text };
+        const read = (type, file, depth) => {
+            if (!type || depth > 4) return unknown;
+            if (rules.wrappers.includes(type.type)) return read(type.namedChild(0), file, depth);
+            if (rules.functionTypes.includes(type.type)) return { signatures: [{ node: type, file }] };
+            if (rules.objectTypes.includes(type.type)) return signatures(type.namedChildren, file) || unknown;
+            const nameNode = rules.genericTypes.includes(type.type) ? type.childForFieldName('name') || type.namedChild(0) : type;
+            if (!nameNode || !rules.typeNames.includes(nameNode.type)) return unknown;
+            const declaration = declarationOf(nameNode.text, file);
+            if (!declaration) return unknown;
+            const { node } = declaration;
+            const body = node.childForFieldName(rules.declarations[node.type]);
+            if (rules.objectTypes.includes(body?.type)) {
+                // Signatures a supertype declares are part of the interface too.
+                if (node.namedChildren.some(child => rules.extendsClauses.includes(child.type))) return unknown;
+                return signatures(body.namedChildren, declaration.file) || unknown;
+            }
+            return read(body, declaration.file, depth + 1);
+        };
+        return read(written, startFile, 0);
     };
-    return read(written, def.file, 0);
+    return { treeOf, declarationAt, signaturesOf };
+}
+
+/**
+ * The return type a binding's written type gives the callable it holds
+ * (`const h: Handler = (c) => {..}`), when the type has ONE call signature
+ * and that signature writes a keyword type (trait
+ * `bindingCallInterface.keywordTypes`). `written` is the annotation's type
+ * node in any revision of `file`; a type name is read where the project
+ * declares it now. Null when the type is unread, has several signatures,
+ * or returns anything else (a type name, a type parameter, a literal
+ * union, a predicate).
+ *
+ * @returns {string|null} the keyword's text
+ */
+function boundReturnType(index, file, written) {
+    const rules = langTraits(index.languageOf(file))?.bindingCallInterface;
+    if (!rules || !written || !rules.keywordTypes) return null;
+    const read = writtenTypeReader(index, rules).signaturesOf(written, file);
+    if (read.unknown || read.signatures.length !== 1) return null;
+    let returned = read.signatures[0].node.childForFieldName('return_type');
+    if (returned && returned.type === rules.annotation) returned = returned.namedChild(0);
+    return returned && rules.keywordTypes.includes(returned.type) ? returned.text : null;
+}
+
+/**
+ * Is the leading parameter a callable writes as a receiver (`self`, `cls`)
+ * an ordinary argument? Where the receiver is a parameter named by
+ * convention (trait `receiverParameterByConvention`), only a member of a
+ * type, or a constructor, is called with it implicitly: a function that is
+ * not a member takes every parameter it writes (`def helper(self, x)` is
+ * called `helper(a, b)`). A language's receiver syntax (TypeScript `this`,
+ * Rust `self`) is never an argument.
+ */
+function receiverIsArgument(def, lang, constructorList) {
+    return langTraits(lang)?.receiverParameterByConvention === true && !constructorList && !def.className;
 }
 
 /**
@@ -2365,7 +2418,8 @@ function verify(index, name, options = {}, direct = null) {
     // `&'a mut self` names the receiver too (fix #369): lifetimes are not
     // part of the receiver spelling.
     const selfSpelling = name => String(name || '').replace(/'[A-Za-z_]\w*\s*/g, '').trim();
-    const stripSelf = (list) => (selfParams && list.length > 0 && list[0] &&
+    const receiverArgument = receiverIsArgument(def, lang, !!ctorParamLists);
+    const stripSelf = (list) => (selfParams && !receiverArgument && list.length > 0 && list[0] &&
         selfParams.includes(selfSpelling(list[0].name)))
         ? list.slice(1) : list;
     let callableIdentityParams = null;
@@ -3642,6 +3696,9 @@ function plan(index, name, options = {}) {
     const planCtorLists = _constructorParamLists(index, def, planLang);
     const currentParams = (planCtorLists && planCtorLists.length === 1 && planCtorLists[0]) ||
         (arrowTypes?.paramsStructured) || def.paramsStructured || [];
+    // A leading `self` / `cls` of a function that is not a member is an
+    // argument its calls pass: call positions count it.
+    const planReceiverArgument = receiverIsArgument(def, planLang, !!(planCtorLists && planCtorLists.length === 1));
     // BUG-BV: render with TS-correct param formatting (`opt?: number`).
     const currentSignature = formatTypedSignature(def,
         (planCtorLists && planCtorLists.length === 1)
@@ -3756,7 +3813,7 @@ function plan(index, name, options = {}) {
         // there now bind the new param: they are listed (`rebindIndex`).
         let rebindIndex = null;
         const selfNames = ['self', 'cls', '&self', '&mut self', 'mut self'];
-        const minIdx = (newParams.length > 0 && selfNames.includes(newParams[0].name)) ? 1 : 0;
+        const minIdx = (!planReceiverArgument && newParams.length > 0 && selfNames.includes(newParams[0].name)) ? 1 : 0;
         const varPositional = p => p.rest && /^\*(?!\*)/.test(String(p.name));
         const varKeyword = p => p.rest && String(p.name).startsWith('**');
         if (langTraits(planLang)?.keywordArguments &&
@@ -3883,7 +3940,7 @@ function plan(index, name, options = {}) {
         const lang = fileEntry?.language;
         let selfOffset = 0;
         const planSelfParams = langTraits(lang)?.selfParam;
-        if (planSelfParams && currentParams.length > 0 && planSelfParams.includes(
+        if (planSelfParams && !planReceiverArgument && currentParams.length > 0 && planSelfParams.includes(
             String(currentParams[0].name || '').replace(/'[A-Za-z_]\w*\s*/g, '').trim())) {
             selfOffset = 1;
         }
@@ -7210,4 +7267,4 @@ function verifyCallSites(index, definition, sites) {
     return result;
 }
 
-module.exports = { verify, verifyCallSites, plan, baseCounterpartOf, sitesReboundByChange, computePlanCallSites, analyzeCallSite, analyzeCallSiteAST, analyzeCallShape, classifyArgNode, findCallNode, clearTreeCache, identifyCallPatterns };
+module.exports = { verify, verifyCallSites, plan, baseCounterpartOf, sitesReboundByChange, computePlanCallSites, analyzeCallSite, analyzeCallSiteAST, analyzeCallShape, classifyArgNode, findCallNode, clearTreeCache, identifyCallPatterns, boundReturnType };

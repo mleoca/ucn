@@ -1439,3 +1439,80 @@ describe('deletion: plan --delete', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #509: an entry point that names a module with no attribute', () => {
+    const module = 'def _target():\n    return 7\n\ndef keep():\n    return 3\n';
+    const sources = [
+        ['pyproject.toml', '[project.scripts]\nsample = "plugin"\n'],
+        ['pyproject.toml', '[project.gui-scripts]\nsample = "plugin"\n'],
+        ['pyproject.toml', '[project.entry-points.pytest11]\nsample = "plugin"\n'],
+        ['pyproject.toml', '[tool.poetry.scripts]\nsample = "plugin"\n'],
+        ['pyproject.toml', '[tool.poetry.scripts]\nsample = { callable = "plugin" }\n'],
+        ['pyproject.toml', '[tool.poetry.plugins."sample.plugins"]\nsample = "plugin"\n'],
+        ['pyproject.toml', '[tool.flit.scripts]\nsample = "plugin"\n'],
+        ['pyproject.toml', '[tool.flit.entrypoints."sample.plugins"]\nsample = "plugin"\n'],
+        ['pyproject.toml', '[project.entry-points.pytest11]\nsample = "plugin [extra]"\n'],
+        ['setup.cfg', '[options.entry_points]\npytest11 =\n    sample = plugin\n'],
+        ['setup.py', 'from setuptools import setup\nsetup(name="sample", entry_points={"pytest11": ["sample = plugin"]})\n'],
+    ];
+    for (const [file, source] of sources) it(`every declaration of the module is reached: ${file} ${source.split('\n').slice(0, 2).join(' ')}`, () => {
+        const dir = tmp({ 'plugin.py': module, 'app.py': module, [file]: source });
+        try {
+            const index = idx(dir);
+            for (const name of ['_target', 'keep']) {
+                const answer = assess(index, name, 'plugin.py');
+                assert.deepStrictEqual([answer.verdict, answer.reason], ['review', 'runtime-entrypoint'], `${name}: ${JSON.stringify(answer)}`);
+                // Another module is not handed over.
+                assert.strictEqual(assess(index, name, 'app.py').verdict, 'no-static-dependents', name);
+            }
+            assert.deepStrictEqual(claimed(index).map(row => row.split(':')[0]), ['app.py', 'app.py']);
+        } finally { rm(dir); }
+    });
+
+    it('a package hands over its __init__, never a submodule; a src layout reaches the same module', () => {
+        const dir = tmp({ 'src/plugin/__init__.py': module, 'src/plugin/sub.py': module,
+            'pyproject.toml': '[project.entry-points."sample.plugins"]\nsample = "plugin"\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(assess(index, '_target', 'src/plugin/__init__.py').reason, 'runtime-entrypoint');
+            assert.strictEqual(assess(index, '_target', 'src/plugin/sub.py').verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+
+    it('a module of another distribution withdraws nothing; a dotted module reaches only itself', () => {
+        const dir = tmp({ 'app.py': module, 'pkg/__init__.py': '', 'pkg/plugin.py': module,
+            'pyproject.toml': '[project.entry-points."sample.plugins"]\noutside = "json"\nnested = "pkg.plugin"\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(assess(index, '_target', 'app.py').verdict, 'no-static-dependents');
+            assert.strictEqual(assess(index, '_target', 'pkg/plugin.py').reason, 'runtime-entrypoint');
+        } finally { rm(dir); }
+    });
+
+    it('a value that is no module name still withholds every declaration', () => {
+        for (const value of ['plugin:', 'plugin.', '1plugin', 'plugin extra', 'plugin:target:other']) {
+            const dir = tmp({ 'plugin.py': module, 'app.py': module,
+                'pyproject.toml': `[project.entry-points.pytest11]\nsample = "${value}"\n` });
+            try {
+                const index = idx(dir);
+                assert.strictEqual(assess(index, '_target', 'app.py').reason, 'runtime-entrypoint', value);
+                assert.deepStrictEqual(claimed(index), [], value);
+            } finally { rm(dir); }
+        }
+    });
+
+    // The pytest row is a hook pytest calls by its name: a named entry
+    // point before any metadata is read.
+    it('the judged rows of the case table are decided by the metadata alone', () => {
+        const judged = require('./runtime-liveness-cases.json').filter(row =>
+            /^(?:entry-module-|poetry-plugins-module|flit-entrypoints-module)/.test(row.id) && !row.requires);
+        assert.strictEqual(judged.length, 8);
+        for (const row of judged) {
+            const dir = tmp(row.files);
+            try {
+                const answer = assess(idx(dir), row.name, row.file);
+                assert.strictEqual(answer.reason, row.breaks ? 'runtime-entrypoint' : 'claimed', `${row.id}: ${JSON.stringify(answer)}`);
+            } finally { rm(dir); }
+        }
+    });
+});

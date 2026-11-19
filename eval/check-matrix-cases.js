@@ -1894,5 +1894,7 @@ CASES.push(...require('./check-outgoing-cases').filter(testCase => !['c', 'js'].
 CASES.push(...require('./check-call-settlement-cases'));
 CASES.push(...require('./check-path-end-cases'));
 CASES.push(...require('./check-call-shape-cases'));
+CASES.push(...require('./check-binding-return-cases'));
+CASES.push(...require('./check-receiver-parameter-cases'));
 
 module.exports = { CASES };

@@ -36,6 +36,19 @@ jobs:
           sudo ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd
           clangd --version
 
+      # Rows of test/runtime-liveness-cases.json that run pytest (some with
+      # pytest-mock) are skipped by an interpreter that cannot import them.
+      # One pinned interpreter with both, named by PYTHON for npm test.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install pytest and pytest-mock (runtime-liveness rows)
+        run: |
+          python -m pip install --disable-pip-version-check pytest==9.2.0 pytest-mock==3.17.0
+          echo "PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+          python -c 'import pytest, pytest_mock; print("pytest", pytest.__version__)'
+
       - name: Run lint
         run: npm run lint
 

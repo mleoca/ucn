@@ -587,7 +587,7 @@ describe('fix #506: a budget keeps the symbols of a check before the lines under
             assert.match(small, /^REVIEW \(14\) — [^\n]*\n {2}fresh_helper_00 \(app\.py:\d+\)/m);
             assert.match(small, /^READY \(1\) — [^\n]*\n {2}fresh_plain \(app\.py:\d+\) \[ADDED, ORPHAN\]/m);
             assert.match(small, /^Action items:\n {2}⚠ fresh_helper_00: 1 outgoing call\(s\) not verified/m);
-            assert.match(small, /^ {2}\.\.\. \+\d+ more$/m);
+            assert.match(small, /^ {2}\.\.\. \+\d+ more (?:symbol|action item|line)s?\b/m);
             assert.match(small, /^TRUST: REVIEW_REQUIRED — /m);
             // A larger one: every symbol before the lines under them.
             const larger = at(2700);
@@ -599,6 +599,57 @@ describe('fix #506: a budget keeps the symbols of a check before the lines under
             const mcp = applyOutputBudget(peerText, { command: 'check', maxChars: 2700, surface: 'mcp', peerText: full }).text;
             assert.strictEqual(itemsOf(mcp), 15, mcp);
             assert.strictEqual(details(mcp), details(larger));
+        } finally { rm(dir); }
+    });
+
+    // fix #509: the line that ends a cut section says how many symbols (or
+    // action items) and how many lines under them are left out, apart.
+    it('fix #509: a cut section counts the symbols and the lines under them it leaves out', () => {
+        const names = Array.from({ length: 14 }, (_, at) => `fresh_helper_${String(at).padStart(2, '0')}`);
+        const dir = repo({ 'lib.py': 'def typed(value: int) -> int:\n    return value\n' });
+        try {
+            write(dir, 'app.py', 'from lib import typed\n' + names.map(name =>
+                `\n\ndef ${name}():\n    value = typed(1)\n    return value\n`).join('') +
+                '\n\ndef fresh_plain():\n    return 1\n');
+            const result = checked(dir);
+            const full = output.formatPublicText('check', result, {}, { surface: 'cli' });
+            const peerText = output.formatPublicText('check', result, {}, { surface: 'mcp' });
+            // Each section: its header, its item lines (two spaces) and the
+            // lines under them (deeper).
+            const sectionsOf = text => {
+                const found = new Map();
+                let current = null;
+                for (const line of text.split('\n')) {
+                    if (/^(?:BLOCKED|REVIEW|READY) \(\d+\) — |^Action items:$/.test(line)) {
+                        current = { items: 0, details: 0, more: null };
+                        found.set(line, current);
+                    } else if (current && /^ {2}\.\.\. /.test(line)) current.more = line;
+                    else if (current && /^ {2}\S/.test(line)) current.items++;
+                    else if (current && /^ {3,}\S/.test(line)) current.details++;
+                    else current = null;
+                }
+                return found;
+            };
+            const plural = (count, word) => `${count} more ${word}${count === 1 ? '' : 's'}`;
+            const whole = sectionsOf(full);
+            let cutSections = 0;
+            for (const budget of [1500, 1800, 2200, 2700]) {
+                const cut = applyOutputBudget(full, { command: 'check', maxChars: budget, surface: 'cli', peerText }).text;
+                assert.ok(cut.length <= budget, `${budget}: ${cut.length}`);
+                for (const [header, shown] of sectionsOf(cut)) {
+                    const all = whole.get(header);
+                    assert.ok(all, header);
+                    const items = all.items - shown.items;
+                    const details = all.details - shown.details;
+                    const noun = header === 'Action items:' ? 'action item' : 'symbol';
+                    const parts = [];
+                    if (items > 0) parts.push(`+${plural(items, noun)}`);
+                    if (details > 0) parts.push(`+${plural(details, 'line')} under ${items > 0 ? `${noun}s` : `the ${noun}s shown`}`);
+                    assert.strictEqual(shown.more, parts.length ? `  ... ${parts.join(', ')}` : null, `${budget} ${header}\n${cut}`);
+                    if (parts.length) cutSections++;
+                }
+            }
+            assert.ok(cutSections >= 3, String(cutSections));
         } finally { rm(dir); }
     });
 });
@@ -1773,5 +1824,60 @@ describe('fix #506: what a decorator registers, and which reflection reaches an 
                 '    for kind in ("cache", "disk"):\n        monkeypatch.setattr(app, "_load_" + kind, lambda: 2)\n');
         });
         assert.ok(pattern.includes('_load_cache:added=review(reflection-reachable)'), pattern.join('  '));
+    });
+});
+
+describe('fix #509: a callable held by a typed binding is held to the type it returns', () => {
+    const lines = (...rows) => rows.join('\n') + '\n';
+    const contract = (code, start, end, context = null) =>
+        callableContract(parseRevision(code, 'typescript'), 'typescript', { startLine: start, endLine: end }, context);
+    const arrow = (anno, ...body) => lines(`const h: ${anno} = (c: string) => {`, ...body.map(row => `    ${row}`), '};');
+
+    it('an inline function type settles results its syntax proves, and only those', () => {
+        const before = contract(arrow('(c: string) => string', 'const p = c;', 'return p;'), 1, 4);
+        const proven = contract(arrow('(c: string) => string', 'const p = c;', 'return p + "/";'), 1, 4);
+        const other = contract(arrow('(c: string) => string', 'const p = c;', 'return p.length;'), 1, 4);
+        assert.strictEqual(classifyChange(before, proven, 'typescript').kind, 'inert');
+        assert.deepStrictEqual(classifyChange(before, other, 'typescript').reasons, ['inferred-return-contract']);
+    });
+
+    it('a statement the result is made of that changed is never settled by the result', () => {
+        const before = contract(arrow('(c: string) => string', 'const p = c;', 'return p + "/";'), 1, 4);
+        const after = contract(arrow('(c: string) => string', 'const p = 1;', 'return p + "/";'), 1, 4);
+        assert.deepStrictEqual(classifyChange(before, after, 'typescript').reasons, ['inferred-return-contract']);
+    });
+
+    it('a type name is read through the context; an unread one settles nothing', () => {
+        const read = { boundReturnType: written => (written.text === 'Handler' ? 'string' : null) };
+        const unread = { boundReturnType: () => null };
+        for (const [context, expected] of [[read, 'inert'], [unread, 'contract'], [null, 'contract']]) {
+            const before = contract(arrow('Handler', 'return c;'), 1, 3, context);
+            const after = contract(arrow('Handler', 'return "/" + c;'), 1, 3, context);
+            assert.strictEqual(classifyChange(before, after, 'typescript').kind, expected);
+        }
+    });
+
+    it('an async callable returns a promise of its results: not settled', () => {
+        const code = result => lines('const h: (c: string) => unknown = async (c: string) => {', `    return ${result};`, '};');
+        assert.deepStrictEqual(classifyChange(contract(code('c'), 1, 3), contract(code('1'), 1, 3), 'typescript').reasons,
+            ['inferred-return-contract']);
+    });
+
+    it('each revision reads its own holder: lines added above the binding move nothing', () => {
+        const dir = tmp({
+            'types.ts': 'export type Handler = (c: string) => string;\n',
+            'lib.ts': lines('import { Handler } from "./types";', '', 'export const h: Handler = (c) => {', '    return c;', '};'),
+            'use.ts': lines('import { h } from "./lib";', 'export const s: string = h("x");'),
+        });
+        try {
+            execFileSync('git', ['init', '-q'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: dir });
+            execFileSync('git', ['add', '-A'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', 'commit', '-q', '-m', 'base'], { cwd: dir });
+            fs.writeFileSync(path.join(dir, 'lib.ts'), lines('import { Handler } from "./types";', '', 'export const prefix = "/";', '',
+                'export const h: Handler = (c) => {', '    return "/" + c;', '};'));
+            const result = execute(idx(dir), 'check', {});
+            assert.ok(verdicts(result.result).includes('h:modified=ready'), verdicts(result.result).join('  '));
+        } finally { rm(dir); }
     });
 });

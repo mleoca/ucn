@@ -10827,3 +10827,43 @@ describe('fix #443: instance initializer reads precede their writes', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #509: a function that is not a member takes every parameter it writes', () => {
+    it('verify counts a leading self or cls of a module-level function; a method still leaves its receiver out', () => {
+        const dir = tmp({
+            'lib.py': 'def helper(self, x):\n    return x\n\n\ndef make(cls, x, y=0):\n    return x\n\n\nclass Box:\n    def helper(self, x):\n        return x\n',
+            'use.py': 'from lib import helper, make, Box\n\n\ndef run():\n    helper(1, 2)\n    helper(1)\n    make(1, 2)\n    Box().helper(1)\n',
+        });
+        try {
+            const index = idx(dir);
+            const free = index.verify('helper', { file: 'lib.py', line: 1 });
+            assert.deepStrictEqual([free.expectedArgs.min, free.expectedArgs.max], [2, 2]);
+            assert.deepStrictEqual(free.mismatchDetails.map(row => [row.line, row.actual]), [[6, 1]]);
+            assert.ok(free.params.some(param => param.name === 'self'));
+            const cls = index.verify('make');
+            assert.deepStrictEqual([cls.expectedArgs.min, cls.expectedArgs.max, cls.mismatches], [2, 3, 0]);
+            const method = index.verify('helper', { file: 'lib.py', className: 'Box' });
+            assert.deepStrictEqual([method.expectedArgs.min, method.expectedArgs.max, method.mismatches], [1, 1, 0]);
+        } finally { rm(dir); }
+    });
+
+    it('plan places a call argument by every parameter a non-member writes', () => {
+        const dir = tmp({
+            'lib.py': 'def helper(self, x):\n    return x\n\n\nclass Box:\n    def helper(self, x):\n        return x\n',
+            'use.py': 'from lib import helper, Box\n\n\ndef run():\n    helper(1, 2)\n    Box().helper(3)\n',
+        });
+        try {
+            const index = idx(dir);
+            const removed = index.plan('helper', { removeParam: 'self', file: 'lib.py', line: 1 });
+            assert.deepStrictEqual(removed.changes.filter(change => change.editKind === 'call').map(change => change.suggestion),
+                ['Remove argument 1: 1']);
+            const second = index.plan('helper', { removeParam: 'x', file: 'lib.py', line: 1 });
+            assert.deepStrictEqual(second.changes.filter(change => change.editKind === 'call').map(change => change.suggestion),
+                ['Remove argument 2: 2']);
+            // The method's receiver is passed by the call's receiver.
+            const method = index.plan('helper', { removeParam: 'x', file: 'lib.py', className: 'Box' });
+            assert.deepStrictEqual(method.changes.filter(change => change.editKind === 'call').map(change => change.suggestion),
+                ['Remove argument 1: 3']);
+        } finally { rm(dir); }
+    });
+});

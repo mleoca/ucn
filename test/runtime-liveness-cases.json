@@ -3412,5 +3412,157 @@
     "name": "_target",
     "breaks": false,
     "native": "python3"
+  },
+  {
+    "id": "entry-module-pep621-group",
+    "files": {
+      "plugin.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[project.entry-points.pytest11]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"pytest11\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"pytest11\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "entry-module-pep621-other-module",
+    "files": {
+      "plugin.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[project.entry-points.pytest11]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"pytest11\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"pytest11\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "entry-module-package-init",
+    "files": {
+      "plugin/__init__.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "plugin/sub.py": "def _other():\n    return 7\n",
+      "pyproject.toml": "[project.entry-points.\"sample.plugins\"]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"sample.plugins\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"sample.plugins\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin/__init__.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "entry-module-package-submodule",
+    "files": {
+      "plugin/__init__.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "plugin/sub.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[project.entry-points.\"sample.plugins\"]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"sample.plugins\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"sample.plugins\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin/sub.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "entry-module-outside-package",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[project.entry-points.\"sample.plugins\"]\nsample = \"json\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"sample.plugins\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"sample.plugins\").load(); assert module.dumps(1)==\"1\"",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3"
+  },
+  {
+    "id": "poetry-plugins-module",
+    "files": {
+      "plugin.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.poetry.plugins.\"sample.plugins\"]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"poetry\"][\"plugins\"][\"sample.plugins\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"sample.plugins\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "flit-entrypoints-module",
+    "files": {
+      "plugin.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[tool.flit.entrypoints.\"sample.plugins\"]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"tool\"][\"flit\"][\"entrypoints\"][\"sample.plugins\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"sample.plugins\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "entry-module-setup-cfg",
+    "files": {
+      "plugin.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "setup.cfg": "[options.entry_points]\nsample.plugins =\n    sample = plugin\n"
+    },
+    "run": "import configparser; from importlib.metadata import EntryPoint; parser=configparser.ConfigParser(); parser.read(\"setup.cfg\"); name, value=[part.strip() for part in parser[\"options.entry_points\"][\"sample.plugins\"].strip().split(\"=\")]; module=EntryPoint(name=name,value=value,group=\"sample.plugins\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "entry-module-pytest-hook",
+    "files": {
+      "plugin.py": "def pytest_configure(config):\n    config.addinivalue_line(\"markers\", \"sample: a marker the plugin registers\")\n\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\n\n\n@pytest.mark.sample\ndef test_it():\n    assert True\n",
+      "pyproject.toml": "[project.entry-points.pytest11]\nsample = \"plugin\"\n"
+    },
+    "run": "import sys, tomllib, pytest; from pathlib import Path; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"pytest11\"][\"sample\"]; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"-p\", value, \"--strict-markers\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin.py",
+    "name": "pytest_configure",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "entry-reexport-star",
+    "files": {
+      "plugin/__init__.py": "from .sub import *\n",
+      "plugin/sub.py": "__all__ = [\"_target\"]\n\ndef _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[project.entry-points.\"sample.plugins\"]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"sample.plugins\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"sample.plugins\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "__all__ = [\"_target\"]\n\ndef _unused():\n    return 3\n",
+    "file": "plugin/sub.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
+  },
+  {
+    "id": "entry-reexport-from",
+    "files": {
+      "plugin/__init__.py": "from .sub import _target\n",
+      "plugin/sub.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "pyproject.toml": "[project.entry-points.\"sample.plugins\"]\nsample = \"plugin\"\n"
+    },
+    "run": "import tomllib; from pathlib import Path; from importlib.metadata import EntryPoint; value=tomllib.loads(Path(\"pyproject.toml\").read_text())[\"project\"][\"entry-points\"][\"sample.plugins\"][\"sample\"]; module=EntryPoint(name=\"sample\",value=value,group=\"sample.plugins\").load(); assert getattr(module, \"_target\")()==7",
+    "after": "def _unused():\n    return 3\n",
+    "file": "plugin/sub.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3"
   }
 ]

@@ -6,12 +6,22 @@ const { pythonPossibleIdentities, pythonBoundValue, pythonSourceName } = require
 const { entrypointToml } = require('./entrypoint-toml');
 const OP_ENTRIES = new WeakMap();
 
-/** A runtime module/member path names this declaration, including src layouts. */
+/**
+ * A runtime module/member path names this declaration, including src
+ * layouts. A target that ends with `:` names a module and no attribute: the
+ * runtime imports the module and hands the module object over, and its
+ * consumer may look up any name in it, so it reaches every declaration that
+ * module holds (a package's `__init__`, never a submodule).
+ */
 function runtimeTargetReaches(index, symbol, target) {
-    const spelling = target.replace(':', '.').split('[')[0].trim();
     const relative = path.relative(index.root, symbol.file).split(path.sep).join('/');
     if (!relative.endsWith('.py')) return false;
     const module = relative.slice(0, -3).replace(/\/__init__$/, '').replaceAll('/', '.');
+    if (target.endsWith(':')) {
+        const named = target.slice(0, -1);
+        return module === named || module.endsWith(`.${named}`);
+    }
+    const spelling = target.replace(':', '.').split('[')[0].trim();
     const mangle = (name, owner) => owner && name.startsWith('__') && !name.endsWith('__') && owner.replace(/^_+/, '')
         ? `_${owner.replace(/^_+/, '')}${name}` : name;
     let owners = symbol.runtimeOwnerPath;
@@ -72,10 +82,18 @@ function literal(node) {
     return valid ? value : null;
 }
 
+/**
+ * The target an entry point value names: `module:attribute` as written, or
+ * `module:` for a module with no attribute (`runtimeTargetReaches`). Null
+ * for a value that is neither: its target cannot be resolved.
+ */
 function targetOf(value) {
     const candidate = value.includes('=') ? value.slice(value.lastIndexOf('=') + 1).trim() : value.trim();
-    return /^[\p{L}_][\p{L}\p{N}_.]*\s*:\s*[\p{L}_][\p{L}\p{N}_.]*(?:\s*\[[^\]]*\])?$/u.test(candidate)
-        ? candidate.replace(/\s/g, '') : null;
+    if (/^[\p{L}_][\p{L}\p{N}_.]*\s*:\s*[\p{L}_][\p{L}\p{N}_.]*(?:\s*\[[^\]]*\])?$/u.test(candidate)) {
+        return candidate.replace(/\s/g, '');
+    }
+    const module = /^([\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*)(?:\s*\[[^\]]*\])?$/u.exec(candidate);
+    return module ? `${module[1]}:` : null;
 }
 
 /** Static packaging declarations, read as data; setup.py is never executed. */

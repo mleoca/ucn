@@ -484,17 +484,23 @@ function declaresPlainReturn(root, symbol, neverTypes, aliases = true) {
  * A statement that shares no name with the slice and ends no path cannot
  * reach the result.
  *
+ * Returned: the units of the derivation in source order (`kept`), the
+ * slice among them (`slice`), and the result units with the expression
+ * each returns (`results`: { unit, expression }, expression null for a
+ * `return` with no value). `serializedDerivation` is what two revisions
+ * compare.
+ *
  * @param {object} [facts] - what `provablyReturns` asks; without it every
  *   bare call is one that may not return
  */
-function returnDerivation(body, facts = null) {
+function derivationUnits(body, facts = null) {
     const units = [];
     const decidable = !!(facts && facts.traits && facts.traits.namedConditionsDecidable);
     const receiver = { receiverMembers: !!(facts && facts.receiverMembers), selfName: facts ? facts.selfName : null };
     // An expression body is the result.
     if (!body.namedChildren.some(child => STATEMENT_SHAPE.test(child.type)) &&
         !['block', 'statement_block', 'compound_statement'].includes(body.type)) {
-        units.push({ at: body.startIndex, result: true, path: [], ...unitOf(body, receiver) });
+        units.push({ at: body.startIndex, result: true, path: [], node: body, ...unitOf(body, receiver) });
     }
     const collect = (container, path, nested, holder) => {
         for (const child of container.namedChildren) {
@@ -508,6 +514,7 @@ function returnDerivation(body, facts = null) {
                 const unit = {
                     at: child.startIndex,
                     type: child.type,
+                    node: child,
                     path,
                     // The compound statement this one sits under.
                     holder,
@@ -575,10 +582,93 @@ function returnDerivation(body, facts = null) {
             for (let up = unit.holder; up && !kept.has(up); up = up.holder) kept.add(up);
         }
     }
-    return JSON.stringify([...kept].sort((a, b) => a.at - b.at).map(unit => {
-        if (slice.has(unit)) return [unit.path, unit.tokens];
+    const ordered = [...kept].sort((a, b) => a.at - b.at);
+    const results = ordered.filter(unit => unit.result).map(unit => ({
+        unit,
+        expression: RESULT_NODES.has(unit.node.type)
+            ? unit.node.namedChildren.find(child => !COMMENT_NODES.has(child.type)) || null
+            : unit.node,
+    }));
+    return { kept: ordered, slice, results };
+}
+
+/**
+ * The derivation as a string. `maskResults`: the result units stand by
+ * their place alone, so two derivations that differ only in what the
+ * results say compare equal.
+ */
+function serializedDerivation({ kept, slice }, maskResults) {
+    return JSON.stringify(kept.map(unit => {
+        if (slice.has(unit)) return [unit.path, maskResults && unit.result ? 'result' : unit.tokens];
         return unit.exit ? ['exit', unit.path, ...unit.exit] : ['guard', unit.path, unit.tokens];
     }));
+}
+
+/**
+ * What the binding that holds a callable says it returns, and whether the
+ * body's results are values of that by their syntax (trait
+ * `bindingCallInterface`: `const h: Handler = (c) => {..}`).
+ *
+ * The binding's written type is what callers see. The callable's own
+ * result type is still read from its body, and the checker holds it to the
+ * binding's type at the binding (a line a body edit does not write). So a
+ * changed derivation is settled only by proof: every result of the body is
+ * a value of the type the binding's one call signature writes as a keyword
+ * (`resultFits`), and nothing else in the derivation moved (`masked`: the
+ * derivation with the results standing by their place, equal in both
+ * revisions).
+ *
+ * @param {Function} [readType] - (typeNode) => keyword text or null: a
+ *   written type that is a name, read where the project declares it
+ * @returns {{type, masked, fits}|null} null when the callable is not held
+ *   by such a binding, is async or a generator, or its type is unread
+ */
+function boundReturnOf(node, derivation, traits, readType) {
+    const rules = traits.bindingCallInterface;
+    if (!rules || !rules.keywordTypes || typeof rules.resultFits !== 'function') return null;
+    if (!rules.callables.includes(node.type)) return null;
+    const holder = node.parent;
+    if (!holder || !rules.holders.includes(holder.type) || !sameNode(holder.childForFieldName('value'), node)) return null;
+    // An async callable returns a promise of its results, a generator
+    // what it yields: the results are not the value.
+    const body = node.childForFieldName('body');
+    if (node.type.includes('generator') ||
+        tokensOf(node, body).some(([type, text]) => type === 'async' || text === '*')) return null;
+    const written = holder.namedChildren.find(child => child.type === rules.annotation)?.namedChild(0);
+    if (!written) return null;
+    let type = null;
+    if (rules.functionTypes.includes(written.type)) {
+        const returned = written.childForFieldName('return_type');
+        type = returned && rules.keywordTypes.includes(returned.type) ? returned.text : null;
+    } else if (typeof readType === 'function') {
+        // A type that cannot be read settles nothing.
+        try { type = readType(written); } catch (_) { type = null; }
+    }
+    if (!type) return null;
+    // A body with no result returns nothing a type other than the ones
+    // that accept every result (`resultFits` of no value) is met by.
+    const results = derivation.results;
+    return {
+        type,
+        masked: serializedDerivation(derivation, true),
+        fits: (results.length > 0 || rules.resultFits(null, type)) &&
+            results.every(result => rules.resultFits(result.expression, type)),
+    };
+}
+
+/**
+ * A changed derivation the binding's return type settles: both revisions
+ * are held to the same type, every result of the changed body is a value
+ * of that type, and every other unit of the derivation is the same in both
+ * revisions, in the same places. A statement the results are made of that
+ * left the body can narrow what an unchanged result reads (a removed
+ * `if (!p) p = ""` before `return "n" + p.length`), so no unit may leave.
+ */
+function boundResultsFit(before, after) {
+    const was = before.boundReturn;
+    const now = after.boundReturn;
+    return !!was && !!now && was.type === now.type && now.fits === true &&
+        was.masked === now.masked;
 }
 
 // ── Where the paths of a body end ───────────────────────────────────────
@@ -918,7 +1008,9 @@ function returnFormOf(node, declaration, symbol, traits) {
  * @param {object} [context] - what the revision's file and the project say
  *   about callees: { fileNames: Set of names the file declares or imports,
  *   returning(name, ownerClass): every project declaration of the name
- *   (of the class's own method) is one a call of which returns }
+ *   (of the class's own method) is one a call of which returns,
+ *   boundReturnType(typeNode): the keyword return type a written binding
+ *   type names, read where the project declares it }
  * @returns {{header, generator, returnForm, inferred, derivation}|null}
  */
 function callableContract(root, language, symbol, context = null) {
@@ -997,10 +1089,17 @@ function callableContract(root, language, symbol, context = null) {
         return facts;
     };
     let derivation = null;
+    let boundReturn = null;
     if (inferred && body) {
         // Expression by expression where the form is "no annotation"; the
         // whole body where the compiler deduces the type from all of it.
-        derivation = returnForm === 'unannotated' ? returnDerivation(body, bodyFacts()) : JSON.stringify(tokensOf(body));
+        if (returnForm === 'unannotated') {
+            const units = derivationUnits(body, bodyFacts());
+            derivation = serializedDerivation(units, false);
+            boundReturn = boundReturnOf(node, units, traits, context && context.boundReturnType);
+        } else {
+            derivation = JSON.stringify(tokensOf(body));
+        }
     }
     // Where the body's paths end (trait `pathEnds`), whatever the return
     // form: a toolchain holds the code after an end, and the paths that
@@ -1138,7 +1237,7 @@ function callableContract(root, language, symbol, context = null) {
     const contract = { header: JSON.stringify(header), generator, returnForm, inferred, derivation, memberBindings };
     Object.defineProperties(contract, {
         outgoingCalls: { value: outgoingCalls }, invocationContext: { value: invocationContext },
-        pathEnds: { value: pathEnds }, unitReturn: { value: unitReturn },
+        pathEnds: { value: pathEnds }, unitReturn: { value: unitReturn }, boundReturn: { value: boundReturn },
     });
     return contract;
 }
@@ -1157,7 +1256,11 @@ function classifyChange(before, after, language) {
     if (before.header !== after.header) reasons.push('header');
     if ((traits.callableKindFromBody || []).includes('generator') &&
         before.generator !== after.generator) reasons.push('callable-kind');
-    if ((before.inferred || after.inferred) && before.derivation !== after.derivation) {
+    // A callable held by a typed binding: callers see the binding's type,
+    // and a change of results proven to be values of it changes nothing
+    // the checker holds the callable to.
+    if ((before.inferred || after.inferred) && before.derivation !== after.derivation &&
+        !boundResultsFit(before, after)) {
         reasons.push('inferred-return-contract');
     }
     if ((before.memberBindings || null) !== (after.memberBindings || null)) reasons.push('inferred-member-type');

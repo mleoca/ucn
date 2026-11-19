@@ -155,24 +155,57 @@ const ITEM_SECTION_HEADER_RE = /^Action items:$/;
 const ITEM_SECTION_HEAD = 2;
 
 /**
+ * The item each line of an item section belongs to: an item is a line at
+ * the section's shallowest indent, the lines after it until the next item
+ * are under it (`owner[at] === at` marks an item; -1 a line before any).
+ */
+function itemOwners(section, indentOf) {
+    const shallowest = Math.min(...section.body.map(indentOf));
+    const owner = [];
+    let last = -1;
+    section.body.forEach((line, at) => {
+        if (indentOf(line) === shallowest) last = at;
+        owner.push(last);
+    });
+    return owner;
+}
+
+/**
+ * The line that ends a cut item section: how many items (symbols, or the
+ * action items of `Action items:`) and how many lines under items are left
+ * out, each counted apart.
+ */
+function itemMoreLine(section, items, details) {
+    const noun = ITEM_SECTION_HEADER_RE.test(section.header) ? 'action item' : 'symbol';
+    const more = (count, word) => `+${count} more ${word}${count === 1 ? '' : 's'}`;
+    const parts = [];
+    if (items > 0) parts.push(more(items, noun));
+    if (details > 0) parts.push(`${more(details, 'line')} under ${items > 0 ? `${noun}s` : `the ${noun}s shown`}`);
+    return `  ... ${parts.join(', ')}`;
+}
+
+/** The longest line `itemMoreLine` can write for a section: its reserve. */
+function itemMoreLineBound(section, indentOf) {
+    const owner = itemOwners(section, indentOf);
+    const items = owner.filter((item, at) => item === at).length;
+    const details = section.body.length - items;
+    return [itemMoreLine(section, items, details), itemMoreLine(section, 0, details), itemMoreLine(section, items, 0)]
+        .reduce((longest, line) => (line.length > longest.length ? line : longest));
+}
+
+/**
  * Cut sections of items (`check`): what a reader acts on is which items
  * there are, so the item lines come before the lines under them. Every
  * section first keeps a short head; then the sections take their remaining
  * item lines in the order they are printed (the worst verdict first); then
  * the lines under the items shown, in the same order. A cut section ends
- * with a `+N more` line that counts every line left out.
+ * with a line that counts the items and the lines under items it leaves
+ * out (`itemMoreLine`).
  */
-function itemSectionsCut(blocks, sections, budget, used, lineCost, moreLine, indentOf) {
+function itemSectionsCut(blocks, sections, budget, used, lineCost, indentOf) {
     const states = new Map();
     for (const section of sections) {
-        const shallowest = Math.min(...section.body.map(indentOf));
-        const owner = [];
-        let last = -1;
-        section.body.forEach((line, at) => {
-            if (indentOf(line) === shallowest) last = at;
-            owner.push(last);
-        });
-        states.set(section, { owner, taken: new Set(), full: false });
+        states.set(section, { owner: itemOwners(section, indentOf), taken: new Set(), full: false });
     }
     const take = (section, at) => {
         const state = states.get(section);
@@ -200,10 +233,15 @@ function itemSectionsCut(blocks, sections, budget, used, lineCost, moreLine, ind
     for (const block of blocks) {
         if (block.kind === 'fixed') { out.push(block.line); continue; }
         out.push(block.header);
-        const { taken } = states.get(block);
-        for (let at = 0; at < block.body.length; at++) if (taken.has(at)) out.push(block.body[at]);
-        const omitted = block.body.length - taken.size;
-        if (omitted > 0) out.push(moreLine(omitted));
+        const { taken, owner } = states.get(block);
+        let items = 0;
+        let details = 0;
+        for (let at = 0; at < block.body.length; at++) {
+            if (taken.has(at)) out.push(block.body[at]);
+            else if (owner[at] === at) items++;
+            else details++;
+        }
+        if (items + details > 0) out.push(itemMoreLine(block, items, details));
     }
     return out.join('\n');
 }
@@ -249,13 +287,14 @@ function sectionAwareCut(text, budget, lineCost = line => line.length, options =
     for (const block of blocks) {
         used += lineCost(block.kind === 'fixed' ? block.line : block.header) + 1;
     }
+    const indentOf = line => line.length - line.trimStart().length;
     // Reserve the worst-case `+N more` line and one gap marker per section.
     for (const section of sections) {
-        used += moreLine(section.body.length).length + gapLine.length + 2;
+        const more = items ? itemMoreLineBound(section, indentOf) : moreLine(section.body.length);
+        used += more.length + gapLine.length + 2;
     }
     if (used > budget) return null;
-    const indentOf = line => line.length - line.trimStart().length;
-    if (items) return itemSectionsCut(blocks, sections, budget, used, lineCost, moreLine, indentOf);
+    if (items) return itemSectionsCut(blocks, sections, budget, used, lineCost, indentOf);
     // Selection order per section: the first numbered site entry and the
     // sub-headers above it come first, so a long preamble list (competing
     // definitions) cannot crowd every site out; then lines in source order.

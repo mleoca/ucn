@@ -2132,6 +2132,9 @@ function calleeFacts(index, entry, filePath, cache) {
         fileNames,
         returning: (name, ownerClass) => ask('returning', name, ownerClass, plain),
         never: (name, ownerClass) => ask('never', name, ownerClass, never),
+        // The keyword return type a binding's written type names, read
+        // where the project declares the type now.
+        boundReturnType: written => require('./verify').boundReturnType(index, filePath, written),
     };
     cache.set(entry, facts);
     return facts;

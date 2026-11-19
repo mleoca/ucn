@@ -119,7 +119,47 @@ const TS_BINDING_CALL_INTERFACE = Object.freeze({
     // symbol kinds those declarations are indexed as.
     declarations: { interface_declaration: 'body', type_alias_declaration: 'value' },
     declarationKinds: ['interface', 'type'],
+    // The return types a signature writes as a keyword (core/verify.js
+    // `boundReturnType`), and whether a result expression is a value of
+    // one by its syntax alone (core/change-kinds.js `boundReturnOf`).
+    keywordTypes: ['predefined_type'],
+    resultFits: tsResultFits,
 });
+
+/**
+ * Is every value `node` can have a value of the keyword type, whatever the
+ * names in it denote? A function type returning `unknown`, `any` or `void`
+ * accepts any result (a `return` with no value and a body that falls off
+ * its end included). `node` null: a `return` with no value.
+ */
+function tsResultFits(node, keyword) {
+    if (['unknown', 'any', 'void'].includes(keyword)) return true;
+    while (node && node.type === 'parenthesized_expression' && node.namedChildCount === 1) node = node.namedChild(0);
+    if (!node) return false;
+    const operator = node.childForFieldName('operator')?.text;
+    const numeric = candidate => candidate?.type === 'number' && !/n$/i.test(candidate.text);
+    switch (keyword) {
+        case 'string':
+            if (node.type === 'string' || node.type === 'template_string') return true;
+            if (node.type === 'unary_expression') return operator === 'typeof';
+            // A `+` with a string operand concatenates.
+            return node.type === 'binary_expression' && operator === '+' &&
+                (tsResultFits(node.childForFieldName('left'), 'string') ||
+                    tsResultFits(node.childForFieldName('right'), 'string'));
+        case 'number':
+            // A bigint literal (`1n`) is no number.
+            if (numeric(node)) return true;
+            return node.type === 'unary_expression' && ['-', '+'].includes(operator) &&
+                numeric(node.childForFieldName('argument'));
+        case 'boolean':
+            if (node.type === 'true' || node.type === 'false') return true;
+            if (node.type === 'unary_expression') return operator === '!';
+            return node.type === 'binary_expression' &&
+                ['===', '!==', '==', '!=', '<', '>', '<=', '>=', 'instanceof', 'in'].includes(operator);
+        default:
+            return false;
+    }
+}
 
 const STRUCTURAL_TRAITS = {
     typeSystem: 'structural',
