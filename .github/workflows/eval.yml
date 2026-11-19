@@ -175,6 +175,10 @@ jobs:
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'matrices' }}
         run: node eval/run-check-matrix.js
 
+      - name: "Check replay (measurement: BLOCKED on accepted upstream commits, READY share)"
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'matrices' }}
+        run: node eval/run-check-replay.js
+
       - name: "Test-unit matrix (gate: every listed test and printed command judged by its runner)"
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && matrix.kind == 'matrices' }}
         run: node eval/run-test-unit-matrix.js

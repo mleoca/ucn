@@ -408,7 +408,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
         const arms = workflow.split(/\n      - name: /).slice(1).filter(step =>
             /\n        run: (?:node eval\/|npm run trust:gate)/.test(step));
-        assert.strictEqual(arms.length, 11);
+        assert.strictEqual(arms.length, 12);
         for (const [event, full] of [['schedule', false], ['workflow_dispatch', true], ['workflow_dispatch', false]]) {
             for (const matrix of evaluationMatrix(event, full).include) {
                 for (const step of arms) {
@@ -425,7 +425,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
                     });
                     const kind = step.startsWith('"Pre-tag') ? 'release' :
                         step.startsWith('"Oracle eval') ? 'oracle' :
-                            / matrix \(gate: /.test(title) ? 'matrices' : 'checks';
+                            / matrix \(gate: /.test(title) || step.startsWith('"Check replay') ? 'matrices' : 'checks';
                     const scheduled = !step.startsWith('"Outcome') && kind === 'checks';
                     const expected = matrix.kind === kind && (!scheduled || event === 'schedule' || full);
                     assert.strictEqual(evaluate(false, 'success'), expected, `${event}/${matrix.id}/${title}`);
