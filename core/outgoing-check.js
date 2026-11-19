@@ -4,7 +4,7 @@
 const { getCachedCalls } = require('./callers');
 const { verifyCallSites } = require('./verify');
 const { langTraits } = require('../languages');
-const { unsettledReason, plainOwner, calleeIdentifierAt } = require('./call-fit');
+const { unsettledReason, plainOwner, calleeIdentifierAt, resultReach } = require('./call-fit');
 
 const order = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -64,7 +64,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
         }
         return receivers.get(key).get(siteKey(site)) || [];
     };
-    return (definition, change, added) => {
+    return (definition, change, added, options = {}) => {
         const mismatches = [];
         const unsettled = [];
         if (!definition) return { mismatches, unsettled };
@@ -95,7 +95,22 @@ function outgoingChecker(index, judge, addedLinesByFile) {
             return JSON.stringify([siteKey(site), callee.file, owner || callee.name,
                 owner ? null : callee.className, callee.namespace, callee.enclosingType]);
         };
-        const uncertain = (site, name, reason) => unsettled.push({ file: relative, line: site.line, column: site.column, name, reason });
+        // A call the change wrote whose value stays on lines the change
+        // wrote is a note: the toolchain reports what is wrong with it
+        // there. One whose value reaches a line the change did not write,
+        // or that stands on such a line, holds the verdict (`reach` says
+        // how). A bare name nothing binds is held wherever it is.
+        const uncertain = (site, name, reason, record, candidates) => {
+            let reach = 'unresolved-callee';
+            if (reason !== 'unresolved-callee') {
+                try {
+                    reach = record ? resultReach(index, definition, record, { added: !!added, written: lines, candidates: candidates || [], replaced: !!options.replaced })
+                        : 'call-not-located';
+                } catch (_) { reach = 'call-not-located'; }
+            }
+            unsettled.push({ file: relative, line: site.line, column: site.column, name, reason,
+                role: reach ? 'verdict' : 'note', ...(reach && { reach }) });
+        };
         // Every (declaration, site) the change's calls are checked against.
         const reached = [];
         const answered = new Set();
@@ -124,7 +139,11 @@ function outgoingChecker(index, judge, addedLinesByFile) {
                     for (const member of members) {
                         reached.push({ callee: member.callee, site, record, provenance: member.provenance, receiverProven: true });
                     }
-                } else uncertain(site, entry.name, entry.reason || 'outgoing-target-unresolved');
+                } else {
+                    // Any declaration of the name may be the one the call binds.
+                    const candidates = (index.symbols.get(entry.name) || []).filter(candidate => Array.isArray(candidate.paramsStructured));
+                    uncertain(site, entry.name, entry.reason || 'outgoing-target-unresolved', record, candidates);
+                }
             }
         }
         for (const { callee, site, record, provenance, receiverProven } of reached) {
@@ -162,11 +181,11 @@ function outgoingChecker(index, judge, addedLinesByFile) {
                 const calleeTraits = langTraits(index.files.get(callee.file)?.language);
                 const conventionalReceiver = !callee.className && calleeTraits?.receiverParameterByConvention &&
                     (calleeTraits.selfParam || []).includes(callee.paramsStructured?.[0]?.name);
-                if ((callee.decorators || []).length) uncertain(site, callee.name, 'decorated-call-interface');
-                else if (conventionalReceiver) uncertain(site, callee.name, 'call-interface-unverified');
-                else if (flexible) uncertain(site, callee.name, 'call-arity-not-enforced');
-                else if (openFamily) uncertain(site, callee.name, 'overload-compatibility-unverified');
-                else issues.push({ family, site, callee, mismatch: {
+                if ((callee.decorators || []).length) uncertain(site, callee.name, 'decorated-call-interface', record, [callee]);
+                else if (conventionalReceiver) uncertain(site, callee.name, 'call-interface-unverified', record, [callee]);
+                else if (flexible) uncertain(site, callee.name, 'call-arity-not-enforced', record, [callee]);
+                else if (openFamily) uncertain(site, callee.name, 'overload-compatibility-unverified', record, [callee]);
+                else issues.push({ family, site, callee, record, mismatch: {
                     ...mismatch, column: site.column, target: callee.name, ...(suppressed && { unchecked: true }),
                 } });
             }
@@ -176,7 +195,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
             for (const row of result.uncertainDetails || []) {
                 // The reason is a code here, as every other row's: the
                 // sentence stays with verify, which prints sentences.
-                issues.push({ family, site, callee, reason: shape?.hasSpread ? 'argument-count-not-static'
+                issues.push({ family, site, callee, record, reason: shape?.hasSpread ? 'argument-count-not-static'
                     : shape?.indirectKind ? 'indirect-call-arguments' : row.code || 'call-arguments-unread' });
             }
             if (result.valid > 0) {
@@ -184,7 +203,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
                     range.start <= site.start && range.end >= (record.callEnd ?? record.callSite?.end ?? site.start));
                 const reason = unsettledReason(index, callee, definition, record, result, { stableInvocation, receiverProven });
                 if (!reason) positiveFamilies.add(family);
-                else issues.push({ family, site, callee, reason });
+                else issues.push({ family, site, callee, record, reason });
             }
         }
         // Overload declarations describe one call interface. A positively
@@ -193,7 +212,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
         for (const issue of issues) {
             if (positiveFamilies.has(issue.family)) continue;
             if (issue.mismatch && !possibleFamilies.has(issue.family)) mismatches.push(issue.mismatch);
-            else uncertain(issue.site, issue.callee.name, issue.reason || 'overload-compatibility-unverified');
+            else uncertain(issue.site, issue.callee.name, issue.reason || 'overload-compatibility-unverified', issue.record, [issue.callee]);
         }
         // A bare call nothing answers: where the language lets every name a
         // file uses be read from it (trait `unboundCallee`), a name with no
@@ -206,7 +225,7 @@ function outgoingChecker(index, judge, addedLinesByFile) {
                 let missing;
                 try { missing = !!identifier && identifier.text === record.name && unbound(identifier, index) === true; } catch (_) { missing = false; }
                 if (missing) {
-                    uncertain({ line: record.line, column: record.callSite?.column }, record.name, 'unresolved-callee');
+                    uncertain({ line: record.line, column: record.callSite?.column }, record.name, 'unresolved-callee', record);
                 }
             }
         }

@@ -154,12 +154,13 @@ claims; 4 additional claims could not be pinned by the oracle and were unscored.
 The release gate also runs three matrices of small projects written by the
 evaluation, each judged by the language's own compiler or test runner. In the
 same run, across 68 deletions, `plan --delete` reported `no-static-dependents`
-for none that a compiler rejects. Across 778 single changes, `check` called
-none ready that a compiler rejects and blocked none that it accepts. Of 344
-test projects, 339 were judged by their own test runners, with zero failures
-in the matrix's test-discovery and command-selection checks. These checks
-account for skipped and conditional tests and each runner's selection scope;
-five projects were not runner-judged.
+for none that a compiler rejects. Across 851 single changes, `check` called
+none ready that a compiler rejects on a line the change did not write, apart
+from 8 known gaps the matrix names case by case, and blocked none that it
+accepts. Of 344 test projects, 339 were judged by their own test runners, with
+zero failures in the matrix's test-discovery and command-selection checks.
+These checks account for skipped and conditional tests and each runner's
+selection scope; five projects were not runner-judged.
 
 The samples are deterministic and stratified by reference activity. Confirmed
 precision applies to scored claims; recall counts in-scope oracle edges found

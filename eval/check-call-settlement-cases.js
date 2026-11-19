@@ -143,8 +143,8 @@ module.exports = [
         },
         "name": "fresh",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "fresh:added=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "fresh:added=ready"
     },
     {
         "id": "settled-py-result-in-operator-clean",
@@ -158,8 +158,8 @@ module.exports = [
         },
         "name": "fresh",
         "expect": "clean",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "fresh:added=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "fresh:added=ready"
     },
     {
         "id": "settled-py-spread-of-a-longer-tuple",
@@ -217,8 +217,8 @@ module.exports = [
         },
         "name": "changed",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "settled-py-new-returned-same-written-type",
@@ -288,8 +288,8 @@ module.exports = [
         },
         "name": "pick",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "pick:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "pick:modified=ready"
     },
     {
         "id": "settled-py-own-parameter-same-type-same-file",
@@ -330,8 +330,8 @@ module.exports = [
         },
         "name": "run",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "run:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "run:modified=ready"
     },
     {
         "id": "settled-py-constructed-receiver-wrong-count",
@@ -507,8 +507,8 @@ module.exports = [
         },
         "name": "pick",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "pick:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "pick:modified=ready"
     },
     {
         "id": "settled-ts-own-parameter-passed-on",
@@ -667,8 +667,8 @@ module.exports = [
         },
         "name": "pick",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "pick:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "pick:modified=ready"
     },
     {
         "id": "settled-ts-function-value-typed-by-its-variable",
@@ -709,8 +709,8 @@ module.exports = [
         },
         "name": "pick",
         "expect": "break",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "pick:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "pick:modified=ready"
     },
     {
         "id": "settled-ts-own-method-new-call",

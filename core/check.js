@@ -44,6 +44,7 @@
 const { diffImpact, composeAccount, callNotResolvedEntries } = require('./analysis');
 const { providedNames } = require('./change-kinds');
 const { outgoingChecker } = require('./outgoing-check');
+const { typedByHolder, carriesUnwrittenNames } = require('./call-fit');
 const { outgoingSummary, outgoingSummaryText } = require('./output/check');
 const fs = require('fs');
 const path = require('path');
@@ -948,7 +949,16 @@ function checkTarget(index, options, repoRoot) {
     const outgoing = outgoingChecker(index, judge, addedLinesByFile);
     const withOutgoing = (item, fn) => {
         if (fn._kind === 'deleted') return item;
-        const result = outgoing(definitionOf(index, fn), fn.change, fn._kind === 'added');
+        // A declaration the diff removed lines from (a line replaced or
+        // deleted) holds every call it makes: what the removed text supplied
+        // to the lines the change did not write is not read. So does one the
+        // diff calls new that keeps unwritten lines naming something (a
+        // renamed callable: the text it replaced is not read either).
+        const definition = definitionOf(index, fn);
+        const replaced = fn._kind === 'added'
+            ? !!definition && carriesUnwrittenNames(index, definition, addedLinesByFile.get(definition.relativePath) || new Set())
+            : (fn.deletedLines || []).length > 0;
+        const result = outgoing(definition, fn.change, fn._kind === 'added', { replaced });
         if (!result.mismatches.length && !result.unsettled.length) return item;
         const blocking = result.mismatches.filter(row => !row.unchecked).length;
         item.signatureMismatches += blocking;
@@ -957,14 +967,17 @@ function checkTarget(index, options, repoRoot) {
             item.outgoingReview = result.unsettled;
             item.outgoingCalls = outgoingSummary(result.unsettled);
         }
+        // A note (a call whose value stays on lines the change wrote) is
+        // disclosed and decided by the toolchain; it is not a reason.
+        const holding = result.unsettled.filter(row => row.role !== 'note').length;
         if (blocking) {
             item.verdict = 'blocked';
             item.reasons = [...new Set(['outgoing-signature-mismatch', ...item.reasons])];
-        } else {
+        } else if (result.mismatches.length || holding) {
             if (item.verdict === 'ready') item.verdict = 'review';
             item.reasons = [...new Set([...item.reasons,
                 ...(result.mismatches.length ? ['site-not-checked'] : []),
-                ...(result.unsettled.length ? ['outgoing-call-unverified'] : [])])];
+                ...(holding ? ['outgoing-call-unverified'] : [])])];
         }
         return item;
     };
@@ -1091,12 +1104,14 @@ function checkTarget(index, options, repoRoot) {
                 // A changed contract matters only to what depends on it.
                 // What a method assigns to a member is the CLASS's
                 // contract: its dependents are the member's users, whoever
-                // calls the method.
+                // calls the method. A callable held by a typed binding (or
+                // an object, or an argument) answers to its holder's type,
+                // whoever calls it.
                 const definition = definitionOf(index, fn);
                 let dependents;
                 try { dependents = definition ? assessDeletion(index, definition) : null; } catch (_) { dependents = null; }
                 if (dependents && dependents.verdict === 'no-static-dependents' &&
-                    !change.reasons.includes('inferred-member-type')) {
+                    !change.reasons.includes('inferred-member-type') && !typedByHolder(index, definition)) {
                     item.verdict = 'ready';
                     item.reasons = [];
                     item.noDependents = true;
@@ -1319,7 +1334,7 @@ function checkTarget(index, options, repoRoot) {
                     (made.length > shown.length ? ` (+${made.length - shown.length} more)` : ''),
             });
         }
-        if (it.outgoingCalls) {
+        if (it.outgoingCalls && it.outgoingCalls.notes < it.outgoingCalls.unverified) {
             actions.push({
                 severity: 'warn',
                 kind: 'outgoing_calls_unverified',

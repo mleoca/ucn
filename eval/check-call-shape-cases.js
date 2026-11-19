@@ -304,8 +304,8 @@ module.exports = [
         },
         "name": "pager",
         "expect": "clean",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "pager:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "pager:modified=ready"
     },
     {
         "id": "callshape-py-module-function-wrong-count",
@@ -548,8 +548,8 @@ module.exports = [
         },
         "name": "pager",
         "expect": "clean",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "pager:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "pager:modified=ready"
     },
     {
         "id": "callshape-ts-module-function-wrong-count",

@@ -276,6 +276,35 @@ const STRUCTURAL_TRAITS = {
     // module binding, no import that can supply it, no builtin. null: the
     // names a file can use are not all written in it.
     unboundCallee: null,
+    // Where the value of a call a change wrote can go past the lines the
+    // change wrote (fix #511, core/call-fit.js resultReach). null: what a
+    // statement binds is not read, so a call whose value a statement uses
+    // holds the check's verdict. Otherwise { assignmentDeclares: assigning
+    // a bare name declares it in the callable (else the assignment writes
+    // the binding the name already has), narrowing: { condition: a written
+    // result type through which a call whose value is tested narrows the
+    // names it is handed (a type predicate), statement: one through which
+    // a call statement does (an assertion signature), unannotatedCondition:
+    // a callee with parameters and no written result may narrow too (an
+    // inferred predicate) }, receiversRetyped: a local's type can grow with
+    // what a call of its method is handed (a TypeScript array declared
+    // empty) }.
+    callResultFlow: {
+        assignmentDeclares: false,
+        receiversRetyped: true,
+        narrowing: { condition: /(?:^|[\s(])(?:this|[A-Za-z_$][\w$]*)\s+is\s/, statement: /^\s*asserts\s/, unannotatedCondition: true },
+    },
+    // What a call the change wrote does to what it is handed, beyond its
+    // value (fix #511, core/call-fit.js callEffectsReach). null: nothing the
+    // engine models. Otherwise any of { evolvingLocals: a local declared with
+    // no written type and no value or an empty array takes its type from its
+    // uses, so handing it to a call reaches its declaration;
+    // argumentDeclarations: node types of an argument that declares a name
+    // in the enclosing block (C# `out var`); handedValues: an argument or a
+    // receiver handed by value is moved unless its written type copies, and
+    // a local with no fixed type takes its type from its uses ({ borrowNodes,
+    // copyTypes, fixedInitializers }) }.
+    callEffects: { evolvingLocals: true },
     // true where the receiver is an ordinary first parameter named by
     // convention (`self`, `cls`): a function that is not a member takes
     // that parameter as an argument like any other.
@@ -751,6 +780,8 @@ const NOMINAL_TRAITS = {
     callAvailableByBinding: false,
     untypedParameters: null,
     unboundCallee: null,
+    callResultFlow: null,
+    callEffects: null,
     decoratorsRegisterNothing: null,
     declarationFilePattern: null,
     receiverParameterByConvention: false,
@@ -1253,6 +1284,11 @@ const LANGUAGES = {
             untypedParameters: { defaultTypes: { integer: 'int', float: 'float', string: 'str', boolean: 'bool' },
                 openDefaults: ['None'], resultFollowsArguments: true },
             unboundCallee: (identifier, index) => require('../core/python-binding-identity').pythonNameUnbound(identifier, index, PY_AMBIENT_CALLABLES),
+            // Assigning a name declares it in the function unless `global` or
+            // `nonlocal` says otherwise; `TypeGuard`/`TypeIs` results narrow.
+            callEffects: null,
+            callResultFlow: { assignmentDeclares: true, receiversRetyped: false,
+                narrowing: { condition: /\b(?:TypeGuard|TypeIs)\s*\[/, statement: null, unannotatedCondition: false } },
             loadedModule: (index, filePath, call) => require('../core/loaded-modules').pythonLoadedModule(index, filePath, call),
             declarationFilePattern: /\.pyi$/,
             receiverParameterByConvention: true,
@@ -1442,6 +1478,14 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             checkLiteralArguments: { smallInteger: ['i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'u8', 'u16', 'u32', 'u64', 'u128', 'usize'], string: ['&str'], boolean: ['bool'] },
+            // A value handed to a call is moved unless borrowed or of a type
+            // that copies; a `let` with no written type takes its type from
+            // its uses unless its value names it.
+            callEffects: { handedValues: {
+                borrowNodes: ['reference_expression'],
+                copyTypes: ['i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64', 'bool', 'char'],
+                fixedInitializers: ['struct_expression', 'string_literal', 'raw_string_literal', 'boolean_literal', 'char_literal'],
+            } },
             testUnits: (fileEntry, helpers) => require('./rust').testUnits(fileEntry, helpers),
             testRunnerFamily: 'rust',
             testFileNames: [/(^|\/)tests\/[^/]+\.rs$/],
@@ -1762,6 +1806,8 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c-sharp'),
         traits: {
             ...NOMINAL_TRAITS,
+            // `M(out var x)` declares `x` in the block that holds the call.
+            callEffects: { argumentDeclarations: ['declaration_expression'] },
             // No call ends a path for the compiler. No unit type is listed:
             // an `out` parameter must be assigned on every path that leaves
             // a `void` method.

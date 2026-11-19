@@ -23,30 +23,41 @@ function callersText(it) {
     return callers;
 }
 
-/** `3 outgoing call(s) not verified (reason 2, reason 1)`. */
+/**
+ * `3 outgoing call(s) not verified (reason 2, reason 1)`, then what decides
+ * them: a call whose value stays on lines the change wrote is a note the
+ * toolchain decides; the others reach lines the change did not write.
+ */
 function outgoingSummaryText(summary) {
-    return `${summary.unverified} outgoing call(s) not verified (` +
+    const line = `${summary.unverified} outgoing call(s) not verified (` +
         `${summary.reasons.map(entry => `${entry.reason} ${entry.calls}`).join(', ')})`;
+    const notes = summary.notes || 0;
+    if (notes === 0) return line;
+    if (notes === summary.unverified) return `${line}: written by this change, the toolchain decides them`;
+    return `${line}; ${summary.unverified - notes} reach lines the change did not write`;
 }
 
 /**
  * The calls behind the rows of an item's outgoing review: how many call
- * sites are not verified, and how many of them each reason holds (a site
- * can have several). Reasons are in a fixed order: most sites first, then
- * by name.
+ * sites are not verified, how many of them each reason holds (a site can
+ * have several), and how many are notes (no row of the site reaches a line
+ * the change did not write). Reasons are in a fixed order: most sites
+ * first, then by name.
  */
 function outgoingSummary(rows) {
     const sites = new Set();
+    const holding = new Set();
     const byReason = new Map();
     for (const row of rows) {
         const site = `${row.file}\0${row.line}\0${row.column ?? ''}`;
         sites.add(site);
+        if (row.role !== 'note') holding.add(site);
         if (!byReason.has(row.reason)) byReason.set(row.reason, new Set());
         byReason.get(row.reason).add(site);
     }
     const reasons = [...byReason].map(([reason, held]) => ({ reason, calls: held.size }))
         .sort((a, b) => b.calls - a.calls || (a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : 0));
-    return { unverified: sites.size, reasons };
+    return { unverified: sites.size, reasons, notes: sites.size - holding.size };
 }
 
 function itemLines(it, options = {}) {
@@ -87,7 +98,8 @@ function itemLines(it, options = {}) {
     const review = it.outgoingReview || [];
     if (review.length > 0 && options.all) {
         for (const site of review) {
-            lines.push(`    ↳ ${site.file}:${site.line}${site.column != null ? `:${site.column + 1}` : ''}  ${site.name}: ${site.reason}`);
+            lines.push(`    ↳ ${site.file}:${site.line}${site.column != null ? `:${site.column + 1}` : ''}  ${site.name}: ${site.reason}` +
+                `${site.role === 'note' ? '  (note)' : ''}`);
         }
     } else if (review.length > 0) {
         lines.push(`    ↳ ${outgoingSummaryText(it.outgoingCalls || outgoingSummary(review))}` +

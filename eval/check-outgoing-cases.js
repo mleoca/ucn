@@ -1145,8 +1145,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "outgoing-review2-cs-zeroarg-generic-constraint",
@@ -1193,8 +1193,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "outgoing-review2-py-bytes-vs-string",
@@ -1481,8 +1481,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "outgoing-review3-cs-overload-obsolete-target",
@@ -1497,8 +1497,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "outgoing-review3-cs-literal-valid-control",
@@ -1527,8 +1527,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "outgoing-review3-java-overload-generic-throws",
@@ -1541,8 +1541,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "changed:modified=ready"
     },
     {
         "id": "outgoing-review3-java-literal-valid-control",

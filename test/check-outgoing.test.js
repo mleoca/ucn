@@ -8,6 +8,10 @@ const { execFileSync } = require('child_process');
 const { tmp, rm, idx } = require('./helpers');
 const { execute } = require('../core/execute');
 const cases = require('../eval/check-outgoing-cases');
+const { READY_LOCAL_BREAKS } = require('../eval/check-scoring');
+// Breaks answered READY because every new error is on a line the change
+// wrote (fix #511): the matrix's list.
+const LOCAL_BREAKS = new Set(READY_LOCAL_BREAKS);
 
 function git(dir, ...args) {
     return execFileSync('git', ['-c', 'user.email=t@example.test', '-c', 'user.name=t', ...args],
@@ -35,7 +39,7 @@ describe('fix #502: outgoing calls in changed code', () => {
             assert.strictEqual(result.trust.status, fixture.answer, fixture.id);
             const items = result.changed.filter(item => item.name === fixture.name);
             assert.ok(items.length, JSON.stringify(result));
-            if (fixture.expect === 'break') assert.ok(items.some(item => item.verdict !== 'ready'), JSON.stringify(items));
+            if (fixture.expect === 'break' && !LOCAL_BREAKS.has(fixture.id)) assert.ok(items.some(item => item.verdict !== 'ready'), JSON.stringify(items));
             else assert.ok(items.every(item => item.verdict !== 'blocked'), JSON.stringify(items));
             git(dir, 'add', '-A');
             write(dir, fixture.base);
@@ -126,7 +130,8 @@ describe('fix #506: what settles a changed call, and what is said of the rest', 
             const result = check(dir, options);
             const item = result.changed.find(row => row.name === name);
             assert.ok(item, JSON.stringify(result.changed));
-            return { result, item, rows: (item.outgoingReview || []).map(row => `${row.line} ${row.name}: ${row.reason}`) };
+            return { result, item, rows: (item.outgoingReview || []).map(row => `${row.line} ${row.name}: ${row.reason}`),
+                roles: (item.outgoingReview || []).map(row => row.role) };
         } finally { rm(dir); }
     }
     const LIB = 'def add(a, b):\n    return a + b\n\n\ndef scale(x, factor=2):\n    return x * factor\n\n\n' +
@@ -145,6 +150,10 @@ describe('fix #506: what settles a changed call, and what is said of the rest', 
     });
 
     it('each unsettled call names the one thing that is not shown', () => {
+        // Each edit replaces a line: what the removed text supplied to the
+        // lines the change did not write is not read, so every call holds
+        // the verdict (fix #511, `lines-replaced`); a name nothing binds
+        // holds it wherever it is.
         const expected = [
             // A literal default types the parameter: another kind is not shown to fit.
             ['    return scale(3, "x")\n', ['5 scale: argument-compatibility-unverified']],
@@ -163,9 +172,56 @@ describe('fix #506: what settles a changed call, and what is said of the rest', 
         for (const [body, rows] of expected) {
             const found = rowsOf({ 'lib.py': LIB, 'app.py': APP }, edit(body), 'use');
             assert.deepStrictEqual(found.rows, rows, body);
+            const unbound = body.includes('scalee');
+            assert.deepStrictEqual(found.item.outgoingReview.map(row => [row.role, row.reach]),
+                rows.map(() => ['verdict', unbound ? 'unresolved-callee' : 'lines-replaced']), body);
             assert.strictEqual(found.item.verdict, 'review', body);
             assert.deepStrictEqual(found.item.reasons, ['outgoing-call-unverified'], body);
         }
+    });
+
+    it('fix #511: a call the change inserted, whose value stays on the lines it wrote, is a note', () => {
+        const insert = body => ({ 'app.py': APP.replace('    return scale(3)\n', `${body}    return scale(3)\n`) });
+        const expected = [
+            ['    scale(3, "x")\n', ['5 scale: argument-compatibility-unverified']],
+            ['    later(1)\n', ['5 later: result-use-unverified']],
+            ['    value = typed(1)\n    print(value)\n', ['5 typed: result-use-unverified']],
+            ['    Box(1, 2)\n', ['5 Box: call-interface-unverified', '5 __init__: call-interface-unverified']],
+        ];
+        for (const [body, rows] of expected) {
+            const found = rowsOf({ 'lib.py': LIB, 'app.py': APP }, insert(body), 'use');
+            assert.deepStrictEqual(found.rows, rows, body);
+            assert.deepStrictEqual(found.roles, rows.map(() => 'note'), body);
+            assert.strictEqual(found.item.verdict, 'ready', body);
+            assert.deepStrictEqual(found.item.reasons, [], body);
+        }
+        // A name nothing binds holds the verdict, inserted or not.
+        const unbound = rowsOf({ 'lib.py': LIB, 'app.py': APP }, insert('    scalee(3)\n'), 'use');
+        assert.deepStrictEqual(unbound.item.outgoingReview.map(row => [row.name, row.role, row.reach]), [['scalee', 'verdict', 'unresolved-callee']]);
+        assert.strictEqual(unbound.item.verdict, 'review');
+    });
+
+    it('fix #511: a call whose value reaches a line the change did not write holds the verdict', () => {
+        const base = 'from lib import Box, add, later, scale, typed\n\n\ndef use():\n    value = 1\n    return value\n';
+        const cases = [
+            // Bound to a name an unwritten line reads.
+            ['    value = 1\n    value = typed(len("a"))\n', ['6 typed: argument-compatibility-unverified'], ['read-on-unwritten-line']],
+            // Stored where the function does not hold it.
+            ['    value = 1\n    Box.last = typed(len("a"))\n', ['6 typed: argument-compatibility-unverified'], ['member-write']],
+        ];
+        for (const [body, rows, reach] of cases) {
+            const found = rowsOf({ 'lib.py': LIB, 'app.py': base }, { 'app.py': base.replace('    value = 1\n', body) }, 'use');
+            assert.deepStrictEqual(found.rows, rows, body);
+            assert.deepStrictEqual(found.item.outgoingReview.map(row => [row.role, row.reach]), reach.map(code => ['verdict', code]), body);
+            assert.strictEqual(found.item.verdict, 'review', body);
+            assert.deepStrictEqual(found.item.reasons, ['outgoing-call-unverified'], body);
+        }
+        // A call on a line the change did not write, whose argument's
+        // binding the change wrote.
+        const lib = 'def typed(value: int) -> int:\n    return value\n\n\ndef use(a: str) -> int:\n    v = 1\n    return typed(v)\n';
+        const unwritten = rowsOf({ 'lib.py': lib }, { 'lib.py': lib.replace('    v = 1\n', '    v = len(a)\n') }, 'use');
+        assert.deepStrictEqual(unwritten.item.outgoingReview.map(row => [row.line, row.role, row.reach]), [[7, 'verdict', 'unwritten-line']]);
+        assert.strictEqual(unwritten.item.verdict, 'review');
     });
 
     it('a bound name is never an unresolved callee', () => {
@@ -224,18 +280,21 @@ describe('fix #506: what settles a changed call, and what is said of the rest', 
             assert.ok(!result.actions.some(action => /\b0 [a-z]/.test(action.message)), JSON.stringify(result.actions));
         }
         // A receiver nothing types stays a candidate, never a break.
+        // The edit replaces a line, so the call holds the verdict (fix #511).
         const { item } = rowsOf({ 'lib.py': LIB, 'app.py': 'from lib import Box\n\n\ndef use(box):\n    return 1\n' },
             { 'app.py': 'from lib import Box\n\n\ndef use(box):\n    return box.grow()\n' }, 'use');
         assert.strictEqual(item.verdict, 'review');
-        assert.deepStrictEqual(item.outgoingReview.map(row => row.name), ['grow']);
+        assert.deepStrictEqual(item.outgoingReview.map(row => [row.name, row.role]), [['grow', 'verdict']]);
     });
 
     it('a function that is not a member and names its first parameter self is not counted without it', () => {
         const lib = 'def helper(self, x):\n    return x\n\n\ndef use():\n    return 1\n';
-        const { item, rows } = rowsOf({ 'lib.py': lib }, { 'lib.py': lib.replace('    return 1\n', '    helper(1, 2)\n    return 1\n') }, 'use');
-        assert.strictEqual(item.verdict, 'review');
+        const { item, rows, roles } = rowsOf({ 'lib.py': lib }, { 'lib.py': lib.replace('    return 1\n', '    helper(1, 2)\n    return 1\n') }, 'use');
+        // A discarded call the change wrote is a note (fix #511).
+        assert.strictEqual(item.verdict, 'ready');
         assert.strictEqual(item.mismatches, undefined);
         assert.deepStrictEqual(rows, ['6 helper: call-interface-unverified']);
+        assert.deepStrictEqual(roles, ['note']);
     });
 
     it('an added declaration with a call that does not fit says which call, and nothing about object literals', () => {
@@ -249,25 +308,45 @@ describe('fix #506: what settles a changed call, and what is said of the rest', 
 
     it('the summary counts calls, the rows stay in the result, and the text lists them only on request', () => {
         const output = require('../core/output');
-        const body = '    Box(1, 2)\n    value = typed(1)\n    return add(*[value, 2]) + typed(len("a"))\n';
+        // Inserted above the kept `return`: nothing is replaced.
+        const body = '    Box(1, 2)\n    value = typed(1)\n    add(*[value, 2]) + typed(len("a"))\n    return scale(3)\n';
         const { result, item } = rowsOf({ 'lib.py': LIB, 'app.py': APP }, edit(body), 'use');
-        // Two rows of one construction are one call.
+        // Two rows of one construction are one call. Every one is written
+        // by the change and stays on its lines: notes (fix #511), counted
+        // under a READY item and left to the toolchain.
         assert.strictEqual(item.outgoingReview.length, 5);
+        assert.strictEqual(item.verdict, 'ready');
+        assert.ok(item.outgoingReview.every(row => row.role === 'note'), JSON.stringify(item.outgoingReview));
         assert.deepStrictEqual(item.outgoingCalls, { unverified: 4, reasons: [
             { reason: 'argument-compatibility-unverified', calls: 1 },
             { reason: 'argument-count-not-static', calls: 1 },
             { reason: 'call-interface-unverified', calls: 1 },
             { reason: 'result-use-unverified', calls: 1 },
-        ] });
+        ], notes: 4 });
         const line = '4 outgoing call(s) not verified (argument-compatibility-unverified 1, argument-count-not-static 1, ' +
-            'call-interface-unverified 1, result-use-unverified 1)';
+            'call-interface-unverified 1, result-use-unverified 1): written by this change, the toolchain decides them';
         const text = output.formatPublicText('check', result, {}, { surface: 'cli' });
         assert.ok(text.includes(`    ↳ ${line}; use --all to list each`), text);
         assert.ok(!text.includes('app.py:6:'), text);
-        assert.ok(text.includes(`  ⚠ use: ${line}; the compiler or type checker decides them`), text);
+        assert.ok(!text.includes('  ⚠ use:'), text);
         const all = output.formatPublicText('check', result, { all: true }, { surface: 'cli' });
-        for (const row of item.outgoingReview) assert.ok(all.includes(`${row.file}:${row.line}:${row.column + 1}  ${row.name}: ${row.reason}`), all);
+        for (const row of item.outgoingReview) assert.ok(all.includes(`${row.file}:${row.line}:${row.column + 1}  ${row.name}: ${row.reason}  (note)`), all);
         assert.ok(output.formatPublicText('check', result, {}, { surface: 'mcp' }).includes(`${line}; use all=true to list each`));
+        // A note is no reason: --strict passes the READY answer.
+        const strict = rowsOf({ 'lib.py': LIB, 'app.py': APP }, edit(body), 'use', { strict: true }).result;
+        assert.deepStrictEqual([strict.trust.status, strict.trust.passes], ['READY_FOR_TOOLCHAIN', true]);
+        // One call that holds the verdict and one that is a note: the
+        // line counts both and says how many reach unwritten lines; the
+        // action repeats it.
+        const base = 'from lib import Box, add, later, scale, typed\n\n\ndef use():\n    value = 1\n    return value\n';
+        const mixed = rowsOf({ 'lib.py': LIB, 'app.py': base },
+            { 'app.py': base.replace('    value = 1\n', '    value = 1\n    value = typed(len("a"))\n    typed(len("b"))\n') }, 'use');
+        assert.strictEqual(mixed.item.verdict, 'review');
+        assert.deepStrictEqual(mixed.item.outgoingCalls.notes, 1);
+        const mixedLine = '2 outgoing call(s) not verified (argument-compatibility-unverified 2); 1 reach lines the change did not write';
+        const mixedText = output.formatPublicText('check', mixed.result, {}, { surface: 'cli' });
+        assert.ok(mixedText.includes(`    ↳ ${mixedLine}; use --all to list each`), mixedText);
+        assert.ok(mixedText.includes(`  ⚠ use: ${mixedLine}; the compiler or type checker decides them`), mixedText);
     });
 
     it('a language with no checker of calls settles a new call that binds one declaration', () => {
@@ -280,10 +359,17 @@ describe('fix #506: what settles a changed call, and what is said of the rest', 
 
     it('a new call where the language requires more than the binding is named as such', () => {
         const source = 'package probe\n\nfunc note(level int) {}\n\nfunc changed() int {\n return 1\n}\n';
-        const { rows, item } = rowsOf({ 'go.mod': 'module example.invalid/probe\n\ngo 1.20\n', 'main.go': source },
+        const { rows, roles, item } = rowsOf({ 'go.mod': 'module example.invalid/probe\n\ngo 1.20\n', 'main.go': source },
             { 'main.go': source.replace(' return 1', ' note(2)\n return 1') }, 'changed');
-        assert.strictEqual(item.verdict, 'review');
         assert.deepStrictEqual(rows, ['6 note: call-requirements-unverified']);
+        // Discarded on a line the change wrote: a note (fix #511). Bound,
+        // in a language whose statement bindings are not read, it holds.
+        assert.deepStrictEqual(roles, ['note']);
+        assert.strictEqual(item.verdict, 'ready');
+        const bound = rowsOf({ 'go.mod': 'module example.invalid/probe\n\ngo 1.20\n', 'main.go': source.replace('func note(level int) {}', 'func note(level int) int { return level }') },
+            { 'main.go': source.replace('func note(level int) {}', 'func note(level int) int { return level }').replace(' return 1', ' n := note(2)\n _ = n\n return 1') }, 'changed');
+        assert.deepStrictEqual(bound.item.outgoingReview.map(row => [row.role, row.reach]), [['verdict', 'binding-facts-unread']]);
+        assert.strictEqual(bound.item.verdict, 'review');
     });
 });
 
@@ -307,8 +393,12 @@ it('fix #502: compile-time argument domains are not runtime literal proofs', () 
     try {
         git(dir, 'init', '-q'); git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'base');
         write(dir, fixture.after);
+        // fix #511: the edit replaces the line, so the call holds the
+        // verdict (`lines-replaced`).
         const result = check(dir);
         assert.strictEqual(result.trust.status, 'REVIEW_REQUIRED');
+        const item = result.changed.find(row => row.name === 'changed');
+        assert.deepStrictEqual(item.outgoingReview.map(row => [row.role, row.reach]), [['verdict', 'lines-replaced']]);
         git(dir, 'add', '-A'); write(dir, fixture.base);
         assert.strictEqual(check(dir, { staged: true }).trust.status, 'REVIEW_REQUIRED');
     } finally { rm(dir); }

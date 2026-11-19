@@ -405,10 +405,12 @@ describe('check: a verdict per changed symbol, by what the change did', () => {
             dir => write(dir, 'app.py', APP +
                 '\n\ndef brand_new_thing(a):\n    return a\n\n\ndef brand_new_user():\n    return brand_new_thing(1)\n'),
             'READY_FOR_TOOLCHAIN', ['brand_new_thing:added=ready', 'brand_new_user:added=ready']],
-        ['a new call whose value goes into a written type needs review',
+        // fix #511: a call in a new declaration stands on lines the change
+        // wrote; the checker reports a wrong result there. A note.
+        ['a new call whose value goes into a written type of a new declaration is a note',
             dir => write(dir, 'app.py', APP +
                 '\n\ndef brand_new_thing(a):\n    return a\n\n\ndef brand_new_user() -> int:\n    return brand_new_thing(1)\n'),
-            'REVIEW_REQUIRED', ['brand_new_thing:added=ready', 'brand_new_user:added=review(outgoing-call-unverified)']],
+            'READY_FOR_TOOLCHAIN', ['brand_new_thing:added=ready', 'brand_new_user:added=ready']],
     ];
     for (const [label, change, trust, expected] of SCENARIOS) {
         it(label, () => {
@@ -516,11 +518,29 @@ describe('check: one change each, and whether it breaks code the change did not 
         });
     }
 
-    it('never passes a change the toolchain rejects, never calls a clean one a break', () => {
+    it('fix #511: passes a change the toolchain rejects only where the matrix placed every new error on a written line, never calls a clean one a break', () => {
+        // eval/check-scoring.js: a break answered READY is listed by id,
+        // either as one whose every new error is on a line the change wrote
+        // (READY_LOCAL_BREAKS) or as a known gap with its diagnostic
+        // (KNOWN_FALSE_READY). The matrix run places the errors; this test
+        // holds the pinned answers to the lists, and the lists to the cases.
+        const { KNOWN_FALSE_READY, READY_LOCAL_BREAKS } = require('../eval/check-scoring');
         const passes = answer => answer === 'READY_FOR_TOOLCHAIN' || answer === 'NO-CHANGES';
+        const listed = new Set([...READY_LOCAL_BREAKS, ...KNOWN_FALSE_READY.map(pin => pin.id)]);
+        const byId = new Map(CASES.map(testCase => [testCase.id, testCase]));
         for (const testCase of CASES) {
-            if (testCase.expect === 'break') assert.ok(!passes(testCase.answer), testCase.id);
-            else assert.notStrictEqual(testCase.answer, 'BLOCKED', testCase.id);
+            if (testCase.expect === 'break') {
+                assert.ok(!passes(testCase.answer) || listed.has(testCase.id), `${testCase.id}: READY for a break that no list names`);
+            } else assert.notStrictEqual(testCase.answer, 'BLOCKED', testCase.id);
+        }
+        for (const id of listed) {
+            const testCase = byId.get(id);
+            assert.ok(testCase && testCase.expect === 'break' && passes(testCase.answer), `${id}: listed, and not a break answered READY`);
+        }
+        // A change that only deletes writes no line: a break it causes is
+        // never local.
+        for (const id of READY_LOCAL_BREAKS) {
+            assert.ok(Object.values(byId.get(id).after).some(content => content !== null), `${id}: writes no line`);
         }
         // Every language has a change that is READY and one that is a
         // break: asking for review of everything would pass the half above.
@@ -567,11 +587,13 @@ describe('fix #506: a budget keeps the symbols of a check before the lines under
     const { applyOutputBudget } = require('../core/output-budget');
     it('lists every symbol to review that fits, then what is ready, then the detail', () => {
         const names = Array.from({ length: 14 }, (_, at) => `fresh_helper_${String(at).padStart(2, '0')}`);
-        const dir = repo({ 'lib.py': 'def typed(value: int) -> int:\n    return value\n' });
+        // Each helper's new call binds a name a line the change did not
+        // write reads: the call holds the verdict (fix #511).
+        const helpers = value => 'from lib import typed\n' + names.map(name =>
+            `\n\ndef ${name}():\n    value = ${value}\n    return value\n`).join('');
+        const dir = repo({ 'lib.py': 'def typed(value: int) -> int:\n    return value\n', 'app.py': helpers('0') });
         try {
-            write(dir, 'app.py', 'from lib import typed\n' + names.map(name =>
-                `\n\ndef ${name}():\n    value = typed(1)\n    return value\n`).join('') +
-                '\n\ndef fresh_plain():\n    return 1\n');
+            write(dir, 'app.py', helpers('typed(1)') + '\n\ndef fresh_plain():\n    return 1\n');
             const result = checked(dir);
             const full = output.formatPublicText('check', result, {}, { surface: 'cli' });
             const peerText = output.formatPublicText('check', result, {}, { surface: 'mcp' });

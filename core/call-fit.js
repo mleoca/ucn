@@ -20,8 +20,9 @@
  *               callable whose return contract is read from its body or is
  *               written as the callee's own.
  *
- * Every answer is a proof or a named reason. A reason means review, never a
- * mismatch.
+ * Every answer is a proof or a named reason. A reason means an unverified
+ * call, never a mismatch: a note when the change wrote the call and its value
+ * stays on lines the change wrote (`resultReach`), review otherwise.
  */
 'use strict';
 
@@ -231,6 +232,49 @@ function isPlainDeclaration(callable) {
     return true;
 }
 
+/** The callable node a declaration's range holds, or null. */
+function ownCallableNode(index, definition) {
+    try {
+        const root = treeOf(index, definition.file)?.rootNode;
+        return root ? callableNodeOf(root, rangeOf(definition)) : null;
+    } catch (_) { return null; }
+}
+
+/**
+ * Is a declaration's callable a value of something else (a binding with or
+ * without a type, a member of an object, an argument), rather than a
+ * declaration statement of its own? Such a callable can take its result
+ * type from where it stands.
+ */
+function heldAsValue(index, definition) {
+    const callable = ownCallableNode(index, definition);
+    return !!callable && (FUNCTION_VALUE_NODES.has(callable.type) || callable.parent?.type === 'object') &&
+        !isPlainDeclaration(callable);
+}
+
+/**
+ * Is a declaration's callable held by something whose written type it must
+ * fit (`const h: Handler = (c) => ..`, a member of an object a typed binding
+ * holds, a field written with a type)? The checker holds it to that type
+ * wherever it is called from, and where it is not called at all.
+ */
+function typedByHolder(index, definition) {
+    const memo = index._opMemo?.('checkTypedByHolder', () => new Map());
+    const key = `${definition.file}\0${definition.startLine}\0${definition.name}`;
+    if (memo?.has(key)) return memo.get(key);
+    let held = false;
+    const callable = ownCallableNode(index, definition);
+    if (callable && (FUNCTION_VALUE_NODES.has(callable.type) || callable.parent?.type === 'object')) {
+        // Up through what holds the value, to the statement that holds it.
+        for (let up = callable.parent; up; up = up.parent) {
+            if (up.childForFieldName('type')) { held = true; break; }
+            if (isUnit(up) || BLOCK_NODES.has(up.type) || up.type === 'arguments') break;
+        }
+    }
+    memo?.set(key, held);
+    return held;
+}
+
 /** Is the declaration's own callable a plain declaration statement? */
 function declaredPlainly(index, definition) {
     const memo = index._opMemo?.('checkPlainDeclarations', () => new Map());
@@ -421,6 +465,12 @@ function unsettledReason(index, definition, caller, record, result, context = {}
         if (!proof) return UNSETTLED.arguments;
         if (proof === 'open') open = true;
     }
+    // A call statement whose callee declares an assertion result narrows
+    // what it is handed for the lines after it (trait
+    // `callResultFlow.narrowing.statement`): discarding its value settles
+    // nothing.
+    const asserting = callerTraits.callResultFlow?.narrowing?.statement;
+    if (site?.use === 'discarded' && asserting && definition.returnType && asserting.test(String(definition.returnType))) return UNSETTLED.result;
     // The checker reads an unannotated result again from the arguments an
     // untyped parameter received: the call's type is the argument's.
     const follows = open && !definition.returnType && traits.untypedParameters?.resultFollowsArguments === true;
@@ -459,6 +509,634 @@ function unsettledReason(index, definition, caller, record, result, context = {}
         sharedBuiltin(index, traits, written, [caller.file, definition.file]) ? null : UNSETTLED.result;
 }
 
+// ── Where a written call's value goes (fix #511) ──────────────────────────
+//
+// A call the change wrote, on lines the change wrote, is the author's own
+// line: whatever the toolchain finds wrong with it, it reports there. Such a
+// call is a note, not a verdict, unless its value reaches a line the change
+// did not write: bound to a name such a line reads, stored in a member, a
+// subscript or an outer name, narrowing a name such a line reads, or
+// returned into a result type written elsewhere.
+
+// Containers whose children are statements, and statement-level nodes.
+const BLOCK_NODES = new Set(['block', 'statement_block', 'compound_statement', 'module', 'program']);
+const UNIT_SHAPE = /(?:_statement|_declaration|_definition|_clause)$|^switch_(?:case|default)$/;
+const TRANSPARENT_NODES = new Set(['parenthesized_expression', 'await_expression', 'await']);
+// Statements that run a call and drop its value.
+const DISCARDING_NODES = new Set(['defer_statement', 'go_statement']);
+const YIELDING_NODES = new Set(['yield', 'yield_expression', 'yield_statement']);
+// A write through a member or an element: what is written is held beyond
+// the callable.
+const MEMBER_WRITE = /^(?:attribute|member_expression|subscript|subscript_expression|field_expression|index_expression|element_access_expression|member_access_expression|field_access|array_access)$/;
+// Expressions that assign to what they name, rather than declare it.
+const ASSIGNING_NODES = new Set(['assignment_expression', 'augmented_assignment_expression', 'update_expression']);
+// What declares a name in the callable that holds it, for languages where
+// assigning does not (trait `callResultFlow.assignmentDeclares: false`).
+const DECLARING_NODES = new Map([
+    ['variable_declarator', 'name'], ['function_declaration', 'name'], ['generator_function_declaration', 'name'],
+    ['class_declaration', 'name'], ['catch_clause', 'parameter'],
+]);
+const SCOPE_LISTS = new Set(['global_statement', 'nonlocal_statement']);
+const VARIABLE_LEAVES = new Set(['identifier', 'shorthand_property_identifier', 'shorthand_property_identifier_pattern', 'this']);
+// Callables written as values (not declaration statements).
+const FUNCTION_VALUE_NODES = new Set(['function_expression', 'generator_function', 'arrow_function', 'lambda',
+    'func_literal', 'closure_expression', 'lambda_expression', 'anonymous_method_expression']);
+
+const linesOf = node => [node.startPosition.row + 1, node.endPosition.row + 1];
+const writtenNode = (node, written) => {
+    const [from, to] = linesOf(node);
+    for (let line = from; line <= to; line++) if (!written.has(line)) return false;
+    return true;
+};
+const isUnit = node => UNIT_SHAPE.test(node.type) || (!!node.parent && BLOCK_NODES.has(node.parent.type));
+
+/** The innermost statement holding `node` (the node itself included). */
+function statementOf(node) {
+    for (let up = node; up; up = up.parent) if (isUnit(up)) return up;
+    return null;
+}
+
+/** The innermost callable holding `node`, or null. */
+function callableOf(node) {
+    for (let up = node.parent; up; up = up.parent) if (CALLABLE_NODES.has(up.type)) return up;
+    return null;
+}
+
+/** A member or keyword name: spelled like a variable, naming none. */
+function namesNoVariable(leaf) {
+    const parent = leaf.parent;
+    if (!parent) return false;
+    const member = parent.childForFieldName('attribute') || parent.childForFieldName('property') ||
+        parent.childForFieldName('field') || (parent.type === 'keyword_argument' ? parent.childForFieldName('name') : null);
+    return !!member && sameNode(member, leaf);
+}
+
+/**
+ * Nodes of a statement's own part: its subtree without the statements and
+ * blocks it holds (a compound statement's own part is its header).
+ */
+function ownNodes(statement, visit) {
+    const walk = node => {
+        visit(node);
+        for (const child of node.namedChildren) {
+            if (BLOCK_NODES.has(child.type) || (isUnit(child) && !sameNode(child, statement))) continue;
+            walk(child);
+        }
+    };
+    walk(statement);
+}
+
+/** Variable names an own part reads (binding positions included). */
+function namesRead(statement) {
+    const names = new Set();
+    ownNodes(statement, node => {
+        if (node.childCount === 0 && VARIABLE_LEAVES.has(node.type) && !namesNoVariable(node)) names.add(node.text);
+        else if (node.type === 'this') names.add('this');
+    });
+    return names;
+}
+
+/**
+ * The facts of one changed callable: its statements, the names it reads on
+ * each line, the names it declares and the names it scopes to an outer
+ * binding. Memoized per operation.
+ */
+function callableFacts(index, definition, own, region) {
+    const memo = index._opMemo?.('checkCallableFacts', () => new Map());
+    const key = `${definition.file}\0${definition.startLine}\0${definition.name}`;
+    if (memo?.has(key)) return memo.get(key);
+    const units = [];
+    const reads = []; // [line, name]
+    const declared = new Set();
+    const locals = new Set();
+    const outer = new Set();
+    const assignmentDeclares = !!(langTraits(index.files.get(definition.file)?.language)?.callResultFlow?.assignmentDeclares);
+    const walk = node => {
+        const [from, to] = linesOf(node);
+        if (to < region.startLine || from > region.endLine) return;
+        if (isUnit(node)) units.push(node);
+        if (node.childCount === 0) {
+            if (VARIABLE_LEAVES.has(node.type) && !namesNoVariable(node) && from >= region.startLine && from <= region.endLine) {
+                reads.push([from, node.text]);
+            }
+            return;
+        }
+        const field = DECLARING_NODES.get(node.type);
+        if (field && node.childForFieldName(field)) {
+            identifiersOf(node.childForFieldName(field), declared);
+            identifiersOf(node.childForFieldName(field), locals);
+        }
+        if (assignmentDeclares && !ASSIGNING_NODES.has(node.type)) {
+            for (const target of bindingTargets(node)) if (target.type === 'identifier') locals.add(target.text);
+        }
+        if (CALLABLE_NODES.has(node.type)) {
+            const parameters = node.childForFieldName('parameters') || node.childForFieldName('parameter');
+            if (parameters) identifiersOf(parameters, declared);
+        }
+        if (SCOPE_LISTS.has(node.type)) identifiersOf(node, outer);
+        for (const child of node.children) walk(child);
+    };
+    // A callable's own header (its name, its parameters and their
+    // defaults) is not where its body's values go; its parameters are
+    // names it declares.
+    const body = own && CALLABLE_NODES.has(own.type) ? own.childForFieldName('body') : own;
+    if (own && CALLABLE_NODES.has(own.type)) {
+        const parameters = own.childForFieldName('parameters') || own.childForFieldName('parameter');
+        if (parameters) identifiersOf(parameters, declared);
+    }
+    if (body) walk(body);
+    for (const name of outer) locals.delete(name);
+    const unitReads = new Map();
+    const readsOf = unit => {
+        if (!unitReads.has(unit.id)) unitReads.set(unit.id, [...namesRead(unit)]);
+        return unitReads.get(unit.id);
+    };
+    const facts = { units, reads, declared, locals, outer, readsOf };
+    memo?.set(key, facts);
+    return facts;
+}
+
+/**
+ * May this call narrow the names it is handed? Where the checker narrows a
+ * name through a callee's declared result (trait `callResultFlow.narrowing`:
+ * a type predicate, an assertion signature, `TypeGuard`/`TypeIs`), a callee
+ * whose result is one, a callee whose result is not written where the
+ * checker infers predicates, or a callee that is not established narrows.
+ */
+function mayNarrow(narrowing, candidates, discarded) {
+    if (!narrowing) return false;
+    const pattern = discarded ? narrowing.statement : narrowing.condition;
+    if (!pattern) return false;
+    if (candidates.length === 0) return true;
+    return candidates.some(candidate => {
+        const written = candidate.returnType ? String(candidate.returnType) : '';
+        if (written) return pattern.test(written);
+        return !discarded && narrowing.unannotatedCondition === true &&
+            (!Array.isArray(candidate.paramsStructured) || candidate.paramsStructured.length > 0);
+    });
+}
+
+/**
+ * The names a narrowing call can re-type: the references it is handed (a
+ * name, or a member chain read through one) and its receiver's root. A
+ * computed argument (a call, an operator) is a new value no later line
+ * reads.
+ */
+function narrowedNames(call) {
+    const names = new Set();
+    const rootOf = node => {
+        let root = node;
+        while (root && MEMBER_WRITE.test(root.type)) root = root.childForFieldName('object') || root.childForFieldName('value');
+        return root && (root.type === 'identifier' || root.type === 'this') ? root : null;
+    };
+    const args = call.childForFieldName('arguments');
+    for (const argument of args ? args.namedChildren : []) {
+        const value = argument.type === 'keyword_argument' ? argument.childForFieldName('value') : argument;
+        const root = value && (value.type === 'identifier' || value.type === 'this' || MEMBER_WRITE.test(value.type)) ? rootOf(value) : null;
+        if (root) names.add(root.type === 'this' ? 'this' : root.text);
+    }
+    const callee = call.childForFieldName('function');
+    const receiver = callee && callee.childForFieldName('object');
+    const root = receiver ? rootOf(receiver) : null;
+    if (root) names.add(root.type === 'this' ? 'this' : root.text);
+    return names;
+}
+
+/**
+ * Locals a statement hands a value to as the receiver of a call: a method
+ * can store what it is handed in its receiver (`xs.push(v)`), and where a
+ * local's type grows with what it holds (an array declared empty), the
+ * local is retyped. `holds(node)`: the argument list carries the value.
+ */
+function receiversHanded(statement, locals, holds) {
+    const names = new Set();
+    ownNodes(statement, node => {
+        if (!CALL_NODES.has(node.type)) return;
+        const args = node.childForFieldName('arguments');
+        const callee = node.childForFieldName('function');
+        if (!args || !callee || !holds(args)) return;
+        let root = callee.childForFieldName('object');
+        if (!root) return;
+        while (root.childForFieldName('object')) root = root.childForFieldName('object');
+        if (root.type === 'identifier' && locals.has(root.text)) names.add(root.text);
+    });
+    return names;
+}
+
+/**
+ * What a statement's own part binds, and whether it writes past the
+ * callable: `{ names, escapes }`. escapes: a member, a subscript, a name
+ * the callable scopes to an outer binding, an assignment to a name the
+ * callable does not declare (where assigning does not declare), or any
+ * binding of a declaration that is not a callable.
+ */
+function bindingsOf(statement, flow, facts, callable) {
+    const names = new Set();
+    let escapes = null;
+    ownNodes(statement, node => {
+        for (const target of bindingTargets(node)) {
+            let member = false;
+            const scan = candidate => {
+                if (MEMBER_WRITE.test(candidate.type)) member = true;
+                else for (const child of candidate.namedChildren) scan(child);
+            };
+            scan(target);
+            if (member) { escapes = escapes || 'member-write'; continue; }
+            const bound = identifiersOf(target);
+            for (const name of bound) {
+                names.add(name);
+                if (facts.outer.has(name)) escapes = escapes || 'outer-write';
+                else if (!flow.assignmentDeclares && ASSIGNING_NODES.has(node.type) && !facts.declared.has(name)) {
+                    escapes = escapes || 'outer-write';
+                }
+            }
+        }
+    });
+    if (!callable && names.size > 0) escapes = escapes || 'declaration-binding';
+    return { names, escapes };
+}
+
+/**
+ * The call node of a call record: by the call's own span where the record
+ * has one, else the innermost call whose callee holds the callee name the
+ * record names.
+ */
+function callOfRecord(index, file, record) {
+    if (Number.isInteger(record.callStart) && Number.isInteger(record.callEnd)) {
+        return callNodeAt(index, file, { start: record.callStart, end: record.callEnd });
+    }
+    const site = record.callSite;
+    if (!site || !Number.isInteger(site.start)) return null;
+    try {
+        const root = treeOf(index, file)?.rootNode;
+        let node = root ? root.descendantForIndex(site.start) : null;
+        while (node && !(node.startIndex === site.start && node.endIndex === site.end)) {
+            if (node.startIndex > site.start || node.endIndex < site.end) return null;
+            node = node.parent;
+        }
+        for (let up = node && node.parent; up; up = up.parent) {
+            if (!CALL_NODES.has(up.type)) continue;
+            const callee = up.childForFieldName('function') || up.childForFieldName('name') ||
+                up.childForFieldName('constructor') || up.childForFieldName('type');
+            if (callee && callee.startIndex <= site.start && callee.endIndex >= site.end) return up;
+        }
+    } catch (_) { /* not located */ }
+    return null;
+}
+
+// What a call does to what it is handed (trait `callEffects`).
+const LOOP_NODES = new Set(['loop_expression', 'while_expression', 'for_expression', 'while_statement', 'for_statement',
+    'for_in_statement', 'do_statement']);
+const NAME_LEAVES = new Set(['identifier', 'self', 'this', 'shorthand_property_identifier']);
+const PATH_NODES = new Set(['scoped_identifier', 'scoped_type_identifier', 'generic_type']);
+
+/**
+ * The names of a callable: where each occurs and how each is declared.
+ * `occurrences`: name -> [{ line, index }] (member names left out);
+ * `declarations`: name -> [{ index, type, value, parameter }] in source
+ * order (`type` the written type's text, `value` the initializer's node
+ * type). Memoized per operation.
+ */
+function callableNames(index, definition, callable) {
+    const memo = index._opMemo?.('checkCallableNames', () => new Map());
+    const key = `${definition.file}\0${definition.startLine}\0${definition.name}`;
+    if (memo?.has(key)) return memo.get(key);
+    const occurrences = new Map();
+    const declarations = new Map();
+    const declare = (name, entry) => {
+        if (!declarations.has(name)) declarations.set(name, []);
+        declarations.get(name).push(entry);
+    };
+    const walk = node => {
+        if (node.childCount === 0) {
+            if (NAME_LEAVES.has(node.type) && !namesNoVariable(node)) {
+                if (!occurrences.has(node.text)) occurrences.set(node.text, []);
+                occurrences.get(node.text).push({ line: node.startPosition.row + 1, index: node.startIndex });
+            }
+            return;
+        }
+        if (node.type === 'let_declaration' || node.type === 'variable_declarator') {
+            const target = node.childForFieldName('pattern') || node.childForFieldName('name');
+            const type = node.childForFieldName('type');
+            const value = node.childForFieldName('value');
+            if (target) {
+                for (const name of identifiersOf(target)) {
+                    declare(name, { index: node.startIndex, type: type ? type.text.replace(/^:\s*/, '') : null,
+                        value: value ? (value.type === 'array' && value.namedChildCount === 0 ? 'empty-array' : value.type) : null });
+                }
+            }
+        } else if (node.type === 'parameter' || node.type === 'required_parameter' || node.type === 'optional_parameter') {
+            const target = node.childForFieldName('pattern') || node.childForFieldName('name');
+            const type = node.childForFieldName('type');
+            if (target) for (const name of identifiersOf(target)) declare(name, { index: node.startIndex, type: type ? type.text.replace(/^:\s*/, '') : null, parameter: true });
+        } else if (node.type === 'self_parameter') {
+            declare('self', { index: node.startIndex, type: node.text, parameter: true });
+        }
+        for (const child of node.children) walk(child);
+    };
+    if (callable) walk(callable);
+    const names = { occurrences, declarations };
+    memo?.set(key, names);
+    return names;
+}
+
+/**
+ * Does a declaration the diff calls new keep lines the change did not
+ * write that name something (a renamed callable keeps its body)? Lines of
+ * braces, keywords and literals alone do not count: a diff aligns them
+ * with any neighbour.
+ */
+function carriesUnwrittenNames(index, definition, written) {
+    try {
+        const root = treeOf(index, definition.file)?.rootNode;
+        if (!root) return true;
+        const range = rangeOf(definition);
+        let found = false;
+        const walk = node => {
+            if (found) return;
+            const from = node.startPosition.row + 1;
+            const to = node.endPosition.row + 1;
+            if (to < range.startLine || from > range.endLine) return;
+            if (node.childCount === 0) {
+                if (node.type.includes('identifier') && from >= range.startLine && from <= range.endLine && !written.has(from)) found = true;
+                return;
+            }
+            for (const child of node.children) walk(child);
+        };
+        walk(root);
+        return found;
+    } catch (_) { return true; }
+}
+
+/** Variable names inside `node`, each with whether a borrow holds it. */
+function handedNamesOf(node, borrowNodes, borrowed = false, out = []) {
+    if (!node) return out;
+    if (node.childCount === 0) {
+        if (NAME_LEAVES.has(node.type) && !namesNoVariable(node)) out.push({ name: node.text, borrowed });
+        return out;
+    }
+    // A path names an item (`Kind::A`, `module::f`), never a local.
+    if (PATH_NODES.has(node.type)) return out;
+    // A member's name is not a variable; the chain's root is.
+    if (MEMBER_WRITE.test(node.type) || node.type === 'field_expression') {
+        const object = node.childForFieldName('object') || node.childForFieldName('value');
+        if (object) handedNamesOf(object, borrowNodes, borrowed, out);
+        const indexNode = node.childForFieldName('index');
+        if (indexNode) handedNamesOf(indexNode, borrowNodes, borrowed, out);
+        return out;
+    }
+    const inner = borrowed || borrowNodes.includes(node.type);
+    for (const child of node.namedChildren) handedNamesOf(child, borrowNodes, inner, out);
+    return out;
+}
+
+/**
+ * What a call the change wrote does to what it is handed, or to the code
+ * that holds it, that reaches a line the change did not write (trait
+ * `callEffects`; a callable instantiated per caller, trait
+ * `inferredReturnForms` 'instantiated'). Null when nothing modeled does.
+ */
+function callEffectsReach(index, definition, call, context) {
+    const { traits, written, candidates, callable } = context;
+    // A call into a template instantiates its body for these arguments:
+    // what does not fit is reported in the body, where the change did not
+    // write.
+    if ((traits.inferredReturnForms || []).includes('instantiated') &&
+        (candidates.length === 0 || candidates.some(candidate => candidate.templateDependent || candidate.templateParams))) {
+        return 'callee-instantiated';
+    }
+    const effects = traits.callEffects;
+    if (!effects || !callable) return null;
+    const names = callableNames(index, definition, callable);
+    const unwrittenOccurrence = (name, keep = () => true) => (names.occurrences.get(name) || [])
+        .some(at => !written.has(at.line) && keep(at));
+    const declarationOf = name => {
+        const all = names.declarations.get(name) || [];
+        const before = all.filter(entry => entry.index < call.startIndex);
+        return before.length ? before[before.length - 1] : all[0] || null;
+    };
+    const args = call.childForFieldName('arguments');
+    const callee = call.childForFieldName('function');
+    const receiver = callee && (callee.childForFieldName('object') || (callee.type === 'field_expression' ? callee.childForFieldName('value') : null));
+    if (effects.argumentDeclarations && args) {
+        for (const kind of effects.argumentDeclarations) {
+            for (const declared of args.descendantsOfType(kind)) {
+                const name = declared.childForFieldName('name');
+                if (name && unwrittenOccurrence(name.text)) return 'declares-a-name';
+            }
+        }
+    }
+    if (effects.evolvingLocals) {
+        const handed = [...handedNamesOf(args, []), ...handedNamesOf(receiver, [])];
+        for (const { name } of handed) {
+            const declaration = declarationOf(name);
+            if (declaration && !declaration.parameter && !declaration.type &&
+                (declaration.value == null || declaration.value === 'empty-array') && unwrittenOccurrence(name)) {
+                return 'evolving-local-handed';
+            }
+        }
+    }
+    const values = effects.handedValues;
+    if (values) {
+        // A method's receiver goes by value unless every declaration the
+        // call may bind borrows it.
+        const receiverBorrowed = candidates.length > 0 && candidates.every(candidate =>
+            /^&/.test(String(candidate.paramsStructured?.[0]?.name || '')));
+        const handed = [...handedNamesOf(args, values.borrowNodes),
+            ...handedNamesOf(receiver, values.borrowNodes, receiverBorrowed)];
+        // Code in a loop around the call runs again after it.
+        let loop = null;
+        for (let up = call.parent; up && !sameNode(up, callable); up = up.parent) if (LOOP_NODES.has(up.type)) loop = up;
+        const afterCall = at => at.index >= call.endIndex || (!!loop && at.index >= loop.startIndex && at.index < loop.endIndex);
+        for (const { name, borrowed } of handed) {
+            // A name bound by a pattern (`for`, `if let`, a `match` arm, a
+            // closure parameter) or outside the callable has no type the
+            // engine reads: as a local with no written type.
+            const declaration = declarationOf(name) || { type: null, value: null };
+            const type = declaration.type ? declaration.type.replace(/\s+/g, ' ').trim() : null;
+            const fixed = !!type || (declaration.value != null && values.fixedInitializers.includes(declaration.value));
+            // The type is taken from the uses: this call can fix it.
+            if (!fixed && unwrittenOccurrence(name)) return 'handed-value-retyped';
+            const copies = !!type && (values.copyTypes.includes(type) || (/^&/.test(type) && !/^&\s*mut\b/.test(type)));
+            // Moved: a later use is a use after the move.
+            if (!borrowed && !copies && unwrittenOccurrence(name, afterCall)) return 'handed-value-moved';
+        }
+    }
+    return null;
+}
+
+/**
+ * Where a changed call's value goes, as far as the lines the change wrote.
+ *
+ * @param {object} index
+ * @param {object} definition - the changed declaration holding the call
+ * @param {object} record - the call record (its span locates the call)
+ * @param {object} context - { added: the declaration is new, written: Set
+ *   of the file's lines the change wrote, candidates: the declarations the
+ *   call may bind }
+ * @returns {string|null} null: nothing the call produces reaches a line the
+ *   change did not write (a note); otherwise why it does
+ */
+function resultReach(index, definition, record, context) {
+    const written = context.written || new Set();
+    const call = callOfRecord(index, definition.file, record);
+    if (!call) return 'call-not-located';
+    const first = statementOf(call);
+    if (!first || !writtenNode(first, written)) return 'unwritten-line';
+    const traits = langTraits(index.files.get(definition.file)?.language) || {};
+    // Where nothing checks a call before it runs (trait `lenientCallArity`),
+    // what is wrong with it surfaces wherever the callee fails, not on the
+    // line that wrote it.
+    if (traits.lenientCallArity) return 'calls-not-checked';
+    // Text the change removed from the declaration (a replaced line, a
+    // deleted one) could have supplied what an unwritten line relies on: a
+    // use, an assignment, a narrowing, a thrown exception. Its calls are
+    // not notes.
+    if (context.replaced) return 'lines-replaced';
+    const range = rangeOf(definition);
+    const root = treeOf(index, definition.file)?.rootNode;
+    const callable = Array.isArray(definition.paramsStructured) && root ? callableNodeOf(root, range) : null;
+    const candidates = context.candidates || [];
+    const effect = callEffectsReach(index, definition, call, { traits, written, candidates, callable });
+    if (effect) return effect;
+    const flow = traits.callResultFlow || null;
+    // Every line of a new declaration is the change's: its own reasons
+    // (capture, novelty) say what can reach it. Where a member's type, and a
+    // module name's, is whatever the code assigns to it (trait
+    // `memberTypesFromAssignments`), a store the new code makes is read
+    // where the change did not write.
+    const added = !!context.added;
+    if (added && !(flow && traits.memberTypesFromAssignments)) return null;
+    const ownResult = node => {
+        const holder = callableOf(node);
+        return !!callable && !!holder && sameNode(holder, callable);
+    };
+
+    // The value is the changed callable's result: a result type read from
+    // the body is the callable's contract (its own reason decides the
+    // item), a written one is checked on the written `return` line.
+    const returned = () => {
+        if (added) return null;
+        if (!callable) return 'result-slot-elsewhere';
+        // A function written as a value (of a typed binding, a member of an
+        // object, an argument) takes its result type from where it stands.
+        if (heldAsValue(index, definition)) return 'result-slot-elsewhere';
+        // A member that may fill an inherited slot is held to the slot's
+        // type, written where the change did not write: a member of an
+        // owner with a written supertype, or of any owner where the slots a
+        // member fills are not declared by its owner (Go methods satisfy
+        // interfaces implicitly; Rust trait members stand in impl blocks).
+        if (definition.className && (!traits.memberFillsSupertypeSlots || !plainOwner(index, definition))) return 'inherited-slot';
+        return null;
+    };
+    const yieldsOwn = node => node.descendantsOfType([...YIELDING_NODES]).some(ownResult);
+    // The last expression of a body that ends in its value (trait
+    // `pathEnds.blockValues`) is the callable's result.
+    const tailOf = (value, parent) => traits.pathEnds?.blockValues === true && parent.type === 'block' &&
+        sameNode(parent.lastNamedChild, value) && parent.lastChild?.type !== ';';
+
+    // Follow the value to the statement that receives it.
+    let value = call;
+    let statement;
+    let discarded = false;
+    for (;;) {
+        while (value.parent && TRANSPARENT_NODES.has(value.parent.type)) value = value.parent;
+        const parent = value.parent;
+        if (!parent) return 'value-unread';
+        if ((parent.type === 'expression_statement' && parent.namedChildCount === 1) || DISCARDING_NODES.has(parent.type)) {
+            statement = parent;
+            discarded = true;
+            break;
+        }
+        // An expression body, or a body's last value, is its callable's
+        // result.
+        const body = CALLABLE_NODES.has(parent.type) && sameNode(parent.childForFieldName('body'), value) ? parent
+            : tailOf(value, parent) && CALLABLE_NODES.has(parent.parent?.type) &&
+                sameNode(parent.parent.childForFieldName('body'), parent) ? parent.parent : null;
+        if (body) {
+            if (callable && sameNode(body, callable)) {
+                if (!writtenNode(value, written)) return 'unwritten-line';
+                return returned();
+            }
+            if (!FUNCTION_VALUE_NODES.has(body.type)) return 'nested-result';
+            value = body;
+            continue;
+        }
+        statement = statementOf(value);
+        if (!statement) return 'value-unread';
+        if (!writtenNode(statement, written)) return 'unwritten-line';
+        if (RESULT_NODES.has(statement.type)) {
+            if (ownResult(statement)) return returned();
+            // Returned from a function value nested in the change: the
+            // value is that function's.
+            const holder = callableOf(statement);
+            if (holder && FUNCTION_VALUE_NODES.has(holder.type) && callable &&
+                holder.startIndex >= callable.startIndex && holder.endIndex <= callable.endIndex) {
+                value = holder;
+                continue;
+            }
+            return 'nested-result';
+        }
+        break;
+    }
+
+    // What the value reaches from that statement on.
+    const taint = new Set();
+    if (mayNarrow(flow?.narrowing || null, candidates, discarded)) for (const name of narrowedNames(call)) taint.add(name);
+    if (discarded && flow) {
+        // A call statement can still bind a name in its arguments.
+        const facts = callableFacts(index, definition, callable || root, range);
+        const own = bindingsOf(statement, flow, facts, callable);
+        if (own.escapes && !(added && own.escapes === 'declaration-binding')) return own.escapes;
+        for (const name of own.names) taint.add(name);
+    }
+    if (!discarded) {
+        if (!flow) return 'binding-facts-unread';
+        const facts = callableFacts(index, definition, callable || root, range);
+        const own = bindingsOf(statement, flow, facts, callable);
+        if (own.escapes && !(added && own.escapes === 'declaration-binding')) return own.escapes;
+        for (const name of own.names) taint.add(name);
+        const carrier = value;
+        if (flow.receiversRetyped) for (const name of receiversHanded(statement, facts.locals,
+            args => args.startIndex <= carrier.startIndex && args.endIndex >= carrier.endIndex)) taint.add(name);
+        // A value a generator yields is part of its result in a way this
+        // reading does not follow.
+        if (yieldsOwn(statement) && !added) return 'yielded';
+    }
+    if (taint.size === 0) return null;
+    if (!flow) return 'binding-facts-unread';
+    const facts = callableFacts(index, definition, callable || root, range);
+    // Statements the value flows through: each one that reads it passes
+    // it on to what it binds, to what it stores, to what it returns.
+    const done = new Set([statement.id]);
+    for (let grew = true; grew;) {
+        grew = false;
+        for (const unit of facts.units) {
+            if (done.has(unit.id)) continue;
+            if (!facts.readsOf(unit).some(name => taint.has(name))) continue;
+            done.add(unit.id);
+            let header = true;
+            ownNodes(unit, node => { if (node.childCount === 0 && !written.has(node.startPosition.row + 1)) header = false; });
+            if (!header) return 'read-on-unwritten-line';
+            const own = bindingsOf(unit, flow, facts, callable);
+            if (own.escapes && !(added && own.escapes === 'declaration-binding')) return own.escapes;
+            if (yieldsOwn(unit) && !added) return 'yielded';
+            if (RESULT_NODES.has(unit.type)) {
+                if (!ownResult(unit)) return added ? null : 'nested-result';
+                const verdict = returned();
+                if (verdict) return verdict;
+            }
+            const handed = flow.receiversRetyped
+                ? receiversHanded(unit, facts.locals, args => [...identifiersOf(args)].some(name => taint.has(name))) : [];
+            for (const name of [...own.names, ...handed]) if (!taint.has(name)) { taint.add(name); grew = true; }
+        }
+    }
+    for (const [line, name] of facts.reads) {
+        if (taint.has(name) && !written.has(line)) return 'read-on-unwritten-line';
+    }
+    return null;
+}
+
 /** The identifier a call record's callee span names, or null. */
 function calleeIdentifierAt(index, file, callSite) {
     if (!callSite || callSite.start == null) return null;
@@ -471,4 +1149,4 @@ function calleeIdentifierAt(index, file, callSite) {
     }
 }
 
-module.exports = { unsettledReason, UNSETTLED, plainOwner, calleeIdentifierAt };
+module.exports = { unsettledReason, UNSETTLED, plainOwner, calleeIdentifierAt, resultReach, typedByHolder, carriesUnwrittenNames };

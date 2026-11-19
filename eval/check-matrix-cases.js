@@ -11,9 +11,10 @@
  *
  * Two consumers share this data:
  *   - eval/run-check-matrix.js judges every case with its compiler and
- *     fails on READY for a change the compiler rejects (false-ready), on
- *     BLOCKED for a change it accepts (a break that was not one), and on a
- *     staged answer that differs from the worktree's;
+ *     fails on READY for a change the compiler rejects on a line the
+ *     change did not write (false-ready, eval/check-scoring.js), on BLOCKED
+ *     for a change it accepts (a break that was not one), and on a staged
+ *     answer that differs from the worktree's;
  *   - test/check-change-kinds.test.js pins the check's answer on every
  *     case, with no toolchain needed.
  *
@@ -213,12 +214,12 @@ const CASES = [
         after: { 'main.ts': L('class Box {', '    #helper(): number { return 2; }', '    size(): number { return 1; }', '}', 'export const box: Box = { size: () => 1 };') } },
     // A static member is not a member of the values: the literal still fits.
     { id: 'ts-class-static-method-added', lang: 'ts', expect: 'clean', answer: 'REVIEW_REQUIRED',
-        detail: 'create:added=review(shape-of-existing-type,outgoing-call-unverified)',
+        detail: 'create:added=review(shape-of-existing-type)',
         base: { 'main.ts': L('class Box {', '    size(): number { return 1; }', '}', 'export const box: Box = { size: () => 1 };') },
         after: { 'main.ts': L('class Box {', '    static create(): Box { return new Box(); }', '    size(): number { return 1; }', '}', 'export const box: Box = { size: () => 1 };') } },
     // The constructor is compared by shape too.
     { id: 'ts-class-static-method-added-constructor-assigned', lang: 'ts', expect: 'break', answer: 'REVIEW_REQUIRED',
-        detail: 'create:added=review(shape-of-existing-type,outgoing-call-unverified)',
+        detail: 'create:added=review(shape-of-existing-type)',
         base: { 'main.ts': L('class Box {', '    size(): number { return 1; }', '}', 'class Other {', '    size(): number { return 2; }', '}', 'export const ctor: typeof Box = Other;') },
         after: { 'main.ts': L('class Box {', '    static create(): Box { return new Box(); }', '    size(): number { return 1; }', '}', 'class Other {', '    size(): number { return 2; }', '}', 'export const ctor: typeof Box = Other;') } },
     // An optional member is owed by nothing.
@@ -437,7 +438,7 @@ const CASES = [
         base: { 'main.ts': L('class Box {', '    private count = 0;', '    size(): number { return this.count; }', '}', 'export const labels: Record<keyof Box, string> = { size: "size" };') },
         after: { 'main.ts': L('class Box {', '    private count = 0;', '    protected helper(): number { return 2; }', '    size(): number { return this.count; }', '}', 'export const labels: Record<keyof Box, string> = { size: "size" };') } },
     { id: 'ts-class-own-private-new-static-member', lang: 'ts', expect: 'break', answer: 'REVIEW_REQUIRED',
-        detail: 'create:added=review(shape-of-existing-type,outgoing-call-unverified)',
+        detail: 'create:added=review(shape-of-existing-type)',
         base: { 'main.ts': L('class Box {', '    private count = 0;', '    size(): number { return this.count; }', '}', 'export const labels: Record<keyof typeof Box, string> = { prototype: "p" };') },
         after: { 'main.ts': L('class Box {', '    private count = 0;', '    static create(): Box { return new Box(); }', '    size(): number { return this.count; }', '}', 'export const labels: Record<keyof typeof Box, string> = { prototype: "p" };') } },
     // A private constructor says who may call it, not what a value has.
@@ -1896,5 +1897,6 @@ CASES.push(...require('./check-path-end-cases'));
 CASES.push(...require('./check-call-shape-cases'));
 CASES.push(...require('./check-binding-return-cases'));
 CASES.push(...require('./check-receiver-parameter-cases'));
+CASES.push(...require('./check-written-line-cases'));
 
 module.exports = { CASES };

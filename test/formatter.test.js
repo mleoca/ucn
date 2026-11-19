@@ -124,6 +124,29 @@ describe('fix #504: usable test selectors and qualified empty audit results', ()
         assert.doesNotMatch(all, /outgoing call\(s\) not verified/);
         assert.strictEqual(output.formatCheck(result, { allHint: 'use --all' }), text, 'the same answer twice');
     });
+
+    it('fix #511: a READY item counts its noted calls, and a row says when it is a note', () => {
+        const { outgoingSummary } = require('../core/output/check');
+        const notes = [
+            { file: 'app.py', line: 5, column: 4, name: 'scale', reason: 'argument-compatibility-unverified', role: 'note' },
+            { file: 'app.py', line: 6, column: 4, name: 'add', reason: 'result-use-unverified', role: 'note' },
+        ];
+        const ready = { base: 'HEAD', changed: [{ name: 'run', file: 'app.py', line: 2, kind: 'modified', verdict: 'ready',
+            reasons: [], outgoingReview: notes, outgoingCalls: outgoingSummary(notes) }] };
+        assert.deepStrictEqual(ready.changed[0].outgoingCalls.notes, 2);
+        const text = output.formatCheck(ready, { allHint: 'use --all' });
+        assert.match(text, /^READY \(1\)/m);
+        assert.match(text, /^ {4}↳ 2 outgoing call\(s\) not verified \(argument-compatibility-unverified 1, result-use-unverified 1\): written by this change, the toolchain decides them; use --all to list each$/m);
+        const all = output.formatCheck(ready, { all: true });
+        assert.match(all, /app\.py:5:5 {2}scale: argument-compatibility-unverified {2}\(note\)$/m);
+        // A row with no role holds the verdict, as one marked so.
+        const held = [...notes, { file: 'app.py', line: 7, column: 4, name: 'grow', reason: 'uncertain-receiver', role: 'verdict', reach: 'read-on-unwritten-line' }];
+        const review = { base: 'HEAD', changed: [{ name: 'run', file: 'app.py', line: 2, kind: 'modified', verdict: 'review',
+            reasons: ['outgoing-call-unverified'], outgoingReview: held, outgoingCalls: outgoingSummary(held) }] };
+        assert.match(output.formatCheck(review, {}), /3 outgoing call\(s\) not verified \(argument-compatibility-unverified 1, result-use-unverified 1, uncertain-receiver 1\); 1 reach lines the change did not write/);
+        assert.match(output.formatCheck(review, { all: true }), /app\.py:7:5 {2}grow: uncertain-receiver$/m);
+        assert.deepStrictEqual(outgoingSummary(held.map(row => ({ ...row, role: undefined }))).notes, 0);
+    });
 });
 
 // ============================================================================
