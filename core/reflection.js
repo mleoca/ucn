@@ -35,10 +35,15 @@
 
 const { langTraits, detectLanguage } = require('../languages');
 const { sameNode } = require('../languages/utils');
-const { pythonPossibleIdentities, pythonSourceName, pythonPatchApi, pythonPatchSpelling,
-    pythonPossibleValues } = require('./python-binding-identity');
+const { pythonPossibleIdentities, pythonResolvedOrigins, pythonSourceName, pythonPatchApi, pythonPatchSpelling, pythonPatchOwner,
+    pythonPossibleValues, pythonContainerNodes, pythonDecoratorsInert } = require('./python-binding-identity');
 
 const WILD = '\u0000*';
+// A parameter of the callable that holds a patch call: its value is what the
+// callable's callers pass (resolved when the project is asked, fix #512).
+const PARAM = '\u0001';
+// Values a patch target or member may hold before the set counts as open.
+const MAX_PATCH_ALTERNATIVES = 256;
 const MODULE_RECEIVER = Object.freeze({ kind: 'module' });
 const CALL_NODE_TYPES = ['call', 'call_expression', 'invocation_expression', 'method_invocation'];
 // Computed-member keys that build a name in place (`'on' + evt`, `\`h${t}\``).
@@ -85,12 +90,12 @@ const THIS_REBINDING_FUNCTIONS = new Set([
 // String patterns
 // ---------------------------------------------------------------------------
 
-function _concat(a, b) {
+function _concat(a, b, cap = MAX_ALTERNATIVES) {
     const out = [];
     for (const x of a) {
         for (const y of b) {
             out.push([...x, ...y]);
-            if (out.length > MAX_ALTERNATIVES) return [[WILD]];
+            if (out.length > cap) return [[WILD]];
         }
     }
     return out;
@@ -146,7 +151,7 @@ function _stringLiteral(node, ctx, depth = 0) {
             const plain = ctx?.interpolations && child.namedChildCount === 1 &&
                 !child.children.some(part => !part.isNamed && part.type === '=');
             const value = plain ? stringAlternatives(child.namedChild(0), ctx, depth + 1) : null;
-            if (value) { alternatives = _concat(alternatives, value); sawPiece = true; } else append(WILD);
+            if (value) { alternatives = _concat(alternatives, value, ctx?.maxAlternatives); sawPiece = true; } else append(WILD);
         } else if (child.type === 'escape_sequence') {
             // An escaped character never spells an identifier fragment.
             append('\\');
@@ -183,7 +188,7 @@ function stringAlternatives(node, ctx, depth = 0) {
             let acc = [[]];
             for (const child of node.namedChildren) {
                 const part = stringAlternatives(child, ctx, depth + 1) || [[WILD]];
-                acc = _concat(acc, part);
+                acc = _concat(acc, part, ctx?.maxAlternatives);
             }
             return acc;
         }
@@ -197,7 +202,7 @@ function stringAlternatives(node, ctx, depth = 0) {
                 const l = stringAlternatives(left, ctx, depth + 1);
                 const r = stringAlternatives(right, ctx, depth + 1);
                 if (!l && !r) return null;
-                return _concat(l || [[WILD]], r || [[WILD]]);
+                return _concat(l || [[WILD]], r || [[WILD]], ctx?.maxAlternatives);
             }
             if (op === '%') {
                 // Python printf-style formatting: only a string left operand.
@@ -224,6 +229,23 @@ function stringAlternatives(node, ctx, depth = 0) {
                 }
                 return null;
             }
+            // Containers the patch reader closes (`ctx.containers`):
+            // `".".join([..])` of a literal sequence, `d.get(key)` of a
+            // literal dictionary.
+            if (ctx.containers && fn?.type === 'attribute') {
+                const member = fn.childForFieldName('attribute')?.text;
+                const owner = fn.childForFieldName('object');
+                if (member === 'join' && args.length === 1 && args[0].type !== 'keyword_argument') {
+                    const separator = stringAlternatives(owner, ctx, depth + 1);
+                    return separator ? _joined(separator, args[0], ctx, depth) : null;
+                }
+                if (member === 'get' && args.length >= 1 && args.length <= 2 &&
+                    !args.some(arg => arg.type === 'keyword_argument')) {
+                    const read = pythonContainerNodes(owner, ctx.memo);
+                    if (read.open) return null;
+                    return _lookedUp(read.nodes, args[0], args[1] || null, ctx, depth);
+                }
+            }
             // Formatting functions from the language vocabulary
             // (fmt.Sprintf, String.format, string.Format).
             let calleeText;
@@ -241,17 +263,27 @@ function stringAlternatives(node, ctx, depth = 0) {
             }
             return null;
         }
+        case 'subscript': {
+            // `d[key]`, `seq[i]` of a container the patch reader closes.
+            if (!ctx.containers) return null;
+            const read = pythonContainerNodes(node.childForFieldName('value'), ctx.memo);
+            const keys = node.childrenForFieldName?.('subscript') || [node.childForFieldName('subscript')];
+            if (read.open || keys.length !== 1 || !keys[0]) return null;
+            return _lookedUp(read.nodes, keys[0], null, ctx, depth);
+        }
         case 'identifier': {
             if (!ctx.resolve || (ctx.resolveDepth || 0) >= MAX_RESOLVE_DEPTH) return null;
             const values = ctx.resolve(node);
-            if (!values || values.length === 0) return null;
+            // A parameter of the enclosing callable is decided by its
+            // callers when the project is asked (`ctx.parameter`).
+            if (!values || values.length === 0) return ctx.parameter?.(node) ? [[PARAM]] : null;
             let out = [];
             for (const value of values) {
                 const alt = stringAlternatives(value,
                     { ...ctx, resolveDepth: (ctx.resolveDepth || 0) + 1 }, depth + 1);
                 if (!alt) return null; // one non-string binding: unknown
                 out.push(...alt);
-                if (out.length > MAX_ALTERNATIVES) return [[WILD]];
+                if (out.length > (ctx.maxAlternatives || MAX_ALTERNATIVES)) return [[WILD]];
             }
             return out;
         }
@@ -345,6 +377,489 @@ function _runtimeTarget(alternative, dottedOnly) {
 }
 
 /**
+ * The glob of a patch target whose member part is not known (fix #512), or
+ * null. The literal part of the path still bounds it: `pkg.core.*` reaches
+ * every declaration of `pkg.core`. With no path segment left (`*`, `*.*`)
+ * the target can be any attribute of any module; that is answered `*` only
+ * for a callee the file's bindings show to be a patch API (`reading`
+ * 'proven'). A callee known only by the member it is written with
+ * ('spelled') keeps the bounded glob; one that is a patch API only because
+ * its origin could not be followed ('possible') names nothing it cannot
+ * spell.
+ */
+function _openTarget(alternative, reading) {
+    if (reading === 'possible' || !alternative.includes(WILD)) return null;
+    const pieces = [];
+    for (const piece of alternative) {
+        if (piece === WILD) {
+            if (pieces[pieces.length - 1] !== WILD) pieces.push(WILD);
+        } else if (piece.length > 0) {
+            if (pieces.length > 0 && pieces[pieces.length - 1] !== WILD) pieces[pieces.length - 1] += piece;
+            else pieces.push(piece);
+        }
+    }
+    const literals = pieces.filter(piece => piece !== WILD);
+    if (literals.some(piece => !DOTTED_FRAGMENT.test(piece))) return null;
+    const glob = pieces.map(piece => (piece === WILD ? '*' : piece)).join('');
+    const anchored = glob.split(/[.*]+/).some(segment => _specific([segment]));
+    if (anchored) return glob;
+    return reading === 'proven' ? '*' : null;
+}
+
+/** Can an alternative be a member name this reader does not know? */
+function _unknownMember(alternatives) {
+    return alternatives.some(alternative => {
+        const pieces = _normalize(alternative);
+        return !!pieces && pieces.includes(WILD) && !_specific(pieces);
+    });
+}
+
+/** Non-string literals: a value of one of these names no attribute. */
+const NON_STRING_VALUES = new Set(['integer', 'float', 'true', 'false', 'none', 'null', 'undefined', 'number',
+    'list', 'dictionary', 'tuple', 'set', 'array', 'object']);
+
+function _valueAlternatives(node, ctx, depth = 0) {
+    const value = _unwrap(node);
+    if (value && NON_STRING_VALUES.has(value.type)) return [];
+    return stringAlternatives(value, ctx, depth) || [[WILD]];
+}
+
+/** `sep.join(seq)` of a literal list or tuple the patch reader closes. */
+function _joined(separator, sequenceNode, ctx, depth) {
+    const read = pythonContainerNodes(sequenceNode, ctx.memo);
+    if (read.open) return null;
+    const cap = ctx.maxAlternatives || MAX_ALTERNATIVES;
+    const out = [];
+    for (const container of read.nodes) {
+        // A set has no order to join in.
+        if (!['list', 'tuple'].includes(container.type)) return null;
+        let joined = [[]];
+        const items = container.namedChildren.filter(child => child.type !== 'comment');
+        for (let position = 0; position < items.length; position++) {
+            if (items[position].type === 'list_splat') return null;
+            if (position > 0) joined = _concat(joined, separator, cap);
+            joined = _concat(joined, stringAlternatives(items[position], ctx, depth + 1) || [[WILD]], cap);
+        }
+        out.push(...joined);
+        if (out.length > cap) return [[WILD]];
+    }
+    return out;
+}
+
+/**
+ * `d[key]`, `seq[i]` or `d.get(key, fallback)` of literal containers: the
+ * entry a literal key selects, every entry for any other key, the fallback
+ * where the key may be absent. A `**spread` makes the keys unknown.
+ */
+function _lookedUp(containers, keyNode, fallbackNode, ctx, depth) {
+    const { pythonStringLiteral } = require('./runtime-entrypoints');
+    const literalKey = node => {
+        const key = _unwrap(node);
+        if (!key) return undefined;
+        if (key.type === 'integer') return Number.isSafeInteger(Number(key.text)) ? Number(key.text) : undefined;
+        if (key.type === 'unary_operator' && /^-\s*\d+$/.test(key.text)) return Number(key.text.replace(/\s+/g, ''));
+        if (STRING_NODES.has(key.type)) return pythonStringLiteral(key) ?? undefined;
+        return undefined;
+    };
+    if (_unwrap(keyNode)?.type === 'slice') return null;
+    const wanted = literalKey(keyNode);
+    const values = [];
+    let missing = wanted === undefined;
+    for (const container of containers) {
+        if (container.type === 'dictionary') {
+            let found = false;
+            for (const pair of container.namedChildren) {
+                if (pair.type === 'comment') continue;
+                if (pair.type !== 'pair') return null;
+                const key = literalKey(pair.childForFieldName('key'));
+                if (wanted !== undefined && key !== undefined && key !== wanted) continue;
+                values.push(pair.childForFieldName('value'));
+                if (key === wanted) found = true;
+            }
+            if (!found) missing = true;
+        } else if (['list', 'tuple'].includes(container.type)) {
+            const items = container.namedChildren.filter(child => child.type !== 'comment');
+            if (items.some(item => item.type === 'list_splat')) return null;
+            if (typeof wanted === 'number') {
+                const item = items[wanted < 0 ? items.length + wanted : wanted];
+                if (item) values.push(item); else missing = true;
+            } else if (wanted === undefined) values.push(...items);
+        } else return null;
+    }
+    if (missing && fallbackNode) values.push(fallbackNode);
+    const cap = ctx.maxAlternatives || MAX_ALTERNATIVES;
+    const out = [];
+    for (const value of values) {
+        out.push(..._valueAlternatives(value, ctx, depth + 1));
+        if (out.length > cap) return [[WILD]];
+    }
+    return out;
+}
+
+/**
+ * Sites of a patch call that names its attribute by a dotted path, from the
+ * alternatives of the path: exact or globbed targets, and an open target
+ * (`_openTarget`) for an alternative whose member is not known. `dottedOnly`:
+ * a literal path counts only when written as one.
+ */
+function _targetSites(alternatives, dottedOnly, reading) {
+    const out = [];
+    const seen = new Set();
+    for (const alternative of alternatives) {
+        const target = _runtimeTarget(alternative, dottedOnly);
+        if (target) {
+            if (seen.has(target.runtimeTarget)) continue;
+            seen.add(target.runtimeTarget);
+            out.push({ kind: 'runtime-target', ...(target.name && { name: target.name }),
+                patterns: target.patterns, dynamic: false, runtimeTarget: target.runtimeTarget });
+            continue;
+        }
+        const open = _openTarget(alternative, reading);
+        if (!open || seen.has(open)) continue;
+        seen.add(open);
+        out.push({ kind: 'runtime-target', patterns: ['*'], dynamic: true, open: true, runtimeTarget: open });
+    }
+    return out;
+}
+
+/**
+ * Sites of a patch call that names its attribute by an owner object and a
+ * member name. An owner the file proves (`owner`, pythonPatchOwner; the
+ * class of a `self` receiver) holds only its own members, so the site
+ * reaches no namesake elsewhere (fix #512); a member that is not known then
+ * reaches every member that owner holds. With no owner, a named member
+ * withholds every declaration of that name, and an unknown one every
+ * declaration, only for a callee the file's bindings show to be a patch
+ * API (`reading`, see _openTarget).
+ */
+function _memberSites(alternatives, receiver, reading, owner = null) {
+    const member = _classifyAlternatives(alternatives);
+    const held = owner || (receiver?.kind === 'self' ? { receiver: true } : null);
+    const out = [];
+    if (member.name || member.patterns) {
+        out.push({ kind: 'runtime-member', ...(member.name && { name: member.name }),
+            patterns: member.patterns || [member.name], dynamic: false,
+            ...(receiver && { receiver }), ...(held && { owner: held }) });
+    }
+    if (reading !== 'possible' && _unknownMember(alternatives)) {
+        if (held) out.push({ kind: 'runtime-member', patterns: ['*'], dynamic: true, open: true, ...(receiver && { receiver }), owner: held });
+        else if (reading === 'proven') out.push({ kind: 'runtime-member', patterns: ['*'], dynamic: true, open: true });
+    }
+    return out;
+}
+
+/** The pieces of `template` with each PARAM piece replaced by `value`. */
+function _substitute(template, value) {
+    const out = [];
+    for (const piece of template) {
+        if (piece === PARAM) out.push(...value);
+        else out.push(piece);
+    }
+    return out;
+}
+
+/**
+ * The value reader of a patch call (fix #512): names read as the language
+ * reads them, containers closed where the file never changes them, a
+ * parameter of the enclosing callable left as PARAM for its callers.
+ */
+function _patchValueCtx(language, memo, slot) {
+    const api = langTraits(language)?.reflectionApi || {};
+    const ctx = { formatCalls: api.formatCalls || null, language, maxAlternatives: MAX_PATCH_ALTERNATIVES };
+    if (api.pythonBindingIdentity) {
+        Object.assign(ctx, { resolve: identifier => pythonPossibleValues(identifier, memo), interpolations: true,
+            containers: true, memo });
+    } else {
+        const resolve = makeResolver();
+        ctx.resolve = identifier => resolve(identifier) || _eachTableValues(identifier, api.eachRunners);
+    }
+    if (slot) ctx.parameter = identifier => _patchParameter(identifier, language, slot, memo);
+    return ctx;
+}
+
+/**
+ * The values a runner's table gives a parameter of the callback it runs
+ * (`test.each(table)(title, fn)`, `it.each`, `describe.each`; the runners
+ * are the trait's `reflectionApi.eachRunners`): a row that is
+ * an array literal spreads into the parameters, another row is the first
+ * one (fix #512, the JS form of a parametrize mark). Null when the callback
+ * is no such one or the table is not a literal array of literal rows.
+ */
+function _eachTableValues(ident, runners) {
+    const fn = runners ? _parameterCallable(ident) : null;
+    if (!fn || !['arrow_function', 'function_expression', 'function'].includes(fn.type)) return null;
+    const position = (_parameterNames(fn) || []).indexOf(ident.text);
+    const call = fn.parent?.type === 'arguments' ? fn.parent.parent : null;
+    const each = call?.type === 'call_expression' ? call.childForFieldName('function') : null;
+    const runner = each?.type === 'call_expression' ? each.childForFieldName('function') : null;
+    if (position < 0 || runner?.type !== 'member_expression' || runner.childForFieldName('property')?.text !== 'each' ||
+        !runners.test(_calleeName(runner.childForFieldName('object')))) return null;
+    if (each.childForFieldName('arguments')?.type !== 'arguments') return null;
+    const table = _unwrap((_callArgs(each) || [])[0]);
+    if (table?.type !== 'array') return null;
+    const values = [];
+    for (const row of table.namedChildren) {
+        if (row.type === 'comment') continue;
+        if (row.type === 'spread_element') return null;
+        if (row.type === 'array') {
+            const cells = row.namedChildren.filter(child => child.type !== 'comment');
+            if (cells.some(cell => cell.type === 'spread_element')) return null;
+            if (cells[position]) values.push(cells[position]);
+        } else if (position === 0) values.push(row);
+    }
+    return values;
+}
+
+/**
+ * Is `ident` a parameter whose value the callers of its callable decide? It
+ * is recorded in `slot` (one parameter per site; another one reads as
+ * unknown). A Python callable a runner or a framework invokes (a `test*`
+ * function, one with a decorator that may register it) is filled by them,
+ * so its parameter stays unknown.
+ */
+function _patchParameter(ident, language, slot, memo) {
+    const key = _keyParameter(ident, language);
+    const fn = key ? _parameterCallable(ident) : null;
+    if (!fn) return false;
+    const api = langTraits(language)?.reflectionApi || {};
+    if (api.pythonBindingIdentity) {
+        const name = fn.childForFieldName('name')?.text || '';
+        const decorated = fn.parent?.type === 'decorated_definition' ? fn.parent : null;
+        if (/^test/.test(name) || (decorated && !pythonDecoratorsInert(decorated, memo))) return false;
+    }
+    // A callable its file hands on as a value (returned by a fixture, kept
+    // in a table) is called under other names, and a member the runtime
+    // invokes by protocol (`__init__` on construction, `__call__`,
+    // `__enter__`) is never called by its name: its callers are not known.
+    if (_callableEscapes(fn, key.name, memo)) return false;
+    const protocol = langTraits(language)?.languageProtocolMember;
+    if (typeof protocol === 'function' && protocol(key.name, { isMember: !!key.owner })) return false;
+    const parameter = { ...key, keyword: ident.text, ..._parameterDefault(fn, ident, language, memo) };
+    if (slot.parameter) {
+        return slot.parameter.name === parameter.name && slot.parameter.line === parameter.line &&
+            slot.parameter.keyword === parameter.keyword;
+    }
+    slot.parameter = parameter;
+    return true;
+}
+
+// Where the name of a callable may stand without handing the callable on:
+// its own declaration, an import or export of it, a parameter or keyword
+// that only shares the spelling.
+const NAMING_PARENTS = new Set(['function_definition', 'function_declaration', 'generator_function_declaration',
+    'method_definition', 'variable_declarator', 'import_statement', 'import_from_statement', 'aliased_import',
+    'dotted_name', 'import_specifier', 'export_specifier', 'import_clause', 'namespace_import', 'parameters',
+    'typed_parameter', 'default_parameter', 'typed_default_parameter', 'formal_parameters', 'required_parameter',
+    'optional_parameter']);
+
+/**
+ * Does the file holding `fn` use its name other than to call it? Any other
+ * occurrence (returned, assigned, stored, passed) lets code call it under
+ * another name, so the calls of its own name are not all of its callers.
+ */
+function _callableEscapes(fn, name, memo) {
+    const key = `patch-callable-escapes:${name}`;
+    if (memo?.has(key)) return memo.get(key);
+    const IDENTIFIERS = ['identifier', 'property_identifier', 'shorthand_property_identifier'];
+    let escapes = false;
+    for (const occurrence of fn.tree.rootNode.descendantsOfType(IDENTIFIERS)) {
+        if (occurrence.text !== name) continue;
+        let node = occurrence;
+        let parent = node.parent;
+        if (!parent) continue;
+        const field = fieldName => sameNode(parent.childForFieldName(fieldName), node);
+        // A keyword of that name, a declaration or import of it, a parameter
+        // sharing the spelling. A default value or an initializer reads it.
+        if (parent.type === 'keyword_argument' && field('name')) continue;
+        if (NAMING_PARENTS.has(parent.type) && !field('value')) continue;
+        // `obj.name(..)`: the member of a call's callee.
+        if (MEMBER_CALLEE_FIELDS[parent.type] && field(MEMBER_CALLEE_FIELDS[parent.type][0])) {
+            node = parent;
+            parent = parent.parent;
+        }
+        if (parent && CALL_NODE_TYPES.includes(parent.type) && sameNode(parent.childForFieldName('function'), node)) continue;
+        escapes = true;
+        break;
+    }
+    memo?.set(key, escapes);
+    return escapes;
+}
+
+/** The callable whose parameter `ident` is, or null (a lambda binds it). */
+function _parameterCallable(ident) {
+    for (let fn = ident.parent; fn; fn = fn.parent) {
+        if (CLASS_NODES.has(fn.type)) return null;
+        if (fn.type === 'lambda') {
+            const own = fn.childForFieldName('parameters');
+            if (own && own.descendantsOfType('identifier').some(id => id.text === ident.text)) return null;
+            continue;
+        }
+        if (!PARAMETER_OWNERS.has(fn.type)) continue;
+        const names = _parameterNames(fn);
+        if (!names) return null;
+        if (names.includes(ident.text)) return fn;
+    }
+    return null;
+}
+
+/**
+ * How a call that does not pass the parameter positionally gives it a value:
+ * `keywordOnly` (after `*` / `*args`), and `fallback`, the alternatives of
+ * its default (absent: no default, so such a call names nothing).
+ */
+function _parameterDefault(fn, ident, language, memo) {
+    const list = fn.childForFieldName('parameters') ||
+        (fn.namedChildren || []).find(child => PARAMETER_LISTS.has(child.type));
+    let keywordOnly = false;
+    for (const param of list?.namedChildren || []) {
+        if (['keyword_separator', 'list_splat_pattern'].includes(param.type)) { keywordOnly = true; continue; }
+        const named = param.type === 'identifier' ? param
+            : param.childForFieldName('name') || param.childForFieldName('pattern') || param.childForFieldName('left') ||
+                (param.type === 'typed_parameter' ? param.namedChild(0) : null);
+        if (named?.text !== ident.text) continue;
+        const value = param.childForFieldName('value') || param.childForFieldName('right') ||
+            param.childForFieldName('default');
+        const out = keywordOnly ? { keywordOnly: true } : {};
+        if (value) out.fallback = _valueAlternatives(value, _patchValueCtx(language, memo, null));
+        return out;
+    }
+    return {};
+}
+
+const MAX_PARAMETER_HOPS = 3;
+
+/**
+ * The values callers pass a recorded parameter: { alternatives, open }.
+ * Each call of the callable's name in the language family is read from its
+ * own AST: the argument at the position or under the keyword, else the
+ * default. A call that spreads its arguments, a use of the callable as a
+ * value, an unreadable caller or too many calls leave the set open; so does
+ * a caller's own parameter past MAX_PARAMETER_HOPS, and so does a callable
+ * no file of the project calls: it is called from elsewhere (a script, a
+ * runner, another package) with values not known here.
+ */
+function _parameterValues(index, file, language, parameter, depth = 0) {
+    const out = { alternatives: [], open: false };
+    if (depth >= MAX_PARAMETER_HOPS) { out.open = true; return out; }
+    const { getCachedCalls } = require('./callers');
+    const { getParser, safeParse } = require('../languages');
+    // An import that renames the callable calls it under another name.
+    for (const entry of index.files.values()) {
+        if ((entry.importBindings || []).some(binding => binding.name === parameter.name &&
+            binding.alias && binding.alias !== parameter.name)) { out.open = true; return out; }
+    }
+    let seen = 0;
+    for (const callerFile of [...(index.getCalleeFiles?.(parameter.name) || [])].sort()) {
+        const entry = index.files.get(callerFile);
+        if (!entry || _family(entry.language) !== _family(language)) continue;
+        const calls = (getCachedCalls(index, callerFile) || []).filter(call => call.name === parameter.name);
+        if (calls.some(call => call.isFunctionReference)) { out.open = true; return out; }
+        // A method is called through a receiver, never by its bare name, and
+        // not through an instance of a class that neither is nor derives from
+        // the method's class.
+        const relevant = calls.filter(call => !(parameter.owner && !call.isMethod) &&
+            !(parameter.owner && call.receiverIsTypeQualified && call.receiver && call.receiver !== parameter.owner) &&
+            !(parameter.owner && call.receiverType && !_mayBeInstanceOf(index, call.receiverType, callerFile, parameter.owner, file)));
+        if (relevant.length === 0) continue;
+        seen += relevant.length;
+        if (seen > MAX_KEY_CALLS) { out.open = true; return out; }
+        let tree;
+        try {
+            const content = index._readFile(callerFile);
+            tree = index._getParsedTree?.(callerFile, content, entry.language) || safeParse(getParser(entry.language), content);
+        } catch { tree = null; }
+        if (!tree) { out.open = true; return out; }
+        const memo = new Map();
+        for (const call of relevant) {
+            const offset = call.callStart ?? call.callSite?.start;
+            let node = Number.isInteger(offset) ? tree.rootNode.descendantForIndex(offset) : null;
+            for (let up = 0; node && up < 6 && !CALL_NODE_TYPES.includes(node.type); up++) node = node.parent;
+            const args = node ? _callArgs(node) : null;
+            if (!args || args.some(arg => /splat|spread/.test(arg.type))) { out.open = true; return out; }
+            // `Other().name(..)`: an instance constructed in place of a class
+            // that is not the method's.
+            const callee = parameter.owner ? _calleeParts(node, true, false) : null;
+            const built = callee?.object ? _calleeNode(callee.object) : null;
+            const builder = built && CALL_NODE_TYPES.includes(built.type) ? _calleeNode(built.childForFieldName('function')) : null;
+            if (builder?.type === 'identifier' && !_mayBeInstanceOf(index, builder.text, callerFile, parameter.owner, file)) continue;
+            const positional = args.filter(arg => arg.type !== 'keyword_argument');
+            const keyword = args.find(arg => arg.type === 'keyword_argument' &&
+                arg.childForFieldName('name')?.text === parameter.keyword)?.childForFieldName('value');
+            let argument = keyword || (!parameter.keywordOnly ? positional[parameter.index] : null);
+            if (argument?.type === 'argument') argument = argument.namedChildren.find(child => child.type !== 'comment') || argument;
+            let alternatives;
+            if (argument) {
+                const slot = {};
+                alternatives = _valueAlternatives(argument, _patchValueCtx(entry.language, memo, slot));
+                // The callable passing its own parameter on to itself adds no value.
+                if (slot.parameter && callerFile === file && slot.parameter.name === parameter.name &&
+                    slot.parameter.line === parameter.line && slot.parameter.keyword === parameter.keyword) {
+                    alternatives = alternatives.filter(alternative => !alternative.includes(PARAM));
+                }
+                if (slot.parameter && alternatives.some(alternative => alternative.includes(PARAM))) {
+                    const inner = _parameterValues(index, callerFile, entry.language, slot.parameter, depth + 1);
+                    const values = inner.open ? [...inner.alternatives, [WILD]] : inner.alternatives;
+                    alternatives = alternatives.flatMap(alternative => (alternative.includes(PARAM)
+                        ? values.map(value => _substitute(alternative, value)) : [alternative]));
+                }
+            } else alternatives = parameter.fallback || [];
+            out.alternatives.push(...alternatives);
+            if (out.alternatives.length > MAX_PATCH_ALTERNATIVES) return { alternatives: [], open: true };
+        }
+    }
+    if (seen === 0) out.open = true;
+    return out;
+}
+
+/**
+ * Can a receiver typed `typeName` (at `callerFile`) be an instance of the
+ * class `owner` declared in `ownerFile`? Unknown classes can.
+ */
+function _mayBeInstanceOf(index, typeName, callerFile, owner, ownerFile) {
+    const ci = require('./class-identity');
+    const ref = ci.resolveClassRef(index, typeName, callerFile);
+    if (!ref?.key) return true;
+    const owners = ci.classDefsNamed(index, owner).entries;
+    const own = owners.filter(entry => entry.def.file === ownerFile);
+    const candidates = own.length > 0 ? own : owners;
+    if (candidates.length === 0) return true;
+    return candidates.some(entry => entry.key === ref.key || _reachesKey(index, ref, entry.key, owner));
+}
+
+/**
+ * The sites a recorded patch site stands for once its parameter is read
+ * (fix #512): the site's alternatives with each value its callers pass,
+ * and an open alternative when the values cannot be closed.
+ */
+function _resolveDeferredSite(index, entry) {
+    const site = entry.site;
+    const deferred = site.deferred;
+    const values = _parameterValues(index, entry.file, entry.language, deferred.parameter);
+    const substitutes = values.open ? [...values.alternatives, [WILD]] : values.alternatives;
+    let alternatives = [];
+    for (const template of deferred.alternatives) {
+        for (const value of substitutes) alternatives.push(_substitute(template, value));
+        if (alternatives.length > MAX_PATCH_ALTERNATIVES) {
+            alternatives = deferred.alternatives.map(own => _substitute(own, [WILD]));
+            break;
+        }
+    }
+    const reading = deferred.spelledOnly ? 'spelled' : 'proven';
+    const concrete = site.kind === 'runtime-target'
+        ? _targetSites(alternatives, !!deferred.dottedOnly, reading)
+        : _memberSites(alternatives, site.receiver || null, reading, site.owner || null);
+    return concrete.map(resolved => ({ ...resolved, line: site.line, expression: site.expression, fromParameter: true }));
+}
+
+/** Could a value of the recorded parameter make the site spell `name`? */
+function _deferredCanSpell(site, name) {
+    return site.deferred.alternatives.some(alternative => {
+        const glob = alternative.map(piece => (piece === PARAM || piece === WILD ? '*' : piece)).join('');
+        return globMatches(site.kind === 'runtime-target' ? glob.slice(glob.lastIndexOf('.') + 1) : glob, name);
+    });
+}
+
+/**
  * Classify a name expression.
  * @returns {{name?: string, patterns?: string[], dynamic: boolean}}
  *   name - one exact spelling; patterns - specific glob patterns (sorted);
@@ -353,6 +868,10 @@ function _runtimeTarget(alternative, dottedOnly) {
 function classifyNameExpression(node, ctx) {
     const alts = stringAlternatives(node, ctx);
     if (!alts) return { dynamic: true };
+    return _classifyAlternatives(alts);
+}
+
+function _classifyAlternatives(alts) {
     const exact = new Set();
     const patterns = new Set();
     let dynamic = false;
@@ -941,7 +1460,7 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
     const unnamed = api.unnamed || [];
     const codeExecution = api.codeExecution || [];
     const constructs = codeExecution.filter(rule => rule.construct);
-    const qualifiers = _packageQualifiers([...unnamed, ...codeExecution], options.imports);
+    const qualifiers = _packageQualifiers([...unnamed, ...codeExecution, ...(api.patches || [])], options.imports);
     const scopeMemo = new Map();
     // Candidate nodes are located natively: reflective calls from the
     // vocabulary's spelling positions (descendantForIndex, walking up to the
@@ -976,9 +1495,10 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
     // Names in it are read as Python reads them: a module constant from a
     // function body, a plain `{name}` of an f-string, every value a name is
     // written with. A runtime part leaves a pattern.
-    const patchCtx = api.pythonBindingIdentity
-        ? { ...ctx, resolve: identifier => pythonPossibleValues(identifier, scopeMemo), interpolations: true } : ctx;
-    const patchSites = (node, shapes, spelledOnly) => {
+    // A name that is a parameter of the callable holding the call is kept as
+    // PARAM: the site is recorded with its alternatives (`deferred`) and
+    // read with what the callers pass when the project is asked (fix #512).
+    const patchSites = (node, shapes, dottedOnly, reading) => {
         const args = _callArgs(node) || [];
         const positional = args.filter(arg => arg.type !== 'keyword_argument');
         const keyword = name => args.find(arg => arg.type === 'keyword_argument' &&
@@ -986,27 +1506,38 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         const at = where => (where ? positional[where.position] || keyword(where.keyword) : null);
         const before = sites.length;
         const seen = new Set();
+        const place = { line: node.startPosition.row + 1, expression: String(node.text).slice(0, EXPRESSION_CAP) };
         for (const shape of shapes) {
             // `create=True` / `raising=False`: the name may be absent.
             if (shape.optional && at(shape.optional.at)?.type === shape.optional.value) continue;
             const targetNode = at(shape.targetAt);
-            if (shape.object && (!shape.target || at(shape.objectWhen))) {
-                const memberNode = at(shape.memberAt);
-                const member = memberNode ? classifyNameExpression(memberNode, patchCtx) : null;
-                const key = `member:${memberNode?.startIndex}`;
-                if (member && (member.name || (member.patterns && !member.dynamic)) && !seen.has(key)) {
-                    seen.add(key);
-                    push(node, 'runtime-member', memberNode, targetNode, undefined, patchCtx);
-                }
+            const object = shape.object && (!shape.target || at(shape.objectWhen));
+            const nameNode = object ? at(shape.memberAt) : targetNode;
+            const key = `${object ? 'member' : 'target'}:${nameNode?.startIndex}`;
+            if (!nameNode || seen.has(key)) continue;
+            seen.add(key);
+            // A callee that is a patch API only by an origin that could not be
+            // followed reads no parameter (`reading` 'possible').
+            const slot = reading === 'possible' ? null : {};
+            const alternatives = _valueAlternatives(nameNode, _patchValueCtx(language, scopeMemo, slot));
+            const receiver = object ? classifyReceiver(targetNode, language) : null;
+            // The object the member is set on, when the file proves it.
+            const owner = object && targetNode ? pythonPatchOwner(targetNode, scopeMemo) : null;
+            if (slot?.parameter && alternatives.some(alternative => alternative.includes(PARAM))) {
+                sites.push({ kind: object ? 'runtime-member' : 'runtime-target', dynamic: false,
+                    ...(receiver && { receiver }), ...(owner && { owner }),
+                    deferred: { parameter: slot.parameter, alternatives, ...(reading === 'spelled' && { spelledOnly: true }),
+                        ...(dottedOnly && { dottedOnly: true }) },
+                    ...place });
                 continue;
             }
-            for (const alternative of stringAlternatives(targetNode, patchCtx) || []) {
-                const target = _runtimeTarget(alternative, spelledOnly);
-                if (!target || seen.has(target.runtimeTarget)) continue;
-                seen.add(target.runtimeTarget);
-                sites.push({ kind: 'runtime-target', ...(target.name && { name: target.name }),
-                    patterns: target.patterns, dynamic: false, runtimeTarget: target.runtimeTarget,
-                    line: node.startPosition.row + 1, expression: String(node.text).slice(0, EXPRESSION_CAP) });
+            const found = object ? _memberSites(alternatives, receiver, reading, owner) : _targetSites(alternatives, dottedOnly, reading);
+            for (const site of found) {
+                const id = site.runtimeTarget != null ? `site-target:${site.runtimeTarget}`
+                    : `site-member:${site.open ? '*' : nameNode.startIndex}`;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                sites.push({ ...site, ...place });
             }
         }
         if (sites.length > before) facts.reflectionUses++;
@@ -1081,12 +1612,18 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
             // pytest's monkeypatch, pytest-mock). One shape is read once,
             // however many identities of the callee share it.
             const shapes = new Set(identities.map(pythonPatchApi).filter(Boolean));
+            // How the callee is known to be a patch API (fix #512): 'proven'
+            // when the file's own bindings give it a patch origin, 'possible'
+            // when only an origin that could not be followed may be one.
+            let reading = shapes.size > 0 && pythonResolvedOrigins(fn, scopeMemo).some(origin => pythonPatchApi(origin))
+                ? 'proven' : 'possible';
             // No identity is proven for the callee: the member it is written
             // with decides, and only a dotted path or a literal member name
             // makes a site of it.
             const spelled = shapes.size === 0 && builtins.length === 0 ? pythonPatchSpelling(fn, scopeMemo) : null;
             if (spelled) shapes.add(spelled);
-            if (shapes.size > 0) patchSites(node, shapes, !!spelled);
+            if (spelled || (reading === 'possible' && shapes.size > 0 && pythonPatchSpelling(fn, scopeMemo))) reading = 'spelled';
+            if (shapes.size > 0) patchSites(node, shapes, !!spelled, reading);
             call.possibleCallees = builtins.map(identity => identity.slice(9));
             call.calleeText = call.possibleCallees[0] || '';
         }
@@ -1123,7 +1660,13 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
         for (const rule of api.patches || []) {
             const written = call.bare ? call.calleeText : call.member;
             if (!written || !rule.name.test(written)) continue;
-            if (call.bare ? !rule.bare : (rule.owner && !rule.owner.test(_calleeName(call.object)))) continue;
+            if (rule.package) {
+                // An API known by its module: the callee, or what it is a
+                // member of, is a module-scope import of that module.
+                const qualifier = call.bare ? _calleeNode(node.childForFieldName('function')) : _calleeNode(call.object);
+                if (qualifier?.type !== 'identifier' || qualifiers.get(qualifier.text) !== rule.package ||
+                    require('../languages/lexical-scope').referenceScope(qualifier, language, scopeMemo) !== 'module') continue;
+            } else if (call.bare ? !rule.bare : (rule.owner && !rule.owner.test(_calleeName(call.object)))) continue;
             const args = _callArgs(node) || [];
             const nameNode = args[rule.nameArg];
             if (!nameNode) continue;
@@ -1140,10 +1683,29 @@ function reflectionFactsInTree(tree, language, code = null, options = {}) {
                     ownerNode = (_callArgs(built) || [])[0] || null;
                 }
             }
-            const member = classifyNameExpression(nameNode, ctx);
+            // A name that is a parameter of the enclosing callable is read
+            // from what its callers pass (fix #512). These rules are matched
+            // as written, so a name that cannot be read names nothing.
+            const slot = {};
+            const read = stringAlternatives(nameNode, _patchValueCtx(language, scopeMemo, slot));
+            if (read && slot.parameter && read.some(alternative => alternative.includes(PARAM))) {
+                facts.reflectionUses++;
+                sites.push({ kind: 'runtime-member', dynamic: false,
+                    ...(ownerNode && { receiver: classifyReceiver(ownerNode, language) }),
+                    deferred: { parameter: slot.parameter, alternatives: read, spelledOnly: true },
+                    line: node.startPosition.row + 1, expression: String(node.text).slice(0, EXPRESSION_CAP) });
+                return;
+            }
+            // Names are read as for any patch call (a runner's table too).
+            const valueCtx = _patchValueCtx(language, scopeMemo, null);
+            const member = classifyNameExpression(nameNode, valueCtx);
             if (!member.name && !(member.patterns && !member.dynamic)) continue;
             facts.reflectionUses++;
-            push(node, 'runtime-member', nameNode, ownerNode);
+            push(node, 'runtime-member', nameNode, ownerNode, undefined, valueCtx);
+            // Its spelling is a pattern too: the member is a possible callee
+            // of the call, listed as such (fix #512).
+            const pushed = sites[sites.length - 1];
+            if (!pushed.patterns) pushed.patterns = [pushed.name];
             return;
         }
         // `eval(cmd)`: the receiver is this file's own top-level namespace,
@@ -1274,6 +1836,8 @@ function reflectionPatternIndex(index) {
     const moduleScoped = new Map();
     const keyParameterSites = [];
     const dynamicMembers = [];
+    const deferredSites = [];
+    const openSites = [];
     for (const [file, sites] of byFile) {
         const fe = index.files.get(file);
         if (!fe) continue;
@@ -1299,6 +1863,19 @@ function reflectionPatternIndex(index) {
                     language: fe.language, family: _family(fe.language), site });
                 continue;
             }
+            // Patch sites read when the project is asked (fix #512): a
+            // parameter's values come from the callers; an open member
+            // matches any name and the reach test bounds it.
+            if (site.deferred) {
+                deferredSites.push({ file, relativePath: fe.relativePath,
+                    language: fe.language, family: _family(fe.language), site });
+                continue;
+            }
+            if (site.open) {
+                openSites.push({ pattern: '*', file, relativePath: fe.relativePath,
+                    language: fe.language, family: _family(fe.language), site });
+                continue;
+            }
             if (!site.patterns) continue;
             for (const pattern of site.patterns) {
                 const frag = _longestFragment(pattern);
@@ -1312,7 +1889,8 @@ function reflectionPatternIndex(index) {
         }
     }
     const result = { byFragment, lengths: [...lengths].sort((a, b) => a - b), entryCount, moduleScoped,
-        keyParameterSites, dynamicMembers, quoted: new Map(), keyNames: new Map() };
+        keyParameterSites, dynamicMembers, quoted: new Map(), keyNames: new Map(),
+        deferredSites, openSites, deferred: new Map() };
     index._reflectionPatternIndex = result;
     return result;
 }
@@ -1334,6 +1912,20 @@ function patternEntriesFor(index, name, language, file = null) {
     for (const entry of pidx.keyParameterSites) {
         if (family && entry.family !== family) continue;
         if (_keyParameterPasses(index, pidx, entry, name)) out.push({ ...entry, pattern: name });
+    }
+    for (const entry of pidx.openSites) {
+        if (!family || entry.family === family) out.push(entry);
+    }
+    for (const entry of pidx.deferredSites) {
+        if ((family && entry.family !== family) || !_deferredCanSpell(entry.site, name)) continue;
+        // Read once per index: the sites the callers' values make of it.
+        let resolved = pidx.deferred.get(entry);
+        if (!resolved) pidx.deferred.set(entry, resolved = _resolveDeferredSite(index, entry));
+        for (const site of resolved) {
+            if (site.open) { out.push({ ...entry, pattern: '*', site }); continue; }
+            const hit = (site.patterns || [site.name]).find(pattern => pattern && globMatches(pattern, name));
+            if (hit) out.push({ ...entry, pattern: hit, site });
+        }
     }
     if (pidx.entryCount === 0) return out;
     const seenFrag = new Set();
@@ -1392,6 +1984,8 @@ function _reachesKey(index, fromRef, targetKey, targetName) {
 function reflectionEntryReaches(index, entry, def) {
     const site = entry.site;
     if (site.runtimeTarget) return require('./runtime-entrypoints').runtimeTargetReaches(index, def, site.runtimeTarget);
+    // A patch call's owner object the file proves (fix #512).
+    if (site.owner && !site.owner.receiver) return require('./runtime-entrypoints').ownerReaches(index, entry, def);
     if (site.membersOnly && !def.className && !def.receiver) return false;
     const recv = site.receiver;
     if (!recv) return true;
@@ -1426,6 +2020,24 @@ function reflectionEntryReaches(index, entry, def) {
     if (_reachesKey(index, recvRef, ownerRef.key, ownerRef.name)) return true; // inherited member
     if (_reachesKey(index, ownerRef, recvRef.key, recvRef.name)) return true; // subclass member
     return ci.shareDescendant(index, recvRef, [def]);
+}
+
+/**
+ * Is `def` a member of the class `className` declared in `file` (the one
+ * declared at `line` when given), or of one of its ancestors? A runtime
+ * attribute lookup on a class or an instance finds both (fix #512).
+ */
+function classOrAncestorDeclares(index, file, className, def, line = null) {
+    if (!def.className) return false;
+    const ci = require('./class-identity');
+    const hit = ci.classDefsNamed(index, className).entries.find(entry => entry.def.file === file &&
+        (line == null ? !entry.def.className : entry.def.startLine === line));
+    if (!hit) return false;
+    const classRef = { name: className, key: hit.key, def: hit.def };
+    const ownerRef = ci.ownerRefOf(index, def);
+    if (!ownerRef) return false;
+    if (!ownerRef.key) return ownerRef.name === className;
+    return ownerRef.key === classRef.key || _reachesKey(index, classRef, ownerRef.key, ownerRef.name);
 }
 
 /** Reaching pattern entries for one definition (sorted file, line). */
@@ -1469,6 +2081,7 @@ module.exports = {
     reflectionEntryReaches,
     reflectionPatternReferences,
     reflectionPatternIndex,
+    classOrAncestorDeclares,
     patternIsAttributable,
     resetReflectionIndex,
     reflectionLiteralNames,

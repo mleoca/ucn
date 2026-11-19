@@ -390,8 +390,13 @@ function bindingValue(site, before) {
     return projectValue(target, assignment.childForFieldName('right'), site);
 }
 
-/** Iteration retains possible written values; it never proves a binding exact. */
-function iterationValues(site) {
+/**
+ * Iteration retains possible written values; it never proves a binding exact.
+ * `containers`: the liveness reader also iterates a literal dictionary (its
+ * keys) and `values()` / `keys()` of one, and marks a container whose
+ * contents it cannot close as unresolved.
+ */
+function iterationValues(site, containers = false) {
     let target = site;
     while (TARGET_WRAPPERS.has(target.parent?.type)) target = target.parent;
     const loop = target.parent;
@@ -408,7 +413,28 @@ function iterationValues(site) {
         while (iterable.type === 'parenthesized_expression') iterable = iterable.namedChild(0);
         if (seen.has(iterable.id)) continue;
         seen.add(iterable.id);
-        if (['list', 'tuple', 'set'].includes(iterable.type)) {
+        if (containers && iterable.type === 'call') {
+            // `d.values()` / `d.keys()` of a dictionary this reader closes.
+            const fn = iterable.childForFieldName('function');
+            const member = fn?.type === 'attribute' ? pythonSourceName(fn.childForFieldName('attribute')?.text) : null;
+            const read = member === 'values' || member === 'keys'
+                ? containerNodes(fn.childForFieldName('object'), memo) : null;
+            if (!read || read.open || (iterable.childForFieldName('arguments')?.namedChildCount || 0) > 0 ||
+                read.nodes.some(node => node.type !== 'dictionary')) { values.unresolved = true; continue; }
+            for (const dictionary of read.nodes) {
+                for (const pair of dictionary.namedChildren) {
+                    if (pair.type !== 'pair') { values.unresolved = true; continue; }
+                    const projected = projectValue(target, pair.childForFieldName(member === 'values' ? 'value' : 'key'), site);
+                    if (projected) values.push(projected);
+                }
+            }
+        } else if (containers && iterable.type === 'dictionary') {
+            for (const pair of iterable.namedChildren) {
+                if (pair.type !== 'pair') { values.unresolved = true; continue; }
+                const projected = projectValue(target, pair.childForFieldName('key'), site);
+                if (projected) values.push(projected);
+            }
+        } else if (['list', 'tuple', 'set'].includes(iterable.type)) {
             for (const value of iterable.namedChildren) {
                 if (value.type === 'list_splat') pending.push(value.namedChild(0));
                 else {
@@ -416,6 +442,12 @@ function iterationValues(site) {
                     if (projected) values.push(projected);
                 }
             }
+        } else if (containers) {
+            // A name iterated here: every container it is written with, and
+            // nothing else touches it.
+            const read = iterable.type === 'identifier' ? containerNodes(iterable, memo) : null;
+            if (!read || read.open) values.unresolved = true;
+            else pending.push(...read.nodes);
         } else if (iterable.type === 'identifier') {
             const scope = sourceScope(iterable, memo);
             if (!scope) continue;
@@ -796,6 +828,15 @@ function pythonPossibleIdentities(expression, memo = new Map()) {
         : origins;
 }
 
+/**
+ * The origins the file's bindings give an expression, without the stand-in
+ * for an origin that could not be followed (pythonPossibleIdentities adds
+ * every runtime API for that one).
+ */
+function pythonResolvedOrigins(expression, memo = new Map()) {
+    return resolveIdentity(expression, memo, 0, true).origins.filter(origin => !origin.startsWith(UNKNOWN_ORIGIN));
+}
+
 /** The patch shape of a resolved API identity (see PATCH_APIS), or null. */
 function pythonPatchApi(identity) {
     return PATCH_APIS.get(canonicalApi(identity)) || null;
@@ -807,9 +848,16 @@ function pythonPatchApi(identity) {
  * receiver (a fixture stored on `self`, a helper's parameter, a wrapper
  * object), or a bare `patch` this file does not define. The spelling proves
  * nothing about the receiver; its only use is to keep a declaration the call
- * names out of a deletion claim.
+ * names out of a deletion claim. A method the receiver's class (one this
+ * file defines) declares itself is that class's own (fix #512): it is read
+ * as a patch API only when its body makes a call shaped like one, as a
+ * wrapper that hands the name on does.
  */
 function pythonPatchSpelling(callee, memo = new Map()) {
+    return patchSpelling(callee, memo, new Set());
+}
+
+function patchSpelling(callee, memo, visiting) {
     let node = callee;
     while (node?.type === 'parenthesized_expression') node = node.namedChild(0);
     if (node?.type === 'attribute') {
@@ -819,13 +867,58 @@ function pythonPatchSpelling(callee, memo = new Map()) {
         const ownerName = owner?.type === 'attribute' ? owner.childForFieldName('attribute')?.text
             : owner?.type === 'identifier' ? owner.text : null;
         if (member === 'object' && pythonSourceName(ownerName) === 'patch') return OBJECT_PATCH;
-        return PATCH_APIS.get(SPELLED_APIS.get(member)) || null;
+        const shape = PATCH_APIS.get(SPELLED_APIS.get(member)) || null;
+        if (shape && ownMethodPatchesNothing(owner, member, memo, visiting)) return null;
+        return shape;
     }
     if (node?.type !== 'identifier' || pythonSourceName(node.text) !== 'patch') return null;
     // A function or class this file defines under the name is that definition.
     const scope = sourceScope(node, memo);
     if (scope && bindingSites(scope, node.text).some(binding => binding.kind === 'def')) return null;
     return TARGET_PATCH;
+}
+
+/** The class_definition a receiver is known to be an instance (or the class) of, in this file. */
+function receiverClass(owner, memo) {
+    if (owner?.type === 'identifier') {
+        // `self` / `cls`: the first parameter of a method of a class body.
+        const scope = sourceScope(owner, memo);
+        if (scope?.type === 'function_definition') {
+            const first = scope.childForFieldName('parameters')?.namedChildren.find(child => child.type !== 'comment');
+            const firstName = first?.type === 'identifier' ? first.text : null;
+            let holder = scope.parent?.type === 'decorated_definition' ? scope.parent.parent : scope.parent;
+            if (firstName === owner.text && holder?.type === 'block' && holder.parent?.type === 'class_definition' &&
+                bindingSites(scope, owner.text).length === 1) return holder.parent;
+        }
+    }
+    const found = pythonPatchOwner(owner, memo);
+    if (!found?.local || (found.path || []).length > 0) return null;
+    return owner.tree.rootNode.descendantsOfType('class_definition').find(node =>
+        node.startPosition.row + 1 === found.line && pythonSourceName(node.childForFieldName('name')?.text) === found.local) || null;
+}
+
+/**
+ * Does the receiver's class, defined in this file, declare `member` itself
+ * with a body that makes no call shaped like a patch API?
+ */
+function ownMethodPatchesNothing(owner, member, memo, visiting) {
+    const cls = owner ? receiverClass(owner, memo) : null;
+    const method = (cls?.childForFieldName('body')?.namedChildren || [])
+        .map(node => (node.type === 'decorated_definition' ? node.namedChildren.find(child => child.type === 'function_definition') : node))
+        .find(node => node?.type === 'function_definition' && pythonSourceName(node.childForFieldName('name')?.text) === member);
+    if (!method) return false;
+    const key = `${method.startIndex}:${method.endIndex}`;
+    // A method calling itself is no patch call.
+    if (visiting.has(key)) return true;
+    visiting.add(key);
+    try {
+        for (const call of method.childForFieldName('body')?.descendantsOfType('call') || []) {
+            const fn = call.childForFieldName('function');
+            if (pythonPossibleIdentities(fn, memo).some(identity => pythonPatchApi(identity))) return false;
+            if (patchSpelling(fn, memo, visiting)) return false;
+        }
+    } finally { visiting.delete(key); }
+    return true;
 }
 
 /**
@@ -842,16 +935,311 @@ function pythonPossibleValues(identifier, memo = new Map()) {
     if (!sites.length) return null;
     const values = [];
     for (const binding of sites) {
+        // A parameter pytest fills from a `parametrize` mark holds the
+        // values the mark lists; an indirect or unreadable mark leaves it
+        // unknown.
+        const parametrized = binding.kind === 'binding' ? parametrizeValues(binding.node, memo) : undefined;
+        if (parametrized !== undefined) {
+            if (!parametrized) return null;
+            values.push(...parametrized);
+            continue;
+        }
         // A parameter holds what its callers pass, whatever its default is.
         if (binding.kind !== 'binding' || parameterOrigins(binding.node, memo, 0, true) ||
             ['default_parameter', 'typed_default_parameter'].includes(binding.node.parent?.type)) return null;
         const value = bindingValue(binding.node, Infinity);
         if (value) { values.push(value); continue; }
-        const iterated = iterationValues(binding.node);
+        const iterated = iterationValues(binding.node, true);
         if (!iterated.length || iterated.unresolved) return null;
         values.push(...iterated);
     }
     return values;
+}
+
+const CONTAINERS = new Set(['dictionary', 'list', 'tuple', 'set']);
+// Calls on a container that read it and change nothing.
+const CONTAINER_READS = new Set(['get', 'values', 'keys', 'items', 'copy', 'index', 'count', '__getitem__', '__contains__']);
+const WRITE_STATEMENTS = new Set(['assignment', 'augmented_assignment', 'delete_statement', 'for_statement',
+    'for_in_clause', 'as_pattern', 'named_expression']);
+
+/**
+ * The literal containers (dictionary, list, tuple, set) an expression can
+ * be: { nodes, open }. A name counts only when every value it is written
+ * with is one and the file never hands it on or changes it (`open` true
+ * otherwise): its contents are then the literal contents.
+ */
+function containerNodes(expression, memo = new Map(), depth = 0) {
+    let node = expression;
+    while (node?.type === 'parenthesized_expression') node = node.namedChild(0);
+    const open = { nodes: [], open: true };
+    if (!node || depth > 4) return open;
+    if (CONTAINERS.has(node.type)) return { nodes: [node], open: false };
+    if (node.type !== 'identifier' || !containerUntouched(node, memo)) return open;
+    const values = pythonPossibleValues(node, memo);
+    if (!values) return open;
+    const nodes = [];
+    for (const value of values) {
+        const read = containerNodes(value, memo, depth + 1);
+        if (read.open) return open;
+        nodes.push(...read.nodes);
+    }
+    return { nodes, open: false };
+}
+
+/** Is every occurrence of the name in its file a read of the container? */
+function containerUntouched(identifier, memo) {
+    const name = pythonSourceName(identifier.text);
+    const effects = effectsOf(identifier);
+    const key = `container-untouched:${name}`;
+    if (memo.has(key)) return memo.get(key);
+    let untouched = !effects.escaped.has(name) && !effects.wildcard;
+    for (const occurrence of untouched ? effects.identifiers : []) {
+        if (pythonSourceName(occurrence.text) !== name || containerRead(occurrence)) continue;
+        untouched = false;
+        break;
+    }
+    memo.set(key, untouched);
+    return untouched;
+}
+
+function containerRead(occurrence) {
+    let node = occurrence;
+    while (node.parent?.type === 'parenthesized_expression') node = node.parent;
+    const parent = node.parent;
+    if (!parent) return false;
+    const field = name => sameNode(parent.childForFieldName(name), node);
+    switch (parent.type) {
+        // The name written again, or another variable of the name: the
+        // binding reader has its values.
+        case 'assignment': return field('left');
+        case 'function_definition': case 'class_definition': return field('name');
+        case 'parameters': case 'typed_parameter': case 'default_parameter': case 'typed_default_parameter':
+            return !field('value') && !field('type');
+        case 'keyword_argument': return field('name') || readerArgument(parent.parent);
+        case 'argument_list': return readerArgument(parent);
+        case 'dotted_name': case 'aliased_import': case 'import_statement': case 'import_from_statement':
+            return true;
+        case 'attribute': {
+            if (field('attribute')) return true;
+            const member = pythonSourceName(parent.childForFieldName('attribute')?.text);
+            return CONTAINER_READS.has(member) && parent.parent?.type === 'call' &&
+                sameNode(parent.parent.childForFieldName('function'), parent);
+        }
+        case 'subscript': {
+            if (!field('value')) return true;
+            // `d[k] = v`, `del d[k]`, `d[k] += 1` change the container.
+            let target = parent;
+            while (TARGET_WRAPPERS.has(target.parent?.type)) target = target.parent;
+            const holder = target.parent;
+            return !(WRITE_STATEMENTS.has(holder?.type) && !sameNode(holder.childForFieldName('right'), target) &&
+                !sameNode(holder.childForFieldName('value'), target));
+        }
+        case 'for_statement': case 'for_in_clause': return field('right');
+        case 'comparison_operator': return true;
+        default: return false;
+    }
+}
+
+// Callables that read a container handed to them and keep nothing that
+// changes it.
+const CONTAINER_READERS = new Set(['pytest.mark.parametrize', ...['len', 'sorted', 'list', 'tuple', 'set',
+    'frozenset', 'iter', 'enumerate', 'zip', 'reversed', 'any', 'all', 'min', 'max', 'sum', 'str', 'repr', 'print']
+    .map(name => `builtins.${name}`)]);
+
+/** Is `argumentList` the arguments of `sep.join(..)` or of a CONTAINER_READERS call? */
+function readerArgument(argumentList) {
+    const call = argumentList?.type === 'argument_list' ? argumentList.parent : null;
+    if (call?.type !== 'call') return false;
+    const fn = call.childForFieldName('function');
+    if (fn?.type === 'attribute' && pythonSourceName(fn.childForFieldName('attribute')?.text) === 'join' &&
+        ['string', 'concatenated_string'].includes(fn.childForFieldName('object')?.type)) return true;
+    const origins = pythonPossibleIdentities(fn);
+    return origins.length > 0 && origins.every(origin => CONTAINER_READERS.has(origin));
+}
+
+const PARAMETER_HOLDERS = new Set(['typed_parameter', 'default_parameter', 'typed_default_parameter']);
+
+/**
+ * The values pytest gives a parameter from a `parametrize` mark of its test
+ * (on the function, on an enclosing class, or a `pytestmark` of the class or
+ * the module): the value nodes in the order written, null when the mark
+ * binds the parameter but its values cannot be read (indirect, built at run
+ * time), undefined when no mark binds it.
+ */
+function parametrizeValues(site, memo) {
+    let holder = site.parent;
+    if (PARAMETER_HOLDERS.has(holder?.type)) {
+        if (!sameNode(holder.childForFieldName('name') || holder.namedChild(0), site)) return undefined;
+        holder = holder.parent;
+    }
+    if (holder?.type !== 'parameters' || holder.parent?.type !== 'function_definition') return undefined;
+    const fn = holder.parent;
+    const name = pythonSourceName(site.text);
+    const decoratorsOf = definition => (definition.parent?.type === 'decorated_definition'
+        ? definition.parent.namedChildren.filter(child => child.type === 'decorator').map(child => child.namedChild(0)) : []);
+    const marksOf = body => {
+        const marks = [];
+        for (const statement of body?.namedChildren || []) {
+            const assignment = statement.type === 'expression_statement' ? statement.namedChild(0) : null;
+            const left = assignment?.type === 'assignment' ? assignment.childForFieldName('left') : null;
+            if (left?.type !== 'identifier' || pythonSourceName(left.text) !== 'pytestmark') continue;
+            const right = assignment.childForFieldName('right');
+            marks.push(...(['list', 'tuple'].includes(right?.type) ? right.namedChildren : [right]));
+        }
+        return marks;
+    };
+    const marks = decoratorsOf(fn);
+    for (let parent = fn.parent; parent; parent = parent.parent) {
+        // A function nested in another one is not collected by pytest.
+        if (parent.type === 'function_definition') break;
+        if (parent.type === 'class_definition') marks.push(...decoratorsOf(parent), ...marksOf(parent.childForFieldName('body')));
+        if (parent.type === 'module') marks.push(...marksOf(parent));
+    }
+    for (const mark of marks) {
+        const read = parametrizeMark(mark, name, memo);
+        if (read !== undefined) return read;
+    }
+    return undefined;
+}
+
+function parametrizeMark(mark, name, memo) {
+    if (mark?.type !== 'call' ||
+        !pythonPossibleIdentities(mark.childForFieldName('function'), memo).includes('pytest.mark.parametrize')) return undefined;
+    const { pythonStringLiteral } = require('./runtime-entrypoints');
+    const args = (mark.childForFieldName('arguments')?.namedChildren || []).filter(child => child.type !== 'comment');
+    // Arguments spread from elsewhere may bind any name.
+    if (args.some(arg => arg.type === 'list_splat' || arg.type === 'dictionary_splat')) return null;
+    const positional = args.filter(arg => arg.type !== 'keyword_argument');
+    const keyword = key => args.find(arg => arg.type === 'keyword_argument' &&
+        pythonSourceName(arg.childForFieldName('name')?.text) === key)?.childForFieldName('value');
+    const namesNode = positional[0] || keyword('argnames');
+    let names = null;
+    const text = namesNode ? pythonStringLiteral(namesNode) : null;
+    if (text != null) names = text.split(',').map(part => part.trim()).filter(Boolean);
+    else if (['list', 'tuple'].includes(namesNode?.type)) {
+        names = namesNode.namedChildren.filter(child => child.type !== 'comment').map(child => pythonStringLiteral(child));
+        if (names.some(part => part == null)) names = null;
+    }
+    // A mark whose names cannot be read may bind this parameter.
+    if (!names) return null;
+    const position = names.map(pythonSourceName).indexOf(name);
+    if (position < 0) return undefined;
+    // `indirect`: the value goes to a fixture of that name, which returns
+    // what it likes.
+    const indirect = keyword('indirect');
+    if (indirect && indirect.type !== 'false') {
+        if (!['list', 'tuple'].includes(indirect.type)) return null;
+        if (indirect.namedChildren.some(child => child.type !== 'comment' &&
+            [null, name].includes(pythonStringLiteral(child) == null ? null : pythonSourceName(pythonStringLiteral(child))))) return null;
+    }
+    const read = containerNodes(positional[1] || keyword('argvalues'), memo);
+    if (read.open) return null;
+    const values = [];
+    for (const container of read.nodes) {
+        if (!['list', 'tuple'].includes(container.type)) return null;
+        for (const element of container.namedChildren) {
+            if (element.type === 'comment') continue;
+            if (element.type === 'list_splat') return null;
+            let row = element;
+            while (row.type === 'parenthesized_expression' && (text == null || names.length > 1)) row = row.namedChild(0);
+            let cells;
+            if (row.type === 'call' &&
+                pythonPossibleIdentities(row.childForFieldName('function'), memo).includes('pytest.param')) {
+                cells = (row.childForFieldName('arguments')?.namedChildren || [])
+                    .filter(child => child.type !== 'comment' && child.type !== 'keyword_argument');
+            } else if (text != null && names.length === 1) {
+                // One name written as a string: each row is the value. Names
+                // written as a sequence make each row a sequence of values.
+                values.push(row);
+                continue;
+            } else if (['tuple', 'list'].includes(row.type)) {
+                cells = row.namedChildren.filter(child => child.type !== 'comment');
+            } else return null;
+            if (cells.some(cell => cell.type === 'list_splat' || cell.type === 'dictionary_splat') ||
+                cells.length !== names.length) return null;
+            values.push(cells[position]);
+        }
+    }
+    return values;
+}
+
+/**
+ * The object a patch call names its member on, when the file proves what it
+ * is (fix #512):
+ *   { import: { module, name }, path }  a name bound only by an import: the
+ *       module as written there, the imported member (null: the module
+ *       itself), and the attributes read from it;
+ *   { module, path }  `importlib.import_module("m")`, `sys.modules["m"]`;
+ *   { local, line, path }  a class this file defines;
+ * `instance` when the owner is an instance of that class. Null for anything
+ * else (a parameter, a call result, a name bound more than once).
+ */
+function pythonPatchOwner(expression, memo = new Map(), depth = 0) {
+    let node = expression;
+    while (node?.type === 'parenthesized_expression') node = node.namedChild(0);
+    if (!node || depth > 4) return null;
+    const path = [];
+    while (node?.type === 'attribute') {
+        const member = node.childForFieldName('attribute')?.text;
+        if (!member) return null;
+        path.unshift(pythonSourceName(member));
+        node = node.childForFieldName('object');
+        while (node?.type === 'parenthesized_expression') node = node.namedChild(0);
+    }
+    if (!node) return null;
+    const extend = owner => (owner ? { ...owner, path: [...(owner.path || []), ...path] } : null);
+    const { pythonStringLiteral } = require('./runtime-entrypoints');
+    if (node.type === 'call') {
+        const fn = node.childForFieldName('function');
+        const args = (node.childForFieldName('arguments')?.namedChildren || []).filter(child => child.type !== 'comment');
+        const identities = pythonPossibleIdentities(fn, memo);
+        if (identities.length === 1 && identities[0] === 'importlib.import_module') {
+            const text = args.length === 1 ? pythonStringLiteral(args[0]) : null;
+            return text && !text.startsWith('.') ? extend({ module: text }) : null;
+        }
+        // `Klass()`: an instance has its class's attributes.
+        const owner = path.length === 0 ? pythonPatchOwner(fn, memo, depth + 1) : null;
+        return owner && (owner.import || owner.local) ? { ...owner, instance: true } : null;
+    }
+    if (node.type === 'subscript') {
+        const identities = pythonPossibleIdentities(node.childForFieldName('value'), memo);
+        const keys = node.childrenForFieldName('subscript');
+        if (identities.length !== 1 || identities[0] !== 'sys.modules' || keys.length !== 1) return null;
+        const text = pythonStringLiteral(keys[0]);
+        return text && !text.startsWith('.') ? extend({ module: text }) : null;
+    }
+    if (node.type !== 'identifier') return null;
+    const name = pythonSourceName(node.text);
+    const effects = effectsOf(node);
+    if (effects.escaped.has(name) || effects.wildcard || effects.unknownWrites) return null;
+    const scope = sourceScope(node, memo);
+    const sites = scope ? bindingSites(scope, node.text) : [];
+    if (sites.length !== 1) return null;
+    const site = sites[0].node;
+    if (sites[0].kind === 'import') {
+        let part = site;
+        while (part.parent && !['import_statement', 'import_from_statement'].includes(part.parent.type)) part = part.parent;
+        const statement = part.parent;
+        if (!statement) return null;
+        const written = part.type === 'aliased_import' ? part.childForFieldName('name')?.text : part.text;
+        if (!written) return null;
+        if (statement.type === 'import_from_statement') {
+            const module = statement.childForFieldName('module_name')?.text;
+            return module ? { import: { module, name: pythonSourceName(written) }, path } : null;
+        }
+        // `import a.b as m` binds the module a.b; `import a.b` binds a.
+        const module = part.type === 'aliased_import' ? written : written.split('.')[0];
+        return { import: { module: pythonSourceName(module), name: null }, path };
+    }
+    const parent = site.parent;
+    if (sites[0].kind === 'def' && parent?.type === 'class_definition') {
+        return { local: name, line: parent.startPosition.row + 1, path };
+    }
+    if (sites[0].kind === 'binding') {
+        const value = bindingValue(site, Infinity);
+        return value ? extend(pythonPatchOwner(value, memo, depth + 1)) : null;
+    }
+    return null;
 }
 
 /** Written nesting is retained on saved declarations for runtime module paths. */
@@ -957,15 +1345,22 @@ function pythonDecoratorsRegisterNothing(index, symbol) {
     if (!declaration) return false;
     const decorated = declaration.parent;
     if (decorated?.type !== 'decorated_definition') return true;
-    const resolved = index.files.get(symbol.file)?.moduleResolved || {};
-    const memo = new Map();
+    return pythonDecoratorsInert(decorated, new Map(), index.files.get(symbol.file)?.moduleResolved || {});
+}
+
+/**
+ * Is every decorator of a `decorated_definition` one that hands the
+ * definition back and records it nowhere (INERT_DECORATORS)? `resolved` is
+ * the file's import resolution when known: a module of the project under a
+ * standard name is not the standard one.
+ */
+function pythonDecoratorsInert(decorated, memo = new Map(), resolved = {}) {
     return decorated.namedChildren.filter(node => node.type === 'decorator').every(decorator => {
         let expression = decorator.namedChild(0);
         if (expression?.type === 'call') expression = expression.childForFieldName('function');
         let identity;
         try { identity = pythonIdentity(expression, memo); } catch { identity = null; }
         if (!identity) return false;
-        // A module of the project under a standard name is not the standard one.
         if (Object.keys(resolved).some(module => resolved[module] && (identity === module || identity.startsWith(`${module}.`)))) return false;
         const canonical = identity.replace(/^typing_extensions\./, 'typing.');
         return INERT_DECORATORS.has(canonical) || INERT_DECORATOR_NAMESPACES.some(namespace => canonical.startsWith(namespace));
@@ -1056,7 +1451,8 @@ function pythonNameUnbound(identifier, index = null, ambientCallables = null) {
     return !index || !projectNamesBuiltins(index);
 }
 
-module.exports = { pythonIdentity, pythonPossibleIdentities, pythonRuntimeOwners, pythonBoundValue, pythonNameUnbound,
-    pythonDecoratorsRegisterNothing,
+module.exports = { pythonIdentity, pythonPossibleIdentities, pythonResolvedOrigins, pythonRuntimeOwners, pythonBoundValue, pythonNameUnbound,
+    pythonDecoratorsRegisterNothing, pythonDecoratorsInert,
     pythonSourceName, pythonNormalizedNames, pythonProjectIdentityAffected, registrationUnknown,
-    pythonPatchApi, pythonPatchSpelling, pythonPossibleValues, fileNormalizedNames, fileNamespaceEffects };
+    pythonPatchApi, pythonPatchSpelling, pythonPatchOwner, pythonPossibleValues, pythonContainerNodes: containerNodes,
+    fileNormalizedNames, fileNamespaceEffects };

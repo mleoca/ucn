@@ -86,7 +86,7 @@ const REASON_TEXT = Object.freeze({
     'runtime-contract': 'invoked by the language runtime, the compiler or an assignment, not by name',
     'registered': 'decorated or registered with a framework, which may invoke it without naming it',
     'entry-point': 'an entry point the runtime or a test runner invokes',
-    'runtime-entrypoint': 'packaging metadata registers this declaration, or its runtime entrypoints cannot be resolved',
+    'runtime-entrypoint': 'packaging metadata registers this declaration or the module that holds it, or its runtime entrypoints cannot be resolved',
     'constructor': 'a constructor: part of its type\'s allocation protocol, assessed with the type',
     'reflection': 'reflection in the project can reach this name',
     'dynamic-dispatch': 'member of a registry that is called through a computed key',

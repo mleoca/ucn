@@ -1043,8 +1043,10 @@ function deadcode(index, options = {}) {
         if (!fe || sites.length === 0) continue;
         for (const site of sites) {
             if (site.dynamic) dynamicReflectionFiles.add(reflectionFile);
-            if (site.name && !site.runtimeTarget) literalReflectionNames.add(site.name);
-            if (site.patterns && site.patterns.length > 0 && !site.name && !site.runtimeTarget) {
+            // A patch site whose owner object is proven reaches only what
+            // that owner holds (fix #512): the pattern matcher decides it.
+            if (site.name && !site.runtimeTarget && !site.owner) literalReflectionNames.add(site.name);
+            if (site.patterns && site.patterns.length > 0 && !site.name && !site.runtimeTarget && !site.owner) {
                 // Exact alternatives of a multi-spelling site are literals.
                 for (const pattern of site.patterns) {
                     if (!pattern.includes('*')) literalReflectionNames.add(pattern);

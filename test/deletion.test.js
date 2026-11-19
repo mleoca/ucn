@@ -409,7 +409,9 @@ describe('fix #505: attributes a test double patches by name, backend entry poin
         ['monkeypatch raising=False', 'import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, "_target", lambda: 4, raising=False)\n    monkeypatch.setattr("app._target", lambda: 4, raising=False)\n', false],
         ['monkeypatch.delattr raising=False', 'import app\ndef test_it(monkeypatch):\n    monkeypatch.delattr(app, "_target", raising=False)\n    monkeypatch.delattr("app._target", raising=False)\n', false],
         ['f-string target of another module', 'from unittest.mock import patch\nMOD = "other"\ndef exercise():\n    with patch(f"{MOD}._target"): pass\n', false],
-        ['f-string target with a runtime member', 'from unittest.mock import patch\ndef exercise(name):\n    with patch(f"app.{name}"): pass\n', false],
+        // Nothing in the project calls `exercise`: what it is given is not
+        // known, and the literal part of the path bounds the module (fix #512).
+        ['f-string target with a runtime member', 'from unittest.mock import patch\ndef exercise(name):\n    with patch(f"app.{name}"): pass\n', true],
         ['another member of the fixture', 'def test_it(monkeypatch):\n    monkeypatch.setenv("_target", "1")\n    monkeypatch.setitem({}, "app._target", 1)\n', false],
         ['a path that is not dotted, on an unproven receiver', 'def test_it(client):\n    client.patch("/app/_target")\n    client.patch(f"/app/{1}._target")\n', false],
         ['a function this file defines as patch', 'def patch(target): return target\ndef exercise():\n    return patch("app._target")\n', false],
@@ -426,7 +428,7 @@ describe('fix #505: attributes a test double patches by name, backend entry poin
             assert.strictEqual(claimed(index).some(row => row.endsWith(':_target')), !live);
             // The function beside it is untouched by the patch.
             assert.strictEqual(assess(index, 'keep').verdict,
-                label === 'targets of a literal loop' ? 'review' : 'no-static-dependents');
+                ['targets of a literal loop', 'f-string target with a runtime member'].includes(label) ? 'review' : 'no-static-dependents');
         } finally { rm(dir); }
     });
     // [label, test file, the double needs the member]
@@ -1514,5 +1516,359 @@ describe('fix #509: an entry point that names a module with no attribute', () =>
                 assert.strictEqual(answer.reason, row.breaks ? 'runtime-entrypoint' : 'claimed', `${row.id}: ${JSON.stringify(answer)}`);
             } finally { rm(dir); }
         }
+    });
+});
+
+describe('fix #512: the values a patched name can hold where it is read', () => {
+    const target = 'def _target():\n    return 7\n\ndef keep():\n    return 3\n';
+    const other = 'def _target():\n    return 9\n\ndef spare():\n    return 1\n';
+    // [label, files besides app.py and other.py, reached: app._target, app.keep, other._target]
+    const rows = [
+        ['parametrize, a string of names', { 'test_use.py': 'import pytest\n@pytest.mark.parametrize("name,value", [("_target", 1)])\ndef test_it(mocker, name, value):\n    mocker.patch(f"app.{name}", return_value=value)\n' }, true, false, false],
+        ['parametrize, names as a list and rows as tuples', { 'test_use.py': 'import pytest\n@pytest.mark.parametrize(["name"], [("_target",)])\ndef test_it(mocker, name):\n    mocker.patch("app." + name)\n' }, true, false, false],
+        ['parametrize, pytest.param rows', { 'test_use.py': 'import pytest\nimport app\n@pytest.mark.parametrize("name", [pytest.param("_target", id="t")])\ndef test_it(monkeypatch, name):\n    monkeypatch.setattr(app, name, lambda: 4)\n' }, true, false, false],
+        ['parametrize on the class', { 'test_use.py': 'import pytest\n@pytest.mark.parametrize("target", ["app._target"])\nclass TestIt:\n    def test_it(self, mocker, target):\n        mocker.patch(target)\n' }, true, false, false],
+        ['parametrize by a module pytestmark', { 'test_use.py': 'import pytest\npytestmark = [pytest.mark.parametrize("target", ["app._target"])]\ndef test_it(mocker, target):\n    mocker.patch(target)\n' }, true, false, false],
+        ['parametrize, values from a module constant only the mark reads', { 'test_use.py': 'import pytest\nTARGETS = ["app._target"]\n@pytest.mark.parametrize("target", TARGETS, ids=TARGETS)\ndef test_it(mocker, target):\n    mocker.patch(target)\n' }, true, false, false],
+        ['parametrize, nine values', { 'test_use.py': `import pytest\n@pytest.mark.parametrize("name", [${['_target', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8'].map(n => `"${n}"`).join(', ')}])\ndef test_it(mocker, name):\n    mocker.patch(f"app.{name}", create=name != "_target")\n` }, true, false, false],
+        ['a literal loop of nine values', { 'test_use.py': `def test_it(mocker):\n    for name in [${['_target', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8'].map(n => `"${n}"`).join(', ')}]:\n        mocker.patch(f"app.{name}")\n` }, true, false, false],
+        ['parametrize naming another module', { 'test_use.py': 'import pytest\n@pytest.mark.parametrize("target", ["other._target"])\ndef test_it(mocker, target):\n    mocker.patch(target)\n' }, false, false, true],
+        // An indirect value goes to a fixture, which may return anything: the
+        // literal part of the path still bounds the module.
+        ['parametrize, indirect', { 'test_use.py': 'import pytest\n@pytest.fixture\ndef name(request):\n    return request.param\n@pytest.mark.parametrize("name", ["_target"], indirect=True)\ndef test_it(mocker, name):\n    mocker.patch(f"app.{name}")\n' }, true, true, false],
+        ['parametrize, values handed on elsewhere', { 'test_use.py': 'import pytest\nNAMES = ["_target"]\nNAMES.append("keep")\n@pytest.mark.parametrize("name", NAMES)\ndef test_it(mocker, name):\n    mocker.patch(f"app.{name}")\n' }, true, true, false],
+        ['a helper, positional', { 'test_use.py': 'import app\ndef _install(patcher, name):\n    patcher.setattr(app, name, lambda: 4)\ndef test_it(monkeypatch):\n    _install(monkeypatch, "_target")\n' }, true, false, false],
+        ['a helper, keyword', { 'test_use.py': 'def _patch(mocker, target):\n    mocker.patch(target)\ndef test_it(mocker):\n    _patch(mocker, target="app._target")\n' }, true, false, false],
+        ['a helper, default', { 'test_use.py': 'def _patch(mocker, target="app._target"):\n    mocker.patch(target)\ndef test_it(mocker):\n    _patch(mocker)\n' }, true, false, false],
+        ['a helper, two hops', { 'test_use.py': 'def _patch(mocker, name):\n    mocker.patch(f"app.{name}")\ndef _outer(mocker, name):\n    _patch(mocker, name)\ndef test_it(mocker):\n    _outer(mocker, "_target")\n' }, true, false, false],
+        ['a helper method', { 'test_use.py': 'class Doubles:\n    def __init__(self, mocker):\n        self.mocker = mocker\n    def replace(self, name):\n        return self.mocker.patch(f"app.{name}")\ndef test_it(mocker):\n    Doubles(mocker).replace("_target")\n' }, true, false, false],
+        ['a helper in another file', { 'helpers.py': 'import app\ndef install(patcher, name):\n    patcher.setattr(app, name, lambda: 4)\n', 'test_use.py': 'from helpers import install\ndef test_it(monkeypatch):\n    install(monkeypatch, "_target")\n' }, true, false, false],
+        ['a helper given another module', { 'test_use.py': 'def _patch(mocker, target):\n    mocker.patch(target)\ndef test_it(mocker):\n    _patch(mocker, "other._target")\n' }, false, false, true],
+        // Called from elsewhere with values not known here (judged clean
+        // when nothing calls it at all: an accepted over-caution).
+        ['a helper nothing calls', { 'test_use.py': 'def _patch(mocker, name):\n    mocker.patch(f"app.{name}")\n' }, true, true, false],
+        ['a helper used as a value', { 'test_use.py': 'def _patch(mocker, name):\n    mocker.patch(f"app.{name}")\ndef test_it(mocker):\n    for name in map(str, ["_target"]):\n        apply(_patch, mocker, name)\n' }, true, true, false],
+        // Members the runtime invokes by protocol are never called by name.
+        ['a helper that is a constructor', { 'test_use.py': 'class Doubles:\n    def __init__(self, mocker, name):\n        mocker.patch(f"app.{name}")\nclass Base:\n    def __init__(self, label):\n        self.label = label\nclass Child(Base):\n    def __init__(self):\n        super().__init__("keep")\ndef test_it(mocker):\n    Doubles(mocker, "_target")\n' }, true, true, false],
+        ['a helper called with spread arguments', { 'test_use.py': 'def _patch(mocker, name):\n    mocker.patch(f"app.{name}")\ndef test_it(mocker):\n    _patch(*[mocker, "_target"])\n' }, true, true, false],
+        ['join of a literal list', { 'test_use.py': 'def test_it(mocker):\n    mocker.patch(".".join(["app", "_target"]))\n' }, true, false, false],
+        ['join of a module tuple', { 'test_use.py': 'PARTS = ("app", "_target")\ndef test_it(mocker):\n    mocker.patch(".".join(PARTS))\n' }, true, false, false],
+        ['join naming another module', { 'test_use.py': 'def test_it(mocker):\n    mocker.patch(".".join(["other", "_target"]))\n' }, false, false, true],
+        ['a dictionary lookup', { 'test_use.py': 'TARGETS = {"main": "app._target", "side": "other.spare"}\ndef test_it(mocker):\n    mocker.patch(TARGETS["main"])\n' }, true, false, false],
+        ['a dictionary get with a default', { 'test_use.py': 'def test_it(mocker):\n    targets = {"main": "other._target"}\n    mocker.patch(targets.get("absent", "app._target"))\n' }, true, false, false],
+        ['the values of a dictionary', { 'test_use.py': 'TARGETS = {"main": "app._target"}\ndef test_it(mocker):\n    for target in TARGETS.values():\n        mocker.patch(target)\n' }, true, false, false],
+        ['a sequence index', { 'test_use.py': 'TARGETS = ["other._target", "app._target"]\ndef test_it(mocker):\n    mocker.patch(TARGETS[-1])\n' }, true, false, false],
+        ['a dictionary key naming another module', { 'test_use.py': 'TARGETS = {"main": "other._target", "spare": "app._target"}\ndef test_it(mocker):\n    mocker.patch(TARGETS["main"])\n' }, false, false, true],
+        // A container the file changes or hands on is not closed.
+        ['a dictionary the file changes', { 'test_use.py': 'TARGETS = {"main": "other._target"}\nTARGETS["main"] = "app.keep"\ndef test_it(mocker):\n    mocker.patch(TARGETS["main"])\n' }, true, true, true],
+        ['an f-string member from a fixture', { 'test_use.py': 'import pytest\n@pytest.fixture\ndef name():\n    return "_target"\ndef test_it(mocker, name):\n    mocker.patch(f"app.{name}")\n' }, true, true, false],
+        ['a whole target from a fixture', { 'test_use.py': 'import pytest\n@pytest.fixture\ndef target():\n    return "app._target"\ndef test_it(mocker, target):\n    mocker.patch(target)\n' }, true, true, true],
+        ['an object member from a fixture', { 'test_use.py': 'import pytest\nimport app\n@pytest.fixture\ndef name():\n    return "_target"\ndef test_it(monkeypatch, name):\n    monkeypatch.setattr(app, name, lambda: 4)\n' }, true, true, false],
+        // A callee that is a patch API only because its origin cannot be
+        // followed reads no parameter and no unknown value, and a literal that
+        // names no member names nothing.
+        ['a call on an origin that cannot be followed', { 'use.py': 'def render(name, widths):\n    box = __import__(name)\n    return box.get_row(widths)\n' }, false, false, false],
+        ['strings that name no member', { 'use.py': 'def clean(raw, parts):\n    return raw.decode("utf-8").replace("\\r\\n", "\\n").split(parts)\n' }, false, false, false],
+    ];
+    for (const [label, files, live, keepLive, otherLive] of rows) it(label, () => {
+        const dir = tmp({ 'app.py': target, 'other.py': other, ...files });
+        try {
+            const index = idx(dir);
+            const answers = [['_target', 'app.py'], ['keep', 'app.py'], ['_target', 'other.py']].map(([name, file]) => assess(index, name, file));
+            const expected = [live, keepLive, otherLive];
+            answers.forEach((answer, position) => {
+                assert.strictEqual(answer.verdict, expected[position] ? 'review' : 'no-static-dependents', JSON.stringify(answer));
+                if (expected[position]) assert.strictEqual(answer.reason, 'reflection');
+            });
+            const audit = claimed(index);
+            assert.strictEqual(audit.some(row => row.startsWith('app.py:') && row.endsWith(':_target')), !live);
+            assert.strictEqual(audit.some(row => row.endsWith(':keep')), !keepLive);
+        } finally { rm(dir); }
+    });
+    // A callee known only by the member it is written with proves nothing; a
+    // value it cannot read names nothing (stated, not covered).
+    it('an unread value on a callee known only by its spelling names nothing', () => {
+        const dir = tmp({ 'app.py': target, 'test_use.py': 'import pytest\n@pytest.fixture\ndef doubles(mocker):\n    return mocker\n@pytest.fixture\ndef target():\n    return "app._target"\ndef test_it(doubles, target):\n    doubles.patch(target)\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(assess(index, '_target').verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+    it('a helper site is listed as an unverified caller, and the account is conserved', () => {
+        const dir = tmp({ 'app.py': target, 'test_use.py': 'def _patch(mocker, name):\n    mocker.patch(f"app.{name}")\ndef test_it(mocker):\n    _patch(mocker, "_target")\n' });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                const context = index.context('_target');
+                assert.deepStrictEqual(context.unverifiedCallers.map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+                    ['test_use.py:2:reflection-pattern']);
+                const account = context.meta.account;
+                assert.strictEqual(account.conserved, true, JSON.stringify(account));
+                assert.strictEqual(account.unaccounted, 0, JSON.stringify(account));
+                // An open site withholds and is never listed as a caller.
+                assert.deepStrictEqual(index.context('keep').unverifiedCallers, []);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+    it('recorded and open sites survive a parallel build and a cache round trip', () => {
+        const files = { 'app.py': target,
+            'test_use.py': 'import pytest\nimport app as application\ndef _patch(mocker, name):\n    mocker.patch(f"app.{name}")\n@pytest.fixture\ndef name():\n    return "keep"\n' +
+                'def test_it(mocker, monkeypatch, name):\n    _patch(mocker, "_target")\n    mocker.patch(f"app.{name}")\n    monkeypatch.setattr(application, "keep", 1)\n' };
+        for (let i = 0; i < 8; i++) files[`f${i}.py`] = `def f${i}(): return ${i}\n`;
+        const dir = tmp(files);
+        try {
+            const sequential = idx(dir);
+            const sites = entry => JSON.stringify(entry.reflectionSites);
+            const expected = sites(sequential.files.get(path.join(dir, 'test_use.py')));
+            assert.match(expected, /"deferred":\{"parameter":\{"name":"_patch"/);
+            assert.match(expected, /"open":true,"runtimeTarget":"app\.\*"/);
+            assert.match(expected, /"owner":\{"import":\{"module":"app","name":null\},"path":\[\]\}/);
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.strictEqual(parallel.lastBuildParallelEligible, true);
+            assert.strictEqual(sites(parallel.files.get(path.join(dir, 'test_use.py'))), expected);
+            parallel.saveCache();
+            const loaded = new ProjectIndex(dir, { quiet: true });
+            assert.ok(loaded.loadCache());
+            assert.strictEqual(sites(loaded.files.get(path.join(dir, 'test_use.py'))), expected);
+            for (const name of ['_target', 'keep']) assert.deepStrictEqual(assess(loaded, name), assess(sequential, name));
+        } finally { rm(dir); }
+    });
+    // [label, test file, the double needs the member]
+    const doubles = [
+        ['a helper passes the name', 'function stubIt(owner, name) { return jest.spyOn(owner, name); }\nstubIt(service, "_target");', true],
+        ['a helper given another name', 'function stubIt(owner, name) { return jest.spyOn(owner, name); }\nstubIt(service, "keep");', false],
+        ['a helper nothing calls', 'function stubIt(owner, name) { return jest.spyOn(owner, name); }', false],
+        ['a helper given a name it cannot read', 'function stubIt(owner, name) { return jest.spyOn(owner, name); }\nfor (const name of names()) stubIt(service, name);', false],
+        // A runner's table is the JS form of a parametrize mark.
+        ['test.each rows of arrays', 'test.each([["_target", 1], ["keep", 2]])("%s", (name, value) => { jest.spyOn(service, name); });', true],
+        ['it.each rows of names', 'it.each(["_target"])("%s", name => { jest.spyOn(service, name); });', true],
+        ['describe.only.each', 'describe.only.each([["_target"]])("%s", function (name) { vi.spyOn(service, name); });', true],
+        ['a table naming another member', 'test.each([["keep"]])("%s", (name) => { jest.spyOn(service, name); });', false],
+        ['a table it cannot read', 'test.each(rows())("%s", (name) => { jest.spyOn(service, name); });', false],
+    ];
+    for (const [language, extension] of [['javascript', 'js'], ['typescript', 'ts']]) {
+        for (const [label, use, live] of doubles) it(`${language}: ${label}`, () => {
+            const dir = tmp({
+                'package.json': '{"name":"sample"}', '.ucn.json': '{"kind":"application"}',
+                [`lib.${extension}`]: 'export class Service {\n  _target() { return 7; }\n  keep() { return 3; }\n  other() { return 1; }\n}\n',
+                [`lib.test.${extension}`]: `import * as lib from "./lib";\nconst service = new lib.Service();\n${use}\n`,
+            });
+            try {
+                const index = idx(dir);
+                const answer = assess(index, '_target');
+                assert.strictEqual(answer.verdict, live ? 'review' : 'no-static-dependents', JSON.stringify(answer));
+                if (live) assert.strictEqual(answer.reason, 'reflection');
+                assert.strictEqual(assess(index, 'other').verdict, 'no-static-dependents');
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #512: the object a patch names its member on', () => {
+    const project = {
+        '.ucn.json': '{"kind":"application"}',
+        'app.py': 'def _target():\n    return 7\n\ndef keep():\n    return 3\n',
+        'other.py': 'def _target():\n    return 9\n',
+        'pkg/__init__.py': 'from .core import Klass\nfrom .impl import *\n',
+        'pkg/core.py': 'class Base:\n    def _inherited(self):\n        return 1\n\n\nclass Klass(Base):\n    def _member(self):\n        return 1\n\n\n' +
+            'class Other:\n    def _member(self):\n        return 2\n\n    def _inherited(self):\n        return 2\n',
+        'pkg/impl.py': 'def helper():\n    return 1\n',
+    };
+    const handles = ['app.py::_target', 'other.py::_target', 'pkg/core.py:Klass:_member', 'pkg/core.py:Other:_member',
+        'pkg/core.py:Base:_inherited', 'pkg/core.py:Other:_inherited', 'pkg/impl.py::helper'];
+    const verdictAt = (index, handle) => {
+        const [file, className, name] = handle.split(':');
+        const defs = (index.symbols.get(name) || []).filter(def => def.relativePath === file && (def.className || '') === className);
+        assert.strictEqual(defs.length, 1, handle);
+        return assessDeletion(index, defs[0]);
+    };
+    // [label, test_use.py, the handles the patch needs]
+    const rows = [
+        ['a module object', 'import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, "_target", lambda: 4)\n', ['app.py::_target']],
+        ['an aliased module', 'import app as application\ndef test_it(mocker):\n    mocker.patch.object(application, "_target")\n', ['app.py::_target']],
+        ['a module a package import names', 'from pkg import core\ndef test_it(monkeypatch):\n    monkeypatch.setattr(core.Klass, "_member", lambda self: 4)\n', ['pkg/core.py:Klass:_member']],
+        ['a class its package re-exports', 'from pkg import Klass\ndef test_it(monkeypatch):\n    monkeypatch.setattr(Klass, "_member", lambda self: 4)\n', ['pkg/core.py:Klass:_member']],
+        ['a string target through the re-export', 'def test_it(mocker):\n    mocker.patch("pkg.Klass._member")\n', ['pkg/core.py:Klass:_member']],
+        ['an inherited member, by object', 'from pkg.core import Klass\ndef test_it(monkeypatch):\n    monkeypatch.setattr(Klass, "_inherited", lambda self: 4)\n', ['pkg/core.py:Base:_inherited']],
+        ['an inherited member, by string', 'def test_it(mocker):\n    mocker.patch("pkg.core.Klass._inherited")\n', ['pkg/core.py:Base:_inherited']],
+        ['a name a star import re-exports, by string', 'def test_it(mocker):\n    mocker.patch("pkg.helper")\n', ['pkg/impl.py::helper']],
+        ['a name a star import re-exports, by object', 'import pkg\ndef test_it(monkeypatch):\n    monkeypatch.setattr(pkg, "helper", lambda: 4)\n', ['pkg/impl.py::helper']],
+        ['an instance', 'from pkg.core import Klass\ndef test_it(monkeypatch):\n    monkeypatch.setattr(Klass(), "_member", lambda: 4)\n', ['pkg/core.py:Klass:_member']],
+        ['a module importlib loads', 'import importlib\ndef test_it(monkeypatch):\n    monkeypatch.setattr(importlib.import_module("app"), "_target", lambda: 4)\n', ['app.py::_target']],
+        ['a module from sys.modules', 'import sys\nimport app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(sys.modules["app"], "_target", lambda: 4)\n', ['app.py::_target']],
+        ['a module outside the project', 'import json\ndef test_it(monkeypatch):\n    monkeypatch.setattr(json, "_target", lambda: 4)\n    monkeypatch.setattr(json.decoder, "_member", lambda: 4)\n', []],
+        ['an owner bound to an instance', 'from pkg.core import Klass\ndef test_it(monkeypatch):\n    instance = Klass()\n    monkeypatch.setattr(instance, "_member", lambda: 4)\n', ['pkg/core.py:Klass:_member']],
+        ['the class of the method that patches', 'class TestIt:\n    def _target(self):\n        return 1\n    def test_it(self, monkeypatch):\n        monkeypatch.setattr(self, "_target", lambda: 4)\n', []],
+        ['an unread member of a module', 'import pytest\nimport app\n@pytest.fixture\ndef name():\n    return "_target"\ndef test_it(monkeypatch, name):\n    monkeypatch.setattr(app, name, lambda: 4)\n', ['app.py::_target']],
+        // The owner is a parameter: what it holds is not proven here.
+        ['an owner the file does not prove', 'def install(patcher, owner):\n    patcher.setattr(owner, "_target", lambda: 4)\n', ['app.py::_target', 'other.py::_target']],
+        ['an owner bound twice', 'import app\nimport other\nowner = app\nowner = other if app else app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(owner, "_target", lambda: 4)\n', ['app.py::_target', 'other.py::_target']],
+    ];
+    for (const [label, use, needed] of rows) it(label, () => {
+        const dir = tmp({ ...project, 'test_use.py': use });
+        try {
+            const index = idx(dir);
+            for (const handle of handles) {
+                const answer = verdictAt(index, handle);
+                const live = needed.includes(handle);
+                assert.strictEqual(answer.verdict, live ? 'review' : 'no-static-dependents', `${handle}: ${JSON.stringify(answer)}`);
+                if (live) assert.strictEqual(answer.reason, 'reflection', handle);
+            }
+            const audit = claimed(index);
+            for (const handle of handles) {
+                const { file, startLine, name } = verdictAt(index, handle).declaration;
+                assert.strictEqual(audit.includes(`${file}:${startLine}:${name}`), !needed.includes(handle), `audit ${handle}`);
+            }
+        } finally { rm(dir); }
+    });
+    it('a class the file defines holds only its own member', () => {
+        const dir = tmp({ ...project, 'use.py': 'class Local:\n    def _target(self):\n        return 1\n\ndef exercise(patcher):\n    patcher.setattr(Local, "_target", lambda self: 4)\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(verdictAt(index, 'use.py:Local:_target').reason, 'reflection');
+            assert.strictEqual(verdictAt(index, 'app.py::_target').verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+    // A root that is itself a package is imported as `mypkg.core` while its
+    // file is `core.py`: such a path is not shown to be outside.
+    it('a module path whose tail names a project module is not outside the project', () => {
+        const dir = tmp({ '.ucn.json': '{"kind":"application"}', '__init__.py': '', 'core.py': 'def _target():\n    return 7\n\ndef keep():\n    return 3\n',
+            'tests/test_use.py': 'import importlib\nimport sys\nimport mypkg.core as core\ndef test_it(monkeypatch, mocker):\n' +
+                '    monkeypatch.setattr(core, "_target", lambda: 4)\n    monkeypatch.setattr(importlib.import_module("mypkg.core"), "_target", 1)\n' +
+                '    monkeypatch.setattr(sys.modules["mypkg.core"], "_target", 1)\n    mocker.patch("mypkg.core._target")\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(assess(index, '_target').reason, 'reflection');
+            assert.strictEqual(assess(index, 'keep').verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+    it('an entry point through a star re-export reaches the declaration', () => {
+        const dir = tmp({ ...project, 'pyproject.toml': '[project.scripts]\nsample = "pkg:helper"\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(verdictAt(index, 'pkg/impl.py::helper').reason, 'runtime-entrypoint');
+            assert.strictEqual(verdictAt(index, 'app.py::_target').verdict, 'no-static-dependents');
+        } finally { rm(dir); }
+    });
+    it('an object form with a proven owner is listed as an unverified caller of that member only', () => {
+        const dir = tmp({ ...project, 'test_use.py': 'import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, "_target", lambda: 4)\n' });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                const own = index.context('_target', { file: 'app.py' });
+                assert.deepStrictEqual(own.unverifiedCallers.map(c => `${c.relativePath}:${c.line}:${c.reason}`), ['test_use.py:3:reflection-pattern']);
+                assert.strictEqual(own.meta.account.conserved, true, JSON.stringify(own.meta.account));
+                assert.strictEqual(own.meta.account.unaccounted, 0, JSON.stringify(own.meta.account));
+                assert.deepStrictEqual(index.context('_target', { file: 'other.py' }).unverifiedCallers, []);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #512: a class the file defines with its own patch or setattr method', () => {
+    const target = 'def _target():\n    return 7\n\ndef keep():\n    return 3\n';
+    // [label, use.py, the call needs the declaration]
+    const rows = [
+        ['a local class whose methods return the path', 'def test_it():\n    class Box:\n        def setattr(self, target, value=None):\n            return target\n        def patch(self, target):\n            return target\n    box = Box()\n    assert box.setattr("app._target") and box.patch("app._target")\n', false],
+        ['a module class, constructed in place', 'class Recorder:\n    def patch(self, target):\n        return target\ndef test_it():\n    assert Recorder().patch("app._target")\n', false],
+        ['its own method, through self', 'class Client:\n    def patch(self, target):\n        return target\n    def run(self):\n        return self.patch("app._target")\n', false],
+        // A method of its own that hands the path to a patcher is a wrapper.
+        ['a method that forwards to a patcher', 'class Forward:\n    def __init__(self, patcher):\n        self._patcher = patcher\n    def setattr(self, target, value):\n        self._patcher.setattr(target, value)\ndef test_it(monkeypatch):\n    Forward(monkeypatch).setattr("app._target", 4)\n', true],
+        ['a method that forwards through super()', 'import pytest\nclass Scoped(pytest.MonkeyPatch):\n    def setattr(self, target, value, raising=True):\n        return super().setattr(target, value, raising=raising)\ndef test_it():\n    Scoped().setattr("app._target", 4)\n', true],
+        ['an inherited method is the library\'s', 'import pytest\nclass Plain(pytest.MonkeyPatch):\n    pass\ndef test_it():\n    Plain().setattr("app._target", 4)\n', true],
+        ['a wrapper method called through self', 'class TestIt:\n    def patch(self, target):\n        return self.mocker.patch(target)\n    def test_it(self):\n        self.patch("app._target")\n', true],
+        ['a class of another file keeps the spelled reading', 'from helpers import Recorder\ndef test_it():\n    assert Recorder().patch("app._target")\n', true],
+    ];
+    for (const [label, use, live] of rows) it(label, () => {
+        const dir = tmp({ 'app.py': target, 'helpers.py': 'class Recorder:\n    def patch(self, target):\n        return target\n', 'use.py': use });
+        try {
+            const index = idx(dir);
+            const answer = assess(index, '_target');
+            assert.strictEqual(answer.verdict, live ? 'review' : 'no-static-dependents', JSON.stringify(answer));
+            if (live) assert.strictEqual(answer.reason, 'reflection');
+            assert.strictEqual(claimed(index).some(row => row.endsWith(':_target')), !live);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #512: object-form patch sites in the caller account', () => {
+    it('a member named on an owner the file does not prove is a possible caller of each declaration of the name', () => {
+        const dir = tmp({ 'app.py': 'def _target():\n    return 7\n', 'other.py': 'def _target():\n    return 9\n',
+            'use.py': 'def install(patcher, owner):\n    patcher.setattr(owner, "_target", lambda: 4)\n' });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                for (const file of ['app.py', 'other.py']) {
+                    const context = index.context('_target', { file });
+                    assert.deepStrictEqual(context.callers, [], file);
+                    assert.deepStrictEqual(context.unverifiedCallers.map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+                        ['use.py:2:reflection-pattern'], file);
+                    assert.strictEqual(context.meta.account.conserved, true, JSON.stringify(context.meta.account));
+                    assert.strictEqual(context.meta.account.unaccounted, 0, JSON.stringify(context.meta.account));
+                }
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+    for (const [language, extension] of [['javascript', 'js'], ['typescript', 'ts']]) {
+        it(`${language}: a double of a member is a possible caller of it`, () => {
+            const dir = tmp({ 'package.json': '{"name":"sample"}',
+                [`lib.${extension}`]: 'export class Service {\n  _target() { return 7; }\n}\n',
+                [`lib.test.${extension}`]: 'import { Service } from "./lib";\nconst service = new Service();\njest.spyOn(service, "_target");\n' });
+            try {
+                const index = idx(dir);
+                index._beginOp();
+                try {
+                    const context = index.context('_target');
+                    assert.deepStrictEqual(context.unverifiedCallers.map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+                        [`lib.test.${extension}:3:reflection-pattern`]);
+                    assert.strictEqual(context.meta.account.conserved, true, JSON.stringify(context.meta.account));
+                } finally { index._endOp(); }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #512: testdouble replaces a member by its name', () => {
+    // [label, test file, the double needs the member]
+    const doubles = [
+        ['td.replace of an imported testdouble', 'import td from "testdouble";\ntd.replace(service, "_target");', true],
+        ['td.replace of a required testdouble', 'const td = require("testdouble");\ntd.replace(service, "_target");', true],
+        ['a namespace import', 'import * as td from "testdouble";\ntd.replace(service, "_target");', true],
+        ['replace imported by name', 'import { replace } from "testdouble";\nreplace(service, "_target");', true],
+        ['a replace of another module', 'import td from "./doubles";\ntd.replace(service, "_target");', false],
+        ['a local shadowing the import', 'import td from "testdouble";\nfunction run(td) { return td.replace(service, "_target"); }', false],
+        ['a whole module replaced by path', 'import td from "testdouble";\ntd.replace("./lib");', false],
+    ];
+    for (const [language, extension] of [['javascript', 'js'], ['typescript', 'ts']]) {
+        for (const [label, use, live] of doubles) it(`${language}: ${label}`, () => {
+            const dir = tmp({
+                'package.json': '{"name":"sample"}', '.ucn.json': '{"kind":"application"}',
+                [`lib.${extension}`]: 'export class Service {\n  _target() { return 7; }\n  keep() { return 3; }\n}\n',
+                [`doubles.${extension}`]: 'export default { replace(owner, name) { return name; } };\n',
+                [`lib.test.${extension}`]: `import * as lib from "./lib";\nconst service = new lib.Service();\n${use}\n`,
+            });
+            try {
+                const index = idx(dir);
+                const answer = assess(index, '_target');
+                assert.strictEqual(answer.verdict, live ? 'review' : 'no-static-dependents', JSON.stringify(answer));
+                if (live) assert.strictEqual(answer.reason, 'reflection');
+                assert.strictEqual(assess(index, 'keep').verdict, 'no-static-dependents');
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #512: the runtime-entrypoint reason names the module form', () => {
+    it('the reason says a declaration or the module that holds it', () => {
+        const dir = tmp({ 'plugin.py': 'def _target():\n    return 7\n', 'pyproject.toml': '[project.entry-points.pytest11]\nsample = "plugin"\n' });
+        try {
+            const answer = assess(idx(dir), '_target');
+            assert.strictEqual(answer.reason, 'runtime-entrypoint');
+            assert.match(answer.basis, /registers this declaration or the module that holds it/);
+        } finally { rm(dir); }
     });
 });

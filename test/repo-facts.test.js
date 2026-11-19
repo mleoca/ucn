@@ -858,7 +858,10 @@ describe('fix #505: a test double that patches a member by name is a reflective 
         ['tsx', 'function f(o: any) { jest.spyOn(o as any, "a"); const e = <div onClick={() => sinon.stub(o, "b")} />; return e; }', ['a', 'b']],
         // The same members with another shape: a string method, a literal
         // where the owner goes, a missing or runtime name.
-        ['javascript', 'function f(o, s) { s.replace(/a/, "b"); "x".replace("a", "b"); o.stub("a"); o.spy("a", "b"); o.method(o, "a"); jest.spyOn(o, s); o.expects(); sinon.stub(); }', []],
+        ['javascript', 'function f(o, s) { s.replace(/a/, "b"); "x".replace("a", "b"); o.stub("a"); o.spy("a", "b"); o.method(o, "a"); o.expects(); sinon.stub(); }', []],
+        // A name that is a parameter is recorded with no name: its callers
+        // give it one when the project is asked (fix #512).
+        ['javascript', 'function f(o, s) { jest.spyOn(o, s); }', [undefined]],
         ['python', 'import app\ndef test_it(monkeypatch, mocker):\n    (monkeypatch.setattr)(app, "a", 1)\n    monkeypatch . delattr(app, "b")\n    mocker.patch("app.c")\n    mocker.spy(app, "d")\n    self.box.patch.object(app, "e")\n',
             ['a', 'b', 'c', 'd', 'e']],
         ['python', 'import app\ndef test_it(monkeypatch, mocker, client):\n    monkeypatch.setenv("a", "1")\n    monkeypatch.setattr(app, "b", 1, raising=False)\n    mocker.patch("app.c", create=True)\n    client.patch("/app/d")\n    mocker.stub("e")\n', []],

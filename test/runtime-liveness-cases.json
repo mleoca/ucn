@@ -3564,5 +3564,700 @@
     "name": "_target",
     "breaks": true,
     "native": "python3"
+  },
+  {
+    "id": "double-parametrize-fstring",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\n@pytest.mark.parametrize(\"name\", [\"_target\", \"_unused\"])\ndef test_it(mocker, name):\n    mocker.patch(f\"app.{name}\", return_value=4)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-parametrize-target",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\n@pytest.mark.parametrize(\"target\", [\"app._target\"])\ndef test_it(mocker, target):\n    assert mocker.patch(target, return_value=4)() == 4\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-parametrize-object",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\nimport app\n@pytest.mark.parametrize(\"name,value\", [pytest.param(\"_target\", 4, id=\"t\")])\ndef test_it(monkeypatch, name, value):\n    monkeypatch.setattr(app, name, lambda: value)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-parametrize-class",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\n@pytest.mark.parametrize(\"name\", [\"_target\"])\nclass TestIt:\n    def test_it(self, mocker, name):\n        mocker.patch(f\"app.{name}\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-parametrize-module-values",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\nTARGETS = [\"app._target\"]\n@pytest.mark.parametrize(\"target\", TARGETS)\ndef test_it(mocker, target):\n    mocker.patch(target)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-parametrize-nine-values",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\n@pytest.mark.parametrize(\"name\", [\"_target\", \"_unused\", \"_a2\", \"_a3\", \"_a4\", \"_a5\", \"_a6\", \"_a7\", \"_a8\"])\ndef test_it(mocker, name):\n    mocker.patch(f\"app.{name}\", create=name.startswith(\"_a\"))\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-literal-loop-nine-values",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "def test_it(mocker):\n    for name in [\"_target\", \"_unused\", \"_a2\", \"_a3\", \"_a4\", \"_a5\", \"_a6\", \"_a7\", \"_a8\"]:\n        mocker.patch(f\"app.{name}\", create=name.startswith(\"_a\"))\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-parametrize-other-module-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _target():\n    return 9\n",
+      "test_use.py": "import pytest\n@pytest.mark.parametrize(\"target\", [\"other._target\"])\ndef test_it(mocker, target):\n    mocker.patch(target)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-helper-name",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef _install(patcher, name):\n    patcher.setattr(app, name, lambda: 4)\ndef test_it(monkeypatch):\n    _install(monkeypatch, \"_target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-helper-keyword",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef _install(patcher, name):\n    patcher.setattr(app, name, lambda: 4)\ndef test_it(monkeypatch):\n    _install(monkeypatch, name=\"_target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-helper-two-hops",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef _install(patcher, name):\n    patcher.setattr(app, name, lambda: 4)\ndef _outer(patcher, name):\n    _install(patcher, name)\ndef test_it(monkeypatch):\n    _outer(monkeypatch, \"_target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-helper-default",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "def _patch(mocker, target=\"app._target\"):\n    return mocker.patch(target)\ndef test_it(mocker):\n    _patch(mocker)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-helper-method",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "class Doubles:\n    def __init__(self, mocker):\n        self.mocker = mocker\n    def replace(self, name):\n        return self.mocker.patch(f\"app.{name}\")\ndef test_it(mocker):\n    Doubles(mocker).replace(\"_target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-helper-other-module-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _target():\n    return 9\n",
+      "test_use.py": "def _patch(mocker, target):\n    return mocker.patch(target)\ndef test_it(mocker):\n    _patch(mocker, \"other._target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-join-literal-list",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "def test_it(mocker):\n    mocker.patch(\".\".join([\"app\", \"_target\"]))\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-join-module-tuple",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "PARTS = (\"app\", \"_target\")\ndef test_it(mocker):\n    mocker.patch(\".\".join(PARTS))\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-join-other-module-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _target():\n    return 9\n",
+      "test_use.py": "def test_it(mocker):\n    mocker.patch(\".\".join([\"other\", \"_target\"]))\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-dict-lookup",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _other():\n    return 9\n",
+      "test_use.py": "TARGETS = {\"main\": \"app._target\", \"side\": \"other._other\"}\ndef test_it(mocker):\n    mocker.patch(TARGETS[\"main\"])\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-dict-get",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "def test_it(mocker):\n    targets = {\"main\": \"app._target\"}\n    mocker.patch(targets.get(\"main\"))\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-dict-values",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "TARGETS = {\"main\": \"app._target\"}\ndef test_it(mocker):\n    for target in TARGETS.values():\n        mocker.patch(target)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-dict-other-key-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _target():\n    return 9\n",
+      "test_use.py": "TARGETS = {\"main\": \"other._target\", \"spare\": \"app._target\"}\ndef test_it(mocker):\n    mocker.patch(TARGETS[\"main\"])\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-sequence-index",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _other():\n    return 9\n",
+      "test_use.py": "TARGETS = [\"other._other\", \"app._target\"]\ndef test_it(mocker):\n    mocker.patch(TARGETS[1])\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-url-helper-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "class Client:\n    def patch(self, url):\n        return url\ndef _send(client, url):\n    return client.patch(url)\ndef test_it():\n    assert _send(Client(), \"/app/_target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-owner-module-namesake-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "other.py": "def _target():\n    return 9\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app, \"_target\", lambda: 4)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "other.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-owner-outside-module-control",
+    "files": {
+      "app.py": "def dumps():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import json\ndef test_it(monkeypatch):\n    monkeypatch.setattr(json, \"dumps\", lambda *a, **k: \"x\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "dumps",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-owner-reexported-class-object",
+    "files": {
+      "pkg/__init__.py": "from .core import Klass\n",
+      "pkg/core.py": "class Klass:\n    def _target(self):\n        return 7\n\n    def _unused(self):\n        return 3\n",
+      "test_use.py": "from pkg import Klass\ndef test_it(monkeypatch):\n    monkeypatch.setattr(Klass, \"_target\", lambda self: 4)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "class Klass:\n    def _unused(self):\n        return 3\n",
+    "file": "pkg/core.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-owner-reexported-class-string",
+    "files": {
+      "pkg/__init__.py": "from .core import Klass\n",
+      "pkg/core.py": "class Klass:\n    def _target(self):\n        return 7\n\n    def _unused(self):\n        return 3\n",
+      "test_use.py": "def test_it(mocker):\n    mocker.patch(\"pkg.Klass._target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "class Klass:\n    def _unused(self):\n        return 3\n",
+    "file": "pkg/core.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-owner-inherited-string",
+    "files": {
+      "pkg/__init__.py": "",
+      "pkg/core.py": "class Base:\n    def _target(self):\n        return 7\n\n    def _unused(self):\n        return 3\n\n\nclass Klass(Base):\n    pass\n",
+      "test_use.py": "def test_it(mocker):\n    mocker.patch(\"pkg.core.Klass._target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "class Base:\n    def _unused(self):\n        return 3\n\n\nclass Klass(Base):\n    pass\n",
+    "file": "pkg/core.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-owner-star-reexport-string",
+    "files": {
+      ".ucn.json": "{\"kind\": \"application\"}",
+      "pkg/__init__.py": "from .impl import *\n",
+      "pkg/impl.py": "def helper():\n    return 7\n\ndef spare():\n    return 3\n",
+      "test_use.py": "def test_it(mocker):\n    mocker.patch(\"pkg.helper\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def spare():\n    return 3\n",
+    "file": "pkg/impl.py",
+    "name": "helper",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-own-method-local-class-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "def test_it():\n    class Box:\n        def setattr(self, target, value=None):\n            return target\n        def patch(self, target):\n            return target\n    box = Box()\n    assert box.setattr(\"app._target\") and box.patch(\"app._target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-own-method-module-class-control",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "class Recorder:\n    def patch(self, target):\n        return target\ndef test_it():\n    assert Recorder().patch(\"app._target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": false,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-own-method-forwards",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "class Forward:\n    def __init__(self, patcher):\n        self._patcher = patcher\n    def setattr(self, target, value):\n        self._patcher.setattr(target, value)\ndef test_it(monkeypatch):\n    Forward(monkeypatch).setattr(\"app._target\", lambda: 4)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-own-method-forwards-super",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\nclass Scoped(pytest.MonkeyPatch):\n    def setattr(self, target, value, raising=True):\n        return super().setattr(target, value, raising=raising)\ndef test_it():\n    patcher = Scoped()\n    patcher.setattr(\"app._target\", lambda: 4)\n    patcher.undo()\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-own-method-inherited-api",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\nclass Plain(pytest.MonkeyPatch):\n    pass\ndef test_it():\n    patcher = Plain()\n    patcher.setattr(\"app._target\", lambda: 4)\n    patcher.undo()\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-own-method-self-wrapper",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\nclass TestIt:\n    @pytest.fixture(autouse=True)\n    def _doubles(self, mocker):\n        self.mocker = mocker\n    def patch(self, target):\n        return self.mocker.patch(target)\n    def test_it(self):\n        self.patch(\"app._target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-open-parametrize-indirect",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\n@pytest.fixture\ndef name(request):\n    return request.param\n@pytest.mark.parametrize(\"name\", [\"_target\"], indirect=True)\ndef test_it(mocker, name):\n    mocker.patch(f\"app.{name}\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-open-fixture-target",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "import pytest\n@pytest.fixture\ndef target():\n    return \"app._target\"\ndef test_it(mocker, target):\n    mocker.patch(target)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-helper-constructor",
+    "files": {
+      "app.py": "def _target():\n    return 7\n\ndef _unused():\n    return 3\n",
+      "test_use.py": "class Doubles:\n    def __init__(self, mocker, name):\n        mocker.patch(f\"app.{name}\")\ndef test_it(mocker):\n    Doubles(mocker, \"_target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "def _unused():\n    return 3\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-owner-module-value-string",
+    "files": {
+      "app.py": "class Service:\n    def _target(self):\n        return 7\n\n    def _unused(self):\n        return 3\n\n\nservice = Service()\n",
+      "test_use.py": "def test_it(mocker):\n    mocker.patch(\"app.service._target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "class Service:\n    def _unused(self):\n        return 3\n\n\nservice = Service()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
+  },
+  {
+    "id": "double-owner-module-value-object",
+    "files": {
+      "app.py": "class Service:\n    def _target(self):\n        return 7\n\n    def _unused(self):\n        return 3\n\n\nservice = Service()\n",
+      "test_use.py": "import app\ndef test_it(monkeypatch):\n    monkeypatch.setattr(app.service, \"_target\", lambda: 4)\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "class Service:\n    def _unused(self):\n        return 3\n\n\nservice = Service()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest"
+    ]
+  },
+  {
+    "id": "double-owner-instance-attribute",
+    "files": {
+      "app.py": "class Repo:\n    def _target(self):\n        return 7\n\n    def _unused(self):\n        return 3\n\n\nclass Holder:\n    def __init__(self):\n        self.repo = Repo()\n",
+      "test_use.py": "from app import Holder\ndef test_it(mocker):\n    mocker.patch.object(Holder().repo, \"_target\")\n"
+    },
+    "run": "import sys, pytest; sys.exit(pytest.main([\"-q\", \"-p\", \"no:cacheprovider\", \"test_use.py\"]))",
+    "after": "class Repo:\n    def _unused(self):\n        return 3\n\n\nclass Holder:\n    def __init__(self):\n        self.repo = Repo()\n",
+    "file": "app.py",
+    "name": "_target",
+    "breaks": true,
+    "native": "python3",
+    "requires": [
+      "pytest",
+      "pytest_mock"
+    ]
   }
 ]

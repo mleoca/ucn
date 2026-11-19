@@ -1051,7 +1051,15 @@ const JS_REFLECTION_API = {
         { name: /^expects$/, nameArg: 0, ownerOfCall: /^mock$/ },
         // node:test: mock.method(obj, 'name'), t.mock.getter(obj, 'name').
         { name: /^(?:method|getter|setter)$/, owner: /(?:^|\.)mock$/, ownerArg: 0, nameArg: 1 },
+        // testdouble: td.replace(obj, 'name') throws when the member is
+        // absent. `package`: the callee is the module's own (imported or
+        // required), or a member of it.
+        { name: /^replace$/, package: 'testdouble', ownerArg: 0, nameArg: 1 },
     ],
+    // Runners that call a test callback once per row of a table
+    // (`test.each(rows)(title, fn)`): a row gives the callback's parameters
+    // their values, as a parametrize mark does in Python.
+    eachRunners: /^(?:test|it|describe)(?:\.(?:only|skip|concurrent|failing|sequential))*$/,
     namespaceLookups: { calls: /^eval$/ },
     // Every other operation of the Reflect namespace (apply, construct,
     // ownKeys, defineProperty, a decorator's Reflect.metadata).

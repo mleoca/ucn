@@ -1028,7 +1028,12 @@ function clearAllCaches() {
 // `normalizedIdentifiers`, the NFKC forms of identifiers written otherwise
 // (core/python-binding-identity.js): the dead-code audit reads both instead
 // of parsing and normalizing the files on each query.
-const CACHE_FORMAT_VERSION = 339;
+// v340 (fix #512): a test double's patch site may be `deferred` (a name
+// that is a parameter of the callable holding it, with the alternatives the
+// callers' values complete) or `open` (a member no value closes, its
+// `runtimeTarget` a glob such as `pkg.mod.*` or `*`); parametrize marks,
+// `str.join`, literal container lookups and more than eight values are read.
+const CACHE_FORMAT_VERSION = 340;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {
