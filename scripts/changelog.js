@@ -215,7 +215,11 @@ function sectionFromHistory(cwd, version, today) {
     const previous = earlier.length > 0 ? earlier[earlier.length - 1] : null;
     const to = own || 'HEAD';
     if (!historyIsComplete(cwd, previous, to)) return null;
-    const date = own ? git(cwd, ['log', '-1', '--format=%cs', own]) : today;
+    // One clock for both: `today` is the UTC calendar date, so a tagged
+    // section is dated by the UTC date of its tag's commit, whatever
+    // timezone the commit records. A section written before the tag exists
+    // and the same section read back from the tag are then identical.
+    const date = own ? new Date(git(cwd, ['log', '-1', '--format=%cI', own])).toISOString().slice(0, 10) : today;
     return renderSection(version, date, commitsBetween(cwd, previous, to));
 }
 

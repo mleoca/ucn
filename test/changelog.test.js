@@ -180,11 +180,30 @@ describe('changelog: written from the history of a repository', () => {
             assert.match(sections[1].text, /- an early fix \(/);
             assert.match(sections[0].text, /- after the first version \(/);
             assert.doesNotMatch(read(dir), /not released yet/);
-            assert.match(sections[0].text, new RegExp(`^## 1\\.1\\.0 - ${git(dir, 'log', '-1', '--format=%cs', 'v1.1.0')}\\n`));
+            const taggedOn = new Date(git(dir, 'log', '-1', '--format=%cI', 'v1.1.0')).toISOString().slice(0, 10);
+            assert.match(sections[0].text, new RegExp(`^## 1\\.1\\.0 - ${taggedOn}\\n`));
             // From a later tag on: the earlier versions are left out.
             run(dir, '--all', '--from', 'v1.1.0');
             assert.deepEqual(changelog.splitSections(read(dir)).map(section => section.version), ['1.1.0']);
             assert.throws(() => run(dir, '--all', '--from', 'v9.9.9'), /not a version tag/);
+        } finally { rm(dir); }
+    });
+
+    it('dates a tagged section on the clock an untagged one is written on', () => {
+        const dir = repository(['feat: the beginning', '1.0.0', '@v1.0.0', 'fix: one change'], '1.0.0');
+        try {
+            // The release commit is made just after midnight east of UTC:
+            // its own timezone says the 10th, UTC says the 9th.
+            const instant = '2026-03-10T00:30:00+02:00';
+            fs.writeFileSync(path.join(dir, 'file.txt'), 'release\n');
+            git(dir, 'add', '-A');
+            execFileSync('git', ['commit', '-q', '-m', '1.1.0'],
+                { cwd: dir, env: { ...GIT_ENV, GIT_COMMITTER_DATE: instant, GIT_AUTHOR_DATE: instant } });
+            const untagged = changelog.sectionFromHistory(dir, '1.1.0', '2026-03-09');
+            git(dir, 'tag', 'v1.1.0');
+            const tagged = changelog.sectionFromHistory(dir, '1.1.0', '2026-03-11');
+            assert.match(tagged, /^## 1\.1\.0 - 2026-03-09\n/);
+            assert.strictEqual(tagged, untagged);
         } finally { rm(dir); }
     });
 
