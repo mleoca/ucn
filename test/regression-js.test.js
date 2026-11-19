@@ -13667,3 +13667,44 @@ describe('fix #513: a JavaScript or TypeScript module loaded by path is the modu
         } finally { rm(dir); }
     });
 });
+
+describe('fix #513: a rename plan edits the imports that bind the pinned definition', () => {
+    const FILES = {
+        'package.json': '{"name":"fixture","version":"1.0.0"}',
+        'lib.js': [
+            'var app = exports = module.exports = {};',
+            '',
+            'app.init = function init(a) {',
+            '  return a;',
+            '};',
+            '',
+            'exports.render = function render(view, options) {',
+            '  return view;',
+            '};',
+            '',
+            'var other = {};',
+            'other.render = function (x) {',
+            '  return x;',
+            '};',
+            '',
+        ].join('\n'),
+        'use.js': "var lib = require('./lib');\n\nlib.init(1);\nlib.render('a', {});\n",
+        'use2.js': "const { render } = require('./lib');\n\nfunction go() {\n  return render('b', {});\n}\n\nmodule.exports = { go };\n",
+    };
+    const editsOf = (index, handle) => {
+        const result = execute(index, 'plan', { name: handle, renameTo: 'draw' });
+        assert.ok(result.ok, JSON.stringify(result));
+        return result.result.changes.map(change => `${change.file}:${change.line}`).sort();
+    };
+
+    it('a member of another value renames its definition only; the export keeps its import and calls', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(editsOf(index, 'lib.js:12:render'), ['lib.js:12']);
+            assert.deepStrictEqual(editsOf(index, 'lib.js:7:render'), ['lib.js:7', 'use.js:4', 'use2.js:1', 'use2.js:4']);
+            // A member of a name the file binds to its module object is the module's name.
+            assert.deepStrictEqual(editsOf(index, 'lib.js:3:init'), ['lib.js:3', 'use.js:3']);
+        } finally { rm(dir); }
+    });
+});

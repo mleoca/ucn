@@ -7,7 +7,9 @@
  * called with it implicitly. Each header change of such a function beside
  * the same change to a method, so the receiver a method's call passes is
  * still left out of its count, and to such a function applied as a class
- * decorator or held as a class attribute.
+ * decorator or held as a class attribute. A method called through its
+ * class's name is the unbound function, so that call writes the receiver
+ * as its first argument (fix #513).
  * `expect` is the toolchain's verdict (eval/run-check-matrix.js);
  * `answer` and `detail` are the check's.
  */
@@ -153,5 +155,47 @@ module.exports = [
         "expect": "break",
         "answer": "REVIEW_REQUIRED",
         "detail": "helper:modified=review(header,inferred-return-contract)"
+    },
+    {
+        "id": "selfparam-py-unbound-call-writes-receiver",
+        "lang": "py",
+        "base": {
+            "lib.py": "class Box:\n    def compute(self, value: int) -> int:\n        return value\n\ndef changed() -> int:\n    return Box().compute(1)\n\ndef consumer() -> int:\n    return changed()\n"
+        },
+        "after": {
+            "lib.py": "class Box:\n    def compute(self, value: int) -> int:\n        return value\n\ndef changed() -> int:\n    return Box.compute(Box(), 1)\n\ndef consumer() -> int:\n    return changed()\n"
+        },
+        "expect": "clean",
+        "name": "changed",
+        "answer": "REVIEW_REQUIRED",
+        "detail": "changed:modified=review(outgoing-call-unverified)"
+    },
+    {
+        "id": "selfparam-py-unbound-call-writes-receiver-and-keyword",
+        "lang": "py",
+        "base": {
+            "lib.py": "class Box:\n    def compute(self, value: int) -> int:\n        return value\n\ndef changed() -> int:\n    return Box().compute(1)\n\ndef consumer() -> int:\n    return changed()\n"
+        },
+        "after": {
+            "lib.py": "class Box:\n    def compute(self, value: int) -> int:\n        return value\n\ndef changed() -> int:\n    return Box.compute(Box(), value=1)\n\ndef consumer() -> int:\n    return changed()\n"
+        },
+        "expect": "clean",
+        "name": "changed",
+        "answer": "REVIEW_REQUIRED",
+        "detail": "changed:modified=review(outgoing-call-unverified)"
+    },
+    {
+        "id": "selfparam-py-unbound-call-without-arguments",
+        "lang": "py",
+        "base": {
+            "lib.py": "class Box:\n    def compute(self, value: int) -> int:\n        return value\n\ndef changed() -> int:\n    return Box().compute(1)\n\ndef consumer() -> int:\n    return changed()\n"
+        },
+        "after": {
+            "lib.py": "class Box:\n    def compute(self, value: int) -> int:\n        return value\n\ndef changed() -> int:\n    return Box.compute()\n\ndef consumer() -> int:\n    return changed()\n"
+        },
+        "expect": "break",
+        "name": "changed",
+        "answer": "BLOCKED",
+        "detail": "changed:modified=blocked(outgoing-signature-mismatch)"
     }
 ];

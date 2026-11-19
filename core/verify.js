@@ -1156,11 +1156,12 @@ function boundReturnType(index, file, written) {
  * convention (trait `receiverParameterByConvention`), only a member of a
  * type, or a constructor, is called with it implicitly: a function that is
  * not a member takes every parameter it writes (`def helper(self, x)` is
- * called `helper(a, b)`). A language's receiver syntax (TypeScript `this`,
- * Rust `self`) is never an argument.
+ * called `helper(a, b)`), and so does a static member. A language's
+ * receiver syntax (TypeScript `this`, Rust `self`) is never an argument.
  */
 function receiverIsArgument(def, lang, constructorList) {
-    return langTraits(lang)?.receiverParameterByConvention === true && !constructorList && !def.className;
+    return langTraits(lang)?.receiverParameterByConvention === true && !constructorList &&
+        (!def.className || def.memberType === 'static' || def.type === 'static');
 }
 
 /**
@@ -2458,6 +2459,26 @@ function verify(index, name, options = {}, direct = null) {
     // Rest params don't count toward expected/min — they accept 0+ extra args
     const expectedParamCount = Math.max(...arities.map(a => a.max));
     const minArgs = inheritedCtorOnly ? 0 : Math.min(...arities.map(a => a.min));
+    // Where the receiver is a parameter named by convention (trait
+    // `receiverParameterByConvention`), a member called through its own
+    // class's name is the unbound function: the receiver is the first
+    // argument the call writes, so that call is counted and bound against
+    // the parameter list as written (`Box.run(box, 1)` fits `def run(self,
+    // x)`, `Box.run(1)` does not). The call record says whether the
+    // receiver spells the class or a local of the same name; a site whose
+    // record is not read keeps the member count.
+    const conventionReceiver = langTraits(lang)?.receiverParameterByConvention === true && !receiverArgument &&
+        !ctorParamLists && !heldInterface?.lists && !declaredShape?.lists && rawParamLists.length === 1 &&
+        params.length !== rawParamLists[0].length;
+    const writesReceiver = call => {
+        if (!conventionReceiver || !call.isMethod || call.invalidOverload || call.rebind) return false;
+        const { getCachedCalls, _receiverPassedImplicitly } = require('./callers');
+        const start = call.callSite?.start;
+        const records = (getCachedCalls(index, call.file) || []).filter(record => record.line === call.line &&
+            record.isMethod && (record.name === name || record.name === call.calledAs) &&
+            (!Number.isInteger(start) || (record.callStart ?? record.callSite?.start) === start));
+        return records.length === 1 && _receiverPassedImplicitly(records[0], def, langTraits(lang)) === 'explicit';
+    };
 
     // v4 tiered contract: the confirmed band is arg-checked below; unverified
     // candidates stay VISIBLE in their own band with reasons (never silently
@@ -2647,10 +2668,14 @@ function verify(index, name, options = {}, direct = null) {
         }
 
         // Check if arg count is valid
+        const receiverWritten = writesReceiver(call) ? 1 : 0;
+        const siteMin = minArgs + receiverWritten;
+        const siteMax = expectedParamCount + receiverWritten;
         const countOk = direct && !inheritedCtorOnly
-            ? arities.some(arity => argCount >= arity.min && (arity.hasRest || argCount <= arity.max))
-            : hasRest ? argCount >= minArgs
-                : (argCount >= minArgs && argCount <= expectedParamCount);
+            ? arities.some(arity => argCount >= arity.min + receiverWritten &&
+                (arity.hasRest || argCount <= arity.max + receiverWritten))
+            : hasRest ? argCount >= siteMin
+                : (argCount >= siteMin && argCount <= siteMax);
         if (call.rebind && call.rebind.kind !== 'no-overload' && (countOk || call.rebind.kind !== 'count')) {
             // Bound the base declaration; the new one may still take it, or
             // another overload may: the compiler decides (fix #394).
@@ -2678,10 +2703,10 @@ function verify(index, name, options = {}, direct = null) {
                 expression: call.content.trim(),
                 ...(call.rebind && { boundBeforeChange: true }),
                 expected: call.invalidOverload && countOk ? 'a compatible overload signature' : hasRest
-                    ? `at least ${minArgs} arg(s)`
-                    : (minArgs === expectedParamCount
-                        ? `${expectedParamCount} arg(s)`
-                        : `${minArgs}-${expectedParamCount} arg(s)`),
+                    ? `at least ${siteMin} arg(s)`
+                    : (siteMin === siteMax
+                        ? `${siteMax} arg(s)`
+                        : `${siteMin}-${siteMax} arg(s)`),
                 actual: argCount,
                 args: analysis.args,
                 patterns: patternFlagsFrom(analysis),
@@ -2694,7 +2719,8 @@ function verify(index, name, options = {}, direct = null) {
         // NAME-level contract too (keyword-only slots, unknown keyword names,
         // required coverage). A reshaping decorator demotes violations to
         // UNCERTAIN: the declared parameters may not be the call interface.
-        const bindingProblems = keywordBindable ? bindKeywordCall(params, analysis) : [];
+        const bindingProblems = keywordBindable
+            ? bindKeywordCall(receiverWritten ? rawParamLists[0] : params, analysis) : [];
         if (bindingProblems.length > 0) {
             if (decoratorReshapes) {
                 uncertain.push(coded({
@@ -2712,10 +2738,10 @@ function verify(index, name, options = {}, direct = null) {
                     line: call.line,
                     expression: call.content.trim(),
                     expected: hasRest
-                        ? `at least ${minArgs} arg(s)`
-                        : (minArgs === expectedParamCount
-                            ? `${expectedParamCount} arg(s)`
-                            : `${minArgs}-${expectedParamCount} arg(s)`),
+                        ? `at least ${siteMin} arg(s)`
+                        : (siteMin === siteMax
+                            ? `${siteMax} arg(s)`
+                            : `${siteMin}-${siteMax} arg(s)`),
                     actual: argCount,
                     args: analysis.args,
                     problem: bindingProblems.join('; '),
@@ -4208,8 +4234,14 @@ function plan(index, name, options = {}) {
         const {
             _nameBindingReaches,
             _moduleAttributeBindingReaches,
+            _moduleExposesTarget,
         } = require('./callers');
-        const renameTargetFiles = new Set([def.file]);
+        // The pin's file stands in for the pin only when the module binds
+        // the name to it (fix #513): a callable assigned to a member of
+        // some other value (`other.render = function (x)` beside
+        // `exports.render = ..`) is not what an import of the name binds.
+        const renameTargetFiles = _moduleExposesTarget(index, def.file, name, [def])
+            ? new Set([def.file]) : new Set();
         // A rename plan is repository-wide. The caller sweep already includes
         // tests; the import/reference sweep must not silently hide them via
         // usages()' navigation-oriented default test exclusion.

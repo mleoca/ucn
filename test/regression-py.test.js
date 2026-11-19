@@ -11261,3 +11261,59 @@ describe('fix #513: a receiver name is not a receiver', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #513: a method called through its class name is counted with the receiver it writes', () => {
+    // pyright (basic mode) on the same file: errors on lines 12, 14, 17 and 19.
+    const LIB = [
+        'class Box:',
+        '    def run(self, x):',
+        '        return x',
+        '',
+        '    @staticmethod',
+        '    def build(self, x):',
+        '        return x',
+        '',
+        '',
+        'def use(box: Box):',
+        '    Box.run(box, 1)',
+        '    Box.run(1)',
+        '    Box.run(box, x=1)',
+        '    Box.run()',
+        '    box.run(1)',
+        '    Box().run(1)',
+        '    Box().run(1, 2)',
+        '    Box.build(box, 1)',
+        '    Box.build(1)',
+        '',
+        '',
+        'def shadow(Box):',
+        '    return Box.run(1)',
+        '',
+    ].join('\n');
+    const lines = rows => (rows || []).map(row => row.line).sort((a, b) => a - b);
+
+    it('the unbound call fits the list as written, and a missing receiver is a mismatch', () => {
+        const dir = tmp({ 'requirements.txt': '', 'lib.py': LIB });
+        try {
+            const index = idx(dir);
+            const run = index.verify('run');
+            assert.deepStrictEqual(lines(run.mismatchDetails), [12, 14, 17]);
+            const missing = run.mismatchDetails.find(row => row.line === 12);
+            assert.strictEqual(missing.expected, '2 arg(s)');
+            assert.strictEqual(missing.actual, 1);
+            // An instance call still leaves the receiver out of its count.
+            assert.strictEqual(run.mismatchDetails.find(row => row.line === 17).expected, '1 arg(s)');
+            // A local spelled like the class may hold anything.
+            assert.ok(!lines(run.mismatchDetails).includes(23));
+        } finally { rm(dir); }
+    });
+
+    it('a static member takes every parameter it writes', () => {
+        const dir = tmp({ 'requirements.txt': '', 'lib.py': LIB });
+        try {
+            const build = idx(dir).verify('build');
+            assert.deepStrictEqual(lines(build.mismatchDetails), [19]);
+            assert.strictEqual(build.mismatchDetails[0].expected, '2 arg(s)');
+        } finally { rm(dir); }
+    });
+});

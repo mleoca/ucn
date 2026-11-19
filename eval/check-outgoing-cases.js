@@ -1252,8 +1252,8 @@ module.exports = [
         },
         "expect": "break",
         "name": "changed",
-        "answer": "REVIEW_REQUIRED",
-        "detail": "changed:modified=review(outgoing-call-unverified)"
+        "answer": "BLOCKED",
+        "detail": "changed:modified=blocked(outgoing-signature-mismatch)"
     },
     {
         "id": "outgoing-review2-js-class-without-new",
