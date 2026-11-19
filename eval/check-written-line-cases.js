@@ -14,7 +14,9 @@
  * assignment, a narrowing, a use, a thrown exception); and the breaks a change makes on unwritten lines
  * that the check does not see (a binding changed before an unchanged
  * `return`, a changed guard or assertion condition, a guard added above a
- * comparison), each pinned by id in eval/check-scoring.js.
+ * comparison, a closure a written call makes mutable, a property its
+ * constructor assigns through a method), each pinned by id in
+ * eval/check-scoring.js.
  * `expect` is the toolchain's verdict (eval/run-check-matrix.js);
  * `answer` and `detail` are the check's.
  */
@@ -978,5 +980,31 @@ module.exports = [
         "expect": "break",
         "answer": "REVIEW_REQUIRED",
         "detail": "run2:added=review(outgoing-call-unverified) run:deleted=ready"
+    },
+    {
+        "id": "written-rs-closure-made-mutable-by-a-call",
+        "lang": "rs",
+        "base": {
+            "lib.rs": "pub struct Counter {\n    pub n: u32,\n}\n\nimpl Counter {\n    pub fn bump(&mut self) -> u32 {\n        self.n += 1;\n        self.n\n    }\n}\n\npub fn run(mut counter: Counter, seed: u32) -> u32 {\n    let report = || {\n        let base = seed + 1;\n        base\n    };\n    report() + report()\n}\n"
+        },
+        "after": {
+            "lib.rs": "pub struct Counter {\n    pub n: u32,\n}\n\nimpl Counter {\n    pub fn bump(&mut self) -> u32 {\n        self.n += 1;\n        self.n\n    }\n}\n\npub fn run(mut counter: Counter, seed: u32) -> u32 {\n    let report = || {\n        let base = seed + 1;\n        counter.bump();\n        base\n    };\n    report() + report()\n}\n"
+        },
+        "expect": "break",
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "run:modified=ready"
+    },
+    {
+        "id": "written-ts-property-assignment-replaced-by-a-method-call",
+        "lang": "ts",
+        "base": {
+            "lib.ts": "export class Box {\n    size: number;\n\n    constructor(seed: number) {\n        this.size = seed;\n    }\n\n    fill(seed: number): void {\n        this.size = seed;\n    }\n\n    area(): number {\n        return this.size * 2;\n    }\n}\n"
+        },
+        "after": {
+            "lib.ts": "export class Box {\n    size: number;\n\n    constructor(seed: number) {\n        this.fill(seed);\n    }\n\n    fill(seed: number): void {\n        this.size = seed;\n    }\n\n    area(): number {\n        return this.size * 2;\n    }\n}\n"
+        },
+        "expect": "break",
+        "answer": "READY_FOR_TOOLCHAIN",
+        "detail": "constructor:modified=ready"
     }
 ];

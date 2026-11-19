@@ -49,15 +49,21 @@ const BLOCKED = 'BLOCKED';
  * is a binding or a condition the change wrote that a line it did not
  * write is checked against (eval/check-written-line-cases.js): a binding
  * changed before an unchanged `return`, a guard or assertion condition
- * changed with its end kept, a guard added above a literal comparison; or
- * text a change only deleted that an unwritten line relied on (the last use
- * of a local in Go, the call a Java `catch` expected).
+ * changed with its end kept, a guard added above a literal comparison; a
+ * settled call that changes what its surroundings are (a Rust closure made
+ * mutable, a property its constructor assigns through a method); or text a
+ * change only deleted that an unwritten line relied on (the last use of a
+ * local in Go, the call a Java `catch` expected).
  */
 const KNOWN_FALSE_READY = Object.freeze([
     Object.freeze({ id: 'written-go-call-removed-leaves-a-local-unused',
         evidence: 'go vet: a.go:6 declared and not used: y' }),
     Object.freeze({ id: 'written-java-throwing-call-removed-from-try',
         evidence: 'javac: Lib.java:13 exception IOException is never thrown in body of corresponding try statement' }),
+    Object.freeze({ id: 'written-rs-closure-made-mutable-by-a-call',
+        evidence: 'rustc: lib.rs:13 E0596, cannot borrow `report` as mutable, as it is not declared as mutable' }),
+    Object.freeze({ id: 'written-ts-property-assignment-replaced-by-a-method-call',
+        evidence: "tsc: lib.ts(2) TS2564, Property 'size' has no initializer and is not definitely assigned in the constructor" }),
     Object.freeze({ id: 'written-py-assert-condition-changed',
         evidence: "pyright: lib.py:3 reportOperatorIssue, Operator \"+\" not supported for types \"None\" and \"Literal[1]\"" }),
     Object.freeze({ id: 'written-py-binding-before-return',
