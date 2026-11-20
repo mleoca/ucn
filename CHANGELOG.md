@@ -2,6 +2,52 @@
 
 One section per released version, written from the commit subjects by `scripts/changelog.js` when the version is cut.
 
+## 5.6.2 - 2026-11-20
+
+### Fixes
+
+- a tagged changelog section is dated on the UTC clock an untagged one is written on, so the publish job's repeated version step leaves CHANGELOG.md unchanged at any hour (2f0d4de)
+- an overload stub is counted against each stub of its family and the implementation keeps its own list, so a call no stub takes is a mismatch again and one that binds another stub is none (d2165ed)
+- a Python method called through a subclass name is the unbound function too, a receiver name the file does not settle is uncertain, and overload stubs with their implementation are one call interface, so a call that binds another overload is no mismatch of an edited stub (37181ad)
+- a receiver spelled like a class is that class only when the file binds it so: callee type-qualified reads and caller identity ask the file's bindings, from-import submodules own their members on the callee side, Go, Java and C# locals are never type receivers; python-dateutil joins the pinned board (9a4e2eb)
+- a call the change inserted is a note only when its value, what it is handed and the text it replaced reach no line the change did not write, and the check matrix calls READY false only when a new error lands on such a line (97d79d8)
+- a Python method called through its class name is counted with the receiver the call writes, a static method takes every parameter it writes, and a rename plan edits only the imports that bind the pinned definition (09c4fba)
+- a module binds a name per definition and a default import its default export, a leading self or cls is an argument outside members called through a receiver, JS and TS loads by path are read like Python's, and every surface counts the test files tests links (896b0d6)
+- a patched name is read where it comes from (parametrize marks, literal containers, join, a helper's callers, runner tables), a patch owner by import, module path, ancestors and re-exports, a project class's own patch method is the project's, and testdouble's replace counts (a1ef04a)
+- a changed call in a large body is compared by the components of statements it depends on, built once and shared, so impact --base and check finish on a change inside a very large function with unchanged answers (d74930b)
+- a Python module loaded by path is the module at that path, so its member calls link that file's tests and callers, a path with a runtime part reaches only the files it matches, and tests lists unverified rows apart with no command (aeaa8e5)
+- a typed binding's result is settled only when its syntax proves the binding's keyword return type, an entry point naming a module reaches that module's declarations, a module-level function counts its leading self or cls, a cut check section counts symbols and lines apart, and CI runs the pytest liveness rows (8e08160)
+- a module exposes its own top-level bindings: a namespace-qualified call, an imported name and a require() receiver no longer confirm a function the module assigns to a member of some other value; members of the module object stay confirmed, and check no longer blocks a change of such a function on calls of the module's export (b886ada)
+- check counts each call against its own arguments and its callee's real interface: the calls of a chain are separate sites, a tuple struct or variant takes one value per field, a type name converts one value, a local of the name is not the project function, an imported name is never a class member, a callable under a typed binding is called as the type says; unread counts are review with a reason code, never a mismatch (434df45)
+- check reviews a body edit that moves where a path ends: a return, a throw, an assertion or a never-returning call removed or replaced, a break added to an endless loop, an end added before statements in Go and Java; 67 judged cases join the check matrix (492f191)
+- check settles a changed call when nothing the checker enforces on it is left unproven, blocks a wrong count through a receiver typed by its construction, reviews a Python callee name nothing binds, and prints one line per symbol for unverified calls; decorators are resolved by identity and a change's own test doubles are no reflective reach (c808026)
+- deletion verdicts hold for pytest fixtures, patch targets with a runtime part, poetry and flit entry points and JS/TS spies; a type is cited only at a proven use; a withheld notice names the count it shows (cb916e3)
+
+### Performance
+
+- dead code reads Python string regions and normalized identifiers from the index, walks the namespace inventory smallest file first, reads a scope's bindings in one walk and tests a few names by word pattern; answers unchanged (709096a)
+
+### Documentation
+
+- the README cites the November 20 release dry run, whose compiler-judged results cover the 861 changes of the check matrix (e739d96)
+- the command reference names every flag the CLI accepts and every structural search kind, the resolution rules state what a receiver name denotes, the trust contract states the latency limits the gate applies, and the help lines, schema descriptions and workflow comments say what the commands do (c4f0999)
+- the skill's check step states the verdicts and the note rule briefly and leaves the reason codes to the command reference (66f59a9)
+- the README reports the check matrix at its current size, 778 single changes (727ae3a)
+
+### Tests
+
+- two index-refresh tests rewrite their fixture at another byte length, so a rewrite inside the first write's clock tick is still seen as a change (bb889e4)
+
+### Evaluation
+
+- off the reference host class the performance gate's absolute floors are advisory, a class baseline gates throughput where one is pinned and a repository without one is reported (076d748)
+- two more judged breaks the check answers READY are named as known gaps, a Rust closure a settled call makes mutable and a TypeScript property its constructor assigns through a method; the README counts 856 changes and 10 gaps (dfedf84)
+- replay pinned upstream history through check: a BLOCKED accepted commit, a stale known-break mark or an error row fails --gate; rates and the lever list per repository, measured on the matrices runner (9cf1bc8)
+
+### Maintenance
+
+- the interoperability test runs against the official MCP SDK 1.32.2, a development dependency the published package ships none of (43b0b6b)
+
 ## 5.6.1 - 2026-11-14
 
 ### Fixes
