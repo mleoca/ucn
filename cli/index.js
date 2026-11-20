@@ -746,10 +746,10 @@ Commands:
   api [file]                      Project or file public API (exact files include tests;
                                   broader scans exclude tests unless --include-tests)
   check [symbol]                  Signature check; without symbol, precommit check
-  plan <symbol>                   Preview rename or parameter edits
+  plan <symbol>                   Preview rename or parameter edits; --delete assesses a deletion
   entrypoints                     Runtime and framework entry points
   endpoints                       Server/client HTTP surface
-  deadcode                        Conservative unreachable-symbol candidates
+  deadcode                        Conservative unreferenced-symbol candidates
   audit-async                     Likely missing-await sites
   stacktrace <text>               Resolve runtime frames to source
 

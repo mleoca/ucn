@@ -10,7 +10,7 @@ name: PR Eval Gate
 #  - any identity, caller-tier, reason, or account disagreement between
 #    overlapping stable-handle commands on the deterministic symbol board
 # The ten-repository publish battery runs before release. The weekly and
-# manually dispatched workflow covers all twenty-two pinned repositories.
+# manually dispatched workflow covers every pinned repository.
 
 on:
   pull_request:

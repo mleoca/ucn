@@ -235,7 +235,7 @@ function resolveAndValidatePath(index, file) {
 // CONSOLIDATED TOOL REGISTRATION
 // ============================================================================
 
-const CONCISE_TOOL_DESCRIPTION = `Auditable AST code intelligence for JavaScript/TypeScript, Python, Go, Rust, Java, C, C++, C#, and HTML.
+const TOOL_DESCRIPTION = `Auditable AST code intelligence for JavaScript/TypeScript, Python, Go, Rust, Java, C, C++, C#, and HTML.
 
 Use UCN for semantic questions: exact definitions, symbol-aware callers/callees, change impact, test selection, dependencies, APIs, entry points, and focused audits. Use grep/ripgrep for simple literals, error messages, configuration, filenames, Markdown, and unsupported languages. UCN search is worthwhile when AST structure, code-only filtering, or the shared agent contract matters.
 
@@ -251,11 +251,6 @@ Use UCN for semantic questions: exact definitions, symbol-aware callers/callees,
 - deadcode/audit_async/stacktrace: focused audits and runtime evidence. Computed dispatch is reported as a health/deletion blind spot; unknown decorators and member-assigned handlers are withheld from default dead-code claims.
 
 CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review; when same-name definitions compete, show returns their stable handles once above the sites. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. CONTRACT is a state: text-complete means every literal-name line of project source was classified, never that aliases, indirect calls, generated code or runtime dispatch are absent. Source UCN reads without analyzing (bundles, paths excluded in .ucn.json, oversized files, unsupported languages) is searched for each name and listed only when the name occurs there; a path that cannot be read degrades every account. repo health states the scope once. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Releases are gated on pinned real repositories: sampled callers, callees, value references, and dead-code claims are compared with ts-morph, Pyright, gopls, rust-analyzer, JDT LS, Roslyn, and clangd, and one handle's claims must agree across find, show, source, impact, tests, check, and caller trace.` + generateMcpParamSection();
-
-// The default description is the only public contract. The former verbose
-// description is intentionally not selectable: it documented retired commands
-// and made the single MCP tool difficult for agents to parse.
-const TOOL_DESCRIPTION = CONCISE_TOOL_DESCRIPTION;
 
 // The public JSON Schema and the runtime validation rules are one object,
 // written from the registry's parameter table: a type, a bound, a value list

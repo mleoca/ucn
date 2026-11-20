@@ -22,7 +22,7 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `impact [handle]` | Direct impact of one symbol; without a handle, the Git diff (`--base=<ref>`, `--staged`). Property targets add an access-site band, type targets a reference-site band. |
 | `tests <handle\|file>` | Statically linked direct tests; `--depth=N` adds transitively affected tests; `--calls-only` keeps direct calls and test-case matches. |
 | `check [handle]` | Call-site validation for one symbol against its declaration at `--base` (default `HEAD`); without a handle, the composed pre-commit check of the diff (`--base`, `--staged`). |
-| `plan <handle>` | Preview `--rename-to=X`, `--add-param=p` (`--default-value=v`), or `--remove-param=p`. Never edits files. A Python param added beside `*args` or keyword-only params is keyword-only (after them, before `**kwargs`); calls passing arguments where a param is inserted before a rest param are listed. `--delete` assesses deleting the declaration with the rule `deadcode` applies to every name: `no-static-dependents` (no use in project source outside its own declarations and no shield applies), `has-static-dependents` (a call proven to reach this declaration or a member of it, or an unambiguous use of its name, exists outside the declaration; the first site is printed), or `review` with the reason (exported from a library, bound to an external or project contract, registered, named by packaging metadata, reflected or named by a test double that requires it, uses of the name or calls sharing a member's name that are not proven to reach this declaration, source that could not be searched, used only inside the declaration itself). Static evidence, not a guarantee: run the compiler and the tests. `"kind": "application"` in `.ucn.json` lets exported symbols be assessed. |
+| `plan <handle>` | Preview `--rename-to=X`, `--add-param=p` (`--default-value=v`, alias `--default`), or `--remove-param=p`. Never edits files. A Python param added beside `*args` or keyword-only params is keyword-only (after them, before `**kwargs`); calls passing arguments where a param is inserted before a rest param are listed. `--delete` assesses deleting the declaration with the rule `deadcode` applies to every name: `no-static-dependents` (no use in project source outside its own declarations and no shield applies), `has-static-dependents` (a call proven to reach this declaration or a member of it, or an unambiguous use of its name, exists outside the declaration; the first site is printed), or `review` with the reason (exported from a library, bound to an external or project contract, registered, named by packaging metadata, reflected or named by a test double that requires it, uses of the name or calls sharing a member's name that are not proven to reach this declaration, source that could not be searched, used only inside the declaration itself). Static evidence, not a guarantee: run the compiler and the tests. `"kind": "application"` in `.ucn.json` lets exported symbols be assessed. |
 
 `show <handle> --sections=tests` and `tests <handle>` select direct tests for the same declaration. Equivalent `--file` and `--line` parameters preserve that pin, including overloaded methods.
 
@@ -42,7 +42,7 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 |---|---|
 | `deadcode` | Conservative unreferenced-symbol candidates for review. `--include-exported`, `--include-decorated`, `--include-tests`, `--in=DIR`. |
 | `audit-async` | Missing-await findings in JavaScript/TypeScript/HTML, Python and C#, and unpolled futures in Rust. MCP spelling: `audit_async`. |
-| `stacktrace <text>` | Advisory stack-frame parsing and source lookup (MCP parameter `stack`). |
+| `stacktrace <text>` | Advisory stack-frame parsing and source lookup (also `--stack=<text>`; MCP parameter `stack`). |
 
 ## Common flags
 
@@ -75,6 +75,17 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `--workers=N` | Build workers; `0` disables the parallel build. |
 | `--code-only` | Exclude comments and strings in `search`/`usages`. |
 | `--regex` | Interpret a `search` term as a regular expression; without it the term is literal. |
+| `--case-sensitive` | `search`: match case; without it the search ignores case. |
+| `--include-methods` / `--no-include-methods` | `show`, `trace`, `impact`, `tests`, `check`: include or leave out method callees where receiver evidence permits. Caller views always tier method sites. |
+| `--min-confidence=N` | `show`: hide caller and callee edges below this ordinal evidence weight, 0 to 1 (default 0); a note counts the hidden edges. Not a probability. |
+| `--hide-confidence` | `show`: leave out the evidence labels (`--show-confidence`, the default, prints them). |
+| `--unreachable-only` | `show`, `impact`: keep only relationships no detected entry point reaches; `FILTERED` counts what it hid. |
+| `--with-types` | `show`: add the related type definitions. |
+| `--git` | `show`: add last-modified, author and recent-change metadata to the summary. |
+| `--diverse` | `show --sections=example`: one example per distinct argument shape. |
+| `--max-files=N` | Files indexed at most (default 50000). |
+| `--no-follow-symlinks` | Do not follow symlinks during discovery (followed by default). |
+| `--interactive`, `--mcp`, `--verbose`, `--version`, `--help` | Process modes: the REPL, the MCP server on stdio, build and wait messages on stderr, the version, the full flag listing. |
 | Flag forms | A value flag is written `--flag=value` or `--flag value`, and is refused without a value. A boolean flag is `--flag`, `--flag=true` or `--flag=false`, including process controls such as `--json`. Negative spellings accept the same values: `--no-compact=false` enables compact output. A negative spelling wins over an affirmative spelling. Closed scalar values are exact strings; surrounding whitespace is refused. Value sets, numeric bounds and defaults are the same on the CLI and over MCP; `ucn --help` lists them all, and a value outside them is refused with the valid list. |
 
 ## Target forms and exit codes
@@ -109,7 +120,7 @@ A name with no definition of exactly that name matches by similarity (substring 
 
 ### search
 
-The term is literal by default; pass `--regex` only when regular-expression semantics are intended. Ordinary regex patterns run through an RE2-compatible linear-time engine; unsafe nested repetition is rejected, and unsupported advanced syntax should be handed to ripgrep. Structural `--param` matches parameter names, types, and defaults; `--returns` matches return annotations; both exclude AST comments and preserve string contents. `--type` accepts `function`, `class`, `call`, `method`, `type`, `state`, `field`, `constant`, `macro`. `--unused` lists callable symbols without call edges, not safe-delete candidates: decorated runtime registrations may still appear, and its safety note and decorator tags are kept in `--lines` output. Structural search discloses hidden test files, including on empty results; `--include-tests` gives the full indexed inventory.
+The term is literal by default; pass `--regex` only when regular-expression semantics are intended. Ordinary regex patterns run through an RE2-compatible linear-time engine; unsafe nested repetition is rejected, and unsupported advanced syntax should be handed to ripgrep. Structural `--param` matches parameter names, types, and defaults; `--returns` matches return annotations; both exclude AST comments and preserve string contents. `--type` accepts the kinds the table above lists. `--unused` lists callable symbols without call edges, not safe-delete candidates: decorated runtime registrations may still appear, and its safety note and decorator tags are kept in `--lines` output. Structural search discloses hidden test files, including on empty results; `--include-tests` gives the full indexed inventory.
 
 ### show and impact
 

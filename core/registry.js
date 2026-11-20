@@ -244,7 +244,7 @@ const PARAMS = {
     git: { type: 'boolean', text: 'show summary: attach last-modified, author, and recent-change metadata.' },
     addParam: { type: 'string', text: 'Parameter name to add (plan command)' },
     removeParam: { type: 'string', text: 'Parameter name to remove (plan command)' },
-    renameTo: { type: 'string', text: 'New name for the function, method, or type (plan command)' },
+    renameTo: { type: 'string', text: 'New name for the selected declaration (plan command)' },
     defaultValue: { type: 'string', cli: ['--default-value', '--default'], text: 'Default value for added parameter (plan command)' },
     delete: { type: 'boolean', text: 'plan: assess deleting the declaration. Returns no-static-dependents, has-static-dependents or review with its basis; static evidence, never a deletion guarantee.' },
     stack: { type: 'string', text: 'The stack trace text to parse (stacktrace command)' },
@@ -338,7 +338,7 @@ const PARAMS = {
     includeBundled: {
         type: 'boolean',
         global: true,
-        text: 'Index *.min.js and *.bundle.js files, which are left out when omitted. Source maps remain disclosed but unindexed. Bypasses the shared cache.',
+        text: 'Index *.min.js and *.bundle.js files; omitted, they are searched for each name and not indexed. Source maps remain disclosed but unindexed. Bypasses the shared cache.',
     },
     bridge: { type: 'boolean', text: 'Match server routes to client requests (endpoints command).' },
     serverOnly: { type: 'boolean', text: 'Only list server routes (endpoints command).' },

@@ -6,7 +6,7 @@ are illustrative. The editable fragment is `ucn-connected-scope.html`;
 with an 8.5-second loop. It needs `sharp` and `ffmpeg` for authoring only.
 The PNG is a still alternative.
 
-`ucn-evidence-graph.gif` is Fable's real-data demonstration, preserved with
+`ucn-evidence-graph.gif` is the real-data demonstration, kept with
 its HTML source, still PNG, and captured data in `ucn-evidence-graph.json`.
 The layout and animation sequence are a presentation of captured findings,
 not a recording of the engine's execution order or speed. The drawing shows
@@ -45,8 +45,7 @@ The animation is that capture. Since 5.5.2 the engine attributes the call at
 `crates/globset/src/lib.rs:635` to globset's own `file_name`, so the live
 partition is 4 confirmed calls, 0 unverified candidates, 17 non-call lines,
 8 other-target lines, and 0 unaccounted (checked against the local CLI on
-2026-11-14). The README's prose states only what holds in both, and its
+2026-11-20). The README's prose states only what holds in both, and its
 caption dates the capture.
 
-This directory is excluded from npm packages. Keep it with the README in
-the repository when promoting the proposal.
+This directory is excluded from npm packages.

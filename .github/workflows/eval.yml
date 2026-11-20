@@ -1,12 +1,13 @@
 name: Eval
 
 # Reliability/accuracy evaluation on pinned real repos:
-#  - conservation: account invariant + engine-gap metrics (43 pinned repos,
+#  - conservation: account invariant + engine-gap metrics (every pinned repo,
 #    covering JavaScript/TypeScript, Python, Go, Rust, Java, C/C++, and C#)
 #  - oracle: tiered caller answers vs compiler/LSP ground truth (ts-morph for
 #    TS repos; pyright-langserver over LSP for Python, jedi available as a
 #    second opinion via --oracle jedi with a self-bootstrapping venv; gopls
-#    for Go; rust-analyzer for Rust; jdtls for Java);
+#    for Go; rust-analyzer for Rust; jdtls for Java; clangd for C/C++;
+#    Roslyn for C#);
 #    fails when missing-unexplained > 0 (the contract gate)
 #  - deadcode: every deadcode claim checked for oracle references — fails
 #    when a default-arm claim has a reference UCN missed (false-dead gate)
