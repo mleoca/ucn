@@ -126,7 +126,7 @@ needs the compiler and tests.
 
 Release gates compare UCN's answers with independent compilers and language
 servers on a ten-repository board of pinned production codebases. The
-November 14, 2026 release dry run on GitHub Actions, using clangd 18.1.3 for
+November 20, 2026 release dry run on GitHub Actions, using clangd 18.1.8 for
 C/C++ and .NET 11.0.100 for Roslyn, recorded these sampled caller results:
 
 | Repository | Pinned commit | Oracle | Symbols sampled | Confirmed precision | In-scope recall |
